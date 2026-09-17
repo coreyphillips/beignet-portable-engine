@@ -1,0 +1,1876 @@
+import {
+	EAddressType,
+	EBoostType,
+	ECoinSelectPreference,
+	EFeeId,
+	IAddresses,
+	IAddressTypesIO,
+	ICoinSelectResponse,
+	IOutput,
+	ISendTransaction,
+	IUtxo,
+	TGetByteCountInputs,
+	TGetByteCountOutputs,
+	TGetTotalFeeObj
+} from '../types';
+import { getDefaultSendTransaction } from '../shapes';
+import { Wallet } from '../wallet';
+import {
+	Result,
+	ok,
+	err,
+	validateTransaction,
+	getTapRootAddressFromPublicKey,
+	isP2trPrefix
+} from '../utils';
+import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
+import { btcToSats } from '../utils/conversion';
+import { TRANSACTION_DEFAULTS } from '../wallet/constants';
+import {
+	constructByteCountParam,
+	createOpReturnScript,
+	getByteCount,
+	getDustThreshold,
+	setReplaceByFee
+} from '../utils';
+import {
+	IAddInput,
+	ICreateTransaction,
+	ISetupTransaction,
+	ITargets,
+	TSetupTransactionResponse
+} from '../types';
+import { Psbt } from 'bitcoinjs-lib';
+import { BIP32Interface } from 'bip32';
+import ecc from '@bitcoinerlab/secp256k1';
+import * as bitcoin from 'bitcoinjs-lib';
+import { getAddressInfo } from 'bitcoin-address-validation';
+import { ECPairInterface } from 'ecpair';
+import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
+
+bitcoin.initEccLib(ecc);
+
+export class Transaction {
+	private _data: ISendTransaction;
+	private readonly _wallet: Wallet;
+
+	constructor({ wallet }: { wallet: Wallet }) {
+		this._wallet = wallet;
+		this._data = getDefaultSendTransaction();
+	}
+
+	public get data(): ISendTransaction {
+		return this._data;
+	}
+
+	/**
+	 * Sets up a transaction for a given wallet by gathering inputs, setting the next available change address as an output and sets up the baseline fee structure.
+	 * This function will not override previously set transaction data. To do that you'll need to call resetSendTransaction.
+	 * @param {string[]} [inputTxHashes]
+	 * @param {IUtxo[]} [utxos]
+	 * @param {boolean} [rbf]
+	 * @param {number} [satsPerByte]
+	 * @param {IUtxo[]} [outputs]
+	 * @returns {Promise<Result<Partial<ISendTransaction>>>}
+	 */
+	public async setupTransaction({
+		inputTxHashes,
+		utxos,
+		rbf = false,
+		satsPerByte = 1,
+		outputs
+	}: ISetupTransaction = {}): Promise<TSetupTransactionResponse> {
+		try {
+			const addressType = this._wallet.addressType;
+
+			const currentWallet = this._wallet.data;
+
+			const transaction = currentWallet.transaction;
+
+			// Gather required inputs. Frozen (blacklisted) UTXOs are excluded
+			// from every wallet-driven selection path; only an explicit utxos
+			// argument (internal RBF/CPFP flows) bypasses the filter.
+			let inputs: IUtxo[] = [];
+			if (inputTxHashes) {
+				// If specified, filter for the desired tx_hash and push the utxo as an input.
+				inputs = this.removeBlackListedUtxos(
+					currentWallet.utxos.filter((utxo) => {
+						return inputTxHashes.includes(utxo.tx_hash);
+					})
+				);
+			} else if (utxos) {
+				inputs = utxos;
+			} else {
+				inputs = this.removeBlackListedUtxos(currentWallet.utxos);
+			}
+
+			if (!inputs.length) {
+				// If inputs were previously selected, leave them.
+				if (transaction.inputs.length > 0) {
+					inputs = transaction.inputs;
+				} else {
+					// Otherwise, lets use our available utxo's.
+					inputs = this.removeBlackListedUtxos(currentWallet.utxos);
+				}
+			}
+
+			if (!inputs.length) {
+				return err('No inputs specified in setupTransaction.');
+			}
+
+			const currentChangeAddresses = currentWallet.changeAddresses;
+
+			const addressTypeKeys = Object.values(EAddressType);
+			let changeAddresses: IAddresses = {};
+			addressTypeKeys.forEach((key) => {
+				changeAddresses = {
+					...changeAddresses,
+					...currentChangeAddresses[key]
+				};
+			});
+			const changeAddressesArr = Object.values(changeAddresses).map(
+				({ address }) => address
+			);
+
+			const changeAddressIndexContent =
+				currentWallet.changeAddressIndex[addressType];
+			// Set the current change address.
+			const changeAddress = changeAddressIndexContent.address;
+			if (!changeAddress) {
+				return err('Unable to successfully generate a change address.');
+			}
+
+			const lightningInvoice = currentWallet.transaction?.lightningInvoice;
+
+			outputs = outputs || currentWallet.transaction?.outputs || [];
+			if (!lightningInvoice) {
+				//Remove any potential change address that may have been included from a previous tx attempt.
+				outputs = outputs.filter((output) => {
+					return !!(
+						output.address && !changeAddressesArr.includes(output.address)
+					);
+				});
+			}
+
+			// Set the minimum fee.
+			const fee = this.getTotalFee({
+				satsPerByte,
+				message: '',
+				transaction: {
+					...transaction,
+					inputs,
+					outputs
+				}
+			});
+
+			const payload = {
+				inputs,
+				changeAddress,
+				fee,
+				outputs,
+				rbf,
+				satsPerByte
+			};
+
+			this._data = {
+				...this._data,
+				...payload
+			};
+
+			// Save the transaction data.
+			await this._wallet.saveWalletData('transaction', this._data);
+
+			return ok(payload);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	public async applyAutoCoinSelect({
+		coinSelectRes
+	}: {
+		coinSelectRes: ICoinSelectResponse;
+	}): Promise<Result<ISendTransaction>> {
+		const data = {
+			...this._data,
+			inputs: coinSelectRes.inputs
+		};
+		this._data = data;
+
+		// Save the transaction data.
+		await this._wallet.saveWalletData('transaction', this._data);
+
+		return ok(data);
+	}
+
+	/**
+	 * This completely resets the send transaction state.
+	 * @returns {Promise<Result<string>>}
+	 */
+	async resetSendTransaction(): Promise<Result<string>> {
+		this._data = getDefaultSendTransaction();
+		await this._wallet.saveWalletData('transaction', this._data);
+		return ok('Transaction reset.');
+	}
+
+	/**
+	 * Removes blacklisted UTXO's from the UTXO array.
+	 * @param utxos
+	 */
+	removeBlackListedUtxos(utxos?: IUtxo[]): IUtxo[] {
+		if (!utxos) {
+			utxos = this._wallet.data.utxos;
+		}
+		const blacklistedUtxos = this._wallet.data.blacklistedUtxos;
+		// Match by outpoint only: height changes when a frozen UTXO confirms
+		// and must not silently unfreeze it.
+		return utxos.filter((utxo) => {
+			return !blacklistedUtxos.find(
+				(blacklistedUtxo) =>
+					utxo.tx_hash === blacklistedUtxo.tx_hash &&
+					utxo.tx_pos === blacklistedUtxo.tx_pos
+			);
+		});
+	}
+
+	/**
+	 * Rewrites plain P2WSH input counts to the weight-accurate
+	 * MULTISIG-P2WSH:m-n key for multisig wallets. getByteCount has no
+	 * generic P2WSH input weight; without this the byte count is unusable.
+	 * @private
+	 * @param {TGetByteCountInputs} param
+	 * @returns {TGetByteCountInputs}
+	 */
+	private applyMultisigInputWeights(
+		param: TGetByteCountInputs
+	): TGetByteCountInputs {
+		// autoCoinSelect must stay usable on a Transaction with no wallet
+		// attached, so tolerate an undefined wallet here.
+		const info = this._wallet?.multisigInfo;
+		if (!info) return param;
+		const record = param as Record<string, number>;
+		const count = record.P2WSH ?? record.p2wsh ?? 0;
+		if (count > 0) {
+			delete record.P2WSH;
+			delete record.p2wsh;
+			record[`MULTISIG-P2WSH:${info.threshold}-${info.totalCosigners}`] = count;
+		}
+		return param;
+	}
+
+	/**
+	 * Attempt to estimate the current fee for a given transaction and its UTXO's
+	 * @param {number} [satsPerByte]
+	 * @param {string} [message]
+	 * @param {Partial<ISendTransaction>} [transaction]
+	 * @param {boolean} [fundingLightning]
+	 * @param {ECoinSelectPreference} [coinSelectPreference]
+	 * @returns {number}
+	 */
+	getTotalFee = ({
+		satsPerByte,
+		message = '',
+		transaction = this.data,
+		fundingLightning = false,
+		coinSelectPreference = this._wallet.coinSelectPreference
+	}: {
+		satsPerByte: number;
+		message?: string;
+		transaction?: Partial<ISendTransaction>;
+		fundingLightning?: boolean;
+		coinSelectPreference?: ECoinSelectPreference;
+	}): number => {
+		const baseTransactionSize = TRANSACTION_DEFAULTS.recommendedBaseFee;
+		try {
+			let inputs = transaction.inputs || [];
+			if (
+				coinSelectPreference !== ECoinSelectPreference.consolidate &&
+				!transaction.max
+			) {
+				const coinSelectRes = this.autoCoinSelect({
+					inputs: transaction.inputs || [],
+					outputs: transaction.outputs || [],
+					changeAddress: transaction.changeAddress,
+					satsPerByte,
+					message,
+					coinSelectPreference
+				});
+				if (coinSelectRes.isOk()) {
+					inputs = coinSelectRes.value.inputs;
+				}
+			}
+			const outputs = transaction.outputs || [];
+			const changeAddress = transaction.changeAddress;
+
+			//Group all input & output addresses into their respective array.
+			const inputAddresses = inputs.map((input) => input.address);
+			const outputAddresses = outputs.map((output) => output.address);
+
+			//No need for a change address when draining the wallet
+			if (changeAddress && !transaction.max) {
+				outputAddresses.push(changeAddress);
+			}
+
+			// Every transaction pays to at least one output, even when the caller has
+			// not named it yet. sendMax works out the amount before it knows where it
+			// is going, so the outputs are still empty here; counting none of them
+			// priced the sweep one output short and it went out below the rate that
+			// was asked for. getTotalFeeObj already assumes the output. Assume it here
+			// too, or the two disagree about the same transaction.
+			let increaseAddressCount = 0;
+			if (!outputAddresses.length) {
+				increaseAddressCount++;
+			}
+
+			//Determine the address type of each address and construct the object for fee calculation
+			const inputParam = this.applyMultisigInputWeights(
+				constructByteCountParam(inputAddresses)
+			);
+			const outputParam = constructByteCountParam(outputAddresses, [
+				{ addrType: this._wallet.addressType, count: increaseAddressCount }
+			]);
+			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+			// every channel funding transaction by 12 vB, which is a real shortfall
+			// at the fee rates a funding transaction is actually broadcast at.
+			if (fundingLightning) {
+				const fundingOutputs = outputParam as TGetByteCountOutputs;
+				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+			}
+
+			let transactionByteCount = getByteCount(inputParam, outputParam, message);
+			if (satsPerByte < 2) {
+				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+				if (transactionByteCount < minByteCount)
+					transactionByteCount = minByteCount;
+			}
+			return transactionByteCount * satsPerByte;
+		} catch {
+			return baseTransactionSize * satsPerByte;
+		}
+	};
+
+	/**
+	 * Attempt to estimate the current fee for a given transaction and its UTXO's
+	 * @param {number} [amount]
+	 * @param {number} [satsPerByte]
+	 * @param {string} [message]
+	 * @param {Partial<ISendTransaction>} [transaction]
+	 * @param {boolean} [fundingLightning]
+	 * @returns {Result<TGetTotalFeeObj>}
+	 */
+	getTotalFeeObj = ({
+		satsPerByte = this._wallet.feeEstimates.normal,
+		message = '',
+		transaction = this.data,
+		fundingLightning = false,
+		coinSelectPreference = this._wallet.coinSelectPreference
+	}: {
+		satsPerByte?: number;
+		message?: string;
+		transaction?: Partial<ISendTransaction>;
+		fundingLightning?: boolean;
+		coinSelectPreference?: ECoinSelectPreference;
+	} = {}): Result<TGetTotalFeeObj> => {
+		try {
+			if (!transaction.inputs?.length) {
+				void this.setupTransaction({});
+				transaction = this.data;
+			}
+			const changeAddress = transaction.changeAddress;
+
+			let inputs = transaction.inputs || [];
+			const outputs = transaction.outputs || [];
+
+			if (
+				coinSelectPreference !== ECoinSelectPreference.consolidate &&
+				!transaction.max
+			) {
+				const coinSelectRes = this.autoCoinSelect({
+					inputs,
+					outputs,
+					changeAddress,
+					satsPerByte,
+					message,
+					coinSelectPreference
+				});
+				if (coinSelectRes.isErr()) {
+					return err(coinSelectRes.error);
+				}
+				inputs = coinSelectRes.value.inputs;
+			}
+
+			if (!inputs.length) {
+				return ok({
+					totalFee: 0,
+					transactionByteCount: 0,
+					satsPerByte: 0,
+					maxSatPerByte: 0
+				});
+			}
+
+			//Group all input & output addresses into their respective array.
+			const inputAddresses = inputs.map((input) => input.address);
+			const outputAddresses = outputs.map((output) => output.address);
+
+			// Always assume we're sending to at least one output for a proper base calculation.
+			let increaseAddressCount = 0;
+			if (!outputAddresses.length) {
+				increaseAddressCount++;
+			}
+			//No need for a change address when draining the wallet
+			if (changeAddress && !transaction.max) {
+				outputAddresses.push(changeAddress);
+			}
+
+			//Determine the address type of each address and construct the object for fee calculation
+			const inputParam = this.applyMultisigInputWeights(
+				constructByteCountParam(inputAddresses)
+			);
+			const outputParam = constructByteCountParam(outputAddresses, [
+				{ addrType: this._wallet.addressType, count: increaseAddressCount }
+			]);
+			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+			// every channel funding transaction by 12 vB, which is a real shortfall
+			// at the fee rates a funding transaction is actually broadcast at.
+			if (fundingLightning) {
+				const fundingOutputs = outputParam as TGetByteCountOutputs;
+				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+			}
+
+			let transactionByteCount = getByteCount(inputParam, outputParam, message);
+			if (satsPerByte < 2) {
+				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+				if (transactionByteCount < minByteCount)
+					transactionByteCount = minByteCount;
+			}
+			const inputAmount = this.getTransactionInputValue({ inputs });
+			const outputAmount = this.getTransactionOutputValue({ outputs });
+			// To prevent the user from spending more in fees than their output, use the output amount if available.
+			const txBalance =
+				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
+			const maxSatPerByte = this.getMaxSatsPerByte({
+				transactionByteCount,
+				balance: txBalance
+			});
+			if (maxSatPerByte < satsPerByte) {
+				return ok({
+					totalFee: transactionByteCount * maxSatPerByte,
+					transactionByteCount: maxSatPerByte ? transactionByteCount : 0,
+					satsPerByte: maxSatPerByte,
+					maxSatPerByte
+				});
+			}
+			return ok({
+				totalFee: transactionByteCount * satsPerByte,
+				transactionByteCount,
+				satsPerByte,
+				maxSatPerByte
+			});
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Returns the maximum sats per byte that can be used for a given transaction.
+	 * @param {number} transactionByteCount
+	 * @param {number} [balance]
+	 * @returns {number}
+	 */
+	getMaxSatsPerByte = ({
+		transactionByteCount,
+		balance = this._wallet.getBalance()
+	}: {
+		transactionByteCount: number;
+		balance?: number;
+	}): number => {
+		return Math.floor(balance / (2 * transactionByteCount));
+	};
+
+	/**
+	 * Creates complete signed transaction using the transaction data store
+	 * @param {ISendTransaction} [transactionData]
+	 * @param {boolean} [shuffleOutputs]
+	 * @param {coinSelectPreference} [ECoinSelectPreference]
+	 * @returns {Promise<Result<{id: string, hex: string}>>}
+	 */
+	createTransaction = async ({
+		transactionData = this.data,
+		shuffleOutputs = true,
+		runCoinSelect = false
+	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
+		let transaction = transactionData;
+		if (runCoinSelect) {
+			const coinSelectRes = this.autoCoinSelect({
+				inputs: transactionData.inputs,
+				outputs: transactionData.outputs,
+				satsPerByte: transactionData.satsPerByte,
+				changeAddress: transactionData.changeAddress,
+				message: transactionData.message,
+				coinSelectPreference: this._wallet.coinSelectPreference
+			});
+			if (coinSelectRes.isErr()) {
+				return err(coinSelectRes.error);
+			}
+			const coinSelectApplyRes = await this.applyAutoCoinSelect({
+				coinSelectRes: coinSelectRes.value
+			});
+			if (coinSelectApplyRes.isErr()) {
+				return err(coinSelectApplyRes.error);
+			}
+			transaction = {
+				...coinSelectApplyRes.value,
+				outputs: transactionData.outputs
+			};
+		}
+
+		const inputValue = this.getTransactionInputValue({
+			inputs: transaction.inputs
+		});
+		const outputValue = this.getTransactionOutputValue({
+			outputs: transaction.outputs
+		});
+		if (inputValue === 0) {
+			const message = 'No inputs to spend.';
+			return err(message);
+		}
+		const fee = inputValue - outputValue;
+
+		//Refuse tx if the fee is greater than the amount we're attempting to send.
+		if (fee > inputValue) {
+			const message = 'Fee is larger than the intended payment.';
+			return err(message);
+		}
+
+		const validateRes = validateTransaction(transaction);
+		if (validateRes.isErr()) return err(validateRes.error.message);
+
+		try {
+			const bip32InterfaceRes = await this._wallet.getBip32Interface();
+			if (bip32InterfaceRes.isErr()) {
+				return err(bip32InterfaceRes.error.message);
+			}
+
+			//Create PSBT before signing inputs
+			const psbtRes = await this.createPsbtFromTransactionData({
+				transactionData: transaction,
+				bip32Interface: bip32InterfaceRes.value,
+				shuffleTargets: shuffleOutputs
+			});
+
+			if (psbtRes.isErr()) {
+				return err(psbtRes.error);
+			}
+
+			const psbt = psbtRes.value;
+
+			const signedPsbtRes = await this.signPsbt({
+				psbt,
+				bip32Interface: bip32InterfaceRes.value
+			});
+
+			if (signedPsbtRes.isErr()) {
+				return err(signedPsbtRes.error);
+			}
+
+			const tx = signedPsbtRes.value.extractTransaction();
+			const id = tx.getId();
+			const hex = tx.toHex();
+			return ok({ id, hex });
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Returns total value of all utxos.
+	 * @param {IUtxo[]} [inputs]
+	 */
+	getTransactionInputValue = ({ inputs }: { inputs?: IUtxo[] }): number => {
+		try {
+			if (!inputs) {
+				const transaction = this.data;
+				inputs = transaction.inputs;
+			}
+			if (inputs) {
+				const response = reduceValue({ arr: inputs, value: 'value' });
+				if (response.isOk()) {
+					return response.value;
+				}
+				// 0 is also what an empty input set returns, so a failure here is
+				// invisible to the caller. Say so rather than only returning it.
+				this._wallet?.logger?.error(
+					'Failed to total the transaction inputs.',
+					response.error
+				);
+			}
+			return 0;
+		} catch (e) {
+			this._wallet?.logger?.error('Failed to total the transaction inputs.', e);
+			return 0;
+		}
+	};
+
+	/**
+	 * Loops through inputs and signs them
+	 * @param {Psbt} psbt
+	 * @param {BIP32Interface} bip32Interface
+	 * @returns {Promise<Result<Psbt>>}
+	 */
+	signPsbt = async ({
+		psbt,
+		bip32Interface
+	}: {
+		psbt: Psbt;
+		bip32Interface: BIP32Interface;
+	}): Promise<Result<Psbt>> => {
+		const transactionDataRes = this.data;
+
+		const { inputs } = transactionDataRes;
+		for (const [index, input] of inputs.entries()) {
+			try {
+				let keyPair = input?.keyPair;
+				if (!keyPair && input?.path) {
+					keyPair = bip32Interface.derivePath(input.path);
+				}
+				if (!keyPair) return err('Unable to derive keyPair.');
+				if (isP2trPrefix(input.address)) {
+					const tapRootAddress = getTapRootAddressFromPublicKey({
+						publicKey: keyPair.publicKey,
+						network: getBitcoinJsNetwork(this._wallet.network)
+					});
+					if (tapRootAddress.isErr()) return err(tapRootAddress.error.message);
+					const childNodeXOnlyPubkey = tapRootAddress.value.internalPubkey;
+					const tweakedChildNode = keyPair.tweak(
+						bitcoin.crypto.taggedHash('TapTweak', childNodeXOnlyPubkey)
+					);
+					psbt.signInput(index, tweakedChildNode);
+				} else {
+					psbt.signInput(index, keyPair);
+				}
+			} catch (e) {
+				return err(e);
+			}
+		}
+
+		psbt.finalizeAllInputs();
+
+		return ok(psbt);
+	};
+
+	/**
+	 * Returns a PSBT that includes unsigned funding inputs.
+	 * @param {ISendTransaction} transactionData
+	 * @param {BIP32Interface} bip32Interface
+	 * @param shuffleTargets
+	 * @returns {Promise<Result<Psbt>>}
+	 */
+	createPsbtFromTransactionData = async ({
+		transactionData,
+		bip32Interface,
+		shuffleTargets = true
+	}: {
+		transactionData: ISendTransaction;
+		bip32Interface?: BIP32Interface;
+		shuffleTargets?: boolean;
+	}): Promise<Result<Psbt>> => {
+		const { inputs, outputs, fee, rbf, message } = transactionData;
+		let { changeAddress } = transactionData;
+
+		//Get balance of current inputs.
+		const balance = this.getTransactionInputValue({
+			inputs
+		});
+
+		//Get value of current outputs.
+		const outputValue = this.getTransactionOutputValue({
+			outputs
+		});
+
+		const network = getBitcoinJsNetwork(this._wallet.network);
+
+		//Collect all outputs.
+		let targets: ITargets[] = outputs.concat();
+
+		//Change address and amount to send back to wallet.
+		if (changeAddress) {
+			const changeAddressValue = balance - (outputValue + fee);
+			// Ensure we're not creating unspendable dust.
+			// If we have less than 2x the recommended base fee, just contribute it to the fee in this transaction.
+			if (changeAddressValue >= TRANSACTION_DEFAULTS.dustLimit) {
+				targets.push({
+					address: changeAddress,
+					value: changeAddressValue,
+					index: targets.length
+				});
+			}
+			// Looks like we don't need a change address.
+			// Double check we don't have any spare sats hanging around.
+		} else if (outputValue + fee < balance) {
+			// If we have spare sats hanging around and the difference is greater than the dust limit, generate a changeAddress to send them to.
+			const diffValue = balance - (outputValue + fee);
+			if (diffValue >= TRANSACTION_DEFAULTS.dustLimit) {
+				const changeAddressRes = await this._wallet.getChangeAddress();
+				if (changeAddressRes.isErr()) {
+					return err(changeAddressRes.error.message);
+				}
+				changeAddress = changeAddressRes.value.address;
+				targets.push({
+					address: changeAddress,
+					value: diffValue,
+					index: targets.length
+				});
+			}
+		}
+
+		//Embed any OP_RETURN messages. getByteCount prices this same script, so
+		//the padding and push rules live in one place.
+		const opReturnScript = createOpReturnScript(message);
+		if (opReturnScript) {
+			targets.push({
+				script: opReturnScript,
+				value: 0,
+				index: targets.length
+			});
+		}
+
+		// Watch-only wallets cannot produce a signing root; inputs only need
+		// public keys here, which derivePublicNode provides in both modes.
+		if (!bip32Interface && !this._wallet.isWatchOnly) {
+			const bip32InterfaceRes = await this._wallet.getBip32Interface();
+			if (bip32InterfaceRes.isErr()) {
+				return err(bip32InterfaceRes.error.message);
+			}
+			bip32Interface = bip32InterfaceRes.value;
+		}
+
+		const root = bip32Interface;
+		const psbt = new bitcoin.Psbt({ network });
+
+		//Add Inputs from inputs array
+		try {
+			for (const input of inputs) {
+				if (this._wallet.isMultisig) {
+					// Multisig inputs are built from the sortedmulti script, not a
+					// single key pair (watch-only multisig has no derivable key).
+					const addRes = await this.addInput({ psbt, input });
+					if (addRes.isErr()) return err(addRes.error.message);
+					continue;
+				}
+				let keyPair: BIP32Interface | ECPairInterface | undefined =
+					input?.keyPair;
+				if (!keyPair && input?.path) {
+					if (root) {
+						keyPair = root.derivePath(input.path);
+					} else {
+						const publicNodeRes = this._wallet.derivePublicNode(input.path);
+						if (publicNodeRes.isErr()) {
+							return err(publicNodeRes.error.message);
+						}
+						keyPair = publicNodeRes.value;
+					}
+				}
+				if (!keyPair) {
+					return err('Unable to derive keyPair.');
+				}
+				await this.addInput({
+					psbt,
+					keyPair,
+					input
+				});
+			}
+		} catch (e) {
+			return err(e);
+		}
+
+		//Set RBF if supported and prompted via rbf in Settings.
+		setReplaceByFee({ psbt, setRbf: !!rbf });
+
+		// Shuffle targets if not run from unit test and add outputs.
+		if (shuffleTargets) {
+			targets = shuffleArray(targets);
+		}
+
+		targets.forEach((target) => {
+			//Check if OP_RETURN
+			let isOpReturn = false;
+			try {
+				isOpReturn = !!target.script;
+			} catch (e) {}
+			if (isOpReturn) {
+				if (target.script) {
+					psbt.addOutput({
+						script: target.script,
+						value: target.value ?? 0
+					});
+				}
+			} else {
+				if (target.address && target.value) {
+					psbt.addOutput({
+						address: target.address,
+						value: target.value
+					});
+				}
+			}
+		});
+
+		return ok(psbt);
+	};
+
+	/**
+	 * Builds an UNSIGNED PSBT from the current (or provided) transaction data
+	 * and attaches the metadata an external signer needs
+	 * (bip32Derivation/tapBip32Derivation). Mirrors createTransaction but
+	 * stops before signing.
+	 * @param {ISendTransaction} [transactionData]
+	 * @param {boolean} [shuffleOutputs]
+	 * @returns {Promise<Result<Psbt>>}
+	 */
+	createUnsignedPsbt = async ({
+		transactionData = this.data,
+		shuffleOutputs = true
+	}: {
+		transactionData?: ISendTransaction;
+		shuffleOutputs?: boolean;
+	} = {}): Promise<Result<Psbt>> => {
+		const inputValue = this.getTransactionInputValue({
+			inputs: transactionData.inputs
+		});
+		const outputValue = this.getTransactionOutputValue({
+			outputs: transactionData.outputs
+		});
+		if (inputValue === 0) {
+			return err('No inputs to spend.');
+		}
+		const fee = inputValue - outputValue;
+		if (fee > inputValue) {
+			return err('Fee is larger than the intended payment.');
+		}
+
+		const validateRes = validateTransaction(transactionData);
+		if (validateRes.isErr()) return err(validateRes.error.message);
+
+		try {
+			const psbtRes = await this.createPsbtFromTransactionData({
+				transactionData,
+				shuffleTargets: shuffleOutputs
+			});
+			if (psbtRes.isErr()) return err(psbtRes.error);
+			const psbt = psbtRes.value;
+			const metadataRes = this.addSignerMetadata({
+				psbt,
+				inputs: transactionData.inputs
+			});
+			if (metadataRes.isErr()) return err(metadataRes.error.message);
+			return ok(psbt);
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Attaches bip32Derivation (tapBip32Derivation for p2tr) to each PSBT
+	 * input so external signers can locate their keys. PSBT inputs are added
+	 * in the order of the inputs array, so indexes line up.
+	 * @param {Psbt} psbt
+	 * @param {IUtxo[]} inputs
+	 * @returns {Result<string>}
+	 * @private
+	 */
+	private addSignerMetadata({
+		psbt,
+		inputs
+	}: {
+		psbt: Psbt;
+		inputs: IUtxo[];
+	}): Result<string> {
+		try {
+			if (this._wallet.isMultisig) {
+				// Multisig inputs carry one bip32Derivation entry PER COSIGNER so
+				// every signer can locate its key.
+				inputs.forEach((input, index) => {
+					if (!input.path) return;
+					const paymentRes = this._wallet.getMultisigPayment(input.path);
+					if (paymentRes.isErr()) throw paymentRes.error;
+					psbt.updateInput(index, {
+						bip32Derivation: paymentRes.value.derivations
+					});
+				});
+				return ok('Signer metadata added.');
+			}
+			const masterFingerprint = this._wallet.getMasterFingerprint();
+			inputs.forEach((input, index) => {
+				// External inputs (e.g. swept keys) have no wallet path; an
+				// external signer cannot be pointed at them.
+				if (!input.path) return;
+				let pubkey: Buffer | undefined;
+				if (input.publicKey) {
+					pubkey = Buffer.from(input.publicKey, 'hex');
+				} else if (input.keyPair) {
+					pubkey = input.keyPair.publicKey;
+				} else {
+					const publicNodeRes = this._wallet.derivePublicNode(input.path);
+					if (publicNodeRes.isErr()) throw publicNodeRes.error;
+					pubkey = publicNodeRes.value.publicKey;
+				}
+				// Watch-only wallets with a supplied key origin pair the master
+				// fingerprint with the path that master actually derives.
+				const originPath = this._wallet.mapPathToKeyOrigin(input.path);
+				if (isP2trPrefix(input.address)) {
+					psbt.updateInput(index, {
+						tapBip32Derivation: [
+							{
+								masterFingerprint,
+								path: originPath,
+								pubkey: toXOnly(pubkey),
+								leafHashes: []
+							}
+						]
+					});
+				} else {
+					psbt.updateInput(index, {
+						bip32Derivation: [
+							{
+								masterFingerprint,
+								path: originPath,
+								pubkey
+							}
+						]
+					});
+				}
+			});
+			return ok('Signer metadata added.');
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Fetches the full previous transaction for a PSBT input, as a spreadable
+	 * { nonWitnessUtxo } field. Segwit v0 signers postdating CVE-2020-14199
+	 * (Ledger 2.x, Trezor >= 2.3.5) require non_witness_utxo alongside
+	 * witness_utxo to verify input amounts. Returns {} when the backend
+	 * cannot supply it (witness_utxo alone remains BIP 174-valid), so
+	 * offline builds still succeed.
+	 * @param {string} txHash
+	 * @returns {Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>>}
+	 * @private
+	 */
+	private async nonWitnessUtxoField(
+		txHash: string
+	): Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>> {
+		try {
+			const transaction = await this._wallet.electrum.getTransactions({
+				txHashes: [{ tx_hash: txHash }]
+			});
+			if (transaction.isErr()) return {};
+			const hex = transaction.value.data[0]?.result?.hex;
+			if (!hex) return {};
+			return { nonWitnessUtxo: Buffer.from(hex, 'hex') };
+		} catch {
+			return {};
+		}
+	}
+
+	addInput = async ({
+		psbt,
+		keyPair,
+		input
+	}: IAddInput): Promise<Result<string>> => {
+		try {
+			const network = getBitcoinJsNetwork(this._wallet.network);
+			const { type } = getAddressInfo(input.address);
+
+			if (!input.value) {
+				return err('No input provided.');
+			}
+
+			if (input.value < TRANSACTION_DEFAULTS.dustLimit) {
+				return err('Input value is below dust limit.');
+			}
+
+			// Use the provided input keyPair if available.
+			if (input?.keyPair) {
+				keyPair = input.keyPair;
+			}
+
+			if (type === 'p2wsh') {
+				// Sorted-multisig input: the witnessScript comes from the wallet's
+				// multisig configuration, keyed by the input's BIP 48 path.
+				const paymentRes = this._wallet.getMultisigPayment(input.path);
+				if (paymentRes.isErr()) return err(paymentRes.error.message);
+				const { address, output, witnessScript } = paymentRes.value;
+				if (address !== input.address) {
+					return err(
+						`Multisig script for path ${input.path} does not produce address ${input.address}.`
+					);
+				}
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					witnessUtxo: {
+						script: output,
+						value: input.value
+					},
+					witnessScript,
+					...(await this.nonWitnessUtxoField(input.tx_hash))
+				});
+				return ok('Success');
+			}
+
+			if (!keyPair) {
+				return err('Unable to derive keyPair.');
+			}
+
+			if (type === 'p2wpkh') {
+				const p2wpkh = bitcoin.payments.p2wpkh({
+					pubkey: keyPair.publicKey,
+					network
+				});
+				if (!p2wpkh?.output) {
+					return err('p2wpkh.output is undefined.');
+				}
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					witnessUtxo: {
+						script: p2wpkh.output,
+						value: input.value
+					},
+					...(await this.nonWitnessUtxoField(input.tx_hash))
+				});
+			}
+
+			if (type === 'p2sh') {
+				const p2wpkh = bitcoin.payments.p2wpkh({
+					pubkey: keyPair.publicKey,
+					network
+				});
+				const p2sh = bitcoin.payments.p2sh({ redeem: p2wpkh, network });
+				if (!p2sh?.output) {
+					return err('p2sh.output is undefined.');
+				}
+				if (!p2sh?.redeem) {
+					return err('p2sh.redeem.output is undefined.');
+				}
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					witnessUtxo: {
+						script: p2sh.output,
+						value: input.value
+					},
+					redeemScript: p2sh.redeem.output,
+					...(await this.nonWitnessUtxoField(input.tx_hash))
+				});
+			}
+
+			if (type === 'p2pkh') {
+				const transaction = await this._wallet.electrum.getTransactions({
+					txHashes: [{ tx_hash: input.tx_hash }]
+				});
+				if (transaction.isErr()) {
+					return err(transaction.error.message);
+				}
+				const hex = transaction.value.data[0].result.hex;
+				const nonWitnessUtxo = Buffer.from(hex, 'hex');
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					nonWitnessUtxo
+				});
+			}
+
+			if (type === 'p2tr') {
+				if (!keyPair && input?.path) {
+					const bip32Interface = await this._wallet.getBip32Interface();
+					if (bip32Interface.isErr()) return err(bip32Interface.error.message);
+					keyPair = bip32Interface.value.derivePath(input.path);
+				}
+				if (!keyPair) return err('No keyPair provided for p2tr input.');
+				const p2trAddress = getTapRootAddressFromPublicKey({
+					publicKey: keyPair.publicKey,
+					network
+				});
+				if (p2trAddress.isErr()) return err(p2trAddress.error.message);
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					witnessUtxo: {
+						script: p2trAddress.value.output,
+						value: input.value
+					},
+					tapInternalKey: p2trAddress.value.internalPubkey
+				});
+			}
+			return ok('Success');
+		} catch {
+			return err('Unable to add input.');
+		}
+	};
+
+	/**
+	 * Adds external inputs to the current transaction.
+	 * @param {IUtxo[]} inputs
+	 * @param {BIP32Interface | ECPairInterface} keyPair
+	 * @returns {Result<IUtxo[]>}
+	 */
+	public addExternalInputs({
+		inputs,
+		keyPair
+	}: {
+		inputs: IUtxo[];
+		keyPair: BIP32Interface | ECPairInterface;
+	}): Result<IUtxo[]> {
+		if (!inputs || !inputs.length) return err('No inputs provided.');
+		const transaction = this.data;
+		const satsPerByte = transaction.satsPerByte;
+		const newInputs = inputs.map((input) => {
+			return {
+				...input,
+				keyPair
+			};
+		});
+		const _inputs = [...transaction.inputs, ...newInputs];
+		const feeInfo = this.getTotalFeeObj({
+			satsPerByte,
+			transaction: {
+				...transaction,
+				inputs: _inputs
+			}
+		});
+		if (feeInfo.isErr()) return err(feeInfo.error.message);
+		const feeUpdateRes = this.updateFee({
+			satsPerByte,
+			transaction: {
+				...transaction,
+				inputs: _inputs
+			}
+		});
+		if (feeUpdateRes.isErr()) return err(feeUpdateRes.error.message);
+		const updateSendRes = this.updateSendTransaction({
+			transaction: {
+				inputs: _inputs
+			}
+		});
+		if (updateSendRes.isErr()) return err(updateSendRes.error.message);
+		return ok(_inputs);
+	}
+
+	/**
+	 * Adds an output at the specified index to the current transaction.
+	 * @param {string} address
+	 * @param {number} value
+	 * @param {number} [index]
+	 * @returns {IOutput}
+	 */
+	addOutput = async ({
+		address,
+		value,
+		index = 0
+	}: IOutput): Promise<Result<string>> => {
+		const dustThreshold = getDustThreshold(address);
+		if (value < dustThreshold) {
+			return err(
+				`Output value is below the dust threshold of ${dustThreshold} sats.`
+			);
+		}
+		if (!this.data.inputs?.length) {
+			const setupRes = await this.setupTransaction();
+			if (setupRes.isErr()) return err(setupRes.error.message);
+		}
+		return this.updateSendTransaction({
+			transaction: {
+				outputs: [{ address, value, index }]
+			}
+		});
+	};
+
+	/**
+	 * Returns total value of all outputs. Excludes any value that would be sent to the change address.
+	 * @param {IOutput[]} [outputs]
+	 * @returns {number}
+	 */
+	getTransactionOutputValue = ({
+		outputs
+	}: {
+		outputs?: IOutput[];
+	} = {}): number => {
+		try {
+			if (!outputs) {
+				const transaction = this.data;
+				outputs = transaction.outputs;
+			}
+			const response = reduceValue({ arr: outputs, value: 'value' });
+			if (response.isOk()) {
+				return response.value;
+			}
+			// See getTransactionInputValue: 0 is a legitimate total, so a silent 0
+			// on failure is indistinguishable from an empty output set.
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				response.error
+			);
+			return 0;
+		} catch (e) {
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				e
+			);
+			return 0;
+		}
+	};
+
+	/**
+	 * This updates the transaction state used for sending.
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @return {Promise<Result<string>>}
+	 */
+	updateSendTransaction = ({
+		transaction
+	}: {
+		transaction: Partial<ISendTransaction>;
+	}): Result<string> => {
+		try {
+			//Add output if specified
+			if (transaction.outputs) {
+				const currentTransaction = this._wallet.transaction.data;
+				const outputs = currentTransaction.outputs.concat();
+				transaction.outputs.forEach((output) => {
+					//if (output.value > TRANSACTION_DEFAULTS.dustLimit)
+					outputs[output.index] = output;
+				});
+				transaction.outputs = outputs;
+			}
+
+			this._data = {
+				...this._data,
+				...transaction
+			};
+
+			void this._wallet.saveWalletData('transaction', this.data);
+
+			return ok('Transaction updated');
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Updates the fee for the current transaction by the specified amount.
+	 * @param {number} [satsPerByte]
+	 * @param {EFeeId} [selectedFeeId]
+	 * @param {number} [index]
+	 * @param {ISendTransaction} [transaction]
+	 * @returns {Result<{ fee: number }>}
+	 */
+	public updateFee({
+		satsPerByte,
+		selectedFeeId = EFeeId.custom,
+		index = 0,
+		transaction = this.data
+	}: {
+		satsPerByte: number;
+		selectedFeeId?: EFeeId;
+		index?: number;
+		transaction?: ISendTransaction;
+	}): Result<{ fee: number }> {
+		const inputTotal = this.getTransactionInputValue({
+			inputs: transaction.inputs
+		});
+
+		const { max, message, outputs } = transaction;
+		let address = '';
+		if (outputs.length > index) {
+			address = outputs[index]?.address ?? '';
+		}
+
+		const newFee = this.getTotalFee({ satsPerByte, transaction, message });
+
+		//Return if the new fee exceeds half of the user's input balance
+		if (newFee >= inputTotal / 2) {
+			return err(
+				'Unable to increase the fee any further. Otherwise, it will exceed half the current input balance.'
+			);
+		}
+
+		const totalTransactionValue = this.getTransactionOutputValue({
+			outputs
+		});
+
+		//Return if the new fee exceeds half of the user's output amount
+		if (newFee >= totalTransactionValue / 2) {
+			return err(
+				'Unable to increase the fee any further. Otherwise, it will exceed half the current sending/output amount.'
+			);
+		}
+
+		const newTotalAmount = totalTransactionValue + newFee;
+		const _transaction: Partial<ISendTransaction> = {
+			satsPerByte,
+			fee: newFee,
+			selectedFeeId
+		};
+
+		if (max) {
+			// Update the tx value with the new fee to continue sending the max amount.
+			_transaction.outputs = [{ address, value: inputTotal - newFee, index }];
+		}
+
+		// Check that the user has enough funds
+		if (max || newTotalAmount <= inputTotal) {
+			this.updateSendTransaction({
+				transaction: _transaction
+			});
+			return ok({ fee: newFee });
+		}
+
+		return err(
+			'New total amount exceeds the available balance. Unable to update the transaction fee.'
+		);
+	}
+
+	/**
+	 * Toggles the max amount to the provided output index.
+	 * @param {string} [address] If left undefined, the current receiving address will be provided.
+	 * @param {ISendTransaction} [transaction]
+	 * @param {number} [index]
+	 * @param satsPerByte
+	 * @param rbf
+	 */
+	sendMax = async ({
+		address,
+		transaction,
+		index = 0,
+		satsPerByte,
+		rbf = false
+	}: {
+		address?: string;
+		transaction?: ISendTransaction;
+		index?: number;
+		satsPerByte?: number;
+		rbf?: boolean;
+	} = {}): Promise<Result<string>> => {
+		try {
+			if (!transaction) {
+				transaction = this.data;
+			}
+			if (!transaction.inputs?.length) {
+				const setupRes = await this.setupTransaction({ rbf });
+				if (setupRes.isErr()) return err(setupRes.error.message);
+			}
+			if (!satsPerByte) {
+				satsPerByte = transaction?.satsPerByte ?? 1;
+			}
+			const outputs = transaction.outputs ?? [];
+			// No address specified, attempt to assign the address currently specified in the current output index.
+			if (!address) {
+				address = outputs[index]?.address ?? '';
+			}
+
+			const maxAmountResponse = this.getMaxSendAmount({
+				satsPerByte,
+				selectedFeeId: transaction.selectedFeeId,
+				transaction
+			});
+			if (maxAmountResponse.isErr()) {
+				return err(maxAmountResponse.error);
+			}
+			const { amount, fee } = maxAmountResponse.value;
+
+			if (!transaction.max) {
+				this.updateSendTransaction({
+					transaction: {
+						satsPerByte,
+						max: true,
+						outputs: [{ address, value: amount, index }],
+						fee
+					}
+				});
+			} else {
+				this.updateSendTransaction({
+					transaction: {
+						max: false
+					}
+				});
+			}
+
+			return ok('Successfully setup max send transaction.');
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Calculates the max amount able to send for onchain/lightning
+	 * @param {ISendTransaction} [transaction]
+	 * @param {number} [index]
+	 */
+	//TODO: Double check the transactionSpeed and customFeeRate are being used correctly.
+	estimateTransactionCosts = ({
+		transaction,
+		customFeeRate
+	}: {
+		transaction?: ISendTransaction;
+		customFeeRate?: number;
+	}): Result<{ amount: number; fee: number; satsPerByte: number }> => {
+		try {
+			if (!transaction) {
+				transaction = this.data;
+			}
+
+			const currentWallet = this._wallet.data;
+			const onchainBalance = currentWallet.balance;
+
+			const inputValue = this.getTransactionInputValue({
+				inputs: transaction.inputs
+			});
+			const amount = onchainBalance > inputValue ? onchainBalance : inputValue;
+
+			let utxos: IUtxo[] = [];
+			//Ensure we add the larger utxo set for a more accurate fee.
+			if (transaction.inputs.length > currentWallet?.utxos.length) {
+				utxos = transaction.inputs;
+			} else {
+				utxos = currentWallet?.utxos ?? [];
+			}
+			const fees = this._wallet.feeEstimates;
+			const selectedFeeId = this._wallet.selectedFeeId;
+			const satsPerByte =
+				customFeeRate ??
+				(fees as Partial<Record<EFeeId, number>>)[selectedFeeId] ??
+				1;
+			const fee = this.getTotalFee({
+				satsPerByte,
+				message: transaction.message,
+				transaction: {
+					...transaction,
+					max: true,
+					inputs: utxos,
+					selectedFeeId,
+					satsPerByte
+				}
+			});
+
+			if (amount <= fee) {
+				return err(
+					`An amount of ${amount} is too low to spend with an expected fee of ${fee} at ${satsPerByte} satsPerVByte.`
+				);
+			}
+
+			const maxAmount = {
+				amount: amount - fee,
+				fee,
+				satsPerByte
+			};
+
+			return ok(maxAmount);
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Calculates the max amount able to send for the provided/current onchain transaction.
+	 * @param {number} satsPerByte
+	 * @param {EFeeId} [selectedFeeId]
+	 * @param {ISendTransaction} [transaction]
+	 * @returns {Result<{ amount: number; fee?: number }>}
+	 */
+	getMaxSendAmount({
+		satsPerByte,
+		selectedFeeId = EFeeId.none,
+		transaction = this.data
+	}: {
+		satsPerByte: number;
+		selectedFeeId?: EFeeId;
+		transaction?: ISendTransaction;
+	}): Result<{ amount: number; fee: number }> {
+		try {
+			const inputValue = this.getTransactionInputValue({
+				inputs: transaction.inputs
+			});
+			const amount = inputValue;
+
+			const inputs = transaction.inputs ?? [];
+
+			const fee = this.getTotalFee({
+				satsPerByte,
+				message: transaction.message,
+				transaction: {
+					...transaction,
+					max: true,
+					inputs,
+					selectedFeeId,
+					satsPerByte
+				}
+			});
+
+			if (amount <= fee) {
+				return err(
+					`An amount of ${amount} is too low to spend with an expected fee of ${fee} at ${satsPerByte} satsPerVByte.`
+				);
+			}
+
+			const maxAmount = {
+				amount: amount - fee,
+				fee
+			};
+
+			return ok(maxAmount);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Sets up a CPFP transaction.
+	 * @param {string} [txid]
+	 * @param {number} [satsPerByte]
+	 */
+	async setupCpfp({
+		txid,
+		satsPerByte
+	}: {
+		txid?: string; // txid of utxo to include in the CPFP tx. Undefined will gather all utxo's.
+		satsPerByte?: number;
+	}): Promise<Result<ISendTransaction>> {
+		try {
+			let minFee = this._wallet.feeEstimates.fast;
+			await this.resetSendTransaction();
+			const setupTransactionRes = await this.setupTransaction({
+				inputTxHashes: txid ? [txid] : undefined,
+				rbf: this._wallet.rbf
+			});
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
+			}
+			const receiveAddress = await this._wallet.getReceiveAddress({});
+			if (receiveAddress.isErr()) {
+				return err(receiveAddress.error.message);
+			}
+
+			// try to calculate satsPerByte if not provided.
+			// child + parent combined fee rate should be higher than fastest.
+			// TODO: take all possible unconfirmed parent UTXOs into account.
+			if (!satsPerByte && txid) {
+				const parent = this._wallet.data.transactions[txid];
+				if (parent) {
+					const parentVsize = parent.vsize;
+					const childVsize = 141; // assume segwit 1 input 1 output
+					const { fast, normal } = this._wallet.feeEstimates;
+					// IFormattedTransaction.fee is denominated in BTC. Subtracting it
+					// from a sat figure took roughly 0.00001 off where it meant to take
+					// 1000, so the parent's paid fee was effectively ignored and the
+					// child overpaid by that fee spread across its own vsize.
+					const parentFeeSats = btcToSats(parent.fee);
+					// A parent that already paid above the target rate can drive these
+					// below 1 sat/vB, which is not a broadcastable rate.
+					satsPerByte = Math.max(
+						1,
+						Math.ceil(
+							(fast * (parentVsize + childVsize) - parentFeeSats) / childVsize
+						)
+					);
+					minFee = Math.max(
+						1,
+						Math.ceil(
+							(normal * (parentVsize + childVsize) - parentFeeSats) / childVsize
+						)
+					);
+				}
+			}
+
+			// if we still don't have a satsPerByte, use 1.5x fastest.
+			if (!satsPerByte) {
+				satsPerByte = Math.ceil(this._wallet.feeEstimates.fast * 1.5);
+			}
+
+			const sendMaxRes = await this.sendMax({
+				transaction: {
+					...this.data,
+					...setupTransactionRes.value,
+					boostType: EBoostType.cpfp
+				},
+				address: receiveAddress.value,
+				satsPerByte,
+				rbf: this._wallet.rbf
+			});
+			if (sendMaxRes.isErr()) {
+				return err(sendMaxRes.error.message);
+			}
+
+			this.updateSendTransaction({ transaction: { minFee } });
+
+			return ok(this.data);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Sets up a transaction for RBF.
+	 * @param {string} txid
+	 */
+	async setupRbf({
+		txid
+	}: {
+		txid: string;
+	}): Promise<Result<ISendTransaction>> {
+		try {
+			await this.resetSendTransaction();
+			const setupTransactionRes = await this.setupTransaction({
+				rbf: true
+			});
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
+			}
+
+			const response = await this._wallet.getRbfData({
+				txHash: { tx_hash: txid }
+			});
+			if (response.isErr()) {
+				return err(response.error.message);
+			}
+			const transaction = response.value;
+
+			const satsPerByte = this._wallet.feeEstimates.fast;
+			const newFee = this.getTotalFee({
+				transaction,
+				satsPerByte,
+				message: transaction.message
+			});
+
+			// filter out change address, otherwise getTransactionOutputValue will include it
+			const outputs = transaction.outputs
+				.filter((output) => output.address !== transaction.changeAddress)
+				.map((output, index) => ({ ...output, index }));
+
+			const inputTotal = this.getTransactionInputValue({
+				inputs: transaction.inputs
+			});
+			// Ensure we have enough funds to perform an RBF transaction.
+			const outputTotal = this.getTransactionOutputValue({
+				outputs
+			});
+
+			if (outputTotal + newFee >= inputTotal || newFee >= inputTotal / 2) {
+				/*
+				 * We could always pull the fee from the output total,
+				 * but this may negatively impact the transaction made by the user.
+				 * (Ex: Reducing the amount paid to the recipient).
+				 * We could always include additional unconfirmed utxo's to cover the fee as well,
+				 * but this may negatively impact the user's privacy by including sensitive utxos.
+				 * Instead of allowing either scenario, we attempt a CPFP instead.
+				 */
+				return err('Not enough sats to support an RBF transaction.');
+			}
+			const newTransaction: Partial<ISendTransaction> = {
+				...transaction,
+				outputs,
+				minFee: this._wallet.feeEstimates.slow,
+				fee: newFee,
+				satsPerByte,
+				rbf: true,
+				boostType: EBoostType.rbf
+			};
+
+			this.updateSendTransaction({
+				transaction: newTransaction
+			});
+
+			return ok(this.data);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Selects coins for transaction construction based on provided parameters.
+	 * @param {IUtxo[]} inputs
+	 * @param {IOutput[]} outputs
+	 * @param {number} [satsPerByte]
+	 * @param {string} [message]
+	 * @param ECoinSelectPreference [coinSelectPreference]
+	 */
+	public autoCoinSelect({
+		inputs = [],
+		outputs = [],
+		changeAddress,
+		satsPerByte = 1,
+		message = '',
+		coinSelectPreference = ECoinSelectPreference.small
+	}: {
+		inputs: IUtxo[];
+		outputs: IOutput[];
+		changeAddress?: string;
+		satsPerByte?: number;
+		message?: string;
+		coinSelectPreference?: ECoinSelectPreference;
+	}): Result<ICoinSelectResponse> {
+		try {
+			if (!inputs || !inputs?.length) {
+				return err('No inputs provided');
+			}
+			if (!outputs || !outputs?.length) {
+				return err('No outputs provided');
+			}
+			// A malformed output value must not become 0. amountToSend being falsy
+			// takes the consolidate branch below, which selects every UTXO in the
+			// wallet, and applyAutoCoinSelect persists that selection before
+			// validateTransaction ever sees the transaction. reduceValue tells a
+			// genuine 0, which legitimately means "spend everything", apart from
+			// non-numeric data, which does not.
+			const amountToSendRes = reduceValue({ arr: outputs, value: 'value' });
+			if (amountToSendRes.isErr()) {
+				return err(amountToSendRes.error);
+			}
+			const amountToSend = amountToSendRes.value;
+
+			switch (coinSelectPreference) {
+				case 'large':
+					// Sort by the largest UTXO amount (Lowest fee, but reveals your largest UTXO's)
+					inputs.sort((a, b) => Number(b.value) - Number(a.value));
+					break;
+				case 'firstInFirstOut':
+					// Sort by oldest UTXOs first (lowest height), treating unconfirmed (height = 0 or undefined) as newest
+					inputs.sort((a, b) => {
+						const heightA = !a.height
+							? Number.MAX_SAFE_INTEGER
+							: Number(a.height);
+						const heightB = !b.height
+							? Number.MAX_SAFE_INTEGER
+							: Number(b.height);
+						return heightA - heightB;
+					});
+					break;
+				case 'lastInFirstOut':
+					// Sort by newest UTXOs first (highest height), treating unconfirmed (height = 0 or undefined) as newest
+					inputs.sort((a, b) => {
+						const heightA = !a.height
+							? Number.MAX_SAFE_INTEGER
+							: Number(a.height);
+						const heightB = !b.height
+							? Number.MAX_SAFE_INTEGER
+							: Number(b.height);
+						return heightB - heightA;
+					});
+					break;
+				case 'small':
+				default:
+					// Sort by the smallest UTXO amount (Highest fee, but hides your largest UTXO's)
+					inputs.sort((a, b) => Number(a.value) - Number(b.value));
+					break;
+			}
+
+			//Add UTXO's until we have more than the target amount to send.
+			let inputAmount = 0;
+			let newInputs: IUtxo[] = [];
+			const oldInputs: IUtxo[] = [];
+
+			//Consolidate UTXO's if unable to determine the amount to send.
+			if (coinSelectPreference === 'consolidate' || !amountToSend) {
+				//Add all inputs
+				newInputs = [...inputs];
+				inputAmount = newInputs.reduce((acc, cur) => {
+					return acc + Number(cur.value);
+				}, 0);
+			} else {
+				//Add only the necessary inputs based on the amountToSend.
+				inputs.forEach((input) => {
+					if (inputAmount < amountToSend) {
+						inputAmount += input.value;
+						newInputs.push(input);
+					} else {
+						oldInputs.push(input);
+					}
+				});
+
+				//The provided UTXO's do not have enough to cover the transaction.
+				if (
+					(amountToSend && inputAmount < amountToSend) ||
+					!newInputs?.length
+				) {
+					return err('Not enough funds.');
+				}
+			}
+
+			// Output address types for the fee calculation. Input types are counted
+			// per selection in calculateFee below, since the selection can grow.
+			const outputTypes = {} as IAddressTypesIO['outputs'];
+
+			const outputAddresses = outputs.map(({ address }) => address);
+			if (changeAddress) {
+				outputAddresses.push(changeAddress);
+			}
+			outputAddresses.forEach((address) => {
+				if (!address) {
+					return;
+				}
+				const validateResponse = getAddressInfo(address);
+				if (!validateResponse) {
+					return;
+				}
+				const type = validateResponse.type.toUpperCase() as EAddressType;
+				if (type in outputTypes) {
+					outputTypes[type] = outputTypes[type] + 1;
+				} else {
+					outputTypes[type] = 1;
+				}
+			});
+
+			//Price the current selection. Every input added costs weight, so this
+			//has to be recomputed whenever the selection changes.
+			const calculateFee = (selected: IUtxo[]): number => {
+				const inputTypes = {} as IAddressTypesIO['inputs'];
+				selected.forEach(({ address }) => {
+					const validateResponse = getAddressInfo(address);
+					if (!validateResponse) {
+						return;
+					}
+					const type = validateResponse.type.toUpperCase() as EAddressType;
+					if (type in inputTypes) {
+						inputTypes[type] = inputTypes[type] + 1;
+					} else {
+						inputTypes[type] = 1;
+					}
+				});
+				let baseFee = getByteCount(
+					this.applyMultisigInputWeights(inputTypes),
+					outputTypes,
+					message
+				);
+				if (satsPerByte < 2) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (baseFee < minByteCount) baseFee = minByteCount;
+				}
+				return baseFee * satsPerByte;
+			};
+
+			let fee = calculateFee(newInputs);
+
+			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
+			//Repricing after each addition matters: the fee the top-up is measured
+			//against used to be the one calculated before any of these inputs
+			//existed, so their weight (~68 vB each for P2WPKH) went unpaid.
+			if (amountToSend) {
+				for (const input of oldInputs) {
+					if (inputAmount >= amountToSend + fee) break;
+					inputAmount += input.value;
+					newInputs.push(input);
+					fee = calculateFee(newInputs);
+				}
+			}
+
+			//The provided UTXO's do not have enough to cover the transaction.
+			if (inputAmount < amountToSend + fee || !newInputs?.length) {
+				return err('Not enough funds');
+			}
+			return ok({ inputs: newInputs, outputs, fee });
+		} catch (e) {
+			return err(e);
+		}
+	}
+}

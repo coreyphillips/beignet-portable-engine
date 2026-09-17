@@ -1,0 +1,229 @@
+/**
+ * BOLT 7.5: Onion Message Codec
+ *
+ * Encode/decode for message type 513 (onion_message).
+ * Wire format:
+ *   [33: blinding_point] [2: len] [len: onion_routing_packet]
+ *
+ * We only ever construct the two BOLT 4 writer-recommended packet sizes
+ * (1366 standard, 32834 large form), but readers derive the payload
+ * space from the packet length, so other bounded sizes from peers are
+ * accepted and preserved when forwarding.
+ */
+
+import { IOnionMessage } from './types';
+import {
+	IOnionMessagePayload,
+	TLV_ENCRYPTED_RECIPIENT_DATA,
+	TLV_REPLY_PATH,
+	TLV_MESSAGE_DATA_BASE
+} from './types';
+import {
+	IBlindedPath,
+	encodeBlindedPath,
+	decodeBlindedPath
+} from '../onion/blinded-path';
+import { encodeBigSize, decodeBigSize } from '../message/codec';
+
+/**
+ * Encode an onion_message for the wire (type 513 payload, excluding the 2-byte type prefix).
+ * Format: blinding_point(33) + len(2) + onion_routing_packet
+ *
+ * The packet must at least hold the fixed onion fields plus one routing
+ * byte and must fit the u16 len field; within those bounds any size is
+ * serialized as-is so a relayed foreign-size onion keeps its length.
+ */
+export function encodeOnionMessage(msg: IOnionMessage): Buffer {
+	if (msg.blindingPoint.length !== 33) {
+		throw new Error(
+			`blinding_point must be 33 bytes, got ${msg.blindingPoint.length}`
+		);
+	}
+	const packetLen = msg.onionRoutingPacket.length;
+	if (packetLen < 67 || packetLen > 65535) {
+		throw new Error(
+			`onion_routing_packet must be 67 to 65535 bytes, got ${packetLen}`
+		);
+	}
+
+	const buf = Buffer.alloc(33 + 2 + packetLen);
+	msg.blindingPoint.copy(buf, 0);
+	buf.writeUInt16BE(packetLen, 33);
+	msg.onionRoutingPacket.copy(buf, 35);
+	return buf;
+}
+
+/**
+ * Decode an onion_message from the wire (type 513 payload, excluding the 2-byte type prefix).
+ */
+export function decodeOnionMessage(buf: Buffer): IOnionMessage {
+	if (buf.length < 35) {
+		throw new Error(
+			`onion_message too short: ${buf.length} bytes (minimum 35)`
+		);
+	}
+
+	const blindingPoint = Buffer.from(buf.subarray(0, 33));
+	const len = buf.readUInt16BE(33);
+
+	if (buf.length < 35 + len) {
+		throw new Error(
+			`onion_message packet truncated: expected ${35 + len} bytes, got ${
+				buf.length
+			}`
+		);
+	}
+
+	const onionRoutingPacket = Buffer.from(buf.subarray(35, 35 + len));
+
+	return { blindingPoint, onionRoutingPacket };
+}
+
+/**
+ * Encode a single TLV record: BigSize type + BigSize length + value.
+ */
+function encodeTlvRecord(type: number, value: Buffer): Buffer {
+	const typeBytes = encodeBigSize(BigInt(type));
+	const lengthBytes = encodeBigSize(BigInt(value.length));
+	return Buffer.concat([typeBytes, lengthBytes, value]);
+}
+
+/**
+ * Encode a blinded path for the reply_path TLV (BOLT 4 `blinded_path`
+ * subtype). Delegates to the shared codec so the sciddir_or_pubkey
+ * first_node_id form is handled identically everywhere.
+ */
+export function encodeBlindedPathTlv(path: IBlindedPath): Buffer {
+	return encodeBlindedPath(path);
+}
+
+/**
+ * Decode a blinded path from a reply_path TLV value. Byte-identical to the
+ * shared BOLT 4 codec; the previous local copy assumed a 33-byte
+ * first_node_id and mis-parsed the scid-dir form (S-4.H4).
+ */
+export function decodeBlindedPathTlv(buf: Buffer): IBlindedPath {
+	const { path, offset } = decodeBlindedPath(buf, 0);
+	if (offset !== buf.length) {
+		throw new Error('reply_path TLV has trailing bytes');
+	}
+	return path;
+}
+
+/**
+ * Encode an onion message payload as a TLV stream suitable for inclusion
+ * in an onion packet hop payload.
+ *
+ * TLV records (sorted by type):
+ *   type 2: reply_path (optional)
+ *   type 4: encrypted_recipient_data (optional)
+ *   type 64+: message TLVs (application data)
+ */
+export function encodeOnionMessagePayload(
+	payload: IOnionMessagePayload
+): Buffer {
+	const records: Buffer[] = [];
+
+	// Collect all TLV records with their types for sorting
+	const tlvs: { type: number; data: Buffer }[] = [];
+
+	// TLV type 2: reply_path
+	if (payload.replyPath) {
+		const replyPathData = encodeBlindedPathTlv(payload.replyPath);
+		tlvs.push({ type: TLV_REPLY_PATH, data: replyPathData });
+	}
+
+	// TLV type 4: encrypted_recipient_data
+	if (payload.encryptedRecipientData) {
+		tlvs.push({
+			type: TLV_ENCRYPTED_RECIPIENT_DATA,
+			data: payload.encryptedRecipientData
+		});
+	}
+
+	// Message TLVs (application data, type >= 64)
+	for (const [type, data] of payload.messageTlvs) {
+		if (type < TLV_MESSAGE_DATA_BASE) {
+			throw new Error(
+				`Message TLV type ${type} is below minimum ${TLV_MESSAGE_DATA_BASE}`
+			);
+		}
+		tlvs.push({ type, data });
+	}
+
+	// Sort by type (BOLT requirement: TLVs must be in ascending order)
+	tlvs.sort((a, b) => a.type - b.type);
+
+	for (const tlv of tlvs) {
+		records.push(encodeTlvRecord(tlv.type, tlv.data));
+	}
+
+	const tlvData = Buffer.concat(records);
+
+	// Wrap in BigSize length prefix (same format as payment hop payloads)
+	const lengthPrefix = encodeBigSize(BigInt(tlvData.length));
+	return Buffer.concat([lengthPrefix, tlvData]);
+}
+
+/**
+ * Decode an onion message payload from a TLV stream.
+ */
+export function decodeOnionMessagePayload(
+	buf: Buffer,
+	offset = 0
+): { payload: IOnionMessagePayload; bytesRead: number } {
+	const startOffset = offset;
+
+	// Read payload length
+	const { value: payloadLength, bytesRead: lenBytes } = decodeBigSize(
+		buf,
+		offset
+	);
+	offset += lenBytes;
+
+	const payloadEnd = offset + Number(payloadLength);
+	if (payloadEnd > buf.length) {
+		throw new Error('Onion message payload extends beyond buffer');
+	}
+
+	const payload: IOnionMessagePayload = {
+		messageTlvs: new Map()
+	};
+
+	while (offset < payloadEnd) {
+		// Read TLV type
+		const typeResult = decodeBigSize(buf, offset);
+		offset += typeResult.bytesRead;
+		const tlvType = Number(typeResult.value);
+
+		// Read TLV length
+		const lengthResult = decodeBigSize(buf, offset);
+		offset += lengthResult.bytesRead;
+		const tlvLength = Number(lengthResult.value);
+
+		const tlvValue = Buffer.from(buf.subarray(offset, offset + tlvLength));
+		offset += tlvLength;
+
+		switch (tlvType) {
+			case TLV_REPLY_PATH:
+				payload.replyPath = decodeBlindedPathTlv(tlvValue);
+				break;
+			case TLV_ENCRYPTED_RECIPIENT_DATA:
+				payload.encryptedRecipientData = tlvValue;
+				break;
+			default:
+				if (tlvType >= TLV_MESSAGE_DATA_BASE) {
+					payload.messageTlvs.set(tlvType, tlvValue);
+				} else if (tlvType % 2 === 0) {
+					// Unknown even TLV type — required but unrecognized
+					throw new Error(
+						`Unknown required TLV type ${tlvType} in onion message payload`
+					);
+				}
+				// Odd unknown types are silently ignored
+				break;
+		}
+	}
+
+	return { payload, bytesRead: offset - startOffset };
+}

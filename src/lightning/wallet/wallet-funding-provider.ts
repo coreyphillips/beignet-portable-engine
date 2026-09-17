@@ -1,0 +1,1029 @@
+/**
+ * Wallet funding provider adapter.
+ *
+ * Wraps the beignet Wallet class to implement IFundingProvider,
+ * enabling LightningNode to auto-fund channels from the on-chain wallet.
+ */
+
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import { ECPairFactory } from 'ecpair';
+import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
+import { ISpliceWalletInput } from '../channel/channel';
+import {
+	estimateSpliceTxWeight,
+	spliceFeeSats,
+	dualFundingContributionWeight,
+	dualFundingTopUpWeight,
+	outputWeight,
+	P2WPKH_INPUT_WEIGHT,
+	P2WPKH_DUST_LIMIT
+} from '../channel/splice-weight';
+
+bitcoin.initEccLib(ecc);
+const ECPair = ECPairFactory(ecc);
+
+/** Classify a scriptPubKey as one of the spendable kinds, or null. */
+export function scriptKind(script: Buffer): 'p2wpkh' | 'p2tr' | null {
+	if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
+		return 'p2wpkh';
+	}
+	if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+		return 'p2tr';
+	}
+	return null;
+}
+
+/**
+ * BIP 86/341 key-path tweak: negate the private key when its point has an
+ * odd Y, then add taggedHash("TapTweak", xonly(P)).
+ */
+export function taprootTweakPrivateKey(
+	privKey: Buffer,
+	pubkey: Buffer
+): Buffer {
+	const xOnly = pubkey.length === 33 ? pubkey.subarray(1, 33) : pubkey;
+	let priv: Uint8Array = privKey;
+	if (pubkey.length === 33 && pubkey[0] === 0x03) {
+		const negated = ecc.privateNegate(priv);
+		if (!negated) throw new Error('taproot tweak: privateNegate failed');
+		priv = negated;
+	}
+	const tweak = bitcoin.crypto.taggedHash('TapTweak', Buffer.from(xOnly));
+	const tweaked = ecc.privateAdd(priv, tweak);
+	if (!tweaked) throw new Error('taproot tweak: privateAdd failed');
+	return Buffer.from(tweaked);
+}
+
+/**
+ * Minimal Result-like interface matching beignet's Result<T> union type.
+ * Both Ok and Err satisfy this via structural typing.
+ */
+interface IResult {
+	isErr(): boolean;
+	isOk(): boolean;
+}
+
+interface IResultOk<T> extends IResult {
+	value: T;
+}
+
+interface IResultErr extends IResult {
+	error: { message: string };
+}
+
+/** A wallet UTXO, shaped like beignet's IUtxo (only the fields we need). */
+export interface ISpliceUtxo {
+	address: string;
+	path: string;
+	/** Txid in big-endian (display/electrum) hex. */
+	tx_hash: string;
+	tx_pos: number;
+	/** Value in satoshis. */
+	value: number;
+	/** Confirmation height; 0 = unconfirmed. */
+	height: number;
+	publicKey: string;
+}
+
+/**
+ * Minimal wallet interface — only the methods we need.
+ * Structurally compatible with beignet's Wallet class without
+ * requiring an import dependency on it.
+ *
+ * The splice-in members (listUtxos, getPrivateKey, getChangeAddress,
+ * electrum.getTransactions) are optional: channel auto-funding works without
+ * them, and selectSpliceInputs throws a descriptive error if they are missing.
+ */
+export interface IWalletLike {
+	send(params: {
+		address: string;
+		amount: number;
+		satsPerByte?: number;
+		broadcast?: boolean;
+		shuffleOutputs?: boolean;
+	}): Promise<IResult>;
+	/**
+	 * Sweep the whole spendable balance to `address` (no change output). Used to
+	 * fund a "max" channel: the funding output then equals inputs minus fee, which
+	 * is exactly the amount the sweep quote computed, so it matches the committed
+	 * funding_satoshis. Optional so minimal/legacy wallets can omit it; a max
+	 * funding request against a wallet without it is rejected rather than guessed.
+	 */
+	sendMax?(params: {
+		address: string;
+		satsPerByte?: number;
+		broadcast?: boolean;
+	}): Promise<IResult>;
+	electrum: {
+		broadcastTransaction(params: {
+			rawTx: string;
+			subscribeToOutputAddress?: boolean;
+		}): Promise<IResult>;
+		getTransactions?(params: {
+			txHashes: Array<{ tx_hash: string }>;
+		}): Promise<IResult>;
+	};
+	listUtxos?(): ISpliceUtxo[];
+	/** Returns the WIF-encoded private key for a derivation path. */
+	getPrivateKey?(path: string): string;
+	/** Returns Result<{ address: string }>. */
+	getChangeAddress?(): Promise<IResult>;
+	/** 'bitcoin' | 'testnet' | 'regtest' (beignet EAvailableNetworks). */
+	network?: string;
+	/** UTXO freeze API, used to pledge inputs to in-flight fundings so two
+	 *  concurrent fundings can never select (and double-spend) the same coin. */
+	isUtxoFrozen?(txid: string, index: number): boolean;
+	freezeUtxo?(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<IResult>;
+	unfreezeUtxo?(params: { txid: string; index: number }): Promise<IResult>;
+	listFrozenUtxos?(): Array<{
+		tx_hash: string;
+		tx_pos: number;
+		freezeTag?: string;
+		frozenAt?: number;
+	}>;
+}
+
+/**
+ * Adapts a beignet Wallet into an IFundingProvider for LightningNode.
+ *
+ * Usage:
+ *   const wallet = (await Wallet.create({ mnemonic, electrumOptions })).value;
+ *   const fundingProvider = new WalletFundingProvider(wallet);
+ *   const node = LightningNode.fromMnemonic(mnemonic, { fundingProvider });
+ *   node.openChannel(peerPubkey, 100_000n); // fully automatic
+ */
+export class WalletFundingProvider implements IFundingProvider {
+	private wallet: IWalletLike;
+
+	/**
+	 * Outpoints pledged to an in-flight funding, keyed txid:vout with the
+	 * pledge time. A pledged coin is frozen in the wallet until either the
+	 * funding tx spends it or PLEDGE_TTL_MS passes (the funding session was
+	 * abandoned before broadcast). Pledge freezes persist in the wallet with
+	 * PLEDGE_TAG; on restart, tagged entries this instance does not know are
+	 * adopted with their original timestamp so they age out through the same
+	 * TTL and spent pruning instead of locking coins forever after a crash.
+	 */
+	private pledged = new Map<string, number>();
+	/**
+	 * Pledges last renewed by pledgeTransactionInputs, i.e. held for a
+	 * transaction the node is still obligated to broadcast rather than for a
+	 * funding session that may simply have been abandoned.
+	 */
+	private renewedPledges = new Set<string>();
+	private adoptedStale = false;
+	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
+	/**
+	 * Expiry for a renewed pledge. Renewals arrive once per block, and a block
+	 * interval exceeds ten minutes better than a third of the time, so reusing
+	 * PLEDGE_TTL_MS would leave the coin unfrozen for most of a long gap: the
+	 * very window the renewal exists to close. Six intervals of slack keeps the
+	 * pledge alive between blocks while still releasing the coin, on its own,
+	 * for an obligation that stopped renewing.
+	 */
+	private static readonly RENEWED_PLEDGE_TTL_MS = 60 * 60_000;
+	private static readonly PLEDGE_TAG = 'funding-pledge';
+
+	/**
+	 * Serializes every selection-then-pledge sequence. Selection excludes
+	 * frozen coins, but the freeze lands only after async work (wallet.send's
+	 * internal selection, the electrum prev-tx fetch), so two interleaved
+	 * fundings could both select a coin before either froze it. The exact
+	 * scenario pledging exists for (two fundings triggered by concurrent
+	 * network events) is also the one that interleaves, so the whole
+	 * select-and-pledge critical section runs under one lock.
+	 */
+	private selectionLock: Promise<unknown> = Promise.resolve();
+
+	constructor(wallet: IWalletLike) {
+		this.wallet = wallet;
+	}
+
+	/** Run fn after every previously queued selection has finished. */
+	private runSelection<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.selectionLock.then(fn, fn);
+		this.selectionLock = run.catch(() => undefined);
+		return run;
+	}
+
+	/**
+	 * Freeze the outpoint and remember when we pledged it. Returns the wallet's
+	 * refusal, or null once the coin is held.
+	 *
+	 * A refused freeze is recorded only for a renewal. A fresh selection can
+	 * still abort, and recording the pledge would leave this instance believing
+	 * a coin is held that the next coin selection, in this process or the next
+	 * one, is free to spend. A renewal has nothing left to abort: the
+	 * transaction exists and is still owed, so keeping the record is what lets
+	 * this provider's own selections stay off the coin and lets the release and
+	 * expiry bookkeeping still reach it.
+	 */
+	private async pledge(
+		txid: string,
+		vout: number,
+		renewed = false
+	): Promise<string | null> {
+		const key = `${txid}:${vout}`;
+		const res = await this.wallet.freezeUtxo?.({
+			txid,
+			index: vout,
+			tag: WalletFundingProvider.PLEDGE_TAG
+		});
+		const refusal = res?.isErr() ? (res as IResultErr).error.message : null;
+		if (refusal === null || renewed) {
+			this.pledged.set(key, Date.now());
+			if (renewed) this.renewedPledges.add(key);
+		}
+		return refusal;
+	}
+
+	/** pledge() for a fresh selection, which must abort on a refusal. */
+	private async pledgeOrThrow(txid: string, vout: number): Promise<void> {
+		const refusal = await this.pledge(txid, vout);
+		if (refusal !== null) {
+			throw new Error(
+				`Failed to reserve funding input ${txid}:${vout}: ${refusal}`
+			);
+		}
+	}
+
+	/**
+	 * Lift the freeze behind a pledge. Returns whether the coin ended up
+	 * released, so a caller only forgets the pledge once it no longer holds
+	 * anything: a wallet that refused the write still has the coin frozen, and
+	 * dropping the record would leave nothing able to try again. A wallet that
+	 * no longer lists the outpoint as frozen is released whatever it called the
+	 * refusal ("not frozen" is the answer to a double release).
+	 */
+	private async releasePledge(txid: string, vout: number): Promise<boolean> {
+		const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+		if (!res?.isErr()) return true;
+		return this.wallet.isUtxoFrozen?.(txid, vout) === false;
+	}
+
+	/**
+	 * Re-pledge the inputs of a transaction whose broadcast obligation is still
+	 * open (IFundingProvider.pledgeTransactionInputs).
+	 *
+	 * Runs under the selection lock, so it can never interleave with the prune
+	 * a selection performs, and only touches coins the wallet still lists as
+	 * unspent: the inputs this transaction already spent need no reservation.
+	 * An input the transaction spent and a later eviction gave back IS listed
+	 * again, and that is precisely the coin this has to re-freeze.
+	 *
+	 * Every input is attempted before a refusal is reported: one coin the
+	 * wallet will not freeze (it dropped out of the UTXO set mid-loop, or the
+	 * blacklist write failed) says nothing about the rest, and stopping there
+	 * would skip renewals the transaction needs just as much. The caller logs
+	 * the refusal and the next block renews again.
+	 */
+	async pledgeTransactionInputs(txHex: string): Promise<void> {
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			// Not a transaction we can read inputs from; nothing to reserve.
+			return;
+		}
+		return this.runSelection(async () => {
+			const utxos = this.wallet.listUtxos?.();
+			// Same reading as prunePledges: no list, or an empty one, is a wallet
+			// that has not loaded rather than a wallet whose coins are gone. Neither
+			// expires a pledge, so neither needs a renewal.
+			if (!utxos || utxos.length === 0) return;
+			const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+			const refused: string[] = [];
+			for (const input of tx.ins) {
+				// Transaction inputs hold the txid in internal byte order.
+				const txid = Buffer.from(input.hash).reverse().toString('hex');
+				if (!live.has(`${txid}:${input.index}`)) continue;
+				const refusal = await this.pledge(txid, input.index, true);
+				if (refusal !== null) {
+					refused.push(`${txid}:${input.index}: ${refusal}`);
+				}
+			}
+			if (refused.length > 0) {
+				throw new Error(
+					`Failed to reserve retained transaction inputs (${refused.join(
+						'; '
+					)})`
+				);
+			}
+		});
+	}
+
+	/**
+	 * Adopt pledge-tagged freezes left over from a previous run (crash between
+	 * freeze and broadcast). They enter the pledged map with their persisted
+	 * timestamp; an entry with no timestamp is treated as already expired, and
+	 * the regular pruning unfreezes them. User freezes (no tag) are never
+	 * touched.
+	 */
+	private adoptStalePledges(): void {
+		if (this.adoptedStale) return;
+		this.adoptedStale = true;
+		const frozen = this.wallet.listFrozenUtxos?.() ?? [];
+		for (const f of frozen) {
+			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
+			const key = `${f.tx_hash}:${f.tx_pos}`;
+			if (this.pledged.has(key)) continue;
+			this.pledged.set(key, f.frozenAt ?? 0);
+		}
+	}
+
+	/** Unfreeze pledges whose funding tx spent them or that timed out. */
+	private async prunePledges(): Promise<void> {
+		this.adoptStalePledges();
+		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
+		const utxos = this.wallet.listUtxos();
+		// An empty UTXO list is indistinguishable from a wallet that has not
+		// loaded or refreshed yet. Treating everything as spent would mass
+		// unfreeze valid pledges, and with no coins there is nothing a pledge
+		// could block anyway.
+		if (utxos.length === 0) return;
+		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+		const now = Date.now();
+		for (const key of [...this.pledged.keys()]) {
+			// Read the timestamp live: a renewal can land between this snapshot
+			// and the unfreeze below, and expiring it on the stale one would drop
+			// the reservation the renewal just made.
+			const ts = this.pledged.get(key);
+			if (ts === undefined) continue;
+			const ttl = this.renewedPledges.has(key)
+				? WalletFundingProvider.RENEWED_PLEDGE_TTL_MS
+				: WalletFundingProvider.PLEDGE_TTL_MS;
+			const spent = !live.has(key);
+			const expired = now - ts > ttl;
+			if (spent || expired) {
+				const sep = key.lastIndexOf(':');
+				const released = await this.releasePledge(
+					key.slice(0, sep),
+					Number(key.slice(sep + 1))
+				);
+				// A refused unfreeze keeps the coin frozen, so keep the entry
+				// that the next prune retries it from. Forgetting it here would
+				// strand the coin: nothing else in this process knows the freeze
+				// is ours to lift.
+				if (!released) continue;
+				this.pledged.delete(key);
+				this.renewedPledges.delete(key);
+			}
+		}
+	}
+
+	/**
+	 * Release the pledges holding these exact outpoints
+	 * (IFundingProvider.releaseInputPledges, issue #311).
+	 *
+	 * Runs under the selection lock so it never interleaves with a
+	 * select-and-pledge or a renewal; a release racing a per-block renewal is
+	 * self-healing anyway (the next pledgeTransactionInputs re-freezes).
+	 * Adopting stale pledges first makes a pledge persisted by a previous run
+	 * releasable too. Only outpoints in the pledged map are touched: the map
+	 * only ever holds PLEDGE_TAG freezes, so user freezes are safe, and
+	 * unknown outpoints (including a double release) are no-ops.
+	 */
+	async releaseInputPledges(
+		outpoints: Array<{ txid: string; vout: number }>
+	): Promise<void> {
+		if (outpoints.length === 0) return;
+		return this.runSelection(async () => {
+			this.adoptStalePledges();
+			for (const { txid, vout } of outpoints) {
+				const key = `${txid}:${vout}`;
+				if (!this.pledged.has(key)) continue;
+				if (await this.releasePledge(txid, vout)) {
+					this.pledged.delete(key);
+					this.renewedPledges.delete(key);
+					continue;
+				}
+				// The coin is still frozen. Keep the entry, but age it out so
+				// the next prune retries the unfreeze instead of holding the
+				// release for a TTL nothing is waiting on any more.
+				this.pledged.set(key, 0);
+				this.renewedPledges.delete(key);
+			}
+		});
+	}
+
+	async buildFundingTransaction(
+		address: string,
+		amountSats: bigint,
+		satsPerByte?: number,
+		max = false
+	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }> {
+		return this.runSelection(() =>
+			this.buildFundingTransactionLocked(address, amountSats, satsPerByte, max)
+		);
+	}
+
+	private async buildFundingTransactionLocked(
+		address: string,
+		amountSats: bigint,
+		satsPerByte?: number,
+		max = false
+	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }> {
+		// Refresh pledges BEFORE coin selection: expired or spent freezes must
+		// be lifted and live ones enforced when the wallet picks inputs.
+		await this.prunePledges();
+		let result: IResult;
+		if (max) {
+			// A max channel sweeps the whole balance into the funding output. Funding
+			// it as a fixed-amount send instead adds a change output whose fee the
+			// swept balance cannot cover, so the fixed path fails at the exact max
+			// ("New total amount exceeds the available balance"). Sweeping produces a
+			// no-change tx whose output is inputs minus fee, i.e. the amount the
+			// caller already committed as funding_satoshis.
+			if (!this.wallet.sendMax) {
+				throw new Error(
+					'Wallet does not support max funding (sendMax unavailable)'
+				);
+			}
+			result = await this.wallet.sendMax({
+				address,
+				broadcast: false,
+				...(satsPerByte !== undefined ? { satsPerByte } : {})
+			});
+		} else {
+			const sendParams: {
+				address: string;
+				amount: number;
+				broadcast: boolean;
+				shuffleOutputs: boolean;
+				satsPerByte?: number;
+			} = {
+				address,
+				amount: Number(amountSats),
+				broadcast: false,
+				shuffleOutputs: true
+			};
+			if (satsPerByte !== undefined) {
+				sendParams.satsPerByte = satsPerByte;
+			}
+			result = await this.wallet.send(sendParams);
+		}
+		if (result.isErr()) {
+			throw new Error(
+				`Wallet send failed: ${(result as IResultErr).error.message}`
+			);
+		}
+
+		const txHex = (result as IResultOk<string>).value;
+		const tx = bitcoin.Transaction.fromHex(txHex);
+
+		// Pledge the built tx's inputs: the tx is broadcast later (after the
+		// channel handshake), and until the wallet sees that spend these coins
+		// must be off limits to every other funding.
+		for (const input of tx.ins) {
+			const txid = Buffer.from(input.hash).reverse().toString('hex');
+			await this.pledgeOrThrow(txid, input.index);
+		}
+
+		// Find the output that pays to the P2WSH funding address
+		const targetScript = bitcoin.address.toOutputScript(
+			address,
+			this.detectNetwork(address)
+		);
+		let outputIndex = -1;
+		for (let i = 0; i < tx.outs.length; i++) {
+			if (tx.outs[i].script.equals(targetScript)) {
+				outputIndex = i;
+				break;
+			}
+		}
+
+		if (outputIndex === -1) {
+			throw new Error('Funding output not found in transaction');
+		}
+
+		// The commitment is built against the committed funding_satoshis, so the
+		// on-chain funding output must equal it exactly — for EVERY open, not
+		// just max sweeps. A max sweep is priced from the same balance and rate
+		// as the amount already committed, so a mismatch means the balance
+		// drifted between quote and funding. A fixed-amount send can also come
+		// back short: near the balance ceiling the wallet quietly reduces the
+		// amount instead of failing when amount + fee exceeds the balance
+		// (observed live: 499170 requested, 499004 funded, no change output).
+		// Signing a commitment against a short output produces a channel whose
+		// funding the peer's on-chain check rejects; failing here instead
+		// aborts the open cleanly.
+		const fundedValue = tx.outs[outputIndex].value;
+		if (fundedValue !== Number(amountSats)) {
+			throw new Error(
+				`Funding output (${fundedValue} sats) does not match committed funding amount (${amountSats} sats); ${
+					max
+						? 'on-chain balance changed since the amount was quoted'
+						: 'the wallet altered the send amount (likely insufficient balance for amount + fee)'
+				}`
+			);
+		}
+
+		// getHash() returns txid in internal byte order (per BOLT 2)
+		const txid = Buffer.from(tx.getHash());
+
+		return { txHex, txid, outputIndex };
+	}
+
+	async broadcastTransaction(txHex: string): Promise<string> {
+		const result = await this.wallet.electrum.broadcastTransaction({
+			rawTx: txHex
+		});
+		if (result.isErr()) {
+			throw new Error(
+				`Broadcast failed: ${(result as IResultErr).error.message}`
+			);
+		}
+		return (result as IResultOk<string>).value;
+	}
+
+	/**
+	 * Source wallet inputs + a change script for a splice-in.
+	 *
+	 * Selects P2WPKH UTXOs (confirmed first, largest first) until they cover
+	 * amount + the splice tx fee — computed with the SAME weight formula the
+	 * channel uses (the channel derives change = walletTotal - amount - fee, so
+	 * under-selection would produce an underfunded splice tx). Each input
+	 * carries a signWitness closure so wallet keys never leave this method.
+	 */
+	async selectSpliceInputs(
+		amountSats: bigint,
+		feeratePerKw: number,
+		opts?: IUtxoSelectionOpts
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		// Cover the splice amount plus the splice tx fee, recomputed per added
+		// input using the SAME weight formula the channel uses to derive change.
+		return this.gatherWalletInputs(
+			'splice-in',
+			(selectedCount) =>
+				amountSats +
+				spliceFeeSats(
+					estimateSpliceTxWeight({
+						walletInputCount: selectedCount,
+						changeScriptLen: 22
+					}),
+					feeratePerKw
+				),
+			false,
+			opts
+		);
+	}
+
+	/**
+	 * Source wallet inputs + a change script to fund an anchor fee bump.
+	 *
+	 * `targetFeeSats` is the fee the bumped tx must pay excluding the wallet's own
+	 * inputs/change; we add the marginal fee of those inputs (and one P2WPKH
+	 * change output) plus a dust buffer so the chain layer can finalise a
+	 * non-dust change. Inputs reuse the same P2WPKH signWitness recipe as
+	 * splice-in (SIGHASH_ALL; keys never leave the closure).
+	 */
+	async selectFeeBumpInputs(
+		targetFeeSats: bigint,
+		feeratePerKw: number
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		// P2WPKH only: the fee-bump attach paths (sweep.ts) sign wallet inputs
+		// with (tx, index, value) and cannot supply the full prevout set a
+		// P2TR input's BIP 341 sighash commits to.
+		return this.gatherWalletInputs(
+			'fee-bump',
+			(selectedCount) =>
+				targetFeeSats +
+				spliceFeeSats(
+					selectedCount * P2WPKH_INPUT_WEIGHT + outputWeight(22),
+					feeratePerKw
+				) +
+				P2WPKH_DUST_LIMIT,
+			true
+		);
+	}
+
+	/**
+	 * The UTXOs a splice-in (or fee bump) may spend. P2WPKH and P2TR
+	 * (key-path) coins: the two script kinds this provider knows how to
+	 * sign. Weight estimation stays on the P2WPKH figure, which
+	 * over-estimates a taproot input, so fees err on the safe side.
+	 * Confirmed before unconfirmed, then largest first within each group.
+	 *
+	 * `p2wpkhOnly` restricts selection to P2WPKH for callers whose signing
+	 * path cannot supply the full prevout set a BIP 341 sighash commits to
+	 * (the fee-bump attach paths in sweep.ts sign with (tx, index, value)
+	 * only, so a P2TR input would throw at signing time).
+	 */
+	private spendableP2wpkhUtxos(p2wpkhOnly = false): ISpliceUtxo[] {
+		if (!this.wallet.listUtxos) return [];
+		const network = this.bitcoinJsNetwork();
+		const candidates = this.wallet.listUtxos().filter((u) => {
+			// Frozen coins (pledged to an in-flight funding, or frozen by the
+			// user) are excluded from selection; listUtxos itself does not
+			// filter them. A renewal whose freeze the wallet refused is held in
+			// the pledged map alone, and a coin a transaction still owes must
+			// not go to a second selection just because the blacklist write
+			// failed.
+			if (this.wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)) return false;
+			if (this.pledged.has(`${u.tx_hash}:${u.tx_pos}`)) return false;
+			try {
+				const kind = scriptKind(
+					bitcoin.address.toOutputScript(u.address, network)
+				);
+				return p2wpkhOnly ? kind === 'p2wpkh' : kind !== null;
+			} catch {
+				return false;
+			}
+		});
+		candidates.sort((a, b) => {
+			const aConf = a.height > 0 ? 0 : 1;
+			const bConf = b.height > 0 ? 0 : 1;
+			if (aConf !== bConf) return aConf - bConf;
+			return b.value - a.value;
+		});
+		return candidates;
+	}
+
+	/**
+	 * Price a splice-in without performing one: what the wallet could add to a
+	 * channel at this feerate. Uses the SAME UTXO filter and weight formula as
+	 * selectSpliceInputs, so the quoted maximum is an amount the selection will
+	 * actually fund rather than a guess reconstructed in a UI. The maximum
+	 * sweeps every spendable UTXO; the change output the weight includes is
+	 * dropped as dust by the channel, a slight, safe overestimate of the fee.
+	 */
+	quoteSpliceIn(feeratePerKw: number): {
+		spendableSats: bigint;
+		feeSats: bigint;
+		maxAmountSats: bigint;
+		inputCount: number;
+	} {
+		const candidates = this.spendableP2wpkhUtxos();
+		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+		const feeSats = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: Math.max(1, candidates.length),
+				changeScriptLen: 22
+			}),
+			feeratePerKw
+		);
+		const maxAmountSats =
+			spendableSats > feeSats ? spendableSats - feeSats : 0n;
+		return {
+			spendableSats,
+			feeSats,
+			maxAmountSats,
+			inputCount: candidates.length
+		};
+	}
+
+	/**
+	 * Price a max (sweep-everything) dual-funded open: every spendable P2WPKH
+	 * UTXO goes in, and the committed funding amount is what remains after the
+	 * initiator's interactive-tx fee share. Priced with the SAME weight formula
+	 * the channel's contribution computation applies, so at funding time the
+	 * derived change is exactly zero and the funding tx has no change output.
+	 */
+	quoteDualFundingMax(feeratePerKw: number): {
+		fundingSatoshis: bigint;
+		spendableSats: bigint;
+		feeSats: bigint;
+		inputCount: number;
+	} {
+		const candidates = this.spendableP2wpkhUtxos();
+		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+		const feeSats = spliceFeeSats(
+			dualFundingContributionWeight(candidates.length, true),
+			feeratePerKw
+		);
+		return {
+			fundingSatoshis: spendableSats > feeSats ? spendableSats - feeSats : 0n,
+			spendableSats,
+			feeSats,
+			inputCount: candidates.length
+		};
+	}
+
+	/**
+	 * Select EVERY spendable P2WPKH UTXO for a max dual-funded open, with the
+	 * same signing closures as splice-in. The change script is still returned
+	 * for the channel's derivation, which nets change out to zero when the
+	 * balance matches the quote.
+	 */
+	async selectMaxDualFundingInputs(): Promise<{
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+	}> {
+		// Target the full spendable balance so selection takes every UTXO.
+		const total = this.spendableP2wpkhUtxos().reduce(
+			(s, u) => s + BigInt(u.value),
+			0n
+		);
+		return this.gatherWalletInputs('max-funded v2 open', () => total);
+	}
+
+	/**
+	 * Source wallet inputs + a change script for a fixed-amount dual-funded
+	 * (v2 open) contribution: the opener's auto-funding, a lease seller's
+	 * acceptor contribution, or an RBF contribution raise.
+	 *
+	 * Priced with dualFundingContributionWeight, the SAME formula the channel's
+	 * contribution computation applies to derive change (inputs - contribution -
+	 * fee), so the selection covers exactly what the channel will charge at
+	 * every input count. Sizing this with the splice weight instead
+	 * under-reserves on a fragmented wallet, because that estimator includes a
+	 * shared 2-of-2 funding input a v2 open funding transaction does not have
+	 * (issue #380).
+	 *
+	 * `topUp` marks an amount that ALREADY covers the contribution's fixed fee
+	 * terms because the contribution already holds registered inputs (an RBF
+	 * raise, whose shortfall quoteV2RbfContributionChange priced over exactly
+	 * those inputs). Such a selection owes only the marginal per-input weight of
+	 * the coins it adds; charging a second full contribution would double-count
+	 * the fixed terms and refuse a raise the wallet can afford.
+	 */
+	async selectDualFundingInputs(
+		amountSats: bigint,
+		feeratePerKw: number,
+		initiator: boolean,
+		topUp = false,
+		opts?: IUtxoSelectionOpts
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		return this.gatherWalletInputs(
+			topUp ? 'v2 open contribution top-up' : 'v2 open contribution',
+			(selectedCount) =>
+				amountSats +
+				spliceFeeSats(
+					topUp
+						? dualFundingTopUpWeight(selectedCount)
+						: dualFundingContributionWeight(selectedCount, initiator),
+					feeratePerKw
+				),
+			false,
+			opts
+		);
+	}
+
+	/**
+	 * Shared wallet UTXO selection used by splice-in, v2 funding and fee
+	 * bumping.
+	 *
+	 * Selects confirmed-first, largest-first until the running total covers
+	 * `computeTarget(selectedCount)` — recomputed per added input because each
+	 * input grows the tx (and thus the fee). Each returned input carries a
+	 * signWitness closure so wallet keys never leave this method.
+	 */
+	private async gatherWalletInputs(
+		purpose: string,
+		computeTarget: (selectedCount: number) => bigint,
+		p2wpkhOnly = false,
+		opts?: IUtxoSelectionOpts
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		return this.runSelection(() =>
+			this.gatherWalletInputsLocked(purpose, computeTarget, p2wpkhOnly, opts)
+		);
+	}
+
+	private async gatherWalletInputsLocked(
+		purpose: string,
+		computeTarget: (selectedCount: number) => bigint,
+		p2wpkhOnly = false,
+		opts?: IUtxoSelectionOpts
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		const wallet = this.wallet;
+		if (
+			!wallet.listUtxos ||
+			!wallet.getPrivateKey ||
+			!wallet.getChangeAddress ||
+			!wallet.electrum.getTransactions
+		) {
+			throw new Error(
+				`wallet does not support ${purpose} (requires listUtxos, getPrivateKey, getChangeAddress and electrum.getTransactions)`
+			);
+		}
+
+		await this.prunePledges();
+		let candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
+		const network = this.bitcoinJsNetwork();
+
+		const selected: ISpliceUtxo[] = [];
+		let selectedSum = 0n;
+		let target = 0n;
+		// An empty directed list must not degrade into unrestricted greedy
+		// selection (issue #572 review): direct provider callers get the same
+		// refusal the shared selection entry enforces.
+		if (opts?.utxos && opts.utxos.length === 0) {
+			throw new Error(
+				`directed ${purpose} selection requires at least one named outpoint`
+			);
+		}
+		if (opts?.utxos?.length) {
+			// Caller-directed selection (issue #572): every named outpoint is
+			// contributed, and a named coin the wallet cannot spend fails the
+			// selection outright rather than being silently skipped (the
+			// caller named it for a reason, e.g. channelizing that deposit).
+			for (const wanted of opts.utxos) {
+				// Case-normalized: the public API accepts uppercase hex while
+				// the wallet reports lowercase tx_hash values.
+				const wantedTxid = wanted.txid.toLowerCase();
+				const match = candidates.find(
+					(u) => u.tx_hash === wantedTxid && u.tx_pos === wanted.vout
+				);
+				if (!match) {
+					throw new Error(
+						`requested funding utxo not spendable: ${wantedTxid}:${wanted.vout}`
+					);
+				}
+				if (selected.includes(match)) continue;
+				selected.push(match);
+				selectedSum += BigInt(match.value);
+			}
+			target = computeTarget(selected.length);
+			// Without allowTopUp the named coins must carry the whole target;
+			// the shared shortfall error below reports the deficit.
+			candidates = opts.allowTopUp
+				? candidates.filter((u) => !selected.includes(u))
+				: [];
+		}
+		for (const utxo of candidates) {
+			if (selectedSum >= target && selected.length > 0) break;
+			selected.push(utxo);
+			selectedSum += BigInt(utxo.value);
+			// Each added input grows the tx (and thus the fee) — recompute.
+			target = computeTarget(selected.length);
+			if (selectedSum >= target) break;
+		}
+		if (selectedSum < target || selected.length === 0) {
+			// Directed selections filtered the seeded coins out of candidates,
+			// so the spendable total is the seeded sum plus what remains.
+			const have =
+				candidates.reduce((s, u) => s + BigInt(u.value), 0n) +
+				(opts?.utxos?.length ? selectedSum : 0n);
+			throw new Error(
+				`insufficient wallet funds for ${purpose}: need ${
+					target > 0n ? target : 0n
+				} sats (amount + fee), have ${have} sats in spendable P2WPKH UTXOs`
+			);
+		}
+
+		// Fetch the raw previous transactions in one batch.
+		const txResult = await wallet.electrum.getTransactions({
+			txHashes: selected.map((u) => ({ tx_hash: u.tx_hash }))
+		});
+		if (txResult.isErr()) {
+			throw new Error(
+				`failed to fetch ${purpose} prev txs: ${
+					(txResult as IResultErr).error.message
+				}`
+			);
+		}
+		const txData = (
+			txResult as IResultOk<{
+				data: Array<{
+					data: { tx_hash: string };
+					result: { hex?: string; txid?: string };
+				}>;
+			}>
+		).value;
+		const hexByTxid = new Map<string, string>();
+		for (const entry of txData.data || []) {
+			const txid = entry.result?.txid || entry.data?.tx_hash;
+			if (txid && entry.result?.hex) hexByTxid.set(txid, entry.result.hex);
+		}
+
+		const inputs: ISpliceWalletInput[] = selected.map((utxo) => {
+			const hex = hexByTxid.get(utxo.tx_hash);
+			if (!hex) {
+				throw new Error(`missing raw tx for ${purpose} input ${utxo.tx_hash}`);
+			}
+			const keyPair = ECPair.fromWIF(wallet.getPrivateKey!(utxo.path), network);
+			const pubkey = Buffer.from(keyPair.publicKey);
+			if (pubkey.toString('hex') !== utxo.publicKey) {
+				throw new Error(
+					`derived key mismatch for ${purpose} input ${utxo.tx_hash}:${utxo.tx_pos}`
+				);
+			}
+			const privKey = Buffer.from(keyPair.privateKey!);
+			const outputScript = bitcoin.address.toOutputScript(
+				utxo.address,
+				network
+			);
+			const kind = scriptKind(outputScript);
+
+			const base = {
+				prevTx: Buffer.from(hex, 'hex'),
+				prevOutputIndex: utxo.tx_pos,
+				value: BigInt(utxo.value),
+				sequence: 0xfffffffd,
+				confirmed: utxo.height > 0
+			};
+
+			if (kind === 'p2tr') {
+				// BIP 86 key-path spend: sign with the taproot-tweaked key over
+				// the BIP 341 sighash, which commits to every input's prevout.
+				// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
+				// so the explicit 65-byte form is emitted rather than the
+				// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
+				// the interactive-tx rule names ALL and peers may enforce it).
+				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
+				return {
+					...base,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number,
+						_value: bigint,
+						prevouts?: { scripts: Buffer[]; values: bigint[] }
+					): Buffer[] => {
+						if (!prevouts) {
+							throw new Error(
+								'P2TR input needs the full prevout set to sign (BIP 341)'
+							);
+						}
+						const sighash = tx.hashForWitnessV1(
+							inputIndex,
+							prevouts.scripts,
+							prevouts.values.map((v) => Number(v)),
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [
+							Buffer.concat([
+								Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
+								Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+							])
+						];
+					}
+				};
+			}
+
+			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+			return {
+				...base,
+				signWitness: (
+					tx: bitcoin.Transaction,
+					inputIndex: number,
+					value: bigint
+				): Buffer[] => {
+					const sighash = tx.hashForWitnessV0(
+						inputIndex,
+						scriptCode,
+						Number(value),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					const sig64 = Buffer.from(ecc.sign(sighash, privKey));
+					const der = bitcoin.script.signature.encode(
+						sig64,
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					return [der, pubkey];
+				}
+			};
+		});
+
+		const changeRes = await wallet.getChangeAddress();
+		if (changeRes.isErr()) {
+			throw new Error(
+				`failed to get change address: ${
+					(changeRes as IResultErr).error.message
+				}`
+			);
+		}
+		const changeAddress = (changeRes as IResultOk<{ address: string }>).value
+			.address;
+		const changeScript = bitcoin.address.toOutputScript(changeAddress, network);
+
+		// Pledge every selected coin: it now belongs to a funding negotiation
+		// whose tx may not broadcast for a while, and no concurrent funding
+		// (this method OR wallet.send) may double-spend it in the meantime.
+		for (const utxo of selected) {
+			await this.pledgeOrThrow(utxo.tx_hash, utxo.tx_pos);
+		}
+
+		return { inputs, changeScript };
+	}
+
+	/**
+	 * Map the wallet's network name to a bitcoinjs-lib network.
+	 */
+	private bitcoinJsNetwork(): bitcoin.Network {
+		switch (this.wallet.network) {
+			case 'bitcoin':
+				return bitcoin.networks.bitcoin;
+			case 'testnet':
+				return bitcoin.networks.testnet;
+			case 'regtest':
+				return bitcoin.networks.regtest;
+			default:
+				return bitcoin.networks.regtest;
+		}
+	}
+
+	/**
+	 * Detect the bitcoin network from a bech32 address prefix.
+	 */
+	private detectNetwork(address: string): bitcoin.Network {
+		if (address.startsWith('bc1')) return bitcoin.networks.bitcoin;
+		if (address.startsWith('tb1')) return bitcoin.networks.testnet;
+		if (address.startsWith('bcrt1')) return bitcoin.networks.regtest;
+		return bitcoin.networks.regtest;
+	}
+}

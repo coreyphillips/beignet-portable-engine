@@ -1,0 +1,2809 @@
+import { Block } from 'bitcoinjs-lib';
+import * as electrum from 'rn-electrum-client/helpers';
+
+import {
+	EAddressType,
+	EAvailableNetworks,
+	EElectrumNetworks,
+	EScanningStrategy,
+	IAddress,
+	IAddresses,
+	IElectrumGetAddressBalanceRes,
+	IGetAddressHistoryResponse,
+	IGetAddressScriptHashBalances,
+	IGetAddressScriptHashesHistoryResponse,
+	IGetAddressTxResponse,
+	IGetHeaderResponse,
+	IGetTransactions,
+	IGetTransactionsFromInputs,
+	IGetUtxosResponse,
+	IHeader,
+	INewBlock,
+	IPeerData,
+	ISubscribeToAddress,
+	ISubscribeToHeader,
+	ITransaction,
+	ITxHash,
+	IUtxo,
+	Net,
+	TAddressTypeContent,
+	TConnectToElectrumRes,
+	TGetAddressHistory,
+	TOnMessage,
+	TServer,
+	TSubscribedReceive,
+	TTxResponse,
+	TTxResult,
+	TUnspentAddressScriptHashData,
+	TUnspentAddressScriptHashResponse,
+	Tls
+} from '../types';
+import {
+	btcPerKbToSatPerVbyte,
+	err,
+	filterAddressesForGapLimit,
+	filterAddressesObjForAddressesList,
+	filterAddressesObjForGapLimit,
+	filterAddressesObjForSingleIndex,
+	filterAddressesObjForStartingIndex,
+	getAddressFromScriptPubKey,
+	getElectrumNetwork,
+	getScriptHash,
+	ok,
+	Result,
+	sleep,
+	splitAddresses
+} from '../utils';
+import { Wallet } from '../wallet';
+import {
+	defaultElectrumPeers,
+	ELECTRUM_SERVER_COOLDOWN_MS,
+	onMessageKeys,
+	POLLING_INTERVAL
+} from '../shapes';
+
+/** Answer of every subscribe refused because the instance has disconnected. */
+const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
+
+/**
+ * A well formed script hash used only to ask a server whether it is still
+ * answering. It addresses nothing; the balance in the reply is discarded. The
+ * same value rn-electrum-client uses for its own post-connect probe.
+ */
+const LIVENESS_SCRIPT_HASH =
+	'77ca78f9a84b48041ad71f7cc6ff6c33460c25f0cb99f558f9813ed9e63727dd';
+
+type TScriptHashSubscription = {
+	callbacks: Set<(data: TSubscribedReceive) => void>;
+	/** Address index of a UTXO tracked beyond the gap limit; that index is
+	 *  rescanned before the wallet refresh on notification. */
+	utxoIndex?: number;
+	/** The status this instance heard before disconnect() withdrew it, kept
+	 *  when a sibling held the hash meanwhile: the router's status may already
+	 *  reflect a change only the sibling was refreshed for. */
+	savedStatus?: string | null;
+	/** Set while deliveries to this instance have not yet started its refresh:
+	 *  the status it heard before them, and how many are still on their way. A
+	 *  status only counts as heard once its refresh starts, so this is what
+	 *  disconnect() saves while a delivery is parked in a scan. */
+	pendingRefresh?: { heard: string | null; deliveries: number };
+	/** Callbacks no subscribe has succeeded with yet: how many attempts still
+	 *  wait on each, and whether the first of them created this record. A
+	 *  failure takes the callback back only once it is the last of them, and
+	 *  never after one succeeded. Removing the callback drops its entry, so
+	 *  attempts from before the removal cannot settle one started after it. */
+	unconfirmedCallbacks?: Map<
+		(data: TSubscribedReceive) => void,
+		{ attempts: number; created: boolean }
+	>;
+};
+
+/** Records a delivery to `sub` that has not started its refresh yet. The
+ *  oldest status heard is kept when one is already on its way. */
+function notePendingRefresh(
+	sub: TScriptHashSubscription,
+	heard: string | null
+): void {
+	if (sub.pendingRefresh) {
+		sub.pendingRefresh.deliveries++;
+	} else {
+		sub.pendingRefresh = { heard, deliveries: 1 };
+	}
+}
+
+type TScriptHashRouter = {
+	/** Every instance that subscribed on this network, for the fallback refresh. */
+	instances: Set<Electrum>;
+	/** scriptHash -> per-instance subscription state. */
+	subscriptions: Map<string, Map<Electrum, TScriptHashSubscription>>;
+	/** The one handler every subscribeAddress call for this network is given. */
+	dispatch: (data: TSubscribedReceive) => Promise<void>;
+	/** The last status heard for each subscribed hash, from a subscribe answer
+	 *  or a notification. */
+	statuses: Map<string, string | null>;
+	/** Records the status a subscribe answered with, and dispatches one that
+	 *  differs from the last heard as the notification it stands for. */
+	noteSubscribed: (scriptHash: string, response: ISubscribeToAddress) => void;
+};
+
+/** The status the instance behind `sub` last heard for a hash the router holds
+ *  a status for. A status still on its way to a refresh, or still owed a
+ *  comparison, is not what that wallet last heard. */
+function lastHeardStatus(
+	router: TScriptHashRouter,
+	scriptHash: string,
+	sub: TScriptHashSubscription
+): string | null {
+	if (sub.pendingRefresh) return sub.pendingRefresh.heard;
+	if (sub.savedStatus !== undefined) return sub.savedStatus;
+	return router.statuses.get(scriptHash) ?? null;
+}
+
+/**
+ * Script hash routing state, shared per network across every Electrum
+ * instance in the process. rn-electrum-client keeps ONE
+ * 'blockchain.scripthash.subscribe' handler per network for the WHOLE process
+ * (the first onReceive it is handed) and answers a repeat script hash with
+ * "Already Subscribed." without wiring the new callback, so per-call closures
+ * are never delivered, and even an instance-local router would strand every
+ * instance but the first. Each network therefore gets one shared registry and
+ * one stable dispatcher that routes by the script hash in the notification
+ * payload; instances withdraw from it in disconnect().
+ */
+const scriptHashRouters: Map<EElectrumNetworks, TScriptHashRouter> = new Map();
+
+type THeaderRouter = {
+	/** Every instance subscribed to this network's headers. */
+	handlers: Map<Electrum, (data: INewBlock[]) => Promise<void>>;
+	/** The one handler every subscribeHeader call for this network is given. */
+	dispatch: (data: INewBlock[]) => Promise<void>;
+	/** The most recent header seen on this network, whatever reported it. The
+	 *  client answers every subscribe after the first with a bare
+	 *  "Already Subscribed." string, so this is the only tip an instance that
+	 *  joins the network later has to reconcile its own stored one against. */
+	last: IHeader | null;
+	/** Bumped every time `last` is replaced. A subscribe compares it across its
+	 *  own await: a notification that landed while the response was in flight is
+	 *  the fresher word from the same socket, and writing the response on top of
+	 *  it would lower the stored height and read the next block as a rollback. */
+	seq: number;
+	/** The notification payload this dispatcher last accepted, compared by
+	 *  identity to swallow a duplicate registration: see the dispatch. */
+	lastDispatched: unknown;
+};
+
+/**
+ * Header routing state, shared per network for the same reason the script hash
+ * routers are: rn-electrum-client keeps ONE
+ * 'blockchain.headers.subscribe' handler per network for the WHOLE process and
+ * answers every later subscribe with "Already Subscribed.", so a per-call
+ * closure only ever reaches the instance that subscribed first, and a client
+ * reset would hand the network's headers to whichever instance re-subscribed
+ * first while silencing the rest. Instances withdraw in disconnect().
+ */
+const headerRouters: Map<EElectrumNetworks, THeaderRouter> = new Map();
+
+/**
+ * Per-network gate over blockchain.headers.subscribe.
+ *
+ * rn-electrum-client registers the notification listener on the client's
+ * shared emitter BEFORE the awaited request and only sets
+ * clients.subscribedHeaders[network] AFTER it returns, so two subscribes that
+ * overlap that window both pass its "Already Subscribed." guard and both
+ * append the router's dispatcher to the same EventEmitter. Every later
+ * notification then runs the whole router queue twice for the life of that
+ * client: two header writes, two wallet refreshes and two newBlock messages
+ * per block, per instance. Three overlapping calls triple it. That overlap is
+ * the normal case rather than an exotic one, because restoreSubscriptions
+ * issues one after every successful connect while an ElectrumBackend reconnect
+ * monitor (or application code) can issue another at the same moment.
+ *
+ * Module level for the same reason the routers are: the state being protected
+ * belongs to the client, and the client is process-wide, so two different
+ * Electrum instances racing on one network is exactly the case to cover.
+ *
+ * Serialised rather than de-duplicated. The caller behind the gate still
+ * issues its OWN subscribe, so a restore that runs after a client was torn
+ * down and rebuilt wires the new client instead of inheriting an answer from
+ * the old one; it simply finds the network already subscribed and is answered
+ * "Already Subscribed." without a second listener.
+ */
+const headerSubscribeGates: Map<EElectrumNetworks, Promise<void>> = new Map();
+
+/**
+ * How long a subscribe may hold the gate before the next caller stops waiting
+ * for it.
+ *
+ * The gate must be bounded, because the attempt behind it is not: the client
+ * falls into connectToRandomPeer when a network has no client, and the
+ * server_version handshake in there carries no timeout of its own, on a socket
+ * whose timeout it disables. One server that accepts the connection and then
+ * says nothing would otherwise wedge every later subscribe on that network for
+ * as long as the process lives. Well above the client's own 10s request
+ * timeouts, so an attempt that is merely slow is still waited for.
+ */
+const HEADER_SUBSCRIBE_GATE_MS = 30_000;
+
+/**
+ * Networks whose shared client may still hold unwired subscriptions because a
+ * restore failed.
+ *
+ * Module state for the same reason the routers are. restoreSubscriptions
+ * re-issues the ONE per-network client's subscriptions: the header handler and
+ * every instance's script hashes in the shared router, not just the ones
+ * belonging to whichever instance happens to be running it. A failure
+ * therefore strands wallets that never ran a restore and have no reconnect
+ * coming, and the instance that noticed may disconnect (taking its own debt
+ * with it) or move to another network. The debt belongs to the network, and
+ * any instance still polling it discharges it.
+ */
+const subscriptionRestoreOwed: Set<EElectrumNetworks> = new Set();
+
+/**
+ * Start times of the restores in flight per network, so the poll hook does not
+ * stack one restore per instance onto the same client every tick. The connect
+ * path never consults it: that restore is unconditional (see _doConnect).
+ *
+ * Times rather than a count, because a restore is not guaranteed to settle: it
+ * awaits caller-supplied storage through applyReportedHeader, and a wallet
+ * whose write never answers would otherwise hold the gate shut and disable the
+ * only retry hook the whole network has, permanently. One that has been
+ * running longer than any real restore takes stops counting.
+ */
+const restoresInFlight: Map<EElectrumNetworks, number[]> = new Map();
+
+/** After this, an unsettled restore no longer holds the poll hook shut. */
+const RESTORE_STALL_MS = 60_000;
+
+/**
+ * Bumped every time a restore records a debt for a network. A restore that
+ * started BEFORE the bump cannot discharge that debt: it never re-issued the
+ * subscription that failed, so its success says nothing about it.
+ */
+const restoreDebtSeq: Map<EElectrumNetworks, number> = new Map();
+
+function restoreIsRunning(network: EElectrumNetworks, now: number): boolean {
+	const started = restoresInFlight.get(network);
+	if (!started) return false;
+	return started.some((at) => now - at < RESTORE_STALL_MS);
+}
+
+/**
+ * Server keys (host|protocol|port) that an instance in this process connected
+ * on a network, and has not disconnected from.
+ *
+ * There is one client per network for the whole process, so the peer it holds
+ * may well have been chosen by a sibling instance rather than by the one
+ * asking, and that client is still the one carrying the shared router's
+ * subscriptions. What this set exists to reject is a peer NOBODY here chose:
+ * rn-electrum-client dials a random peers.json server whenever a network's
+ * client is missing, which produces a live socket with none of this process's
+ * subscriptions on it. See isOurPeer.
+ */
+const connectedServers: Map<
+	EElectrumNetworks,
+	Map<string, Set<Electrum>>
+> = new Map();
+
+/** Whether any instance in this process holds `serverKey` on `network`. */
+function isConnectedServer(
+	network: EElectrumNetworks,
+	serverKey: string
+): boolean {
+	return (connectedServers.get(network)?.get(serverKey)?.size ?? 0) > 0;
+}
+
+function getHeaderRouter(network: EElectrumNetworks): THeaderRouter {
+	let router = headerRouters.get(network);
+	if (!router) {
+		const created: THeaderRouter = {
+			handlers: new Map(),
+			last: null,
+			seq: 0,
+			lastDispatched: null,
+			dispatch: async (data: INewBlock[]): Promise<void> => {
+				// One notification, dispatched once, however many times the
+				// client holds this dispatcher.
+				//
+				// rn-electrum-client appends it to the client's emitter once
+				// per subscribe that gets past its "Already Subscribed." guard,
+				// and it sets that guard only AFTER the awaited request: two
+				// subscribes that overlap the window both register, and a
+				// subscribe that FAILS leaves its registration behind with the
+				// network still marked unsubscribed, so the next one registers
+				// on top of it. Serialising the requests (see
+				// headerSubscribeGates) closes the overlap but not the retry.
+				//
+				// The emitter hands every listener the identical payload object
+				// for one notification, while a genuine second notification is
+				// always a freshly parsed one, so identity is what tells a
+				// duplicate registration apart from a repeated block.
+				if (created.lastDispatched === data) return;
+				created.lastDispatched = data;
+				// The instances are snapshotted so a handler may withdraw itself
+				// or a sibling mid-dispatch, but each handler is read at the
+				// moment it is called rather than taken from that snapshot: an
+				// instance that disconnects while this dispatch is in flight
+				// must not be refreshed by a header it is merely still
+				// registered for.
+				//
+				// Dispatched concurrently rather than one wallet at a time. The
+				// handler awaits caller-supplied storage and a whole wallet
+				// refresh, neither of which this library can bound, and a
+				// wallet whose updateHeader never settles used to park every
+				// instance behind it in the map, for that block and for every
+				// block after it: the catch below only ever covered a
+				// rejection, never a promise that does not settle. The client
+				// emits notifications without awaiting this handler, so
+				// per-instance handling could already overlap across blocks and
+				// nothing here relied on the order.
+				await Promise.all(
+					[...created.handlers.keys()].map(async (instance) => {
+						const handler = created.handlers.get(instance);
+						if (!handler) return;
+						try {
+							await handler(data);
+						} catch {
+							// One instance must not starve the rest. Kept inside
+							// the callback, so a rejection neither short-circuits
+							// Promise.all nor escapes it unhandled.
+						}
+					})
+				);
+			}
+		};
+		router = created;
+		headerRouters.set(network, created);
+	}
+	return router;
+}
+
+function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
+	let router = scriptHashRouters.get(network);
+	if (!router) {
+		/** Hands one notification to one instance registered for its hash.
+		 *  `pending` is the record notePendingRefresh was called on for it. */
+		const deliver = async (
+			instance: Electrum,
+			subs: Map<Electrum, TScriptHashSubscription>,
+			data: TSubscribedReceive,
+			pending: TScriptHashSubscription
+		): Promise<void> => {
+			// Re-read rather than taken from a snapshot, as the header dispatch
+			// does: the entry ahead of this one parks for as long as a single
+			// index scan takes, and an instance that withdrew in the meantime
+			// (disconnect() deletes it from exactly this map) must not be called
+			// back or refreshed by a notification it is merely still queued for.
+			// An instance that withdrew and registered again holds a new record,
+			// which its reconnect compares and refreshes on its own.
+			const sub = subs.get(instance);
+			if (sub !== pending) return;
+			// Snapshots: a callback may unregister itself or a sibling
+			// mid-dispatch.
+			for (const callback of [...sub.callbacks]) {
+				try {
+					callback(data);
+				} catch {
+					// One subscriber must not starve the rest or the refresh.
+				}
+			}
+			if (sub.utxoIndex !== undefined) {
+				await instance.getUtxos({
+					scanningStrategy: EScanningStrategy.singleIndex,
+					addressIndex: sub.utxoIndex,
+					changeAddressIndex: sub.utxoIndex
+				});
+				// Checked again: the withdrawal can land while this instance's
+				// own scan is in flight, and the refresh below would restart a
+				// wallet that has shut down.
+				if (subs.get(instance) !== pending) return;
+			}
+			// Spent when the refresh body starts rather than here: a wallet
+			// already refreshing only queues this call, and the refresh in flight
+			// may have scanned before this status arrived.
+			const started = (): void => {
+				const owed = pending.pendingRefresh;
+				if (owed && --owed.deliveries === 0) {
+					delete pending.pendingRefresh;
+				} else if (owed) {
+					// This refresh reads the server as of the newest status, so
+					// only a status that arrives after it is still unheard.
+					owed.heard = created.statuses.get(data[0]) ?? null;
+				}
+			};
+			void instance.wallet.refreshWallet({ onStart: started });
+		};
+		const created: TScriptHashRouter = {
+			instances: new Set(),
+			subscriptions: new Map(),
+			statuses: new Map(),
+			noteSubscribed: (scriptHash, response): void => {
+				const data: unknown = response.data;
+				if (response.error) return;
+				// Withdrawn while the subscribe was in flight.
+				const subs = created.subscriptions.get(scriptHash);
+				if (!subs) return;
+				// "Already Subscribed." carries no status: the subscription was
+				// never lost, so neither was a notification. A hash with no history
+				// answers null, which the client hands back as the whole message.
+				if (data !== 'Already Subscribed.') {
+					const status = typeof data === 'string' ? data : null;
+					const known = created.statuses.has(scriptHash);
+					const previous = created.statuses.get(scriptHash);
+					// A server only notifies a live subscription, so a change that
+					// landed while the socket was down is only ever seen here. The
+					// dispatch records the status itself, because it reads the one
+					// before it as what each instance last heard.
+					if (known && previous !== status) {
+						void created.dispatch([scriptHash, status as string]);
+						return;
+					}
+					created.statuses.set(scriptHash, status);
+				}
+				// A returning instance whose sibling kept the hash has no status
+				// of its own in the router to compare, so it is compared here.
+				if (!created.statuses.has(scriptHash)) return;
+				const current = created.statuses.get(scriptHash) ?? null;
+				for (const [instance, sub] of subs) {
+					if (sub.savedStatus === undefined) continue;
+					const saved = sub.savedStatus;
+					delete sub.savedStatus;
+					if (saved !== current) {
+						notePendingRefresh(sub, saved);
+						void deliver(instance, subs, [scriptHash, current as string], sub);
+					}
+				}
+			},
+			dispatch: async (data: TSubscribedReceive): Promise<void> => {
+				const scriptHash = Array.isArray(data) ? data[0] : undefined;
+				const subs = scriptHash
+					? created.subscriptions.get(scriptHash)
+					: undefined;
+				// With no status before this one, there is nothing older to save.
+				let previous: string | null = null;
+				if (scriptHash && subs) {
+					const status = data[1] ?? null;
+					previous = created.statuses.has(scriptHash)
+						? created.statuses.get(scriptHash) ?? null
+						: status;
+					created.statuses.set(scriptHash, status);
+				}
+				if (!subs || subs.size === 0) {
+					// Nothing registered for this hash (a race with removal, or a
+					// subscription that predates the registry): fall back to the
+					// pre-registry behaviour and refresh every subscribed wallet.
+					for (const instance of [...created.instances]) {
+						void instance.wallet.refreshWallet({});
+					}
+					return;
+				}
+				// Every instance registered now is refreshed below, so none is
+				// still owed a comparison of what it heard before withdrawing.
+				// Marked up front, because an instance queued behind another's
+				// scan has not heard this status until its own refresh starts.
+				const queued = [...subs];
+				for (const [, sub] of queued) {
+					const heard =
+						sub.savedStatus !== undefined ? sub.savedStatus : previous;
+					delete sub.savedStatus;
+					notePendingRefresh(sub, heard);
+				}
+				for (const [instance, sub] of queued) {
+					await deliver(instance, subs, data, sub);
+				}
+			}
+		};
+		router = created;
+		scriptHashRouters.set(network, created);
+	}
+	return router;
+}
+
+export class Electrum {
+	private readonly _wallet: Wallet;
+	private sendMessage: TOnMessage;
+	private latestConnectionState: boolean | null = null;
+	private connectionPollingInterval: NodeJS.Timeout | null;
+	private net: Net;
+	private tls: Tls;
+	/** Shared in-flight connect, so concurrent callers don't race (see connectToElectrum). */
+	private _connectInFlight: Promise<Result<TConnectToElectrumRes>> | null =
+		null;
+	/** Per-server failure tracking for rotation (keyed by host|protocol|port). */
+	private _serverFailures: Map<
+		string,
+		{ failures: number; lastFailureAt: number }
+	> = new Map();
+	private _currentServer: TServer | null = null;
+	/** Number of times the connected server changed after the first connect. */
+	private _rotationCount = 0;
+	/** The entry this instance holds in connectedServers, so it can release
+	 *  exactly that one when it moves or stops. */
+	private _heldServer: { network: EElectrumNetworks; key: string } | null =
+		null;
+	/** Network whose subscription restore last failed, cleared once one
+	 *  succeeds. A restore only fails on a socket that can stay healthy
+	 *  indefinitely, and nothing else reconnects while it does, so the
+	 *  connection poll owns the retry. */
+	private _restoreOwed: EElectrumNetworks | null = null;
+	/** Per-network bookkeeping for concurrent header subscribes: how many are in
+	 *  flight and whether the handler must stay registered (see subscribeToHeader). */
+	private readonly _headerSubscribes: Map<
+		EElectrumNetworks,
+		{ inFlight: number; committed: boolean }
+	> = new Map();
+	/** Set by disconnect(): this instance withdrew from the shared routers, so
+	 *  work still in flight must not register it back into them. Cleared when a
+	 *  new connect is explicitly requested. */
+	// Read requests also check this before calling rn-electrum-client: its
+	// helpers silently dial a peer when disconnect() has cleared the client.
+	// Check again between batches, which yield while a wallet can stop.
+	private _disconnected = false;
+	/** The last status of each script hash disconnect(), or the rollback of a
+	 *  failed subscribe, withdrew this instance from. Withdrawing the last
+	 *  subscriber deletes the router's own record, so without this an explicit
+	 *  reconnect reads every answer as a first sighting and misses a deposit
+	 *  that landed while it was offline. */
+	private _withdrawnStatuses: {
+		network: EElectrumNetworks;
+		statuses: Map<string, string | null>;
+	} | null = null;
+	/** A drop in this wallet's stored height that has not been reconciled yet.
+	 *  The header write that revealed the rollback also replaced the only
+	 *  evidence of it, so a reconciliation that fails is owed here and every
+	 *  later header retries it until one succeeds. */
+	private _reorgOwed = false;
+	/** Set when a server answered with the stored tip's own parent, which says
+	 *  it does not hold that tip. Until something confirms the tip again, a
+	 *  header that arrives too far away to be compared is read as a rollback
+	 *  rather than as growth: see applyHeader. */
+	private _tipUnverified = false;
+
+	public servers?: TServer | TServer[];
+	public network: EAvailableNetworks;
+	public electrumNetwork: EElectrumNetworks;
+	public connectedToElectrum: boolean;
+	public onReceive?: (data: unknown) => void;
+	public batchLimit: number;
+	public batchDelay: number;
+
+	constructor({
+		wallet,
+		network,
+		net,
+		tls,
+		servers,
+		batchLimit = 20,
+		batchDelay = 50,
+		onReceive
+	}: {
+		wallet: Wallet;
+		network: EAvailableNetworks;
+		net: Net;
+		tls: Tls;
+		servers?: TServer | TServer[];
+		batchLimit?: number;
+		batchDelay?: number;
+		onReceive?: (data: unknown) => void;
+	}) {
+		this._wallet = wallet;
+		this.sendMessage = wallet.sendMessage;
+		this.servers = servers ?? [];
+		this.network = network;
+		this.electrumNetwork = getElectrumNetwork(this.network);
+		this.connectedToElectrum = false;
+		this.onReceive = onReceive;
+		this.net = net;
+		this.tls = tls;
+		this.batchLimit = batchLimit;
+		this.batchDelay = batchDelay;
+		this.connectionPollingInterval = setInterval((): void => {
+			void this.checkConnection();
+		}, POLLING_INTERVAL);
+	}
+
+	/**
+	 * True from disconnect() until an explicit connectToElectrum revives this
+	 * instance.
+	 *
+	 * A different question from connectedToElectrum, which is also false for a
+	 * server that is merely down. This one says the instance was STOPPED, so
+	 * every subscribe is refused by design (see subscribeToHeader and
+	 * subscribeToAddresses), and a caller running its own liveness loop must
+	 * read that refusal as "nothing to monitor" rather than as a server fault.
+	 */
+	public get isDisconnected(): boolean {
+		return this._disconnected;
+	}
+
+	public get wallet(): Wallet {
+		return this._wallet;
+	}
+
+	/**
+	 * Connect to the Electrum server.
+	 *
+	 * Concurrent callers share a single in-flight attempt. At startup several
+	 * independent paths (background refreshWallet, sweep-address lookup, header
+	 * subscription) can each trigger a connect at once; without this guard they
+	 * race over rn-electrum-client's shared global client, clobbering the socket
+	 * mid-connect so the losing attempt returns an error and logs a spurious
+	 * "Unable to connect to Electrum server." De-duping collapses them into one
+	 * real connect, so the others simply join its result.
+	 */
+	async connectToElectrum(args: {
+		network?: EAvailableNetworks;
+		servers?: TServer | TServer[];
+		disableRegtestCheck?: boolean;
+	}): Promise<Result<TConnectToElectrumRes>> {
+		// An explicit connect revives an instance that had disconnected; a
+		// disconnect landing mid-connect keeps the flag set, so the attempt it
+		// interrupted still declines to re-register the instance.
+		this._disconnected = false;
+		if (this._connectInFlight) return this._connectInFlight;
+		this._connectInFlight = this._doConnect(args).finally(() => {
+			this._connectInFlight = null;
+		});
+		return this._connectInFlight;
+	}
+
+	private async _doConnect({
+		network = this.network,
+		servers,
+		disableRegtestCheck = false // Used to ignore regtest check for certain tests.
+	}: {
+		network?: EAvailableNetworks;
+		servers?: TServer | TServer[];
+		disableRegtestCheck?: boolean;
+	}): Promise<Result<TConnectToElectrumRes>> {
+		let customPeers = servers
+			? Array.isArray(servers)
+				? servers
+				: [servers]
+			: [];
+		// @ts-ignore
+		customPeers = customPeers.length ? customPeers : this?.servers ?? [];
+		const electrumNetwork = getElectrumNetwork(network);
+		if (
+			!disableRegtestCheck &&
+			electrumNetwork === 'bitcoinRegtest' &&
+			!customPeers.length
+		) {
+			return err('Regtest requires that you pre-specify a server.');
+		}
+		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
+		let connected = false;
+		let lastError = 'No Electrum servers available.';
+		/** Whether any candidate got past the teardown and reached a socket. */
+		let dialledAny = false;
+		/** Whether any candidate was refused because the peer would not stop. */
+		let refusedAny = false;
+		for (const candidate of this.orderCandidates(candidates)) {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			const startResponse = await this.attemptConnect(
+				candidate,
+				electrumNetwork
+			);
+			dialledAny = dialledAny || !startResponse.teardownRefused;
+			refusedAny = refusedAny || !!startResponse.teardownRefused;
+			if (startResponse.error) {
+				// A candidate the teardown refused was never dialled, so it must
+				// not be blamed for the failure and cooled down.
+				if (!startResponse.teardownRefused) {
+					this.recordServerFailure(candidate);
+				}
+				lastError = String(startResponse.error);
+				continue;
+			}
+			this.recordServerSuccess(candidate, electrumNetwork);
+			connected = true;
+			break;
+		}
+		// Every candidate was refused before it was dialled, and the peer whose
+		// teardown refused them is still connected: the switch was declined on
+		// purpose to keep a working connection rather than build a client on
+		// stale bookkeeping, so nothing about this instance's connection
+		// changed. Reporting a disconnect would contradict the peer that is
+		// still serving every call, and adopting the refused target would point
+		// the reconnect guards and the connection poll at the same doomed
+		// switch on every later call. The error still goes back to the caller,
+		// and the poll remains the authority on whether the kept peer is alive.
+		if (
+			!connected &&
+			refusedAny &&
+			!dialledAny &&
+			!!electrum.getConnectedPeer(electrumNetwork)?.host
+		) {
+			return err(lastError);
+		}
+		// A network switch needs the network fields updated even when the new
+		// network has no reachable server, but that must never be reported as
+		// success: every Electrum call gates on connectedToElectrum, and a
+		// false success leaves them all believing a connection exists.
+		// A network switch leaves the OLD network's client alive:
+		// rn-electrum-client keys its client by network and
+		// stopPeerIfServerChanged only tears down the target network's peer, so
+		// the old socket can keep dispatching into the shared routers this
+		// instance is still registered in. _onNewBlock and _scriptHashRecord
+		// resolve their router from this.electrumNetwork, so an old-network
+		// notification would write a foreign chain's header into the NEW
+		// network's router.last, and the next subscribe there would fan that
+		// tip out to every wallet on the network.
+		if (electrumNetwork !== this.electrumNetwork) {
+			this.withdrawFromRouters();
+			// The debt names the network being left, and the poll only retries
+			// one equal to the current electrumNetwork, so it could never be
+			// discharged again. The network keeps it in subscriptionRestoreOwed
+			// for whichever instance is still there.
+			if (this._restoreOwed === this.electrumNetwork) {
+				subscriptionRestoreOwed.add(this._restoreOwed);
+				this._restoreOwed = null;
+			}
+		}
+		this.network = network;
+		this.electrumNetwork = electrumNetwork;
+		if (customPeers.length) {
+			this.servers = customPeers;
+		}
+		if (!connected) {
+			this.publishConnectionChange(false);
+			return err(lastError);
+		}
+		// Checked BEFORE anything is announced. disconnect() may have landed
+		// while this attempt was in flight: it withdrew the instance from the
+		// shared routers and tore the client down, and this attempt has since
+		// built a fresh one, so a live socket (and the client's own keep-alive
+		// interval) would be left behind a wallet the caller believes is
+		// stopped. Take it back down, and announce nothing: disconnect()
+		// publishes nothing itself, and a connected event for a stopped wallet
+		// is a lie its consumers act on.
+		if (this._disconnected) {
+			await electrum.stop({ network: electrumNetwork });
+			return err(DISCONNECTED_ERROR);
+		}
+		this.publishConnectionChange(true);
+		// Unconditional, because a connect cannot tell whether the client it now
+		// holds is the one that was subscribed. Our own teardown resets it on a
+		// server change, and rn-electrum-client resets it behind our back on the
+		// same-server path: start() pings the live peer and, when the socket is
+		// dead, disconnects (dropping subscribedAddresses/subscribedHeaders/
+		// onAddressReceive for the whole process) before building a fresh client,
+		// with nothing observable left for the teardown above to notice. The
+		// torn down client takes every subscription in this process with it,
+		// including the ones this instance never made, and the wallet's own
+		// addresses have no other reconnect hook here. Restoring costs nothing
+		// when nothing was lost: the client answers a known script hash with
+		// "Already Subscribed." without touching the socket.
+		this.restoreSubscriptionsBestEffort(electrumNetwork);
+		return ok('Connected to Electrum server.');
+	}
+
+	/**
+	 * Attempts a single connect to the given server. Isolated so tests can
+	 * exercise rotation with a fake connection layer.
+	 */
+	private async attemptConnect(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): Promise<{
+		error: unknown;
+		teardownRefused?: boolean;
+	}> {
+		const teardown = await this.stopPeerIfServerChanged(
+			server,
+			electrumNetwork
+		);
+		if (teardown.error) {
+			return { error: teardown.error, teardownRefused: true };
+		}
+		if (this._disconnected) {
+			return { error: DISCONNECTED_ERROR, teardownRefused: true };
+		}
+		const startResponse = await electrum.start({
+			clientName: 'beignet',
+			protocolVersion: '1.4',
+			network: electrumNetwork,
+			net: this.net,
+			tls: this.tls,
+			customPeers: [server]
+		});
+		return { error: startResponse.error };
+	}
+
+	/**
+	 * Disconnects the connected peer when the next connect targets a different
+	 * server.
+	 *
+	 * rn-electrum-client builds a fresh client whenever the target
+	 * host/port/protocol differ from the connected peer, but only its
+	 * disconnect path clears the per-network bookkeeping (subscribedAddresses,
+	 * subscribedHeaders, onAddressReceive) while the notification handlers live
+	 * on the client object that is thrown away. Without this reset every
+	 * subscribe after a failover answers "Already Subscribed." although nothing
+	 * is subscribed on the new connection and no handler is wired to it, so the
+	 * process silently stops receiving header and script hash notifications.
+	 * The same-server path is left alone: the client pings the live connection
+	 * and disconnects itself (resetting the same state) if the ping fails, which
+	 * is why the restore after a successful connect is unconditional.
+	 *
+	 * The client only clears that bookkeeping when closing the socket succeeds
+	 * and reports the failure as { error: true }, so a teardown that did not
+	 * happen refuses the candidate instead of connecting a fresh client on top
+	 * of stale state, which is the very bug this guards against. Rotation then
+	 * moves on, and the still-connected server is accepted unchanged when it
+	 * comes back around. When it is not among the candidates at all the connect
+	 * fails without touching the connection it kept: see _doConnect.
+	 */
+	private async stopPeerIfServerChanged(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): Promise<{ error?: string }> {
+		const peer = electrum.getConnectedPeer(electrumNetwork);
+		if (!peer?.host) return {};
+		const peerKey = `${peer.host}|${peer.protocol}|${peer.port}`;
+		// The target IS the connected peer. The client would handle that case
+		// itself, and for a live peer it does the right thing: it pings, finds
+		// the socket healthy and no-ops, keeping every handler wired. But when
+		// the ping fails it runs its own disconnect, which calls close() FIRST
+		// and clears subscribedAddresses/subscribedHeaders/onAddressReceive
+		// only afterwards, discards the result, and builds the replacement
+		// client regardless. A close() that throws therefore leaves that
+		// bookkeeping pointing at a client that no longer exists: every restore
+		// is then answered "Already Subscribed." without touching the socket,
+		// and since the peer is rewritten with the same host, port and
+		// protocol, there is nothing left for us to notice. RPCs keep working
+		// and no notification ever arrives again. So when the peer does not
+		// answer, the reset is done here instead, where a teardown that did not
+		// happen refuses the candidate rather than building on stale state.
+		if (peerKey === this.serverKey(server)) {
+			if (await this.peerResponds(electrumNetwork)) return {};
+		}
+		const stopResponse = await electrum.stop({ network: electrumNetwork });
+		// The cleared peer is the observable proof that the bookkeeping went
+		// with it, so it decides, and the reported error only sharpens the
+		// message.
+		const clientReset = !electrum.getConnectedPeer(electrumNetwork)?.host;
+		if (!clientReset) {
+			const reason = stopResponse?.error
+				? `: ${String(stopResponse.data ?? '')}`
+				: '.';
+			return {
+				error: `Unable to disconnect from ${peer.host} before reconnecting${reason}`
+			};
+		}
+		return {};
+	}
+
+	/**
+	 * Whether the peer connected on this network still answers.
+	 *
+	 * Network scoped on purpose: the unscoped helpers key off the module-global
+	 * clients.network and dial a random peer when that network has no client.
+	 * Only ever called with a peer already connected on `electrumNetwork`,
+	 * which is what guarantees the helper holds a client object for it and its
+	 * connectToRandomPeer fallback cannot fire.
+	 */
+	private async peerResponds(
+		electrumNetwork: EElectrumNetworks
+	): Promise<boolean> {
+		try {
+			const response = await electrum.getAddressScriptHashBalance({
+				scriptHash: LIVENESS_SCRIPT_HASH,
+				network: electrumNetwork
+			});
+			return !response?.error;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Re-issues every subscription this process holds for the network, run after
+	 * every successful connect because a client may have been torn down.
+	 *
+	 * rn-electrum-client keeps one client, and with it one set of
+	 * subscriptions and one notification handler, per network for the whole
+	 * process, so a reset by any instance drops what every other instance
+	 * subscribed as well. The shared script hash router is the record of that
+	 * state; re-subscribing its hashes restores the handler wiring for all of
+	 * them, and this instance's own wallet addresses are re-issued on top to
+	 * pick up anything generated since. The header subscription is part of the
+	 * same restore, so a failure to re-issue it is owed and retried like the
+	 * hashes are.
+	 */
+	private async restoreSubscriptions(
+		electrumNetwork: EElectrumNetworks
+	): Promise<void> {
+		// A bail is not a restore: whatever the shared client was left holding
+		// is still unwired, so the network's debt has to stay owed for whoever
+		// is left to discharge it.
+		if (this._disconnected) throw new Error(DISCONNECTED_ERROR);
+		// Re-issues the shared header dispatcher, so every instance subscribed
+		// to this network's headers is wired to the new client, not just this
+		// one. Started before the hashes and awaited after them, so neither
+		// failure defers the other, and settled the moment it is started, so a
+		// rejection is never left unhandled when the hashes fail first.
+		// The internal form, because the restore is the one caller that may read
+		// a failed reconciliation: it is what retries it. Every other caller
+		// sees only whether the subscription itself is live.
+		const headerFailed = this.subscribeToHeaderInternal().then(
+			({ result, reconcileOwed }) => result.isErr() || reconcileOwed,
+			() => true
+		);
+		const router = scriptHashRouters.get(electrumNetwork);
+		if (router) {
+			await Promise.all(
+				[...router.subscriptions.keys()].map(async (scriptHash) => {
+					const response = await electrum.subscribeAddress({
+						scriptHash,
+						network: electrumNetwork,
+						onReceive: router.dispatch
+					});
+					if (response.error) {
+						throw new Error('Unable to restore address subscriptions.');
+					}
+					router.noteSubscribed(scriptHash, response);
+				})
+			);
+		}
+		// Checked again: disconnect() can land while the hashes above are in
+		// flight, and subscribeToAddresses would register this instance back
+		// into the router it just withdrew from. A bail here is not a restore
+		// either.
+		if (this._disconnected) throw new Error(DISCONNECTED_ERROR);
+		const walletSubscriptions = await this.subscribeToAddresses({});
+		if (walletSubscriptions.isErr()) {
+			throw walletSubscriptions.error;
+		}
+		// subscribeToHeader answers a protocol failure with an error value
+		// rather than a rejection, so nothing outside the restore would ever
+		// notice one, and the socket it failed on can stay healthy
+		// indefinitely: without the debt below the wallet would receive no
+		// header notification until the next reconnect. The debt also covers a
+		// reconciliation the reported header revealed and could not complete,
+		// which is deliberately invisible to every other caller: the
+		// subscription is live, and the retry is this one's job.
+		if (await headerFailed) {
+			throw new Error('Unable to restore the header subscription.');
+		}
+	}
+
+	/**
+	 * Runs the restore without letting it fail the connect. A re-subscribe that
+	 * errors leaves the debt recorded, because the socket it failed on is
+	 * otherwise healthy: no reconnect is coming to restore unconditionally, so
+	 * the connection poll retries it instead of leaving the hashes unwired.
+	 */
+	private restoreSubscriptionsBestEffort(
+		electrumNetwork: EElectrumNetworks
+	): void {
+		const startedAt = Date.now();
+		const started = restoresInFlight.get(electrumNetwork) ?? [];
+		started.push(startedAt);
+		restoresInFlight.set(electrumNetwork, started);
+		// Read at the start, so a debt recorded WHILE this restore was running
+		// is not discharged by it: this attempt re-issued the subscriptions the
+		// router held when it began, and a failure since then is about a
+		// different attempt on a client this one never saw.
+		const debtSeenAt = restoreDebtSeq.get(electrumNetwork) ?? 0;
+		this.restoreSubscriptions(electrumNetwork)
+			.then(
+				() => {
+					if ((restoreDebtSeq.get(electrumNetwork) ?? 0) !== debtSeenAt) {
+						return;
+					}
+					if (this._restoreOwed === electrumNetwork) {
+						this._restoreOwed = null;
+					}
+					// Every hash in the shared router and the header
+					// subscription were re-issued on the one client the network
+					// has, whichever instance ran it.
+					subscriptionRestoreOwed.delete(electrumNetwork);
+				},
+				() => {
+					// Recorded before the disconnect check: the hashes left
+					// unwired are the shared router's, so an instance that walks
+					// away mid-restore leaves the debt behind rather than taking
+					// it with it.
+					restoreDebtSeq.set(electrumNetwork, debtSeenAt + 1);
+					subscriptionRestoreOwed.add(electrumNetwork);
+					// A restore that failed because THIS instance disconnected
+					// owes nothing of its OWN: disconnect() cleared that field,
+					// its retry hook is stopped, and the next connect restores
+					// unconditionally.
+					if (this._disconnected) return;
+					this._restoreOwed = electrumNetwork;
+				}
+			)
+			.finally(() => {
+				const left = restoresInFlight.get(electrumNetwork);
+				if (!left) return;
+				const at = left.indexOf(startedAt);
+				if (at >= 0) left.splice(at, 1);
+				if (left.length === 0) restoresInFlight.delete(electrumNetwork);
+			});
+	}
+
+	/**
+	 * Ordered rotation candidates: user-provided servers first, then the
+	 * hardcoded fallback peers for the network (never for regtest), deduped.
+	 */
+	private getServerCandidates(
+		customPeers: TServer[],
+		electrumNetwork: EElectrumNetworks
+	): TServer[] {
+		const fallback =
+			electrumNetwork === EElectrumNetworks.bitcoinRegtest
+				? []
+				: defaultElectrumPeers[electrumNetwork] ?? [];
+		const candidates: TServer[] = [];
+		const seen = new Set<string>();
+		for (const server of [...customPeers, ...fallback]) {
+			const key = this.serverKey(server);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			candidates.push(server);
+		}
+		return candidates;
+	}
+
+	/**
+	 * Starts iteration at the currently connected server (stable across
+	 * transient reconnects) and moves servers still cooling down from a recent
+	 * failure to the end, so a dead server is only retried once healthier
+	 * candidates have been exhausted.
+	 */
+	private orderCandidates(candidates: TServer[]): TServer[] {
+		let ordered = candidates;
+		if (this._currentServer) {
+			const currentKey = this.serverKey(this._currentServer);
+			const index = candidates.findIndex(
+				(s) => this.serverKey(s) === currentKey
+			);
+			if (index > 0) {
+				ordered = [...candidates.slice(index), ...candidates.slice(0, index)];
+			}
+		}
+		const now = Date.now();
+		const coolingDown = (server: TServer): boolean => {
+			const failure = this._serverFailures.get(this.serverKey(server));
+			if (!failure) return false;
+			return now - failure.lastFailureAt < ELECTRUM_SERVER_COOLDOWN_MS;
+		};
+		return [
+			...ordered.filter((s) => !coolingDown(s)),
+			...ordered.filter(coolingDown)
+		];
+	}
+
+	private serverKey(server: TServer): string {
+		const port = server.protocol === 'ssl' ? server.ssl : server.tcp;
+		return `${server.host}|${server.protocol}|${port}`;
+	}
+
+	private recordServerFailure(server: TServer): void {
+		const key = this.serverKey(server);
+		const failure = this._serverFailures.get(key);
+		this._serverFailures.set(key, {
+			failures: (failure?.failures ?? 0) + 1,
+			lastFailureAt: Date.now()
+		});
+	}
+
+	private recordServerSuccess(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): void {
+		const key = this.serverKey(server);
+		this._serverFailures.delete(key);
+		if (this._currentServer && this.serverKey(this._currentServer) !== key) {
+			this._rotationCount++;
+		}
+		this._currentServer = server;
+		// Taken here rather than from this.electrumNetwork, which a network
+		// switch only adopts further down _doConnect.
+		this.holdConnectedServer(electrumNetwork, key);
+	}
+
+	/**
+	 * Records that this instance holds `serverKey` on `network`, releasing
+	 * whatever it held before. Refcounted by instance, because isOurPeer asks
+	 * whether ANY instance in this process chose the connected peer.
+	 */
+	private holdConnectedServer(
+		network: EElectrumNetworks | null,
+		serverKey: string | null
+	): void {
+		if (this._heldServer) {
+			const { network: held, key } = this._heldServer;
+			const holders = connectedServers.get(held)?.get(key);
+			holders?.delete(this);
+			if (holders && holders.size === 0) {
+				connectedServers.get(held)?.delete(key);
+			}
+			this._heldServer = null;
+		}
+		if (!network || !serverKey) return;
+		let byKey = connectedServers.get(network);
+		if (!byKey) {
+			byKey = new Map();
+			connectedServers.set(network, byKey);
+		}
+		let holders = byKey.get(serverKey);
+		if (!holders) {
+			holders = new Set();
+			byKey.set(serverKey, holders);
+		}
+		holders.add(this);
+		this._heldServer = { network, key: serverKey };
+	}
+
+	/** The server of the most recent successful connect, if any. */
+	public get currentServer(): TServer | null {
+		return this._currentServer;
+	}
+
+	/** How many times the connected server has changed (rotation history). */
+	public get rotationCount(): number {
+		return this._rotationCount;
+	}
+
+	async isConnected(): Promise<boolean> {
+		// Guarded for the reason checkConnection is: a ping with no client for
+		// the network dials a random peers.json server rather than answering
+		// false, so a bare ping both lies and connects. And asked of this
+		// instance's own network, which the unscoped ping does not do.
+		if (!this.isOurPeer()) return false;
+		return this.peerResponds(this.electrumNetwork);
+	}
+
+	/**
+	 * Whether the client this process holds for our network is the one this
+	 * instance connected.
+	 *
+	 * rn-electrum-client's helpers dial a random peers.json server whenever
+	 * clients.mainClient[network] is falsy (pingServer, subscribeAddress,
+	 * getAddressScriptHashBalance and the rest all do it), and
+	 * disconnectFromPeer clears clients.peers[network] on the way out, so the
+	 * fallback list is the hardcoded one. After a failover where every
+	 * candidate failed, or after any instance's disconnect, the next ping would
+	 * silently connect to a default peer and the health check would report a
+	 * live connection forever with zero script hashes subscribed to it.
+	 */
+	private isOurPeer(): boolean {
+		const peer = electrum.getConnectedPeer(this.electrumNetwork);
+		if (!peer?.host) return false;
+		const key = `${peer.host}|${peer.protocol}|${peer.port}`;
+		// Any instance in this process, not only this one: there is a single
+		// client per network, so a sibling may have moved it to a server from
+		// its own list, and that client is still the one carrying the shared
+		// router's subscriptions. Only a peer nobody here chose is a stray dial.
+		return isConnectedServer(this.electrumNetwork, key);
+	}
+
+	/**
+	 * Returns the balance in sats for a given address.
+	 * @param {string} scriptHash
+	 * @return {number}
+	 */
+	async getAddressBalance(
+		scriptHash: string
+	): Promise<IElectrumGetAddressBalanceRes> {
+		if (this._disconnected)
+			return { error: true, confirmed: 0, unconfirmed: 0 };
+		if (!this.connectedToElectrum)
+			await this.connectToElectrum({
+				network: this.network,
+				servers: this.servers
+			});
+		if (this._disconnected)
+			return { error: true, confirmed: 0, unconfirmed: 0 };
+		const network = this.electrumNetwork;
+		const response = await electrum.getAddressScriptHashBalance({
+			scriptHash,
+			network
+		});
+		if (response.error) {
+			return { error: response.error, confirmed: 0, unconfirmed: 0 };
+		}
+		const { confirmed, unconfirmed } = response.data;
+		return { error: response.error, confirmed, unconfirmed };
+	}
+
+	async getAddressScriptHashBalances(
+		scriptHashes: string[]
+	): Promise<IGetAddressScriptHashBalances> {
+		return await electrum.getAddressScriptHashBalances({
+			scriptHashes,
+			network: this.electrumNetwork
+		});
+	}
+
+	/**
+	 * Returns the fee estimate in sat/vB for the given confirmation target via
+	 * blockchain.estimatefee. Errs when the server has no estimate (-1) or
+	 * returns an unusable value; results are clamped to a sane range.
+	 * @param {number} blocksWillingToWait
+	 * @returns {Promise<Result<number>>}
+	 */
+	async getFeeEstimate(blocksWillingToWait: number): Promise<Result<number>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		const response = await electrum.getFeeEstimate({
+			blocksWillingToWait,
+			network: this.electrumNetwork
+		});
+		if (response.error) {
+			return err('Unable to get fee estimate from Electrum server.');
+		}
+		const satPerVbyte = btcPerKbToSatPerVbyte(Number(response.data));
+		if (satPerVbyte <= 0) {
+			return err('Electrum server returned an unusable fee estimate.');
+		}
+		return ok(satPerVbyte);
+	}
+
+	/**
+	 * Returns currently connected peer.
+	 * @returns {Promise<Result<IPeerData>>}
+	 */
+	async getConnectedPeer(): Promise<Result<IPeerData>> {
+		const response = await electrum.getConnectedPeer(this.electrumNetwork);
+		if (response?.host && response?.port && response?.protocol) {
+			return ok(response);
+		}
+		return err('No peer available.');
+	}
+
+	/**
+	 * Queries Electrum to return the available UTXO's and balance of the provided addresses.
+	 * @param {TUnspentAddressScriptHashData} addresses
+	 * @returns {Promise<Result<IGetUtxosResponse>>}
+	 */
+	async listUnspentAddressScriptHashes({
+		addresses
+	}: {
+		addresses: TUnspentAddressScriptHashData;
+	}): Promise<Result<IGetUtxosResponse>> {
+		try {
+			const addressBatches = splitAddresses(addresses, this.batchLimit);
+			let balance = 0;
+			const utxos: IUtxo[] = [];
+			for (const batch of addressBatches) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
+				const unspentAddressResult: TUnspentAddressScriptHashResponse =
+					await electrum.listUnspentAddressScriptHashes({
+						scriptHashes: {
+							key: 'scriptHash',
+							data: batch
+						},
+						network: this.electrumNetwork
+					});
+
+				if (unspentAddressResult.error) {
+					return err(JSON.stringify(unspentAddressResult?.data ?? ''));
+				}
+
+				unspentAddressResult.data.forEach(
+					({ data, result: unspentAddresses }) => {
+						if (unspentAddresses?.length > 0) {
+							unspentAddresses.forEach((unspentAddress) => {
+								balance += unspentAddress.value;
+								utxos.push({
+									...data,
+									...unspentAddress
+								});
+							});
+						}
+					}
+				);
+				await sleep(this.batchDelay);
+			}
+
+			return ok({ utxos, balance });
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Returns the available history for the provided address script hashes.
+	 * @param {IAddress[]} [scriptHashes]
+	 * @param {boolean} [scanAllAddresses]
+	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
+	 */
+	async getAddressHistory({
+		scriptHashes = [],
+		scanAllAddresses = false
+	}: {
+		scriptHashes?: IAddress[];
+		scanAllAddresses?: boolean;
+	}): Promise<Result<IGetAddressHistoryResponse[]>> {
+		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			if (!this.connectedToElectrum)
+				await this.connectToElectrum({
+					network: this.network,
+					servers: this.servers
+				});
+			const currentWallet = this._wallet.data;
+			const currentAddresses: TAddressTypeContent<IAddresses> =
+				currentWallet.addresses;
+			const currentChangeAddresses: TAddressTypeContent<IAddresses> =
+				currentWallet.changeAddresses;
+
+			const addressIndexes = currentWallet.addressIndex;
+			const changeAddressIndexes = currentWallet.changeAddressIndex;
+
+			if (scriptHashes.length < 1) {
+				const addressTypeKeys = this._wallet.addressTypesToMonitor;
+				addressTypeKeys.forEach((addressType) => {
+					const addresses = currentAddresses[addressType];
+					const changeAddresses = currentChangeAddresses[addressType];
+					let addressValues = Object.values(addresses);
+					let changeAddressValues = Object.values(changeAddresses);
+
+					const addressIndex = addressIndexes[addressType].index;
+					const changeAddressIndex = changeAddressIndexes[addressType].index;
+
+					// Instead of scanning all addresses, adhere to the gap limit.
+					if (
+						!scanAllAddresses &&
+						addressIndex >= 0 &&
+						changeAddressIndex >= 0
+					) {
+						addressValues = filterAddressesForGapLimit({
+							addresses: addressValues,
+							index: addressIndex,
+							gapLimitOptions: this._wallet.gapLimitOptions,
+							change: false
+						});
+						changeAddressValues = filterAddressesForGapLimit({
+							addresses: changeAddressValues,
+							index: changeAddressIndex,
+							gapLimitOptions: this._wallet.gapLimitOptions,
+							change: true
+						});
+					}
+					const utxoScriptHashes: IAddress[] = currentWallet.utxos;
+
+					scriptHashes = [
+						...utxoScriptHashes,
+						...scriptHashes,
+						...addressValues,
+						...changeAddressValues
+					];
+				});
+			}
+			// remove items with same path
+			scriptHashes = scriptHashes.filter((sh, index, arr) => {
+				return index === arr.findIndex((v) => sh.path === v.path);
+			});
+			if (scriptHashes.length < 1) {
+				return err('No scriptHashes available to check.');
+			}
+
+			const combinedResponse: TTxResponse[] = [];
+			const promises: Promise<IGetAddressScriptHashesHistoryResponse>[] = [];
+
+			// split payload in chunks of 10 addresses per-request
+			for (let i = 0; i < scriptHashes.length; i += this.batchLimit) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
+				const chunk = scriptHashes.slice(i, i + this.batchLimit);
+				const payload = {
+					key: 'scriptHash',
+					data: chunk
+				};
+				promises.push(
+					electrum.getAddressScriptHashesHistory({
+						scriptHashes: payload,
+						network: this.electrumNetwork
+					})
+				);
+				await sleep(this.batchDelay);
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
+				promises.push(
+					electrum.getAddressScriptHashesMempool({
+						scriptHashes: payload,
+						network: this.electrumNetwork
+					})
+				);
+				await sleep(this.batchDelay);
+			}
+
+			const responses = await Promise.all(promises);
+			responses.forEach((response) => {
+				if (!response.error) {
+					combinedResponse.push(...response.data);
+				}
+			});
+
+			const history: IGetAddressHistoryResponse[] = [];
+			combinedResponse.forEach(
+				({ data, result }: { data: IAddress; result: TTxResult[] }): void => {
+					if (result && result?.length > 0) {
+						result.forEach((item) => {
+							history.push({ ...data, ...item });
+						});
+					}
+				}
+			);
+			return ok(history);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Used to retrieve scriptPubkey history for LDK.
+	 * @param {string} scriptPubkey
+	 * @returns {Promise<TGetAddressHistory[]>}
+	 */
+	async getScriptPubKeyHistory(
+		scriptPubkey: string
+	): Promise<TGetAddressHistory[]> {
+		const history: { txid: string; height: number }[] = [];
+		const address = getAddressFromScriptPubKey(scriptPubkey, this.network);
+		if (!address) {
+			return history;
+		}
+		const scriptHash = getScriptHash({
+			network: this.network,
+			address
+		});
+		if (!scriptHash) {
+			return history;
+		}
+		const response = await electrum.getAddressScriptHashesHistory({
+			scriptHashes: [scriptHash],
+			network: this.electrumNetwork
+		});
+		if (response.error) {
+			return history;
+		}
+		await Promise.all(
+			response.data.map(({ result }: { result: TTxResult[] }): void => {
+				if (result && result?.length > 0) {
+					result.map((item) => {
+						history.push({
+							txid: item?.tx_hash ?? '',
+							height: item?.height ?? 0
+						});
+					});
+				}
+			})
+		);
+		return history;
+	}
+
+	/**
+	 * Returns an array of tx_hashes and their height for a given array of address script hashes.
+	 * @param {string[]} scriptHashes
+	 * @returns {Promise<Result<TTxResponse>>}
+	 */
+	async getAddressScriptHashesHistory(
+		scriptHashes: string[] = []
+	): Promise<Result<IGetAddressTxResponse>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		const response = await electrum.getAddressScriptHashesHistory({
+			scriptHashes,
+			network: this.electrumNetwork
+		});
+		if (response.error) {
+			return err(
+				response?.data ?? 'Unable to get address script hashes history.'
+			);
+		}
+		return ok(response);
+	}
+
+	/**
+	 * Returns UTXO's for a given wallet and network along with the available balance.
+	 * @param {EScanningStrategy} [scanningStrategy]
+	 * @param {number} addressIndex
+	 * @param {number} changeAddressIndex
+	 * @param {EAddressType[]} [addressTypesToCheck]
+	 * @additionalAddresses {string[]} [additionalAddresses]
+	 * @returns {Promise<Result<IGetUtxosResponse>>}
+	 */
+	async getUtxos({
+		scanningStrategy = EScanningStrategy.gapLimit,
+		addressIndex,
+		changeAddressIndex,
+		addressTypesToCheck = this._wallet.addressTypesToMonitor,
+		additionalAddresses = []
+	}: {
+		scanningStrategy?: EScanningStrategy;
+		addressIndex?: number;
+		changeAddressIndex?: number;
+		addressTypesToCheck?: EAddressType[];
+		additionalAddresses?: string[];
+	}): Promise<Result<IGetUtxosResponse>> {
+		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			if (!this.connectedToElectrum)
+				await this.connectToElectrum({
+					network: this.network,
+					servers: this.servers
+				});
+			const currentWallet = this._wallet.data;
+
+			let addresses = {} as IAddresses;
+			let changeAddresses = {} as IAddresses;
+			const existingUtxos: { [key: string]: IUtxo } = {};
+
+			for (const addressType of addressTypesToCheck) {
+				// Grab all addresses and change addresses.
+				const allAddresses = currentWallet.addresses[addressType] ?? {};
+				const allChangeAddresses =
+					currentWallet.changeAddresses[addressType] ?? {};
+
+				// Skip a type only when NEITHER collection has been generated.
+				// Two things to note here:
+				//   - `continue`, not `break`: address types are independent, and a
+				//     `break` dropped every LATER type from the query. Since p2tr is
+				//     last in EAddressType, a wallet with no p2sh addresses returned
+				//     zero UTXOs for its own p2tr addresses, indistinguishable from
+				//     having no funds.
+				//   - both collections are checked: getChangeAddress generates with
+				//     `addressAmount: 0`, so a type can hold change addresses and no
+				//     receiving addresses. Testing only the receiving side skipped
+				//     those change addresses, dropping real UTXOs from the scan.
+				if (
+					Object.keys(allAddresses).length === 0 &&
+					Object.keys(allChangeAddresses).length === 0
+				) {
+					continue;
+				}
+
+				if (scanningStrategy === EScanningStrategy.all) {
+					addresses = { ...addresses, ...allAddresses };
+					changeAddresses = { ...changeAddresses, ...allChangeAddresses };
+				} else {
+					// Grab the current index for address/change addresses if none were provided.
+					const _addressIndex =
+						addressIndex === undefined
+							? currentWallet.addressIndex[addressType].index
+							: addressIndex;
+					const _changeAddressIndex =
+						changeAddressIndex === undefined
+							? currentWallet.changeAddressIndex[addressType].index
+							: changeAddressIndex;
+
+					// Use the lowest index to ensure we're not starting above our current index.
+					// TODO: Consider removing this entirely or at least updating it to allow up to the max stored address/change address index.
+					const lowestAddressIndex = Math.min(
+						_addressIndex,
+						currentWallet.addressIndex[addressType].index
+					);
+					const lowestChangeAddressIndex = Math.min(
+						_changeAddressIndex,
+						currentWallet.changeAddressIndex[addressType].index
+					);
+
+					switch (scanningStrategy) {
+						case EScanningStrategy.gapLimit:
+							addresses = {
+								...addresses,
+								...filterAddressesObjForGapLimit({
+									addresses: allAddresses,
+									index: lowestAddressIndex,
+									gapLimitOptions: this._wallet.gapLimitOptions,
+									change: false
+								}),
+								...filterAddressesObjForAddressesList({
+									addresses: allAddresses,
+									additionalAddresses
+								})
+							};
+							changeAddresses = {
+								...changeAddresses,
+								...filterAddressesObjForGapLimit({
+									addresses: allChangeAddresses,
+									index: lowestChangeAddressIndex,
+									gapLimitOptions: this._wallet.gapLimitOptions,
+									change: true
+								})
+							};
+							break;
+						case EScanningStrategy.startingIndex:
+							addresses = {
+								...addresses,
+								...filterAddressesObjForStartingIndex({
+									addresses: allAddresses,
+									index: lowestAddressIndex
+								}),
+								...filterAddressesObjForAddressesList({
+									addresses: allAddresses,
+									additionalAddresses
+								})
+							};
+							changeAddresses = {
+								...changeAddresses,
+								...filterAddressesObjForStartingIndex({
+									addresses: allChangeAddresses,
+									index: lowestChangeAddressIndex
+								})
+							};
+							break;
+						case EScanningStrategy.singleIndex:
+							addresses = {
+								...addresses,
+								...filterAddressesObjForSingleIndex({
+									addresses: allAddresses,
+									addressIndex: _addressIndex
+								}),
+								...filterAddressesObjForAddressesList({
+									addresses: allAddresses,
+									additionalAddresses
+								})
+							};
+							changeAddresses = {
+								...changeAddresses,
+								...filterAddressesObjForSingleIndex({
+									addresses: allChangeAddresses,
+									addressIndex: _changeAddressIndex
+								})
+							};
+							break;
+					}
+				}
+			}
+
+			// Make sure we're re-check existing utxos that may exist outside the gap limit and putting them in the necessary format.
+			currentWallet.utxos.map((utxo) => {
+				existingUtxos[utxo.scriptHash] = utxo;
+			});
+
+			const data: TUnspentAddressScriptHashData = {
+				...addresses,
+				...changeAddresses,
+				...existingUtxos
+			};
+
+			return this.listUnspentAddressScriptHashes({ addresses: data });
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Returns available transactions from electrum based on the provided txHashes.
+	 * @param {ITxHash[]} txHashes
+	 * @return {Promise<Result<IGetTransactions>>}
+	 */
+	async getTransactions({
+		txHashes = []
+	}: {
+		txHashes: ITxHash[];
+	}): Promise<Result<IGetTransactions>> {
+		try {
+			if (txHashes.length < 1) {
+				return ok({
+					error: false,
+					id: 0,
+					method: 'getTransactions',
+					network: this.electrumNetwork,
+					data: []
+				});
+			}
+
+			const result: ITransaction<IUtxo>[] = [];
+			const promises: Promise<IGetTransactions>[] = [];
+
+			// split payload in chunks of 10 transactions per-request
+			for (let i = 0; i < txHashes.length; i += this.batchLimit) {
+				if (this._disconnected) return err(DISCONNECTED_ERROR);
+				const chunk = txHashes.slice(i, i + this.batchLimit);
+
+				const data = {
+					key: 'tx_hash',
+					data: chunk
+				};
+
+				promises.push(
+					electrum.getTransactions({
+						txHashes: data,
+						network: this.electrumNetwork
+					})
+				);
+				await sleep(this.batchDelay);
+			}
+			const responses = await Promise.all(promises);
+			responses.forEach((response) => {
+				if (!response.error) result.push(...response.data);
+			});
+			return ok({
+				error: false,
+				id: 0,
+				method: 'getTransactions',
+				network: this.electrumNetwork,
+				data: result
+			});
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Determines whether a transaction exists based on the transaction response from electrum.
+	 * @param {ITransaction<IUtxo>} txData
+	 * @returns {boolean}
+	 */
+	public transactionExists(txData: ITransaction<IUtxo>): boolean {
+		if (
+			// @ts-ignore
+			txData?.error &&
+			// @ts-ignore
+			txData?.error?.message &&
+			/No such mempool or blockchain transaction|Invalid tx hash/.test(
+				// @ts-ignore
+				txData?.error?.message
+			)
+		) {
+			//Transaction was removed/bumped from the mempool or potentially reorg'd out.
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Returns the block hex of the provided block height.
+	 * @param {number} [height]
+	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async getBlockHex({
+		height = 0
+	}: {
+		height?: number;
+	}): Promise<Result<string>> {
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		const response: IGetHeaderResponse = await electrum.getHeader({
+			height,
+			network: this.electrumNetwork
+		});
+		if (response.error) {
+			return err(response.data);
+		}
+		return ok(response.data);
+	}
+
+	/**
+	 * Returns the block hash given a block hex.
+	 * Leaving blockHex empty will return the last known block hash from storage.
+	 * @param {string} [blockHex]
+	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @returns {string}
+	 */
+	public getBlockHashFromHex({ blockHex }: { blockHex?: string }): string {
+		// If empty, return the last known block hex from storage.
+		if (!blockHex) {
+			const { hex } = this.getBlockHeader();
+			blockHex = hex;
+		}
+		if (!blockHex) return '';
+		const block = Block.fromHex(blockHex);
+		const hash = block.getId();
+		return hash;
+	}
+
+	/**
+	 * Returns last known block height, and it's corresponding hex from local storage.
+	 * @returns {IHeader}
+	 */
+	public getBlockHeader(): IHeader {
+		return this.wallet.data.header;
+	}
+
+	/**
+	 * Block id of the PARENT recorded inside an 80 byte header hex, or '' when
+	 * there is no hex or it does not parse. Every header carries its parent, so
+	 * whether one block builds on another is answerable from what is already in
+	 * hand, with no round trip to a server.
+	 */
+	private getPrevBlockHash(blockHex?: string): string {
+		if (!blockHex) return '';
+		try {
+			const { prevHash } = Block.fromHex(blockHex);
+			if (!prevHash) return '';
+			// Internal byte order on the wire, display order everywhere the
+			// wallet compares hashes.
+			return Buffer.from(prevHash).reverse().toString('hex');
+		} catch {
+			return '';
+		}
+	}
+
+	/**
+	 * Block id of an 80 byte header hex, or '' when there is no hex or it does
+	 * not parse. getBlockHashFromHex is the public form and throws on a hex it
+	 * cannot read, which is fine for a caller handing it a header a server just
+	 * sent; this one is for reading back STORAGE, where a short or corrupt hex
+	 * must not become an exception on every block.
+	 */
+	private getBlockHashOf(blockHex?: string): string {
+		if (!blockHex) return '';
+		try {
+			return Block.fromHex(blockHex).getId();
+		} catch {
+			return '';
+		}
+	}
+
+	/**
+	 * Returns transactions associated with the provided transaction hashes.
+	 * @param {ITxHash[]} txHashes
+	 * @return {Promise<Result<IGetTransactionsFromInputs>>}
+	 */
+	async getTransactionsFromInputs({
+		txHashes = []
+	}: {
+		txHashes: ITxHash[];
+	}): Promise<Result<IGetTransactionsFromInputs>> {
+		try {
+			if (this._disconnected) return err(DISCONNECTED_ERROR);
+			const data = {
+				key: 'tx_hash',
+				data: txHashes
+			};
+			const response = await electrum.getTransactions({
+				txHashes: data,
+				network: this.electrumNetwork
+			});
+			if (response && !response.error) {
+				return ok(response);
+			} else {
+				if (response?.error?.message) return err(response.error.message);
+				return err(response ?? 'Unable to get transactions from inputs.');
+			}
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Returns the merkle branch to a confirmed transaction given its hash and height.
+	 * @param {string} tx_hash
+	 * @param {number} height
+	 * @returns {Promise<{ merkle: string[]; block_height: number; pos: number }>}
+	 */
+	async getTransactionMerkle({
+		tx_hash,
+		height
+	}: {
+		tx_hash: string;
+		height: number;
+	}): Promise<{
+		merkle: string[];
+		block_height: number;
+		pos: number;
+	}> {
+		return await electrum.getTransactionMerkle({
+			tx_hash,
+			height,
+			network: this.electrumNetwork
+		});
+	}
+
+	/**
+	 * Stores a header in this instance's wallet and reconciles the rollback it
+	 * implies, if any.
+	 *
+	 * Every header write goes through here, the one a (re)subscribe answers
+	 * with included: a header below the stored one is the only evidence of a
+	 * rollback this instance gets, and writing it straight to storage spends
+	 * that evidence. The stored height silently drops, and the next
+	 * notification, higher than what was written, then reads as ordinary
+	 * growth, so a chain that rolled back while this process was away, or
+	 * while it was talking to a server that has since been swapped out, is
+	 * never reconciled at all.
+	 *
+	 * The height alone does not settle it, and the hash is right there in the
+	 * header. A tip REPLACED at the same height is a rollback although the
+	 * chain never got shorter: the block this wallet's transactions were
+	 * confirmed in is gone. A chain that rolled back and rebuilt taller while
+	 * the process was away arrives ABOVE the stored tip and read as ordinary
+	 * growth. And a server one block behind, which is what a failover normally
+	 * lands on, read as a rollback and fired a 'reorg' message at every wallet
+	 * on the network. Every header carries its parent, so the three are told
+	 * apart from what is already in hand.
+	 */
+	private async applyHeader(
+		header: IHeader,
+		/** Whether this header is a server's answer about its CURRENT tip (a
+		 *  subscribe response) rather than a notification that its tip just
+		 *  changed. The two mean different things one block below the stored
+		 *  tip: see the parent case below. */
+		reported = false
+	): Promise<Result<string>> {
+		const stored = this.getBlockHeader();
+		// A fresh wallet's header is { height: 0, hash: '', hex: '' } and older
+		// storage may carry a hex with no hash, so the hash is derived when it
+		// has to be. Derived through the same guarded read the parent link uses,
+		// because a stored hex too short or too malformed to parse would
+		// otherwise throw out of here, wedging this wallet on every block and
+		// aborting the fan-out to the rest. With nothing to compare against,
+		// the height-only reading this always had is kept.
+		const storedHash = stored.hash || this.getBlockHashOf(stored.hex);
+		let reorgDetected = this._reorgOwed || header.height < stored.height;
+		if (!this._reorgOwed && storedHash && stored.height) {
+			if (header.height === stored.height) {
+				// A different block at the stored height: the stored one was
+				// orphaned, and writing this one on top is what spends the
+				// evidence.
+				reorgDetected = header.hash !== storedHash;
+				// The same block: a server holds the stored tip after all.
+				if (!reorgDetected) this._tipUnverified = false;
+			} else if (header.height === stored.height + 1) {
+				// The ordinary block-by-block case, and the only hot one. A
+				// successor that does not build on the stored tip means the
+				// stored tip is gone, however much taller the chain now is.
+				reorgDetected = this.getPrevBlockHash(header.hex) !== storedHash;
+				// A block built on it is the same confirmation.
+				if (!reorgDetected) this._tipUnverified = false;
+			} else if (
+				reported &&
+				header.height === stored.height - 1 &&
+				this.getPrevBlockHash(stored.hex) === header.hash
+			) {
+				// Exactly the stored tip's parent, on this very chain, and
+				// REPORTED rather than notified: the server is answering with
+				// the tip it currently holds, and after a failover that is
+				// commonly a server one block behind. It holds no block at the
+				// stored height and so has nothing to say about it. Not stored
+				// either: lowering the tip would spend the evidence of a
+				// rollback that orphaned it.
+				//
+				// A NOTIFICATION at the same height means something else
+				// entirely, which is why this is gated. The client only
+				// notifies when the server's tip CHANGES, so a server that
+				// announces the parent of the block this wallet holds is
+				// telling it that block was undone. That one keeps the reading
+				// it always had, below.
+				//
+				// Remembered, though: a server that answers with this tip's
+				// parent is saying it does not hold the tip. If the next header
+				// this wallet applies lands close enough to be compared, that
+				// settles it either way. If it lands further out, the gap rule
+				// below would read it as growth and the rollback would be lost
+				// for good, so an unconfirmed tip makes that case a rollback.
+				this._tipUnverified = true;
+				return ok('Header below the stored tip ignored.');
+			} else if (this._tipUnverified) {
+				// Too far away to compare, on a tip a server has already
+				// declined to confirm. Reconciling a chain that was fine costs
+				// a reorg message with nothing in it; reading a rollback as
+				// growth loses it permanently.
+				reorgDetected = true;
+			}
+			// Otherwise a gap of more than one block in either direction is left
+			// with the height-only reading: the wallet stores one tip, so it
+			// holds no evidence about the blocks in between.
+		}
+		// The header this wallet already holds, with nothing owed on it: the
+		// tip is re-applied on every subscribe, and the reconnect monitor makes
+		// one of those a poll, so this is the common case rather than the rare
+		// one. Persisting it again would buy nothing.
+		if (
+			!reorgDetected &&
+			header.height === stored.height &&
+			header.hash === storedHash
+		) {
+			return ok('Header already stored.');
+		}
+		// Owed before the WRITE, not after it, for the same reason the
+		// comparison above exists: Wallet.updateHeader replaces the in-memory
+		// header before it awaits storage, so a write that rejects has already
+		// replaced the height the rollback was read from. The debt has to
+		// outlive the write as well as the reconciliation, and be retried by
+		// the next header rather than forgotten.
+		if (reorgDetected) this._reorgOwed = true;
+		await this._wallet.updateHeader(header);
+		// The tip this doubt was about has been replaced.
+		this._tipUnverified = false;
+		if (!reorgDetected) return ok('Header stored.');
+		const reconciled = await this._wallet.checkUnconfirmedTransactions(true);
+		if (reconciled.isErr()) return err(reconciled.error.message);
+		this._reorgOwed = false;
+		return ok('Header stored and reconciled.');
+	}
+
+	/**
+	 * Applies a header that arrived outside the notification path, the one a
+	 * (re)subscribe answers with, to every instance on the network.
+	 *
+	 * Only one instance ever holds that answer: the client keeps a single
+	 * subscription per network for the whole process and tells every other
+	 * subscriber "Already Subscribed." without a header, and an instance that
+	 * is not the one reconnecting is never asked at all. Handing it to that one
+	 * wallet alone would leave every other wallet's stored height above a chain
+	 * that rolled back, with the notification that follows too high to reveal
+	 * it, which is the same bug the reconnect one had.
+	 */
+	private async applyReportedHeader(
+		header: IHeader,
+		/** The network the subscribe was ISSUED on, captured before its await.
+		 *  Not re-read from this.electrumNetwork, which a network change may
+		 *  have moved in the meantime: the old network's tip would then be
+		 *  written into the new network's router and fanned out to every wallet
+		 *  on it, where the height gap reads as an enormous rollback. */
+		electrumNetwork: EElectrumNetworks
+	): Promise<Result<string>> {
+		const router = getHeaderRouter(electrumNetwork);
+		router.last = header;
+		router.seq++;
+		let failure = '';
+		for (const instance of [...router.handlers.keys()]) {
+			// Re-read rather than taken from the snapshot, as the dispatch does:
+			// an instance that withdrew while a wallet ahead of it was writing
+			// must not have a header applied to it after all.
+			if (!router.handlers.has(instance)) continue;
+			// Reported, so the caller keeps the restore owed and retries, which
+			// is what re-drives the reconciliation for every wallet here. One
+			// failing wallet must not stop the rest from being reconciled, and
+			// a wallet whose storage THROWS rather than answering an error must
+			// not either, which is what the catch is for.
+			try {
+				const applied = await instance.applyHeader(header, true);
+				if (applied.isErr()) failure = applied.error.message;
+			} catch (e) {
+				failure = e instanceof Error ? e.message : String(e);
+			}
+		}
+		return failure ? err(failure) : ok('Header applied.');
+	}
+
+	/**
+	 * Applies a new block header to this instance's wallet. Handed to the
+	 * shared per-network header router rather than to the client directly, so
+	 * every subscribed instance is reached by the one handler the client keeps.
+	 */
+	private readonly _onNewBlock = async (data: INewBlock[]): Promise<void> => {
+		const hex = data[0].hex;
+		const hash = this.getBlockHashFromHex({ blockHex: hex });
+		const header: IHeader = { ...data[0], hash };
+		// Recorded for the instances this notification does not reach: one that
+		// subscribes later is answered "Already Subscribed." and carries no
+		// header of its own to reconcile against.
+		const router = getHeaderRouter(this.electrumNetwork);
+		router.last = header;
+		router.seq++;
+		// A failed reconciliation is owed inside applyHeader and retried by the
+		// next header, so there is nothing for a notification to report.
+		await this.applyHeader(header);
+		// The dispatch no longer runs the instances one at a time, so the
+		// withdrawal it used to honour by re-reading the map before each call
+		// is honoured here instead: disconnect() may have landed while the
+		// header write above was in flight, and a wallet that has stopped must
+		// not be refreshed or called back into. Checked after applyHeader, so a
+		// reconciliation this instance owes is still recorded in _reorgOwed.
+		if (this._disconnected) return;
+		await this._wallet.refreshWallet();
+		this.onReceive?.(data);
+		this.sendMessage(onMessageKeys.newBlock, data[0]);
+	};
+
+	/**
+	 * Subscribes to the current networks headers.
+	 * @return {Promise<Result<string>>}
+	 */
+	public async subscribeToHeader(): Promise<Result<IHeader>> {
+		return (await this.subscribeToHeaderInternal()).result;
+	}
+
+	/**
+	 * The same subscribe, answered as a liveness check on the SERVER rather
+	 * than on the subscription.
+	 *
+	 * A failed reconciliation is left out of the subscription result on
+	 * purpose: the subscription is registered, wired and answering, and a
+	 * caller that only needs headers (ChainWatcher, which refuses to accept
+	 * work at all without one) must not be told otherwise. But the RPCs the
+	 * reconciliation runs are the same server's, and a server that serves
+	 * blockchain.headers.subscribe while failing the history batches behind
+	 * checkUnconfirmedTransactions is exactly what a reconnect monitor exists
+	 * to rotate away from. So the monitor asks with this instead, and gets the
+	 * debt as the failure it is for that question.
+	 */
+	public async pingHeaderSubscription(): Promise<Result<IHeader>> {
+		const { result, reconcileOwed } = await this.subscribeToHeaderInternal();
+		if (result.isErr() || !reconcileOwed) return result;
+		return err('Unable to reconcile the header this server reported.');
+	}
+
+	/**
+	 * The subscribe itself, with the reconciliation debt reported apart from
+	 * the subscription result.
+	 *
+	 * A reconciliation that failed is wallet data debt on a subscription that
+	 * is registered, wired and answering, and only the restore may read it: it
+	 * is the one caller that retries it. Reported as a subscribe failure, it
+	 * told ElectrumBackend's reconnect monitor to count a ping failure, three
+	 * of which fail the server over although the debt is not the server's, and
+	 * told ChainWatcher.start it had no header subscription, so the watcher
+	 * refused to accept work at all. It is another wallet's debt as often as
+	 * this one's: applyReportedHeader reports whichever instance on the
+	 * network failed.
+	 */
+	private async subscribeToHeaderInternal(): Promise<{
+		result: Result<IHeader>;
+		reconcileOwed: boolean;
+	}> {
+		// disconnect() withdrew this instance from the shared header router, and
+		// a caller that outlived it (an ElectrumBackend reconnect monitor still
+		// ticking after wallet.stop()) must not put it back: _onNewBlock would
+		// then refresh a wallet that has shut down. A stopped instance owes
+		// nothing either: disconnect() cleared the restore debt.
+		if (this._disconnected) {
+			return { result: err(DISCONNECTED_ERROR), reconcileOwed: false };
+		}
+		const electrumNetwork = this.electrumNetwork;
+		const router = getHeaderRouter(electrumNetwork);
+		// Registered before the call, and left registered on "Already
+		// Subscribed.": the client wires a handler only for the first subscribe
+		// on the network, so this is what makes the later instances (and the
+		// ones a client reset silenced) receive headers at all.
+		let state = this._headerSubscribes.get(electrumNetwork);
+		if (!state) {
+			state = { inFlight: 0, committed: false };
+			this._headerSubscribes.set(electrumNetwork, state);
+		}
+		// A handler already registered predates this attempt, so a failure here
+		// must not withdraw it.
+		if (router.handlers.has(this)) state.committed = true;
+		router.handlers.set(this, this._onNewBlock);
+		// Read when the request actually goes out, not when this caller queued
+		// behind another one, so the response below can be told apart from a
+		// header that overtook it: see THeaderRouter.seq.
+		let seenAt = router.seq;
+		const run = async (): Promise<ISubscribeToHeader> => {
+			// Re-checked here, not only on the way in: this caller can sit
+			// queued behind another subscribe for as long as that one takes,
+			// and a disconnect can land in the meantime. Issuing the request
+			// then would dial from a stopped instance, because the client falls
+			// into connectToRandomPeer whenever the network it is asked about
+			// has no client, and disconnect() is exactly what leaves it with
+			// none.
+			if (this._disconnected) {
+				return {
+					error: true,
+					data: DISCONNECTED_ERROR
+				} as unknown as ISubscribeToHeader;
+			}
+			seenAt = router.seq;
+			return electrum.subscribeHeader({
+				network: electrumNetwork,
+				onReceive: router.dispatch
+			});
+		};
+		// Queued behind whatever subscribe this network already has in flight,
+		// settled or thrown: see headerSubscribeGates. A failed predecessor
+		// leaves the network unsubscribed, and the caller behind it is the one
+		// that re-issues the request.
+		const previous = headerSubscribeGates.get(electrumNetwork);
+		const attempt = previous ? previous.then(run, run) : run();
+		// Bounded on purpose: see HEADER_SUBSCRIBE_GATE_MS. The caller still
+		// awaits the attempt itself, and its own timeout is its own business;
+		// what must not hang is the next subscribe on this network.
+		const gate = Promise.race([
+			attempt.then(
+				() => undefined,
+				() => undefined
+			),
+			new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, HEADER_SUBSCRIBE_GATE_MS);
+				if (timer.unref) timer.unref?.();
+			})
+		]);
+		headerSubscribeGates.set(electrumNetwork, gate);
+		void gate.then(() => {
+			if (headerSubscribeGates.get(electrumNetwork) === gate) {
+				headerSubscribeGates.delete(electrumNetwork);
+			}
+		});
+		// Counted around the wait as a whole, the queued part included, so a
+		// caller still waiting its turn keeps a failing sibling from rolling
+		// back the handler it is about to rely on.
+		state.inFlight++;
+		let subscribeResponse: ISubscribeToHeader;
+		try {
+			subscribeResponse = await attempt;
+		} finally {
+			state.inFlight--;
+		}
+		// Checked again: a disconnect that landed while the subscribe was in
+		// flight already withdrew the handler registered above, so it stays
+		// withdrawn and the header stays out of a stopped wallet.
+		if (this._disconnected) {
+			return { result: err(DISCONNECTED_ERROR), reconcileOwed: false };
+		}
+		if (subscribeResponse.error) {
+			// Rolled back only when this attempt is the last word: a concurrent
+			// call that already succeeded, or one still in flight, owns the
+			// handler now, and deleting it would silence a live subscription.
+			if (!state.committed && state.inFlight === 0) {
+				router.handlers.delete(this);
+			}
+			// A real subscription fault, which every caller must see: this is
+			// what the reconnect monitor counts and what ChainWatcher.start
+			// refuses to start without.
+			return {
+				result: err('Unable to subscribe to headers.'),
+				reconcileOwed: false
+			};
+		}
+		state.committed = true;
+		// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+		// @ts-ignore
+		if (subscribeResponse?.data === 'Already Subscribed.') {
+			// The client answers a network it already holds a subscription for
+			// with that bare string and no header, so the tip the last
+			// subscribe or notification reported is all there is to reconcile
+			// against, and this instance may well have registered after it
+			// landed. Re-applied to everyone, because this is also the call the
+			// restore retries with, and a reconciliation that failed the first
+			// time is owed by whichever wallets it failed for.
+			if (router.last) {
+				const applied = await this.applyReportedHeader(
+					router.last,
+					electrumNetwork
+				);
+				return {
+					result: ok(this.getBlockHeader()),
+					reconcileOwed: applied.isErr()
+				};
+			}
+			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
+		}
+		// Update local storage with current height and hex. Reconciled rather
+		// than written, because a subscribe is exactly where a rollback shows
+		// up: this is the first header the wallet sees after a reconnect, and
+		// after a failover it comes from a server the wallet has never spoken
+		// to.
+		const hex = subscribeResponse.data.hex;
+		const hash = this.getBlockHashFromHex({ blockHex: hex });
+		const header: IHeader = { ...subscribeResponse.data, hash };
+		// A header that landed while this response was in flight came from the
+		// same socket and is the fresher of the two, and it has already been
+		// applied and reconciled. Writing this one on top of it would lower the
+		// stored height and turn the next block into a rollback that never
+		// happened.
+		if (router.seq !== seenAt) {
+			// The notification that overtook this response applied and owes its
+			// own reconciliation through _reorgOwed.
+			return { result: ok(this.getBlockHeader()), reconcileOwed: false };
+		}
+		const lastHeard = router.last;
+		const applied = await this.applyReportedHeader(header, electrumNetwork);
+		// A tip above the last one heard was found while the socket was down, and
+		// no notification will ever come for it: without one, no wallet here
+		// refreshes and nothing listening for blocks learns the height. Not
+		// replayed once a notification has replaced it, which did all of that.
+		if (
+			lastHeard &&
+			header.height > lastHeard.height &&
+			router.last === header
+		) {
+			void router.dispatch([{ height: header.height, hex }]);
+		}
+		// The restore reads this: a wallet left holding an unreconciled
+		// rollback has not been restored, whatever the subscription itself did.
+		// The header is stored either way, because applyHeader writes before it
+		// reconciles, so the subscription answers ok with it.
+		return { result: ok(header), reconcileOwed: applied.isErr() };
+	}
+
+	/**
+	 * This instance's subscription record for a script hash in the shared
+	 * per-network router, created on demand. Every subscribed hash gets a
+	 * record so notifications refresh exactly the wallets that subscribed it.
+	 */
+	private _scriptHashRecord(scriptHash: string): TScriptHashSubscription {
+		const router = getScriptHashRouter(this.electrumNetwork);
+		router.instances.add(this);
+		const withdrawn = this._withdrawnStatuses;
+		let savedStatus: string | null | undefined;
+		if (
+			withdrawn?.network === this.electrumNetwork &&
+			withdrawn.statuses.has(scriptHash)
+		) {
+			const saved = withdrawn.statuses.get(scriptHash) ?? null;
+			if (router.statuses.has(scriptHash)) {
+				savedStatus = saved;
+			} else {
+				router.statuses.set(scriptHash, saved);
+			}
+			withdrawn.statuses.delete(scriptHash);
+		}
+		let subs = router.subscriptions.get(scriptHash);
+		if (!subs) {
+			subs = new Map();
+			router.subscriptions.set(scriptHash, subs);
+		}
+		let sub = subs.get(this);
+		if (!sub) {
+			sub = { callbacks: new Set() };
+			subs.set(this, sub);
+		}
+		if (savedStatus !== undefined) {
+			sub.savedStatus = savedStatus;
+		}
+		return sub;
+	}
+
+	/**
+	 * Detach a callback previously handed to subscribeToAddresses (matched by
+	 * function reference). Notifications for the hash stop reaching that
+	 * callback; the wallet refresh on notification is unaffected.
+	 */
+	removeScriptHashCallback({
+		scriptHash,
+		onReceive
+	}: {
+		scriptHash: string;
+		onReceive: (data: TSubscribedReceive) => void;
+	}): boolean {
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		const subs = router?.subscriptions.get(scriptHash);
+		const sub = subs?.get(this);
+		if (!router || !subs || !sub) {
+			return false;
+		}
+		const removed = sub.callbacks.delete(onReceive);
+		sub.unconfirmedCallbacks?.delete(onReceive);
+		if (sub.callbacks.size === 0 && sub.utxoIndex === undefined) {
+			subs.delete(this);
+			if (subs.size === 0) {
+				router.subscriptions.delete(scriptHash);
+				router.statuses.delete(scriptHash);
+			}
+		}
+		return removed;
+	}
+
+	/**
+	 * Adds a subscribe attempt's callback to `sub`. Returns the unconfirmed
+	 * entry the attempt waits on, if any, which it must either confirm or roll
+	 * back.
+	 */
+	private addScriptHashCallback(
+		sub: TScriptHashSubscription,
+		onReceive: (data: TSubscribedReceive) => void,
+		created: boolean
+	): { attempts: number; created: boolean } | undefined {
+		let unconfirmed = sub.unconfirmedCallbacks?.get(onReceive);
+		if (unconfirmed) {
+			unconfirmed.attempts++;
+		} else if (!sub.callbacks.has(onReceive)) {
+			unconfirmed = { attempts: 1, created };
+			(sub.unconfirmedCallbacks ??= new Map()).set(onReceive, unconfirmed);
+		}
+		sub.callbacks.add(onReceive);
+		return unconfirmed;
+	}
+
+	/**
+	 * Takes back the callback a failed subscribe added to `sub`, once no other
+	 * attempt with it on `sub` is still waiting or has succeeded. Nothing is
+	 * touched once `sub` is no longer this instance's record: a disconnect
+	 * withdrew it, and whatever stands in its place belongs to a later
+	 * subscribe. The record itself goes only if an attempt created it, and
+	 * then the status it last heard goes back to _withdrawnStatuses, where
+	 * _scriptHashRecord may have just taken it from, so the retry still has
+	 * something to compare the server's answer with.
+	 */
+	private rollBackScriptHashCallback(
+		scriptHash: string,
+		sub: TScriptHashSubscription,
+		onReceive: (data: TSubscribedReceive) => void,
+		unconfirmed: { attempts: number; created: boolean }
+	): void {
+		// The entry is gone once an attempt with this callback succeeded on the
+		// record, or replaced once the callback was removed.
+		if (sub.unconfirmedCallbacks?.get(onReceive) !== unconfirmed) return;
+		if (--unconfirmed.attempts > 0) return;
+		sub.unconfirmedCallbacks?.delete(onReceive);
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		const subs = router?.subscriptions.get(scriptHash);
+		if (!router || !subs || subs.get(this) !== sub) return;
+		sub.callbacks.delete(onReceive);
+		if (
+			!unconfirmed.created ||
+			sub.callbacks.size > 0 ||
+			sub.utxoIndex !== undefined
+		) {
+			return;
+		}
+		const heard = router.statuses.has(scriptHash)
+			? lastHeardStatus(router, scriptHash, sub)
+			: undefined;
+		subs.delete(this);
+		if (subs.size === 0) {
+			router.subscriptions.delete(scriptHash);
+			router.statuses.delete(scriptHash);
+		}
+		if (heard === undefined) return;
+		if (this._withdrawnStatuses?.network !== this.electrumNetwork) {
+			this._withdrawnStatuses = {
+				network: this.electrumNetwork,
+				statuses: new Map()
+			};
+		}
+		this._withdrawnStatuses.statuses.set(scriptHash, heard);
+	}
+
+	/**
+	 * Subscribes to a number of address script hashes for receiving.
+	 * @param {string[]} scriptHashes
+	 * @param onReceive
+	 * @return {Promise<Result<string>>}
+	 */
+	async subscribeToAddresses({
+		scriptHashes = [],
+		onReceive
+	}: {
+		scriptHashes?: string[];
+		onReceive?: (data: TSubscribedReceive) => void;
+	} = {}): Promise<Result<string>> {
+		// Same guard the restore path carries: every subscribe below registers
+		// this instance in the shared script hash router, where a notification
+		// refreshes its wallet. A caller that outlived disconnect() must not put
+		// a stopped wallet back on that path.
+		if (this._disconnected) return err(DISCONNECTED_ERROR);
+		const allUtxos: IUtxo[] = [];
+		const currentWallet = this._wallet.data;
+		const addressTypeKeys = this._wallet.addressTypesToMonitor;
+		// Gather the receiving address scripthash for each address type if no scripthashes were provided.
+		if (!scriptHashes.length) {
+			for (const addressType of addressTypeKeys) {
+				const addresses = currentWallet.addresses[addressType];
+				const addressCount = Object.keys(addresses).length;
+
+				// Check if addresses of this type have been generated. If not, skip.
+				if (addressCount > 0) {
+					let addressIndex = currentWallet.addressIndex[addressType]?.index;
+					addressIndex = addressIndex > 0 ? addressIndex : 0;
+
+					// Only subscribe up to the gap limit.
+					const addressesInRangeToSubscribe = filterAddressesForGapLimit({
+						addresses: Object.values(addresses),
+						index: addressIndex,
+						gapLimitOptions: this._wallet.gapLimitOptions,
+						change: false
+					});
+					const _scriptHashes = addressesInRangeToSubscribe.map(
+						(address) => address.scriptHash
+					);
+					scriptHashes.push(..._scriptHashes);
+				}
+			}
+			// Keep an eye on existing UTXO's regardless of the gap limit.
+			currentWallet.utxos.forEach((utxo) => {
+				if (!scriptHashes.includes(utxo.scriptHash)) {
+					allUtxos.push(utxo);
+				}
+			});
+		}
+
+		// Subscribe to all provided script hashes. Callbacks are registered
+		// before the client call: the protocol subscription can deliver a
+		// notification immediately, and a repeat hash resolves as "Already
+		// Subscribed." without touching the client's own handler wiring. On
+		// failure, only what this attempt added is rolled back, so a caller
+		// retrying with a fresh closure cannot accumulate dead callbacks and a
+		// concurrent subscription for the same hash keeps its own.
+		const router = getScriptHashRouter(this.electrumNetwork);
+		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
+			const created = !router.subscriptions.get(scriptHash)?.has(this);
+			const sub = this._scriptHashRecord(scriptHash);
+			const unconfirmed = onReceive
+				? this.addScriptHashCallback(sub, onReceive, created)
+				: undefined;
+			const response: ISubscribeToAddress = await electrum.subscribeAddress({
+				scriptHash,
+				network: this.electrumNetwork,
+				onReceive: router.dispatch
+			});
+			if (response.error) {
+				if (unconfirmed && onReceive) {
+					this.rollBackScriptHashCallback(
+						scriptHash,
+						sub,
+						onReceive,
+						unconfirmed
+					);
+				}
+				throw Error('Unable to subscribe to receiving addresses.');
+			}
+			if (
+				onReceive &&
+				sub.unconfirmedCallbacks?.get(onReceive) === unconfirmed
+			) {
+				sub.unconfirmedCallbacks?.delete(onReceive);
+			}
+			router.noteSubscribed(scriptHash, response);
+		});
+
+		const allUtxosPromises = allUtxos.map(async (utxo) => {
+			const created = !router.subscriptions.get(utxo.scriptHash)?.has(this);
+			const sub = this._scriptHashRecord(utxo.scriptHash);
+			const unconfirmed = onReceive
+				? this.addScriptHashCallback(sub, onReceive, created)
+				: undefined;
+			sub.utxoIndex = utxo.index;
+			const response: ISubscribeToAddress = await electrum.subscribeAddress({
+				scriptHash: utxo.scriptHash,
+				network: this.electrumNetwork,
+				onReceive: router.dispatch
+			});
+			if (response.error) {
+				if (unconfirmed && onReceive) {
+					this.rollBackScriptHashCallback(
+						utxo.scriptHash,
+						sub,
+						onReceive,
+						unconfirmed
+					);
+				}
+				throw Error('Unable to subscribe to receiving addresses.');
+			}
+			if (
+				onReceive &&
+				sub.unconfirmedCallbacks?.get(onReceive) === unconfirmed
+			) {
+				sub.unconfirmedCallbacks?.delete(onReceive);
+			}
+			router.noteSubscribed(utxo.scriptHash, response);
+		});
+
+		try {
+			await Promise.all([...allScriptHashesPromises, ...allUtxosPromises]);
+		} catch (e) {
+			return err(e);
+		}
+
+		return ok('Successfully subscribed to addresses.');
+	}
+
+	public async broadcastTransaction({
+		rawTx,
+		subscribeToOutputAddress = true
+	}: {
+		rawTx: string;
+		subscribeToOutputAddress?: boolean;
+	}): Promise<Result<string>> {
+		/**
+		 * Subscribe to the output address and refresh the wallet when the Electrum server detects it.
+		 * This prevents updating the wallet prior to the Electrum server detecting the new tx in the mempool.
+		 */
+		if (subscribeToOutputAddress) {
+			const transaction = this._wallet.transaction.data;
+			await Promise.all(
+				transaction.outputs.map(async (o) => {
+					const address = o?.address;
+					if (address) {
+						const scriptHash = getScriptHash({
+							address,
+							network: this.network
+						});
+						if (scriptHash) {
+							await this.subscribeToAddresses({
+								scriptHashes: [scriptHash]
+							});
+						}
+					}
+				})
+			);
+		}
+
+		const broadcastResponse = await electrum.broadcastTransaction({
+			rawTx,
+			network: this.electrumNetwork
+		});
+		// TODO: This needs to be resolved in rn-electrum-client
+		if (broadcastResponse.error || broadcastResponse.data.includes(' ')) {
+			return err(broadcastResponse.data);
+		}
+		// The mirror of the output subscription above. Nothing else removes the
+		// coins this transaction spends, and the UTXO set is only ever replaced
+		// by a whole scan, which arrives on a notification at best and never on
+		// a timer: until one lands, every caller of listUtxos can still select a
+		// coin that is already gone.
+		await this._wallet.removeSpentUtxos(rawTx);
+		return ok(broadcastResponse.data);
+	}
+
+	/**
+	 * Attempts to check the current Electrum connection.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async checkConnection(): Promise<void> {
+		// disconnect() stops the poll, but the tick it was already inside is
+		// not cancelled, and pinging a stopped client is itself a reconnect:
+		// with mainClient cleared, the helper dials a random peers.json server.
+		if (this._disconnected) return;
+		try {
+			// Never pinged blind. Every rn-electrum-client helper calls
+			// connectToRandomPeer when clients.mainClient[network] is falsy, so
+			// a bare ping can CREATE a connection nobody asked for, to a
+			// hardcoded peers.json server, on a socket carrying none of this
+			// process's subscriptions. The healthy branch would then report a
+			// live connection forever with nothing subscribed to it. A peer
+			// that is not the one this instance connected reads as a lost
+			// connection, and the reconnect below is the repair: it tears the
+			// foreign peer down and restores every subscription the network
+			// holds.
+			const ours = this.isOurPeer();
+			// Scoped to OUR network, not asked of whichever network connected
+			// last. electrum.pingServer takes no network and resolves one from
+			// clients.network, so in a process with instances on more than one
+			// network a wallet whose own socket has died can ping a sibling's
+			// live client, get a pong, and report itself healthy for as long as
+			// the sibling stays up.
+			const error = ours
+				? !(await this.peerResponds(this.electrumNetwork))
+				: true;
+			// A disconnect that landed while the ping was in flight has already
+			// withdrawn this instance. Nothing past here may run for it:
+			// connectToElectrum clears _disconnected for an EXPLICIT revive, so
+			// reconnecting from a poll would put the stopped wallet back on the
+			// network, and publishing would speak for a wallet that is shutting
+			// down (disconnect() deliberately publishes nothing itself).
+			if (this._disconnected) return;
+
+			if (error) {
+				this.wallet.logger.info(
+					ours
+						? 'Connection to Electrum Server lost, reconnecting...'
+						: 'Electrum peer changed behind us, reconnecting...'
+				);
+				// A successful connect re-subscribes every script hash this
+				// process holds and re-issues the header subscription itself, so
+				// there is nothing left to re-issue here.
+				const response = await this.connectToElectrum({
+					network: this.network,
+					servers: this.servers
+				});
+
+				if (response.isErr()) {
+					this.publishConnectionChange(false);
+				}
+			} else {
+				this.publishConnectionChange(true);
+				// The socket is fine, so no reconnect will run the restore a
+				// previous connect left owed. This is its only other retry hook,
+				// and it answers for the NETWORK as well as for this instance:
+				// the client is shared, so the instance whose restore failed may
+				// have disconnected or moved on while the hashes it left unwired
+				// are still in the shared router. One restore at a time, because
+				// every instance on the network is now a retry candidate.
+				const owed =
+					this._restoreOwed === this.electrumNetwork ||
+					subscriptionRestoreOwed.has(this.electrumNetwork);
+				if (
+					owed &&
+					!this._disconnected &&
+					!restoreIsRunning(this.electrumNetwork, Date.now())
+				) {
+					this.restoreSubscriptionsBestEffort(this.electrumNetwork);
+				}
+			}
+		} catch (e) {
+			this.wallet.logger.error('Electrum connection check failed.', e);
+			// A rejection that raced the shutdown must not publish for a
+			// withdrawn instance either.
+			if (this._disconnected) return;
+			this.publishConnectionChange(false);
+		}
+	}
+
+	private publishConnectionChange(isConnected: boolean): void {
+		const stateChanged = this.latestConnectionState !== isConnected;
+		// Internal truth always tracks, including mid-switch: the reconnect
+		// guards read connectedToElectrum, and a stale true would survive a
+		// failed switch connect otherwise.
+		this.connectedToElectrum = isConnected;
+		// Externally observable transition events stay suppressed during a
+		// switch. latestConnectionState is deliberately left alone then, so
+		// the first check after the switch announces the final state instead
+		// of assuming it was already published.
+		if (this.wallet.isSwitchingNetworks || !stateChanged) return;
+		this.sendMessage('connectedToElectrum', isConnected);
+		this.latestConnectionState = isConnected;
+	}
+
+	/**
+	 * Removes this instance from every shared per-network router.
+	 *
+	 * Shared by disconnect() and the network switch in _doConnect: a router
+	 * entry only ever belongs to the network the instance was on when it
+	 * registered, and both _onNewBlock and _scriptHashRecord resolve their
+	 * router from this.electrumNetwork, so an entry left behind on a network
+	 * the instance has left is answered by the wrong router.
+	 */
+	private withdrawFromRouters(): void {
+		for (const router of headerRouters.values()) {
+			router.handlers.delete(this);
+		}
+		// The withdrawn handlers are no longer registered, so nothing a later
+		// subscribe installs predates them. The entries themselves are kept, so
+		// a subscribe still in flight keeps sharing state with the ones a
+		// reconnect issues rather than rolling back their handler.
+		for (const state of this._headerSubscribes.values()) {
+			state.committed = false;
+		}
+		for (const router of scriptHashRouters.values()) {
+			router.instances.delete(this);
+			for (const [scriptHash, subs] of router.subscriptions) {
+				subs.delete(this);
+				if (subs.size === 0) {
+					router.subscriptions.delete(scriptHash);
+					router.statuses.delete(scriptHash);
+				}
+			}
+		}
+	}
+
+	public async disconnect(): Promise<void> {
+		this.stopConnectionPolling();
+		// Withdraw from the shared routers: a notification routed after this
+		// point must not refresh or call back into a wallet that is shutting
+		// down. The flag keeps work still in flight (a subscription restore
+		// mid-await) from quietly registering the instance back.
+		this._disconnected = true;
+		// This instance no longer vouches for the server it was on, so a peer
+		// left behind on it reads as a stray dial to whoever is still polling.
+		this.holdConnectedServer(null, null);
+		// This instance's own debt goes with it: the next connect restores
+		// unconditionally anyway, and the poll that would retry it is stopped.
+		// The NETWORK's debt in subscriptionRestoreOwed deliberately stays: the
+		// hashes it names belong to the shared router, so whichever instance is
+		// still polling this network is the one that discharges them.
+		this._restoreOwed = null;
+		// Merged rather than replaced, so a second disconnect before the
+		// reconnect re-subscribed everything keeps what the first one saved.
+		const router = scriptHashRouters.get(this.electrumNetwork);
+		if (router) {
+			if (this._withdrawnStatuses?.network !== this.electrumNetwork) {
+				this._withdrawnStatuses = {
+					network: this.electrumNetwork,
+					statuses: new Map()
+				};
+			}
+			const { statuses } = this._withdrawnStatuses;
+			for (const [scriptHash, subs] of router.subscriptions) {
+				const sub = subs.get(this);
+				if (!sub || !router.statuses.has(scriptHash)) continue;
+				statuses.set(scriptHash, lastHeardStatus(router, scriptHash, sub));
+			}
+		}
+		this.withdrawFromRouters();
+		// Named, because the client resolves a missing network from
+		// clients.network, which is whatever network connected LAST by any
+		// instance in this process: a bare stop() tears down a sibling's socket
+		// on another network, along with every subscription that network holds,
+		// and leaves this instance's own client running with nothing polling it.
+		const response = await electrum.stop({ network: this.electrumNetwork });
+		if (response.error) {
+			throw new Error(
+				`Unable to disconnect from Electrum: ${String(response.data)}`
+			);
+		}
+		this.connectedToElectrum = false;
+	}
+
+	public startConnectionPolling(): void {
+		if (this.connectionPollingInterval) return;
+		this.connectionPollingInterval = setInterval((): void => {
+			void this.checkConnection();
+		}, POLLING_INTERVAL);
+	}
+
+	public stopConnectionPolling(): void {
+		if (this.connectionPollingInterval) {
+			clearInterval(this.connectionPollingInterval);
+			this.connectionPollingInterval = null;
+		}
+	}
+}

@@ -1,0 +1,1621 @@
+/**
+ * Serialization helpers for Lightning state persistence.
+ *
+ * Converts complex types (Buffer, bigint, Maps, ShaChainStore, etc.)
+ * to/from JSON-safe representations for SQLite storage.
+ */
+
+import {
+	IChannelState,
+	ISpliceInFlight,
+	IV2InFlight,
+	ChannelCloseReason
+} from '../channel/channel-state';
+import {
+	FforAbortReason,
+	FforRole,
+	FforSlotState,
+	FforState,
+	IFforEpochRecord
+} from '../ffor/types';
+import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
+import { IChannelBasepoints } from '../keys/derivation';
+import {
+	ChannelState,
+	ChannelRole,
+	IChannelConfig,
+	IHtlcEntry,
+	IHtlcSnapshotEntry,
+	HtlcDirection,
+	HtlcState,
+	DEFAULT_CHANNEL_CONFIG
+} from '../channel/types';
+import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
+import { IChainMonitorState } from '../chain/chain-monitor';
+import { IGraphChannel, IGraphNode } from '../gossip/types';
+
+// ─── Primitive helpers ───
+
+export function bufToHex(buf: Buffer | null | undefined): string | null {
+	return buf ? buf.toString('hex') : null;
+}
+
+export function hexToBuf(hex: string | null | undefined): Buffer | null {
+	return hex ? Buffer.from(hex, 'hex') : null;
+}
+
+export function bigintToStr(val: bigint): string {
+	return val.toString();
+}
+
+export function strToBigint(val: string): bigint {
+	return BigInt(val);
+}
+
+// ─── IChannelConfig ───
+
+export interface ISerializedChannelConfig {
+	dustLimitSatoshis: string;
+	maxHtlcValueInFlightMsat: string;
+	channelReserveSatoshis: string;
+	htlcMinimumMsat: string;
+	toSelfDelay: number;
+	maxAcceptedHtlcs: number;
+	feeratePerKw: number;
+}
+
+export function serializeChannelConfig(
+	c: IChannelConfig
+): ISerializedChannelConfig {
+	return {
+		dustLimitSatoshis: bigintToStr(c.dustLimitSatoshis),
+		maxHtlcValueInFlightMsat: bigintToStr(c.maxHtlcValueInFlightMsat),
+		channelReserveSatoshis: bigintToStr(c.channelReserveSatoshis),
+		htlcMinimumMsat: bigintToStr(c.htlcMinimumMsat),
+		toSelfDelay: c.toSelfDelay,
+		maxAcceptedHtlcs: c.maxAcceptedHtlcs,
+		feeratePerKw: c.feeratePerKw
+	};
+}
+
+export function deserializeChannelConfig(
+	s: ISerializedChannelConfig
+): IChannelConfig {
+	return {
+		dustLimitSatoshis: strToBigint(s.dustLimitSatoshis),
+		maxHtlcValueInFlightMsat: strToBigint(s.maxHtlcValueInFlightMsat),
+		channelReserveSatoshis: strToBigint(s.channelReserveSatoshis),
+		htlcMinimumMsat: strToBigint(s.htlcMinimumMsat),
+		toSelfDelay: s.toSelfDelay,
+		maxAcceptedHtlcs: s.maxAcceptedHtlcs,
+		feeratePerKw: s.feeratePerKw
+	};
+}
+
+// ─── IChannelBasepoints ───
+
+export interface ISerializedBasepoints {
+	fundingPubkey: string;
+	revocationBasepoint: string;
+	paymentBasepoint: string;
+	delayedPaymentBasepoint: string;
+	htlcBasepoint: string;
+	firstPerCommitmentPoint: string;
+}
+
+export function serializeBasepoints(
+	bp: IChannelBasepoints
+): ISerializedBasepoints {
+	return {
+		fundingPubkey: bp.fundingPubkey.toString('hex'),
+		revocationBasepoint: bp.revocationBasepoint.toString('hex'),
+		paymentBasepoint: bp.paymentBasepoint.toString('hex'),
+		delayedPaymentBasepoint: bp.delayedPaymentBasepoint.toString('hex'),
+		htlcBasepoint: bp.htlcBasepoint.toString('hex'),
+		firstPerCommitmentPoint: bp.firstPerCommitmentPoint.toString('hex')
+	};
+}
+
+export function deserializeBasepoints(
+	s: ISerializedBasepoints
+): IChannelBasepoints {
+	return {
+		fundingPubkey: Buffer.from(s.fundingPubkey, 'hex'),
+		revocationBasepoint: Buffer.from(s.revocationBasepoint, 'hex'),
+		paymentBasepoint: Buffer.from(s.paymentBasepoint, 'hex'),
+		delayedPaymentBasepoint: Buffer.from(s.delayedPaymentBasepoint, 'hex'),
+		htlcBasepoint: Buffer.from(s.htlcBasepoint, 'hex'),
+		firstPerCommitmentPoint: Buffer.from(s.firstPerCommitmentPoint, 'hex')
+	};
+}
+
+// ─── IHtlcEntry ───
+
+export interface ISerializedHtlcEntry {
+	key: string;
+	id: string;
+	amountMsat: string;
+	paymentHash: string;
+	cltvExpiry: number;
+	onionRoutingPacket: string;
+	direction: string;
+	state: string;
+	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
+	 * survives restart and can still peel its onion with the blinded key. */
+	blindingPoint?: string;
+	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
+	addRemoteCommitted?: boolean;
+	removalRemoteCommitted?: boolean;
+	commitCoverPending?: boolean;
+	addLocallyRevoked?: boolean;
+	removalLocallyRevoked?: boolean;
+	/** FFOR Variant D voucher marker (see IHtlcEntry.fforVoucher). */
+	fforVoucher?: boolean;
+	/** FFOR Variant D mismatching-add marker (see IHtlcEntry.fforMismatch). */
+	fforMismatch?: boolean;
+	/** Whether the stored remote signature covers this add (see IHtlcEntry). */
+	addRemoteSigned?: boolean;
+	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
+	forwardEmitted?: boolean;
+	/** Admission-time dust-exposure classification (see IHtlcEntry). */
+	dustExposureFailback?: boolean;
+	/** Admitted while the capsule-restore hold stood (see IHtlcEntry). */
+	addedWhileRestoreUnproven?: boolean;
+	/** Admitted while the funding-missing quarantine stood (see IHtlcEntry). */
+	addedWhileFundingUnaccounted?: boolean;
+}
+
+export interface ISerializedHtlcSnapshot {
+	commitmentNumber: string;
+	htlcs: Array<{
+		paymentHash: string;
+		amountMsat: string;
+		cltvExpiry: number;
+		direction: string;
+	}>;
+}
+
+export function serializeHtlcEntry(
+	key: string,
+	e: IHtlcEntry
+): ISerializedHtlcEntry {
+	return {
+		key,
+		id: bigintToStr(e.id),
+		amountMsat: bigintToStr(e.amountMsat),
+		paymentHash: e.paymentHash.toString('hex'),
+		cltvExpiry: e.cltvExpiry,
+		onionRoutingPacket: e.onionRoutingPacket.toString('hex'),
+		direction: e.direction,
+		state: e.state,
+		...(e.fforVoucher === true ? { fforVoucher: true } : {}),
+		...(e.fforMismatch === true ? { fforMismatch: true } : {}),
+		...(e.blindingPoint
+			? { blindingPoint: e.blindingPoint.toString('hex') }
+			: {}),
+		...(e.addRemoteCommitted !== undefined
+			? { addRemoteCommitted: e.addRemoteCommitted }
+			: {}),
+		...(e.removalRemoteCommitted !== undefined
+			? { removalRemoteCommitted: e.removalRemoteCommitted }
+			: {}),
+		...(e.commitCoverPending !== undefined
+			? { commitCoverPending: e.commitCoverPending }
+			: {}),
+		...(e.addLocallyRevoked !== undefined
+			? { addLocallyRevoked: e.addLocallyRevoked }
+			: {}),
+		...(e.removalLocallyRevoked !== undefined
+			? { removalLocallyRevoked: e.removalLocallyRevoked }
+			: {}),
+		...(e.addRemoteSigned !== undefined
+			? { addRemoteSigned: e.addRemoteSigned }
+			: {}),
+		...(e.forwardEmitted !== undefined
+			? { forwardEmitted: e.forwardEmitted }
+			: {}),
+		...(e.dustExposureFailback !== undefined
+			? { dustExposureFailback: e.dustExposureFailback }
+			: {}),
+		...(e.addedWhileRestoreUnproven !== undefined
+			? { addedWhileRestoreUnproven: e.addedWhileRestoreUnproven }
+			: {}),
+		...(e.addedWhileFundingUnaccounted !== undefined
+			? { addedWhileFundingUnaccounted: e.addedWhileFundingUnaccounted }
+			: {})
+	};
+}
+
+export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
+	key: string;
+	entry: IHtlcEntry;
+} {
+	return {
+		key: s.key,
+		entry: {
+			id: strToBigint(s.id),
+			amountMsat: strToBigint(s.amountMsat),
+			paymentHash: Buffer.from(s.paymentHash, 'hex'),
+			cltvExpiry: s.cltvExpiry,
+			onionRoutingPacket: Buffer.from(s.onionRoutingPacket, 'hex'),
+			direction: s.direction as HtlcDirection,
+			state: s.state as HtlcState,
+			...(s.fforVoucher === true ? { fforVoucher: true } : {}),
+			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
+			...(s.blindingPoint
+				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
+				: {}),
+			...(s.addRemoteCommitted !== undefined
+				? { addRemoteCommitted: s.addRemoteCommitted }
+				: {}),
+			...(s.removalRemoteCommitted !== undefined
+				? { removalRemoteCommitted: s.removalRemoteCommitted }
+				: {}),
+			...(s.commitCoverPending !== undefined
+				? { commitCoverPending: s.commitCoverPending }
+				: {}),
+			...(s.addLocallyRevoked !== undefined
+				? { addLocallyRevoked: s.addLocallyRevoked }
+				: {}),
+			...(s.removalLocallyRevoked !== undefined
+				? { removalLocallyRevoked: s.removalLocallyRevoked }
+				: {}),
+			...(s.addRemoteSigned !== undefined
+				? { addRemoteSigned: s.addRemoteSigned }
+				: {}),
+			...(s.forwardEmitted !== undefined
+				? { forwardEmitted: s.forwardEmitted }
+				: {}),
+			...(s.dustExposureFailback !== undefined
+				? { dustExposureFailback: s.dustExposureFailback }
+				: {}),
+			...(s.addedWhileRestoreUnproven !== undefined
+				? { addedWhileRestoreUnproven: s.addedWhileRestoreUnproven }
+				: {}),
+			...(s.addedWhileFundingUnaccounted !== undefined
+				? { addedWhileFundingUnaccounted: s.addedWhileFundingUnaccounted }
+				: {})
+		}
+	};
+}
+
+// ─── ShaChainStore ───
+
+export interface ISerializedShaChainEntry {
+	index: string;
+	secret: string;
+}
+
+export function serializeShaChainEntries(store: ShaChainStore): {
+	entries: ISerializedShaChainEntry[];
+	knownCount: string;
+} {
+	return {
+		entries: store.getEntries().map((e) => ({
+			index: bigintToStr(e.index),
+			secret: e.secret.toString('hex')
+		})),
+		knownCount: bigintToStr(store.getKnownCount())
+	};
+}
+
+export function deserializeShaChainStore(data: {
+	entries: ISerializedShaChainEntry[];
+	knownCount: string;
+}): ShaChainStore {
+	const entries: IShaChainEntry[] = data.entries.map((e) => ({
+		index: strToBigint(e.index),
+		secret: Buffer.from(e.secret, 'hex')
+	}));
+	return ShaChainStore.restore(entries, strToBigint(data.knownCount));
+}
+
+// ─── IChannelState ───
+
+export interface ISerializedChannelState {
+	channelId: string | null;
+	temporaryChannelId: string;
+	role: string;
+	state: string;
+	fundingSatoshis: string;
+	pushMsat: string;
+	fundingTxid: string | null;
+	pendingFundingTxHex?: string;
+	fundingMissingSinceHeight?: number;
+	/**
+	 * Issue #593: the funding is unaccounted for on chain and the channel is
+	 * quarantined against NEW HTLCs. MUST persist - a restart must not lift a
+	 * quarantine the chain has not lifted.
+	 */
+	fundingUnaccounted?: boolean;
+	fundingOutputIndex: number;
+	minimumDepth: number;
+	localConfig: ISerializedChannelConfig;
+	localBasepoints: ISerializedBasepoints;
+	localPerCommitmentSeed: string;
+	remoteConfig: ISerializedChannelConfig;
+	remoteBasepoints: ISerializedBasepoints | null;
+	localCommitmentNumber: string;
+	remoteCommitmentNumber: string;
+	/**
+	 * Count of revoke_and_ack messages received from the peer (next remote
+	 * revocation index). Optional for backward compatibility; absent means
+	 * "in sync with remoteCommitmentNumber" (see Channel accessors).
+	 */
+	remoteRevocationNumber?: string;
+	needsCommitment?: boolean;
+	/**
+	 * A staged (uncommitted) update_fee rate. Persisted so a restart mid
+	 * fee-round restores the exact rate the in-flight commitment was built
+	 * with. Optional for backward compatibility.
+	 */
+	pendingFeeratePerKw?: number;
+	/**
+	 * Two-phase update_fee phases for the staged rate (see IChannelState).
+	 * Optional for backward compatibility.
+	 */
+	pendingFeerateSignable?: boolean;
+	pendingFeerateCommitted?: boolean;
+	/**
+	 * The feerate baked into the current signed local commitment (the rate
+	 * remoteCommitmentSignature covers) — force-close rebuilds at this rate.
+	 * Optional for backward compatibility.
+	 */
+	lastSignedCommitFeeratePerKw?: number;
+	/**
+	 * Two-phase update_blockheight (bLIP-0051 leases): staged height, its
+	 * phases, the height the current signed local commitment was built at,
+	 * and every distinct committed height (old-commitment classification).
+	 * All optional for backward compatibility.
+	 */
+	pendingLeaseBlockheight?: number;
+	pendingLeaseBlockheightSignable?: boolean;
+	pendingLeaseBlockheightCommitted?: boolean;
+	lastSignedCommitLeaseBlockheight?: number;
+	leaseHeightHistory?: number[];
+	localBalanceMsat: string;
+	remoteBalanceMsat: string;
+	shaChainData: { entries: ISerializedShaChainEntry[]; knownCount: string };
+	remoteCurrentPerCommitmentPoint: string | null;
+	remoteNextPerCommitmentPoint: string | null;
+	localHtlcCounter: string;
+	htlcs: ISerializedHtlcEntry[];
+	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
+	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	remoteCommitmentSignature: string | null;
+	remoteHtlcSignatures: string[];
+	/**
+	 * option_taproot: the peer's 66-byte signing nonce for the current local
+	 * commitment, persisted so a restored taproot channel can still aggregate the
+	 * key-spend witness at force-close. Optional for backward compatibility with
+	 * pre-taproot serialized states.
+	 */
+	remoteSigningNonce?: string | null;
+	channelType: string | null;
+	localChannelReady: boolean;
+	remoteChannelReady: boolean;
+	condemned?: boolean;
+	localShutdownScript: string | null;
+	remoteShutdownScript: string | null;
+	lastSentCommitmentSigned: string | null;
+	lastSentPartialSignatureWithNonce: string | null;
+	lastSentHtlcSignatures: string[];
+	lastSentRevokeSecret: string | null;
+	lastSentRevokeNextPoint: string | null;
+	lastSentWasRevoke?: boolean | null;
+	pendingLocalUpdates?: Array<{ type: number; payloadHex: string }>;
+	pendingLocalUpdatesSignedCount?: number;
+	preReestablishState: string | null;
+	lastProposedClosingFeeSat: string | null;
+	closingFeeMin: string | null;
+	closingFeeMax: string | null;
+	theirLastClosingFeeSat: string | null;
+	/**
+	 * option_simple_close. Optional for backward compatibility with pre-simple-
+	 * close serialized states (all-absent deserializes to legacy behavior).
+	 * awaitingClosingSig is intentionally NOT persisted — negotiation restarts
+	 * on reconnect per spec.
+	 */
+	simpleClose?: boolean | null;
+	lastCloseFeeSat?: string | null;
+	lastCloseLocktime?: number | null;
+	lastCloseCloserScript?: string | null;
+	lastCloseCloseeScript?: string | null;
+	lastCloseSentVariants?: number[] | null;
+	shortChannelId: string | null;
+	fundingConfirmationHeight: number;
+	fundingBroadcastHeight?: number;
+	fundingTxIndex: number;
+	announcementSigsSent: boolean;
+	announcementSigsReceived: boolean;
+	remoteAnnouncementNodeSig: string | null;
+	remoteAnnouncementBitcoinSig: string | null;
+	localAnnouncementNodeSig: string | null;
+	localAnnouncementBitcoinSig: string | null;
+	announceChannel: boolean;
+	scidAlias: string | null;
+	remoteScidAlias: string | null;
+	zeroConfEnabled?: boolean;
+	trustedPeer?: boolean;
+	quiescenceState?: string;
+	quiescenceInitiator?: boolean;
+	spliceFundingTxid?: string | null;
+	spliceFundingOutputIndex?: number;
+	preSpliceState?: string | null;
+	spliceInFlight?: ISerializedSpliceInFlight | null;
+	/** Issue #764: splice (internal hex) the broadcast force close spends. */
+	closeSpendsSpliceTxid?: string | null;
+	/** Issue #756: fully signed splice txs not yet seen confirmed (txid internal hex). */
+	unconfirmedSpliceTxs?: Array<{ txid: string; txHex: string }>;
+	/** Issue #760: splices reverted on a confirmed input conflict (display hex). */
+	revertedSplices?: Array<{
+		spliceTxid: string;
+		conflictTxid: string;
+		revertedAt: number;
+		commitmentNumber: string;
+		spliceTxHex: string;
+		newFundingOutputIndex: number;
+		remoteFundingPubkey: string;
+		remoteCommitmentSig: string | null;
+		remoteHtlcSignatures?: string[];
+		remoteCommitmentSigFeeratePerKw?: number;
+	}>;
+	spliceAbortOwed?: boolean;
+	remoteForwardingPolicy?: {
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		cltvExpiryDelta: number;
+		htlcMinimumMsat: string;
+		htlcMaximumMsat: string | null;
+		timestamp: number;
+	} | null;
+	fundingVersion?: number;
+	/**
+	 * Which generation of the code wrote localConfig.channelReserveSatoshis.
+	 * Absent on every row written before it existed, which is exactly what
+	 * authorizes the load-time repair to re-derive those (issue #381).
+	 */
+	channelReserveVersion?: number;
+	commitmentFeeratePerkw?: number;
+	fundingLocktime?: number;
+	v2InFlight?: ISerializedV2InFlight | null;
+	// Broadcastable attempts superseded by an accepted RBF, newest last;
+	// absent on rows written before the spec-window RBF support (issue #360).
+	v2PreviousAttempts?: ISerializedV2InFlight[];
+	// Liquidity ads (bLIP-0051): if we are the lessor, our to_local (and its
+	// exact on-chain script) is CLTV-locked until leaseExpiry. These MUST persist —
+	// otherwise a restart rebuilds the commitment without the lock, the peer's cached
+	// signature no longer validates, and our whole balance becomes unbroadcastable.
+	isLessor?: boolean;
+	leaseExpiry?: number;
+	leaseCommitBlockheight?: number;
+	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
+	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
+	lastCooperativeCloseTxHex?: string;
+	// Data loss protection: MUST persist - a restart after detecting we fell
+	// behind would otherwise forget the flag and let a force-close broadcast
+	// our stale (revoked) commitment.
+	dataLossDetected?: boolean;
+	// Issue #413: the funding reached depth in a state whose ready flow could
+	// not consume it (zero-conf fast-track, or already failed). MUST persist -
+	// it is the durable proof the outpoint exists that lets a restart's
+	// failure-resolution paths broadcast the owed close.
+	fundingConfirmedLate?: boolean;
+	// Recovery 5.6 StateUncertain: MUST persist for the same reason - a
+	// restart of a possibly-stale restore must not forget that broadcasting
+	// is forbidden until reestablish proves the state current.
+	stateUncertain?: boolean;
+	// Issue #479: funding outpoints a splice superseded whose spend must still
+	// be watched, with the splice tx expected to spend each. MUST persist -
+	// spliceInFlight is cleared at splice_locked, so it cannot rebuild this
+	// watch after a restart, and the old outpoint would go unwatched.
+	preSpliceSpendWatches?: Array<{
+		txid: string;
+		outputIndex: number;
+		script: string;
+		spliceTxid: string;
+	}>;
+	// Issue #469: this row came from a Recovery Capsule, whose recency nothing
+	// can prove. MUST persist - a restart must not forget that an AUTOMATIC
+	// commitment broadcast is forbidden.
+	restoreRecencyUnproven?: boolean;
+	// Issue #469: the operator acknowledged the stale-close risk when
+	// initiating a mutual close of the row above. MUST persist - a restart
+	// inside the negotiation must not turn the authorized close into a
+	// refusal.
+	staleCloseRiskAccepted?: boolean;
+	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
+	// error is regenerated from this on every reconnect. 'restore-unproven' is
+	// DERIVED from the flag above rather than stamped, so it is never written
+	// here; the union carries it so the two types stay one shape.
+	recoveryCloseReason?:
+		| 'local-data-loss'
+		| 'state-uncertain'
+		| 'restore-unproven';
+	// Why WE closed the channel ('user' or an automatic close code).
+	closeReason?: ChannelCloseReason;
+	dlpRemotePerCommitmentPoint?: string | null;
+	/** FFOR Variant D epoch record (see IChannelState.ffor). */
+	ffor?: ISerializedFforEpoch | null;
+	fforUsedEpochIds?: string[];
+}
+
+export interface ISerializedSpliceInFlight {
+	spliceTxid: string;
+	newFundingOutputIndex: number;
+	newFundingSatoshis: string;
+	spliceTxHex: string;
+	fullySigned: boolean;
+	isInitiator: boolean;
+	localRelativeSatoshis: string;
+	remoteRelativeSatoshis: string;
+	remoteFundingPubkey: string;
+	ourSharedInputSig: string;
+	ourWalletWitnesses: string[][];
+	ourWalletInputIndices: number[];
+	// Issue #592: tx-input indices of externally owned splice inputs whose
+	// witnesses arrive out of band; absent on records without external inputs.
+	externalInputIndices?: number[];
+	inputPrevouts?: Array<{ script: string; valueSats: string }>;
+	remoteCommitmentSig: string | null;
+	remoteCommitmentSigFeeratePerKw?: number;
+	remoteCommitmentSigLeaseBlockheight?: number;
+	remoteHtlcSignatures?: string[];
+	sentTxSignatures: boolean;
+	receivedTxSignatures: boolean;
+	localSpliceLocked: boolean;
+	remoteSpliceLocked: boolean;
+	confirmed: boolean;
+	/** Issue #764: height the splice was first seen in, below its lock depth. */
+	confirmedHeight?: number;
+	/** Issue #760: per-splice lock depth; absent on older rows. */
+	lockAtDepth?: number;
+	/** Issue #760: the confirmed competing spend of one of its inputs. */
+	conflict?: {
+		txid: string;
+		height: number;
+		inputIndex: number;
+		revertRequestedAt?: number;
+	};
+}
+
+export function serializeSpliceInFlight(
+	f: ISpliceInFlight
+): ISerializedSpliceInFlight {
+	return {
+		spliceTxid: f.spliceTxid.toString('hex'),
+		newFundingOutputIndex: f.newFundingOutputIndex,
+		newFundingSatoshis: bigintToStr(f.newFundingSatoshis),
+		spliceTxHex: f.spliceTxHex,
+		fullySigned: f.fullySigned,
+		isInitiator: f.isInitiator,
+		localRelativeSatoshis: bigintToStr(f.localRelativeSatoshis),
+		remoteRelativeSatoshis: bigintToStr(f.remoteRelativeSatoshis),
+		remoteFundingPubkey: f.remoteFundingPubkey.toString('hex'),
+		ourSharedInputSig: f.ourSharedInputSig.toString('hex'),
+		ourWalletWitnesses: f.ourWalletWitnesses.map((w) =>
+			w.map((b) => b.toString('hex'))
+		),
+		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		externalInputIndices: f.externalInputIndices
+			? [...f.externalInputIndices]
+			: undefined,
+		inputPrevouts: f.inputPrevouts.map((p) => ({
+			script: p.script.toString('hex'),
+			valueSats: bigintToStr(p.valueSats)
+		})),
+		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
+		remoteCommitmentSigFeeratePerKw: f.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: f.remoteCommitmentSigLeaseBlockheight,
+		remoteHtlcSignatures: f.remoteHtlcSignatures?.map((b) => b.toString('hex')),
+		sentTxSignatures: f.sentTxSignatures,
+		receivedTxSignatures: f.receivedTxSignatures,
+		localSpliceLocked: f.localSpliceLocked,
+		remoteSpliceLocked: f.remoteSpliceLocked,
+		confirmed: f.confirmed,
+		confirmedHeight: f.confirmedHeight,
+		lockAtDepth: f.lockAtDepth,
+		conflict: f.conflict ? { ...f.conflict } : undefined
+	};
+}
+
+export function deserializeSpliceInFlight(
+	s: ISerializedSpliceInFlight
+): ISpliceInFlight {
+	return {
+		spliceTxid: Buffer.from(s.spliceTxid, 'hex'),
+		newFundingOutputIndex: s.newFundingOutputIndex,
+		newFundingSatoshis: strToBigint(s.newFundingSatoshis),
+		spliceTxHex: s.spliceTxHex,
+		fullySigned: s.fullySigned,
+		isInitiator: s.isInitiator,
+		localRelativeSatoshis: strToBigint(s.localRelativeSatoshis),
+		remoteRelativeSatoshis: strToBigint(s.remoteRelativeSatoshis),
+		remoteFundingPubkey: Buffer.from(s.remoteFundingPubkey, 'hex'),
+		ourSharedInputSig: Buffer.from(s.ourSharedInputSig, 'hex'),
+		ourWalletWitnesses: s.ourWalletWitnesses.map((w) =>
+			w.map((h) => Buffer.from(h, 'hex'))
+		),
+		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		externalInputIndices: s.externalInputIndices
+			? [...s.externalInputIndices]
+			: undefined,
+		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
+			script: Buffer.from(p.script, 'hex'),
+			valueSats: strToBigint(p.valueSats)
+		})),
+		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
+		remoteCommitmentSigFeeratePerKw: s.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: s.remoteCommitmentSigLeaseBlockheight,
+		remoteHtlcSignatures: s.remoteHtlcSignatures?.map((h) =>
+			Buffer.from(h, 'hex')
+		),
+		sentTxSignatures: s.sentTxSignatures,
+		receivedTxSignatures: s.receivedTxSignatures,
+		localSpliceLocked: s.localSpliceLocked,
+		remoteSpliceLocked: s.remoteSpliceLocked,
+		confirmed: s.confirmed,
+		confirmedHeight: s.confirmedHeight,
+		lockAtDepth: s.lockAtDepth,
+		conflict: s.conflict ? { ...s.conflict } : undefined
+	};
+}
+
+export interface ISerializedV2InFlight {
+	fundingTxid: string;
+	fundingOutputIndex: number;
+	fundingTxHex: string;
+	fullySigned: boolean;
+	isInitiator: boolean;
+	localContributionSats: string;
+	remoteContributionSats: string;
+	fundingFeeratePerkw: number;
+	weSignFirst: boolean;
+	ourWitnesses: string[][];
+	ourWalletInputIndices: number[];
+	// Issue #554: tx-input indices of externally owned inputs whose witnesses
+	// arrive out of band; absent on records without external inputs.
+	externalInputIndices?: number[];
+	inputPrevouts?: Array<{ script: string; valueSats: string }>;
+	remoteCommitmentSig: string | null;
+	sentTxSignatures: boolean;
+	receivedTxSignatures: boolean;
+	confirmed?: boolean;
+	rbfAttempt: number;
+	/**
+	 * Per-attempt channel values (see IV2InFlight). Absent on rows written
+	 * before contribution-changing RBF existed; localChannelReserveSatoshis is
+	 * additionally absent on rows written before the v2 open derived it.
+	 */
+	fundingSatoshis?: string;
+	localBalanceMsat?: string;
+	remoteBalanceMsat?: string;
+	remoteChannelReserveSatoshis?: string;
+	localChannelReserveSatoshis?: string;
+}
+
+export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
+	return {
+		fundingTxid: f.fundingTxid.toString('hex'),
+		fundingOutputIndex: f.fundingOutputIndex,
+		fundingTxHex: f.fundingTxHex,
+		fullySigned: f.fullySigned,
+		isInitiator: f.isInitiator,
+		localContributionSats: bigintToStr(f.localContributionSats),
+		remoteContributionSats: bigintToStr(f.remoteContributionSats),
+		fundingFeeratePerkw: f.fundingFeeratePerkw,
+		weSignFirst: f.weSignFirst,
+		ourWitnesses: f.ourWitnesses.map((w) => w.map((b) => b.toString('hex'))),
+		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		externalInputIndices: f.externalInputIndices
+			? [...f.externalInputIndices]
+			: undefined,
+		inputPrevouts: f.inputPrevouts.map((p) => ({
+			script: p.script.toString('hex'),
+			valueSats: bigintToStr(p.valueSats)
+		})),
+		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
+		sentTxSignatures: f.sentTxSignatures,
+		receivedTxSignatures: f.receivedTxSignatures,
+		confirmed: f.confirmed,
+		rbfAttempt: f.rbfAttempt,
+		fundingSatoshis:
+			f.fundingSatoshis !== undefined
+				? bigintToStr(f.fundingSatoshis)
+				: undefined,
+		localBalanceMsat:
+			f.localBalanceMsat !== undefined
+				? bigintToStr(f.localBalanceMsat)
+				: undefined,
+		remoteBalanceMsat:
+			f.remoteBalanceMsat !== undefined
+				? bigintToStr(f.remoteBalanceMsat)
+				: undefined,
+		remoteChannelReserveSatoshis:
+			f.remoteChannelReserveSatoshis !== undefined
+				? bigintToStr(f.remoteChannelReserveSatoshis)
+				: undefined,
+		localChannelReserveSatoshis:
+			f.localChannelReserveSatoshis !== undefined
+				? bigintToStr(f.localChannelReserveSatoshis)
+				: undefined
+	};
+}
+
+export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
+	return {
+		fundingTxid: Buffer.from(s.fundingTxid, 'hex'),
+		fundingOutputIndex: s.fundingOutputIndex,
+		fundingTxHex: s.fundingTxHex,
+		fullySigned: s.fullySigned,
+		isInitiator: s.isInitiator,
+		localContributionSats: strToBigint(s.localContributionSats),
+		remoteContributionSats: strToBigint(s.remoteContributionSats),
+		fundingFeeratePerkw: s.fundingFeeratePerkw,
+		weSignFirst: s.weSignFirst,
+		ourWitnesses: s.ourWitnesses.map((w) =>
+			w.map((h) => Buffer.from(h, 'hex'))
+		),
+		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		externalInputIndices: s.externalInputIndices
+			? [...s.externalInputIndices]
+			: undefined,
+		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
+			script: Buffer.from(p.script, 'hex'),
+			valueSats: strToBigint(p.valueSats)
+		})),
+		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
+		sentTxSignatures: s.sentTxSignatures,
+		receivedTxSignatures: s.receivedTxSignatures,
+		confirmed: s.confirmed ?? false,
+		rbfAttempt: s.rbfAttempt,
+		fundingSatoshis:
+			s.fundingSatoshis !== undefined
+				? strToBigint(s.fundingSatoshis)
+				: undefined,
+		localBalanceMsat:
+			s.localBalanceMsat !== undefined
+				? strToBigint(s.localBalanceMsat)
+				: undefined,
+		remoteBalanceMsat:
+			s.remoteBalanceMsat !== undefined
+				? strToBigint(s.remoteBalanceMsat)
+				: undefined,
+		remoteChannelReserveSatoshis:
+			s.remoteChannelReserveSatoshis !== undefined
+				? strToBigint(s.remoteChannelReserveSatoshis)
+				: undefined,
+		localChannelReserveSatoshis:
+			s.localChannelReserveSatoshis !== undefined
+				? strToBigint(s.localChannelReserveSatoshis)
+				: undefined
+	};
+}
+
+export function serializeChannelState(
+	s: IChannelState
+): ISerializedChannelState {
+	const htlcs: ISerializedHtlcEntry[] = [];
+	for (const [key, entry] of s.htlcs) {
+		htlcs.push(serializeHtlcEntry(key, entry));
+	}
+
+	let revokedHtlcSnapshots: ISerializedHtlcSnapshot[] | undefined;
+	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.size > 0) {
+		revokedHtlcSnapshots = [];
+		for (const [commitmentNumber, entries] of s.revokedHtlcSnapshots) {
+			revokedHtlcSnapshots.push({
+				commitmentNumber,
+				htlcs: entries.map((e) => ({
+					paymentHash: e.paymentHash.toString('hex'),
+					amountMsat: bigintToStr(e.amountMsat),
+					cltvExpiry: e.cltvExpiry,
+					direction: e.direction
+				}))
+			});
+		}
+	}
+
+	return {
+		channelId: bufToHex(s.channelId),
+		temporaryChannelId: s.temporaryChannelId.toString('hex'),
+		role: s.role,
+		state: s.state,
+		fundingSatoshis: bigintToStr(s.fundingSatoshis),
+		pushMsat: bigintToStr(s.pushMsat),
+		fundingTxid: bufToHex(s.fundingTxid),
+		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
+		fundingUnaccounted: s.fundingUnaccounted,
+		fundingOutputIndex: s.fundingOutputIndex,
+		minimumDepth: s.minimumDepth,
+		localConfig: serializeChannelConfig(s.localConfig),
+		localBasepoints: serializeBasepoints(s.localBasepoints),
+		localPerCommitmentSeed: s.localPerCommitmentSeed.toString('hex'),
+		remoteConfig: serializeChannelConfig(s.remoteConfig),
+		remoteBasepoints: s.remoteBasepoints
+			? serializeBasepoints(s.remoteBasepoints)
+			: null,
+		localCommitmentNumber: bigintToStr(s.localCommitmentNumber),
+		remoteCommitmentNumber: bigintToStr(s.remoteCommitmentNumber),
+		remoteRevocationNumber:
+			s.remoteRevocationNumber !== undefined
+				? bigintToStr(s.remoteRevocationNumber)
+				: undefined,
+		needsCommitment: s.needsCommitment,
+		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		pendingFeerateSignable: s.pendingFeerateSignable,
+		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
+		localBalanceMsat: bigintToStr(s.localBalanceMsat),
+		remoteBalanceMsat: bigintToStr(s.remoteBalanceMsat),
+		shaChainData: serializeShaChainEntries(s.shaChainStore),
+		remoteCurrentPerCommitmentPoint: bufToHex(
+			s.remoteCurrentPerCommitmentPoint
+		),
+		remoteNextPerCommitmentPoint: bufToHex(s.remoteNextPerCommitmentPoint),
+		localHtlcCounter: bigintToStr(s.localHtlcCounter),
+		htlcs,
+		revokedHtlcSnapshots,
+		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
+		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
+		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
+		channelType: bufToHex(s.channelType),
+		localChannelReady: s.localChannelReady,
+		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
+		localShutdownScript: bufToHex(s.localShutdownScript),
+		remoteShutdownScript: bufToHex(s.remoteShutdownScript),
+		lastSentCommitmentSigned: bufToHex(s.lastSentCommitmentSigned),
+		lastSentPartialSignatureWithNonce: bufToHex(
+			s.lastSentPartialSignatureWithNonce
+		),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
+			type: u.type,
+			payloadHex: u.payload.toString('hex')
+		})),
+		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
+		lastSentHtlcSignatures: s.lastSentHtlcSignatures.map((b) =>
+			b.toString('hex')
+		),
+		lastSentRevokeSecret: bufToHex(s.lastSentRevokeSecret),
+		lastSentRevokeNextPoint: bufToHex(s.lastSentRevokeNextPoint),
+		lastSentWasRevoke: s.lastSentWasRevoke,
+		preReestablishState: s.preReestablishState,
+		lastProposedClosingFeeSat:
+			s.lastProposedClosingFeeSat !== null
+				? bigintToStr(s.lastProposedClosingFeeSat)
+				: null,
+		closingFeeMin:
+			s.closingFeeMin !== null ? bigintToStr(s.closingFeeMin) : null,
+		closingFeeMax:
+			s.closingFeeMax !== null ? bigintToStr(s.closingFeeMax) : null,
+		theirLastClosingFeeSat:
+			s.theirLastClosingFeeSat !== null
+				? bigintToStr(s.theirLastClosingFeeSat)
+				: null,
+		simpleClose: s.simpleClose,
+		lastCloseFeeSat: s.lastLocalClosingComplete
+			? bigintToStr(s.lastLocalClosingComplete.feeSatoshis)
+			: null,
+		lastCloseLocktime: s.lastLocalClosingComplete?.locktime ?? null,
+		lastCloseCloserScript: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.closerScript.toString('hex')
+			: null,
+		lastCloseCloseeScript: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.closeeScript.toString('hex')
+			: null,
+		lastCloseSentVariants: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.sentVariants
+			: null,
+		shortChannelId: bufToHex(s.shortChannelId),
+		fundingConfirmationHeight: s.fundingConfirmationHeight,
+		fundingBroadcastHeight: s.fundingBroadcastHeight,
+		fundingTxIndex: s.fundingTxIndex,
+		announcementSigsSent: s.announcementSigsSent,
+		announcementSigsReceived: s.announcementSigsReceived,
+		remoteAnnouncementNodeSig: bufToHex(s.remoteAnnouncementNodeSig),
+		remoteAnnouncementBitcoinSig: bufToHex(s.remoteAnnouncementBitcoinSig),
+		localAnnouncementNodeSig: bufToHex(s.localAnnouncementNodeSig),
+		localAnnouncementBitcoinSig: bufToHex(s.localAnnouncementBitcoinSig),
+		announceChannel: s.announceChannel,
+		scidAlias: bufToHex(s.scidAlias),
+		remoteScidAlias: bufToHex(s.remoteScidAlias),
+		zeroConfEnabled: s.zeroConfEnabled,
+		trustedPeer: s.trustedPeer,
+		quiescenceState: s.quiescenceState,
+		quiescenceInitiator: s.quiescenceInitiator,
+		spliceFundingTxid: bufToHex(s.spliceFundingTxid),
+		spliceFundingOutputIndex: s.spliceFundingOutputIndex,
+		preSpliceState: s.preSpliceState as string | null,
+		spliceInFlight: s.spliceInFlight
+			? serializeSpliceInFlight(s.spliceInFlight)
+			: null,
+		closeSpendsSpliceTxid: bufToHex(s.closeSpendsSpliceTxid),
+		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
+			? s.unconfirmedSpliceTxs.map((e) => ({
+					txid: e.txid.toString('hex'),
+					txHex: e.txHex
+			  }))
+			: undefined,
+		revertedSplices: s.revertedSplices?.length
+			? s.revertedSplices.map((r) => ({
+					...r,
+					remoteHtlcSignatures: r.remoteHtlcSignatures
+						? [...r.remoteHtlcSignatures]
+						: undefined
+			  }))
+			: undefined,
+		spliceAbortOwed: s.spliceAbortOwed === true ? true : undefined,
+		remoteForwardingPolicy: s.remoteForwardingPolicy
+			? {
+					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,
+					feeProportionalMillionths:
+						s.remoteForwardingPolicy.feeProportionalMillionths,
+					cltvExpiryDelta: s.remoteForwardingPolicy.cltvExpiryDelta,
+					htlcMinimumMsat: s.remoteForwardingPolicy.htlcMinimumMsat.toString(),
+					htlcMaximumMsat:
+						s.remoteForwardingPolicy.htlcMaximumMsat === null
+							? null
+							: s.remoteForwardingPolicy.htlcMaximumMsat.toString(),
+					timestamp: s.remoteForwardingPolicy.timestamp
+			  }
+			: null,
+		fundingVersion: s.fundingVersion,
+		channelReserveVersion: s.channelReserveVersion,
+		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
+		fundingLocktime: s.fundingLocktime,
+		v2InFlight: s.v2InFlight ? serializeV2InFlight(s.v2InFlight) : null,
+		v2PreviousAttempts: s.v2PreviousAttempts?.length
+			? s.v2PreviousAttempts.map(serializeV2InFlight)
+			: undefined,
+		isLessor: s.isLessor,
+		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		dataLossDetected: s.dataLossDetected,
+		fundingConfirmedLate: s.fundingConfirmedLate,
+		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
+		recoveryCloseReason: s.recoveryCloseReason,
+		closeReason: s.closeReason,
+		dlpRemotePerCommitmentPoint: bufToHex(
+			s.dlpRemotePerCommitmentPoint ?? null
+		),
+		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds?.length
+			? [...s.fforUsedEpochIds]
+			: undefined
+	};
+}
+
+// ─── FFOR Variant D epoch record (specs/ffor-offline-receive.md 7.5.5) ───
+
+export interface ISerializedFforEpoch {
+	role: string;
+	state: number;
+	epochId: string;
+	params: {
+		variant: number;
+		budgetMsat: string;
+		maxPayments: number;
+		minPaymentMsat: string;
+		settlementDeadline: number;
+		voucherExpiry: number;
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		escapeGranularityMsat: string;
+		rPerCommitmentPoints: string[];
+		voucherAmountsMsat: string[];
+		witnessPeers?: string[];
+		hashChain?: boolean;
+	};
+	remoteNodeId: string;
+	initWire: string;
+	acceptWire: string | null;
+	sCommitmentNumber: string | null;
+	sHtlcIdBase: string | null;
+	paymentHashes: string[];
+	preimages: string[];
+	tInit: string;
+	tSetup: string | null;
+	hBook: string | null;
+	hCommit: string | null;
+	hAct: string | null;
+	epochStartHeight: number | null;
+	activateWire: string | null;
+	activateAckWire: string | null;
+	closeWire: string | null;
+	closeAckWire: string | null;
+	slotStates: string[];
+	slotUpstream: (string | null)[];
+	settledBitmap: string | null;
+	knownPreimages: (string | null)[];
+	/** Absent on records written before the field existed: no slot exposed. */
+	exposedSlots?: boolean[];
+	/** Absent on records written before D-R existed: no witnesses. */
+	witnesses?: {
+		witnessNodeId: string;
+		mailboxId: string;
+		fetchPrivkey: string;
+		encPrivkey: string;
+		retentionUntil: number;
+		minReceipts: number;
+		manifestWire: string;
+		ackedAt: number | null;
+	}[];
+	closeProcessed: boolean;
+	voucherRoundFailed: boolean;
+	unwindOwed: boolean;
+	abortReason: number | null;
+	closeSent: boolean;
+	activationMismatch: boolean;
+}
+
+export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
+	return {
+		role: f.role,
+		state: f.state,
+		epochId: f.epochId.toString('hex'),
+		params: {
+			variant: f.params.variant,
+			budgetMsat: bigintToStr(f.params.budgetMsat),
+			maxPayments: f.params.maxPayments,
+			minPaymentMsat: bigintToStr(f.params.minPaymentMsat),
+			settlementDeadline: f.params.settlementDeadline,
+			voucherExpiry: f.params.voucherExpiry,
+			feeBaseMsat: f.params.feeBaseMsat,
+			feeProportionalMillionths: f.params.feeProportionalMillionths,
+			escapeGranularityMsat: bigintToStr(f.params.escapeGranularityMsat),
+			rPerCommitmentPoints: f.params.rPerCommitmentPoints.map((p) =>
+				p.toString('hex')
+			),
+			voucherAmountsMsat: f.params.voucherAmountsMsat.map(bigintToStr),
+			...(f.params.witnessPeers
+				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
+				: {}),
+			...(f.params.hashChain ? { hashChain: true } : {})
+		},
+		remoteNodeId: f.remoteNodeId.toString('hex'),
+		initWire: f.initWire.toString('hex'),
+		acceptWire: bufToHex(f.acceptWire),
+		sCommitmentNumber:
+			f.sCommitmentNumber === null ? null : bigintToStr(f.sCommitmentNumber),
+		sHtlcIdBase: f.sHtlcIdBase === null ? null : bigintToStr(f.sHtlcIdBase),
+		paymentHashes: f.paymentHashes.map((h) => h.toString('hex')),
+		preimages: f.preimages.map((p) => p.toString('hex')),
+		tInit: f.tInit.toString('hex'),
+		tSetup: bufToHex(f.tSetup),
+		hBook: bufToHex(f.hBook),
+		hCommit: bufToHex(f.hCommit),
+		hAct: bufToHex(f.hAct),
+		epochStartHeight: f.epochStartHeight,
+		activateWire: bufToHex(f.activateWire),
+		activateAckWire: bufToHex(f.activateAckWire),
+		closeWire: bufToHex(f.closeWire),
+		closeAckWire: bufToHex(f.closeAckWire),
+		slotStates: [...f.slotStates],
+		slotUpstream: [...f.slotUpstream],
+		settledBitmap: bufToHex(f.settledBitmap),
+		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		exposedSlots: [...f.exposedSlots],
+		witnesses: f.witnesses.map((w) => ({
+			witnessNodeId: w.witnessNodeId.toString('hex'),
+			mailboxId: w.mailboxId.toString('hex'),
+			fetchPrivkey: w.fetchPrivkey.toString('hex'),
+			encPrivkey: w.encPrivkey.toString('hex'),
+			retentionUntil: w.retentionUntil,
+			minReceipts: w.minReceipts,
+			manifestWire: w.manifestWire.toString('hex'),
+			ackedAt: w.ackedAt
+		})),
+		closeProcessed: f.closeProcessed,
+		voucherRoundFailed: f.voucherRoundFailed,
+		unwindOwed: f.unwindOwed,
+		abortReason: f.abortReason,
+		closeSent: f.closeSent,
+		activationMismatch: f.activationMismatch
+	};
+}
+
+export function deserializeFforEpoch(
+	s: ISerializedFforEpoch
+): IFforEpochRecord {
+	return {
+		role: s.role as FforRole,
+		state: s.state as FforState,
+		epochId: Buffer.from(s.epochId, 'hex'),
+		params: {
+			variant: s.params.variant,
+			budgetMsat: strToBigint(s.params.budgetMsat),
+			maxPayments: s.params.maxPayments,
+			minPaymentMsat: strToBigint(s.params.minPaymentMsat),
+			settlementDeadline: s.params.settlementDeadline,
+			voucherExpiry: s.params.voucherExpiry,
+			feeBaseMsat: s.params.feeBaseMsat,
+			feeProportionalMillionths: s.params.feeProportionalMillionths,
+			escapeGranularityMsat: strToBigint(s.params.escapeGranularityMsat),
+			rPerCommitmentPoints: s.params.rPerCommitmentPoints.map((p) =>
+				Buffer.from(p, 'hex')
+			),
+			voucherAmountsMsat: s.params.voucherAmountsMsat.map(strToBigint),
+			...(s.params.witnessPeers
+				? {
+						witnessPeers: s.params.witnessPeers.map((p) =>
+							Buffer.from(p, 'hex')
+						)
+				  }
+				: {}),
+			...(s.params.hashChain ? { hashChain: true } : {})
+		},
+		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
+		initWire: Buffer.from(s.initWire, 'hex'),
+		acceptWire: hexToBuf(s.acceptWire),
+		sCommitmentNumber:
+			s.sCommitmentNumber === null ? null : strToBigint(s.sCommitmentNumber),
+		sHtlcIdBase: s.sHtlcIdBase === null ? null : strToBigint(s.sHtlcIdBase),
+		paymentHashes: s.paymentHashes.map((h) => Buffer.from(h, 'hex')),
+		preimages: s.preimages.map((p) => Buffer.from(p, 'hex')),
+		tInit: Buffer.from(s.tInit, 'hex'),
+		tSetup: hexToBuf(s.tSetup),
+		hBook: hexToBuf(s.hBook),
+		hCommit: hexToBuf(s.hCommit),
+		hAct: hexToBuf(s.hAct),
+		epochStartHeight: s.epochStartHeight,
+		activateWire: hexToBuf(s.activateWire),
+		activateAckWire: hexToBuf(s.activateAckWire),
+		closeWire: hexToBuf(s.closeWire),
+		closeAckWire: hexToBuf(s.closeAckWire),
+		slotStates: s.slotStates.map((x) => x as FforSlotState),
+		slotUpstream: [...s.slotUpstream],
+		settledBitmap: hexToBuf(s.settledBitmap),
+		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
+		witnesses: (s.witnesses ?? []).map((w) => ({
+			witnessNodeId: Buffer.from(w.witnessNodeId, 'hex'),
+			mailboxId: Buffer.from(w.mailboxId, 'hex'),
+			fetchPrivkey: Buffer.from(w.fetchPrivkey, 'hex'),
+			encPrivkey: Buffer.from(w.encPrivkey, 'hex'),
+			retentionUntil: w.retentionUntil,
+			minReceipts: w.minReceipts,
+			manifestWire: Buffer.from(w.manifestWire, 'hex'),
+			ackedAt: w.ackedAt
+		})),
+		closeProcessed: s.closeProcessed === true,
+		voucherRoundFailed: s.voucherRoundFailed === true,
+		unwindOwed: s.unwindOwed === true,
+		abortReason:
+			s.abortReason === null || s.abortReason === undefined
+				? null
+				: (s.abortReason as FforAbortReason),
+		closeSent: s.closeSent === true,
+		activationMismatch: s.activationMismatch === true
+	};
+}
+
+export function deserializeChannelState(
+	s: ISerializedChannelState
+): IChannelState {
+	const htlcs = new Map<string, IHtlcEntry>();
+	for (const h of s.htlcs) {
+		const { key, entry } = deserializeHtlcEntry(h);
+		htlcs.set(key, entry);
+	}
+
+	let revokedHtlcSnapshots: Map<string, IHtlcSnapshotEntry[]> | undefined;
+	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.length > 0) {
+		revokedHtlcSnapshots = new Map();
+		for (const snap of s.revokedHtlcSnapshots) {
+			revokedHtlcSnapshots.set(
+				snap.commitmentNumber,
+				snap.htlcs.map((e) => ({
+					paymentHash: Buffer.from(e.paymentHash, 'hex'),
+					amountMsat: strToBigint(e.amountMsat),
+					cltvExpiry: e.cltvExpiry,
+					direction: e.direction as HtlcDirection
+				}))
+			);
+		}
+	}
+
+	return {
+		channelId: hexToBuf(s.channelId),
+		temporaryChannelId: Buffer.from(s.temporaryChannelId, 'hex'),
+		role: s.role as ChannelRole,
+		state: s.state as ChannelState,
+		fundingSatoshis: strToBigint(s.fundingSatoshis),
+		pushMsat: strToBigint(s.pushMsat),
+		fundingTxid: hexToBuf(s.fundingTxid),
+		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
+		fundingUnaccounted: s.fundingUnaccounted,
+		fundingOutputIndex: s.fundingOutputIndex,
+		minimumDepth: s.minimumDepth,
+		localConfig: deserializeChannelConfig(s.localConfig),
+		localBasepoints: deserializeBasepoints(s.localBasepoints),
+		localPerCommitmentSeed: Buffer.from(s.localPerCommitmentSeed, 'hex'),
+		remoteConfig: s.remoteConfig
+			? deserializeChannelConfig(s.remoteConfig)
+			: { ...DEFAULT_CHANNEL_CONFIG },
+		remoteBasepoints: s.remoteBasepoints
+			? deserializeBasepoints(s.remoteBasepoints)
+			: null,
+		localCommitmentNumber: strToBigint(s.localCommitmentNumber),
+		remoteCommitmentNumber: strToBigint(s.remoteCommitmentNumber),
+		remoteRevocationNumber:
+			s.remoteRevocationNumber !== undefined
+				? strToBigint(s.remoteRevocationNumber)
+				: undefined,
+		needsCommitment: s.needsCommitment ?? false,
+		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		pendingFeerateSignable: s.pendingFeerateSignable,
+		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
+		localBalanceMsat: strToBigint(s.localBalanceMsat),
+		remoteBalanceMsat: strToBigint(s.remoteBalanceMsat),
+		shaChainStore: deserializeShaChainStore(s.shaChainData),
+		remoteCurrentPerCommitmentPoint: hexToBuf(
+			s.remoteCurrentPerCommitmentPoint
+		),
+		remoteNextPerCommitmentPoint: hexToBuf(s.remoteNextPerCommitmentPoint),
+		localHtlcCounter: strToBigint(s.localHtlcCounter),
+		htlcs,
+		revokedHtlcSnapshots,
+		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
+		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
+			Buffer.from(h, 'hex')
+		),
+		remoteSigningNonce: hexToBuf(s.remoteSigningNonce) ?? undefined,
+		channelType: hexToBuf(s.channelType),
+		localChannelReady: s.localChannelReady,
+		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
+		localShutdownScript: hexToBuf(s.localShutdownScript),
+		remoteShutdownScript: hexToBuf(s.remoteShutdownScript),
+		lastSentCommitmentSigned: hexToBuf(s.lastSentCommitmentSigned),
+		lastSentPartialSignatureWithNonce: hexToBuf(
+			s.lastSentPartialSignatureWithNonce
+		),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
+			type: u.type,
+			payload: Buffer.from(u.payloadHex, 'hex')
+		})),
+		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
+		lastSentHtlcSignatures: (s.lastSentHtlcSignatures || []).map((h) =>
+			Buffer.from(h, 'hex')
+		),
+		lastSentRevokeSecret: hexToBuf(s.lastSentRevokeSecret),
+		lastSentRevokeNextPoint: hexToBuf(s.lastSentRevokeNextPoint),
+		lastSentWasRevoke: s.lastSentWasRevoke ?? null,
+		preReestablishState: (s.preReestablishState as ChannelState) || null,
+		lastProposedClosingFeeSat:
+			s.lastProposedClosingFeeSat !== null
+				? strToBigint(s.lastProposedClosingFeeSat)
+				: null,
+		closingFeeMin:
+			s.closingFeeMin !== null ? strToBigint(s.closingFeeMin) : null,
+		closingFeeMax:
+			s.closingFeeMax !== null ? strToBigint(s.closingFeeMax) : null,
+		theirLastClosingFeeSat:
+			s.theirLastClosingFeeSat !== null
+				? strToBigint(s.theirLastClosingFeeSat)
+				: null,
+		simpleClose: s.simpleClose ?? null,
+		lastLocalClosingComplete:
+			s.lastCloseFeeSat != null &&
+			s.lastCloseLocktime != null &&
+			s.lastCloseCloserScript != null &&
+			s.lastCloseCloseeScript != null
+				? {
+						feeSatoshis: strToBigint(s.lastCloseFeeSat),
+						locktime: s.lastCloseLocktime,
+						closerScript: Buffer.from(s.lastCloseCloserScript, 'hex'),
+						closeeScript: Buffer.from(s.lastCloseCloseeScript, 'hex'),
+						sentVariants: s.lastCloseSentVariants ?? []
+				  }
+				: null,
+		// Not persisted by design: reconnection restarts simple-close negotiation.
+		awaitingClosingSig: false,
+		shortChannelId: hexToBuf(s.shortChannelId),
+		fundingConfirmationHeight: s.fundingConfirmationHeight || 0,
+		fundingBroadcastHeight: s.fundingBroadcastHeight ?? 0,
+		fundingTxIndex: s.fundingTxIndex || 0,
+		announcementSigsSent: s.announcementSigsSent || false,
+		announcementSigsReceived: s.announcementSigsReceived || false,
+		remoteAnnouncementNodeSig: hexToBuf(s.remoteAnnouncementNodeSig),
+		remoteAnnouncementBitcoinSig: hexToBuf(s.remoteAnnouncementBitcoinSig),
+		localAnnouncementNodeSig: hexToBuf(s.localAnnouncementNodeSig),
+		localAnnouncementBitcoinSig: hexToBuf(s.localAnnouncementBitcoinSig),
+		announceChannel: s.announceChannel ?? true,
+		scidAlias: hexToBuf(s.scidAlias),
+		remoteScidAlias: hexToBuf(s.remoteScidAlias),
+		zeroConfEnabled: s.zeroConfEnabled ?? false,
+		trustedPeer: s.trustedPeer ?? false,
+		quiescenceState: s.quiescenceState ?? 'NORMAL',
+		quiescenceInitiator: s.quiescenceInitiator ?? false,
+		spliceFundingTxid: s.spliceFundingTxid
+			? hexToBuf(s.spliceFundingTxid)
+			: null,
+		spliceFundingOutputIndex: s.spliceFundingOutputIndex ?? 0,
+		preSpliceState: (s.preSpliceState as ChannelState) || null,
+		spliceInFlight: s.spliceInFlight
+			? deserializeSpliceInFlight(s.spliceInFlight)
+			: null,
+		closeSpendsSpliceTxid: s.closeSpendsSpliceTxid
+			? hexToBuf(s.closeSpendsSpliceTxid)
+			: null,
+		unconfirmedSpliceTxs: s.unconfirmedSpliceTxs?.length
+			? s.unconfirmedSpliceTxs.map((e) => ({
+					txid: Buffer.from(e.txid, 'hex'),
+					txHex: e.txHex
+			  }))
+			: [],
+		revertedSplices: s.revertedSplices?.length
+			? s.revertedSplices.map((r) => ({
+					...r,
+					remoteHtlcSignatures: r.remoteHtlcSignatures
+						? [...r.remoteHtlcSignatures]
+						: undefined
+			  }))
+			: [],
+		spliceAbortOwed: s.spliceAbortOwed ?? false,
+		remoteForwardingPolicy: s.remoteForwardingPolicy
+			? {
+					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,
+					feeProportionalMillionths:
+						s.remoteForwardingPolicy.feeProportionalMillionths,
+					cltvExpiryDelta: s.remoteForwardingPolicy.cltvExpiryDelta,
+					htlcMinimumMsat: BigInt(s.remoteForwardingPolicy.htlcMinimumMsat),
+					htlcMaximumMsat:
+						s.remoteForwardingPolicy.htlcMaximumMsat === null
+							? null
+							: BigInt(s.remoteForwardingPolicy.htlcMaximumMsat),
+					timestamp: s.remoteForwardingPolicy.timestamp
+			  }
+			: null,
+		fundingVersion: (s.fundingVersion ?? 1) as 1 | 2,
+		channelReserveVersion: s.channelReserveVersion,
+		dualFundingSession: null,
+		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
+		fundingLocktime: s.fundingLocktime ?? 0,
+		v2InFlight: s.v2InFlight ? deserializeV2InFlight(s.v2InFlight) : null,
+		v2PreviousAttempts: s.v2PreviousAttempts?.length
+			? s.v2PreviousAttempts.map(deserializeV2InFlight)
+			: undefined,
+		isLessor: s.isLessor,
+		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		dataLossDetected: s.dataLossDetected,
+		fundingConfirmedLate: s.fundingConfirmedLate,
+		stateUncertain: s.stateUncertain,
+		restoreRecencyUnproven: s.restoreRecencyUnproven,
+		staleCloseRiskAccepted: s.staleCloseRiskAccepted,
+		preSpliceSpendWatches: s.preSpliceSpendWatches?.length
+			? s.preSpliceSpendWatches.map((w) => ({ ...w }))
+			: undefined,
+		recoveryCloseReason: s.recoveryCloseReason,
+		closeReason: s.closeReason,
+		dlpRemotePerCommitmentPoint:
+			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined,
+		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds?.length
+			? [...s.fforUsedEpochIds]
+			: undefined
+	};
+}
+
+// ─── IPaymentInfo ───
+
+export interface ISerializedPaymentInfo {
+	paymentHash: string;
+	preimage?: string;
+	amountMsat: string;
+	status: string;
+	direction: string;
+	route?: string; // JSON string
+	sharedSecrets?: string[]; // hex
+	failureCode?: number;
+	failureSourceIndex?: number;
+	failureReason?: string;
+	createdAt: number;
+	completedAt?: number;
+	settledHtlcs?: string[];
+	metadata?: Record<string, string>;
+}
+
+export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
+	return {
+		paymentHash: p.paymentHash.toString('hex'),
+		preimage: bufToHex(p.preimage) ?? undefined,
+		amountMsat: bigintToStr(p.amountMsat),
+		status: p.status,
+		direction: p.direction,
+		route: p.route
+			? JSON.stringify(p.route, (_, v) =>
+					typeof v === 'bigint'
+						? `__bigint__${v.toString()}`
+						: // Buffers reach the replacer already in toJSON form (see
+						// serializeChainMonitorState); keep the isBuffer check as a fallback.
+						isBufferJson(v)
+						? `__buffer__${Buffer.from(v.data).toString('hex')}`
+						: Buffer.isBuffer(v)
+						? `__buffer__${v.toString('hex')}`
+						: v
+			  )
+			: undefined,
+		sharedSecrets: p.sharedSecrets?.map((b) => b.toString('hex')),
+		failureCode: p.failureCode,
+		failureSourceIndex: p.failureSourceIndex,
+		failureReason: p.failureReason,
+		createdAt: p.createdAt,
+		completedAt: p.completedAt,
+		settledHtlcs: p.settledHtlcs,
+		metadata: p.metadata
+	};
+}
+
+export function deserializePaymentInfo(
+	s: ISerializedPaymentInfo
+): IPaymentInfo {
+	const reviver = (_: string, v: unknown): unknown => {
+		if (typeof v === 'string' && v.startsWith('__bigint__'))
+			return BigInt(v.slice(10));
+		if (typeof v === 'string' && v.startsWith('__buffer__'))
+			return Buffer.from(v.slice(10), 'hex');
+		// Legacy rows persisted Buffers in raw toJSON form (replacer never saw them).
+		if (isBufferJson(v)) return Buffer.from(v.data);
+		return v;
+	};
+
+	return {
+		paymentHash: Buffer.from(s.paymentHash, 'hex'),
+		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
+		amountMsat: strToBigint(s.amountMsat),
+		status: s.status as PaymentStatus,
+		direction: s.direction as PaymentDirection,
+		route: s.route ? JSON.parse(s.route, reviver) : undefined,
+		sharedSecrets: s.sharedSecrets?.map((h) => Buffer.from(h, 'hex')),
+		failureCode: s.failureCode,
+		failureSourceIndex: s.failureSourceIndex,
+		failureReason: s.failureReason,
+		createdAt: s.createdAt,
+		completedAt: s.completedAt,
+		settledHtlcs: s.settledHtlcs,
+		metadata: s.metadata
+	};
+}
+
+// ─── IChainMonitorState ───
+
+export function serializeChainMonitorState(s: IChainMonitorState): string {
+	return JSON.stringify(s, (_, v) => {
+		if (typeof v === 'bigint') return `__bigint__${v.toString()}`;
+		// JSON.stringify invokes Buffer.prototype.toJSON BEFORE the replacer, so
+		// Buffers arrive here already converted to { type: 'Buffer', data: [...] }.
+		if (isBufferJson(v))
+			return `__buffer__${Buffer.from(v.data).toString('hex')}`;
+		if (Buffer.isBuffer(v)) return `__buffer__${v.toString('hex')}`;
+		return v;
+	});
+}
+
+/** The { type: 'Buffer', data: number[] } shape Buffer.prototype.toJSON produces. */
+function isBufferJson(v: unknown): v is { type: 'Buffer'; data: number[] } {
+	return (
+		v !== null &&
+		typeof v === 'object' &&
+		(v as { type?: unknown }).type === 'Buffer' &&
+		Array.isArray((v as { data?: unknown }).data)
+	);
+}
+
+export function deserializeChainMonitorState(json: string): IChainMonitorState {
+	return JSON.parse(json, (_, v) => {
+		if (typeof v === 'string' && v.startsWith('__bigint__'))
+			return BigInt(v.slice(10));
+		if (typeof v === 'string' && v.startsWith('__buffer__'))
+			return Buffer.from(v.slice(10), 'hex');
+		// Legacy rows: Buffers were persisted in raw toJSON form because the old
+		// replacer's Buffer.isBuffer check never matched (toJSON ran first).
+		if (isBufferJson(v)) return Buffer.from(v.data);
+		return v;
+	}) as IChainMonitorState;
+}
+
+// ─── Gossip types ───
+
+function serializeBufferFields(
+	obj: Record<string, unknown>
+): Record<string, unknown> {
+	const result: Record<string, unknown> = {};
+	for (const [key, val] of Object.entries(obj)) {
+		if (Buffer.isBuffer(val)) {
+			result[key] = `__buffer__${val.toString('hex')}`;
+		} else if (typeof val === 'bigint') {
+			result[key] = `__bigint__${val.toString()}`;
+		} else if (val && typeof val === 'object' && !Array.isArray(val)) {
+			result[key] = serializeBufferFields(val as Record<string, unknown>);
+		} else if (Array.isArray(val)) {
+			result[key] = val.map((item) =>
+				item &&
+				typeof item === 'object' &&
+				!Array.isArray(item) &&
+				!Buffer.isBuffer(item)
+					? serializeBufferFields(item as Record<string, unknown>)
+					: Buffer.isBuffer(item)
+					? `__buffer__${item.toString('hex')}`
+					: typeof item === 'bigint'
+					? `__bigint__${item.toString()}`
+					: item
+			);
+		} else {
+			result[key] = val;
+		}
+	}
+	return result;
+}
+
+function genericReviver(_: string, v: unknown): unknown {
+	if (typeof v === 'string' && v.startsWith('__bigint__'))
+		return BigInt(v.slice(10));
+	if (typeof v === 'string' && v.startsWith('__buffer__'))
+		return Buffer.from(v.slice(10), 'hex');
+	return v;
+}
+
+export function serializeGraphChannel(ch: IGraphChannel): string {
+	const obj = serializeBufferFields(ch as unknown as Record<string, unknown>);
+	return JSON.stringify(obj);
+}
+
+export function deserializeGraphChannel(json: string): IGraphChannel {
+	// Provenance flags round-trip as-is; rows that predate them come back with
+	// the flags absent and are resolved by signature verification at the
+	// common restore boundary (NetworkGraph.restoreChannel). Absence must NOT
+	// be trusted here: pre-#340 rows could hold zero-signature RGS messages
+	// persisted alongside a verified update.
+	return JSON.parse(json, genericReviver) as IGraphChannel;
+}
+
+export function serializeGraphNode(node: IGraphNode): string {
+	const obj: Record<string, unknown> = {
+		nodeId: `__buffer__${node.nodeId.toString('hex')}`,
+		channels: [...node.channels]
+	};
+	if (node.announcement) {
+		obj.announcement = serializeBufferFields(
+			node.announcement as unknown as Record<string, unknown>
+		);
+	}
+	if (node.announcementVerified !== undefined) {
+		obj.announcementVerified = node.announcementVerified;
+	}
+	if (node.announcementVerifyDeferred !== undefined) {
+		obj.announcementVerifyDeferred = node.announcementVerifyDeferred;
+	}
+	return JSON.stringify(obj);
+}
+
+export function deserializeGraphNode(json: string): IGraphNode {
+	const parsed = JSON.parse(json, genericReviver);
+	// Provenance resolution for legacy rows happens in NetworkGraph.restoreNode.
+	return {
+		...parsed,
+		channels: new Set(parsed.channels as string[])
+	} as IGraphNode;
+}

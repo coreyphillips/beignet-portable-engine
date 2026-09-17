@@ -1,0 +1,3116 @@
+#!/usr/bin/env node
+
+/**
+ * Beignet CLI: AI-friendly Bitcoin + Lightning interface.
+ *
+ * Commands are thin HTTP clients that send requests to the daemon,
+ * except `init` and `start` which are handled locally.
+ */
+
+import * as http from 'http';
+import * as fs from 'fs';
+import * as nodePath from 'path';
+import { generateMnemonic } from '../utils/helpers';
+import {
+	loadConfig,
+	saveConfig,
+	resolveConfig,
+	writePidFile,
+	readPidFile,
+	removePidFile,
+	getDaemonPort
+} from './config';
+import { startDaemon } from './daemon';
+import { daemonOptions } from './daemon-options';
+import { defaultDataDirForMnemonic } from './beignet-node';
+import { performDbRestore } from './restore';
+import { InstanceLockError } from './instance-lock';
+import { ApiResponse, BeignetConfig } from './types';
+
+const args = process.argv.slice(2);
+const pretty = args.includes('--pretty');
+const filteredArgs = args.filter((a) => a !== '--pretty');
+
+function output(data: unknown): void {
+	const str = pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data);
+	process.stdout.write(str + '\n');
+}
+
+function parseFlag(name: string): string | undefined {
+	const idx = filteredArgs.indexOf(name);
+	if (idx === -1 || idx + 1 >= filteredArgs.length) return undefined;
+	return filteredArgs[idx + 1];
+}
+
+function hasFlag(name: string): boolean {
+	return filteredArgs.includes(name);
+}
+
+/** Collect every value of a repeatable flag (e.g. --watchtower a --watchtower b). */
+function parseRepeatedFlag(name: string): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < filteredArgs.length - 1; i++) {
+		if (filteredArgs[i] === name) out.push(filteredArgs[i + 1]);
+	}
+	return out;
+}
+
+// Flags every command accepts (the HTTP plumbing reads them on each request),
+// so they may trail any command's positional arguments.
+const GLOBAL_VALUE_FLAGS = new Set(['--api-key', '--api-token']);
+
+/**
+ * Positional arguments with the global flag/value pairs removed. A command
+ * with an OPTIONAL trailing positional must read it from here, not from
+ * filteredArgs: when the positional is omitted, a raw index read swallows the
+ * first trailing flag token instead (issue #534 review: `channel splice-out
+ * <id> <sats> <feerate> --api-key k` sent the literal string --api-key as the
+ * address). A command that takes its own value flags passes them in
+ * localValueFlags so they are stripped the same way, or the flag token
+ * re-creates the identical bug one column over. A boolean flag of the
+ * command's own (no value follows it) goes in localBooleanFlags for the same
+ * reason: `direct-funding send <request> --recover-receipt` with the optional
+ * amount omitted read the flag as the amount (issue #767 review).
+ */
+function positionalArgs(
+	localValueFlags?: ReadonlySet<string>,
+	localBooleanFlags?: ReadonlySet<string>
+): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < filteredArgs.length; i++) {
+		if (
+			GLOBAL_VALUE_FLAGS.has(filteredArgs[i]) ||
+			localValueFlags?.has(filteredArgs[i])
+		) {
+			i++; // skip the flag's value too
+			continue;
+		}
+		if (localBooleanFlags?.has(filteredArgs[i])) continue;
+		out.push(filteredArgs[i]);
+	}
+	return out;
+}
+
+// Resolve the bearer credential for HTTP requests: CLI flag, env, or config
+// file. A named scoped key's secret works anywhere the legacy token does
+// (--api-key/BEIGNET_API_KEY are aliases for supplying one explicitly).
+function getApiToken(): string | undefined {
+	const flagToken = parseFlag('--api-token') || parseFlag('--api-key');
+	if (flagToken) return flagToken;
+	if (process.env.BEIGNET_API_TOKEN) return process.env.BEIGNET_API_TOKEN;
+	if (process.env.BEIGNET_API_KEY) return process.env.BEIGNET_API_KEY;
+	const config = loadConfig();
+	return config.apiToken;
+}
+
+async function httpRequest(
+	method: string,
+	path: string,
+	body?: Record<string, unknown>
+): Promise<ApiResponse<unknown>> {
+	const port = getDaemonPort();
+	const token = getApiToken();
+	return new Promise((resolve, reject) => {
+		const payload = body ? JSON.stringify(body) : undefined;
+		const headers: Record<string, string | number> = {};
+		if (payload) {
+			headers['Content-Type'] = 'application/json';
+			headers['Content-Length'] = Buffer.byteLength(payload);
+		}
+		if (token) {
+			headers['Authorization'] = `Bearer ${token}`;
+		}
+		const req = http.request(
+			{
+				hostname: '127.0.0.1',
+				port,
+				path,
+				method,
+				headers
+			},
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on('data', (chunk: Buffer) => chunks.push(chunk));
+				res.on('end', () => {
+					try {
+						resolve(JSON.parse(Buffer.concat(chunks).toString()));
+					} catch {
+						resolve({
+							ok: false,
+							error: { code: 'PARSE_ERROR', message: 'Invalid JSON response' }
+						});
+					}
+				});
+			}
+		);
+		req.on('error', (err) => {
+			reject(
+				new Error(
+					`Cannot connect to daemon on port ${port}: ${err.message}. Is it running? Use 'beignet start' first.`
+				)
+			);
+		});
+		if (payload) req.write(payload);
+		req.end();
+	});
+}
+
+async function main(): Promise<void> {
+	const cmd = filteredArgs[0];
+
+	if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+		printHelp();
+		return;
+	}
+
+	switch (cmd) {
+		case 'init':
+			return handleInit();
+		case 'start':
+			return handleStart();
+		case 'stop':
+			return handleStop();
+		case 'info':
+			return outputResult(await httpRequest('GET', '/info'));
+		case 'balance':
+			return outputResult(await httpRequest('GET', '/balance'));
+		case 'transactions':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					filteredArgs[1]
+						? `/transactions?limit=${encodeURIComponent(filteredArgs[1])}`
+						: '/transactions'
+				)
+			);
+		case 'utxos':
+			return outputResult(await httpRequest('GET', '/utxos'));
+		case 'utxo':
+			return handleUtxo();
+		case 'fee-estimates':
+			return outputResult(await httpRequest('GET', '/fees/estimates'));
+		case 'address':
+			if (filteredArgs[1] === 'validate') {
+				return outputResult(
+					await httpRequest('POST', '/address/validate', {
+						address: filteredArgs[2]
+					})
+				);
+			}
+			if (filteredArgs[1] === 'label') {
+				// Empty label ('' or omitted) clears an existing label.
+				return outputResult(
+					await httpRequest('POST', '/address/label', {
+						address: filteredArgs[2],
+						label: filteredArgs.slice(3).join(' ')
+					})
+				);
+			}
+			if (filteredArgs[1] === 'labels') {
+				return outputResult(await httpRequest('GET', '/address/labels'));
+			}
+			if (hasFlag('--bip21')) {
+				const amountFlag = parseFlag('--amount');
+				const labelFlag = parseFlag('--label');
+				const messageFlag = parseFlag('--message');
+				return outputResult(
+					await httpRequest('POST', '/address/new', {
+						bip21: true,
+						...(amountFlag ? { amountSats: parseInt(amountFlag, 10) } : {}),
+						...(labelFlag ? { label: labelFlag } : {}),
+						...(messageFlag ? { message: messageFlag } : {})
+					})
+				);
+			}
+			return outputResult(await httpRequest('POST', '/address/new'));
+		case 'mnemonic':
+			return outputResult(await httpRequest('GET', '/mnemonic'));
+		case 'send':
+			return outputResult(
+				await httpRequest('POST', '/send', {
+					address: filteredArgs[1],
+					amountSats: parseInt(filteredArgs[2], 10)
+				})
+			);
+		case 'send-max':
+			return outputResult(
+				await httpRequest('POST', '/send-max', {
+					address: filteredArgs[1],
+					satsPerVbyte: filteredArgs[2]
+						? parseInt(filteredArgs[2], 10)
+						: undefined
+				})
+			);
+		case 'tx':
+			return handleTx();
+		case 'psbt':
+			return handlePsbt();
+		case 'consolidate':
+			return outputResult(
+				await httpRequest('POST', '/consolidate', {
+					satsPerVbyte: filteredArgs[1]
+						? parseInt(filteredArgs[1], 10)
+						: undefined
+				})
+			);
+		case 'peer':
+			return handlePeer();
+		case 'channel':
+			return handleChannel();
+		case 'invoice':
+			return handleInvoice();
+		case 'jit':
+			return handleJit();
+		case 'swaps':
+			return handleSwaps();
+		case 'payment':
+			return handlePayment();
+		case 'keysend':
+			return handleKeysend();
+		case 'forwards':
+			return handleForwards();
+		case 'graph':
+			return handleGraph();
+		case 'gossip':
+			return handleGossip();
+		case 'message':
+			return handleMessage();
+		case 'recover-fallback-funds':
+			return outputResult(
+				await httpRequest('POST', '/recover-fallback-funds', {
+					feeRatePerVbyte: parseFlag('--fee-rate')
+						? parseInt(parseFlag('--fee-rate')!, 10)
+						: undefined
+				})
+			);
+		case 'watchtower':
+			return handleWatchtower();
+		case 'route':
+			return handleRoute();
+		case 'rebalance':
+			return handleRebalance();
+		case 'advisor':
+			return handleAdvisor();
+		case 'bootstrap':
+			return handleBootstrap();
+		case 'trusted-peer':
+			return handleTrustedPeer();
+		case 'offer':
+			return handleOffer();
+		case 'health':
+			return outputResult(await httpRequest('GET', '/health'));
+		case 'ready':
+			return outputResult(await httpRequest('GET', '/ready'));
+		case 'readiness':
+			return outputResult(await httpRequest('GET', '/readiness'));
+		case 'metrics':
+			return handleMetrics();
+		case 'stats':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					filteredArgs[1] ? `/stats?window=${filteredArgs[1]}` : '/stats'
+				)
+			);
+		case 'liquidity':
+			return outputResult(await httpRequest('GET', '/liquidity'));
+		case 'fees':
+			return outputResult(await httpRequest('GET', '/fees'));
+		case 'spend-limit':
+			return outputResult(await httpRequest('GET', '/spend-limit'));
+		case 'logs':
+			return handleLogs();
+		case 'can-send':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/can-send?amountSats=${encodeURIComponent(filteredArgs[1] || '0')}`
+				)
+			);
+		case 'can-receive':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/can-receive?amountSats=${encodeURIComponent(
+						filteredArgs[1] || '0'
+					)}`
+				)
+			);
+		case 'wallet':
+			return handleWallet();
+		case 'node':
+			return handleNode();
+		case 'webhooks':
+			return handleWebhooks();
+		case 'queue':
+			return handleQueue();
+		case 'direct-funding':
+			return handleDirectFunding();
+		case 'l402':
+			return handleL402();
+		case 'auth':
+			return handleAuth();
+		case 'backup':
+			return handleBackup();
+		case 'restore':
+			return handleRestore();
+		case 'recovery':
+			return handleRecovery();
+		case 'guardian':
+			return handleGuardian();
+		default:
+			output({
+				ok: false,
+				error: { code: 'UNKNOWN_COMMAND', message: `Unknown command: ${cmd}` }
+			});
+			process.exitCode = 1;
+	}
+}
+
+function handleInit(): void {
+	const config = loadConfig();
+	const network = parseFlag('--network') || config.network || 'mainnet';
+	const alias = parseFlag('--alias') || config.alias;
+
+	if (config.mnemonic) {
+		output({
+			ok: true,
+			result: {
+				message: 'Config already exists',
+				mnemonic: config.mnemonic,
+				network: config.network
+			}
+		});
+		return;
+	}
+
+	const mnemonic = generateMnemonic();
+	const newConfig: BeignetConfig = {
+		...config,
+		mnemonic,
+		network: network as BeignetConfig['network']
+	};
+	if (alias) newConfig.alias = alias;
+	saveConfig(newConfig);
+
+	output({ ok: true, result: { message: 'Initialized', mnemonic, network } });
+}
+
+async function handleStart(): Promise<void> {
+	const existing = readPidFile();
+	if (existing) {
+		// Check if process is still alive
+		try {
+			process.kill(existing.pid, 0);
+			output({
+				ok: false,
+				error: {
+					code: 'ALREADY_RUNNING',
+					message: `Daemon already running (PID ${existing.pid}, port ${existing.port})`
+				}
+			});
+			return;
+		} catch {
+			removePidFile();
+		}
+	}
+
+	const cliFlags: Partial<BeignetConfig> = {};
+	const networkFlag = parseFlag('--network');
+	if (networkFlag) cliFlags.network = networkFlag as BeignetConfig['network'];
+	const portFlag = parseFlag('--port');
+	if (portFlag) cliFlags.daemonPort = parseInt(portFlag, 10);
+	const aliasFlag = parseFlag('--alias');
+	if (aliasFlag) cliFlags.alias = aliasFlag;
+	const hostFlag = parseFlag('--host');
+	if (hostFlag) cliFlags.daemonHost = hostFlag;
+	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
+	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
+	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
+	if (hasFlag('--metrics-public')) cliFlags.metricsPublic = true;
+	if (hasFlag('--insecure')) cliFlags.insecure = true;
+	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
+	if (hasFlag('--eager-gossip-verify')) cliFlags.eagerGossipVerify = true;
+	if (hasFlag('--no-auto-reconnect')) cliFlags.autoReconnect = false;
+	const apiTokenFlag = parseFlag('--api-token');
+	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
+	const backupPathFlag = parseFlag('--backup-path');
+	if (backupPathFlag) cliFlags.backupPath = backupPathFlag;
+	const backupIntervalFlag = parseFlag('--backup-interval');
+	if (backupIntervalFlag)
+		cliFlags.backupIntervalMs = parseInt(backupIntervalFlag, 10);
+	const spendLimitFlag = parseFlag('--daily-spend-limit');
+	if (spendLimitFlag)
+		cliFlags.dailySpendLimitSats = parseInt(spendLimitFlag, 10);
+	const tlsCertFlag = parseFlag('--tls-cert');
+	if (tlsCertFlag) cliFlags.tlsCert = tlsCertFlag;
+	const tlsKeyFlag = parseFlag('--tls-key');
+	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
+	const torProxyFlag = parseFlag('--tor-proxy');
+	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
+	const announceAddrFlag = parseFlag('--announce-addr');
+	if (announceAddrFlag)
+		cliFlags.announceAddresses = announceAddrFlag
+			.split(',')
+			.map((a) => a.trim())
+			.filter((a) => a.length > 0);
+	const watchtowerFlags = parseRepeatedFlag('--watchtower');
+	if (watchtowerFlags.length > 0) cliFlags.watchtowers = watchtowerFlags;
+	const feeSourceFlag = parseFlag('--fee-source');
+	if (feeSourceFlag)
+		cliFlags.feeEstimationSource =
+			feeSourceFlag as BeignetConfig['feeEstimationSource'];
+	const logLevelFlag = parseFlag('--log-level');
+	if (logLevelFlag)
+		cliFlags.logLevel = logLevelFlag as BeignetConfig['logLevel'];
+	const recoveryModeFlag = parseFlag('--recovery-mode');
+	if (recoveryModeFlag) cliFlags.recoveryMode = recoveryModeFlag;
+	const recoveryGuardianFlags = parseRepeatedFlag('--recovery-guardian');
+	if (recoveryGuardianFlags.length > 0)
+		cliFlags.recoveryGuardians = recoveryGuardianFlags;
+	const recoveryProfileFlag = parseFlag('--recovery-profile');
+	if (recoveryProfileFlag) cliFlags.recoveryProfile = recoveryProfileFlag;
+	if (hasFlag('--recovery-auto-apply')) cliFlags.recoveryAutoApply = true;
+	if (hasFlag('--guardian-serve')) cliFlags.guardianServe = true;
+	const guardianTokenFlag = parseFlag('--guardian-token');
+	if (guardianTokenFlag) cliFlags.guardianToken = guardianTokenFlag;
+
+	const config = resolveConfig(cliFlags);
+
+	if (!config.mnemonic) {
+		output({
+			ok: false,
+			error: {
+				code: 'NO_MNEMONIC',
+				message:
+					'No mnemonic found. Run "beignet init" first or set BEIGNET_MNEMONIC.'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+
+	const daemonPort = config.daemonPort || 2112;
+	const isDaemon = hasFlag('--daemon');
+
+	try {
+		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
+
+		writePidFile(process.pid, daemonPort);
+		output({
+			ok: true,
+			result: { message: 'Node started', port: daemonPort, pid: process.pid }
+		});
+
+		// Clean shutdown on signals: the same teardown POST /stop runs, so an
+		// in-flight backup completes and SQLite closes before the process ends.
+		// The inner bound caps the node's HTLC drain; the outer one covers a
+		// hang the node's own timeout does not reach (SQLite close, wallet
+		// stop) so Ctrl-C always terminates.
+		const SHUTDOWN_NODE_TIMEOUT_MS = 10_000;
+		const SHUTDOWN_FORCE_EXIT_MS = 15_000;
+		let shuttingDown = false;
+		const shutdown = (): void => {
+			if (shuttingDown) {
+				// Second signal: the operator insists, skip the graceful path.
+				process.exit(1);
+			}
+			shuttingDown = true;
+			removePidFile();
+			const forceExit = setTimeout(() => {
+				process.stderr.write('beignet: shutdown timed out, forcing exit\n');
+				process.exit(1);
+			}, SHUTDOWN_FORCE_EXIT_MS);
+			forceExit.unref?.();
+			void stop(SHUTDOWN_NODE_TIMEOUT_MS)
+				.catch(() => {
+					// Best effort; the exit below is the point.
+				})
+				.then(() => {
+					clearTimeout(forceExit);
+					process.exit(0);
+				});
+		};
+		process.on('SIGINT', shutdown);
+		process.on('SIGTERM', shutdown);
+
+		if (isDaemon) {
+			// Keep running
+		} else {
+			// Keep running in foreground
+		}
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		output({ ok: false, error: { code: 'START_FAILED', message: msg } });
+		process.exitCode = 1;
+	}
+}
+
+async function handleStop(): Promise<void> {
+	try {
+		const result = await httpRequest('POST', '/stop');
+		removePidFile();
+		outputResult(result);
+	} catch (err: unknown) {
+		removePidFile();
+		const msg = err instanceof Error ? err.message : String(err);
+		output({ ok: false, error: { code: 'STOP_FAILED', message: msg } });
+	}
+}
+
+async function handleTx(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'bump-fee':
+			return outputResult(
+				await httpRequest('POST', '/tx/bump-fee', {
+					txid: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'boost':
+			return outputResult(
+				await httpRequest('POST', '/tx/boost', {
+					txid: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'boostable':
+			return outputResult(await httpRequest('GET', '/transactions/boostable'));
+		case 'quote': {
+			// What a send would cost, without sending it. The destination is part of
+			// the answer, not decoration: a P2TR output is 43 vB against a P2WPKH's
+			// 31, so quoting without the address prices the wrong transaction.
+			// A channel funding open has no address to give, and says so instead.
+			const channelFunding = hasFlag('--channel-funding');
+			const isMax = hasFlag('--max');
+			const quoteAddress = channelFunding ? undefined : filteredArgs[2];
+			// Positional layout: [address?] [amountSats?] [satsPerVbyte?]. An address
+			// is absent when funding a channel, and an amount is absent when sweeping,
+			// so the rate lands wherever those leave it.
+			let next = channelFunding ? 2 : 3;
+			const amountArg = isMax ? undefined : filteredArgs[next++];
+			const rateArg = filteredArgs[next];
+			if (!channelFunding && !quoteAddress) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet tx quote <address> <amountSats> [satsPerVbyte] | beignet tx quote <address> --max [satsPerVbyte] | beignet tx quote --channel-funding <amountSats> [satsPerVbyte]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/tx/quote', {
+					address: quoteAddress,
+					amountSats: amountArg ? parseInt(amountArg, 10) : undefined,
+					satsPerVbyte: rateArg ? Number(rateArg) : undefined,
+					max: isMax,
+					channelFunding
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable|quote <address> <amountSats> [satsPerVbyte] [--max] [--channel-funding]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+/** Accepts a PSBT as a base64 string or as a path to a file containing one. */
+function readPsbtArg(arg?: string): string | undefined {
+	if (!arg) return undefined;
+	try {
+		if (fs.existsSync(arg) && fs.statSync(arg).isFile()) {
+			return fs.readFileSync(arg, 'utf8').trim();
+		}
+	} catch {
+		// Fall through: treat the argument as a base64 string.
+	}
+	return arg;
+}
+
+async function handlePsbt(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'build':
+			return outputResult(
+				await httpRequest('POST', '/psbt/build', {
+					outputs: [
+						{
+							address: filteredArgs[2],
+							amountSats: parseInt(filteredArgs[3], 10)
+						}
+					],
+					satsPerVbyte: filteredArgs[4]
+						? parseInt(filteredArgs[4], 10)
+						: undefined
+				})
+			);
+		case 'import-signed':
+			return outputResult(
+				await httpRequest('POST', '/psbt/import-signed', {
+					psbtBase64: readPsbtArg(filteredArgs[2])
+				})
+			);
+		case 'combine':
+			return outputResult(
+				await httpRequest('POST', '/psbt/combine', {
+					psbts: filteredArgs
+						.slice(2)
+						.map((arg) => readPsbtArg(arg))
+						.filter((psbt): psbt is string => !!psbt)
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handlePeer(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'connect': {
+			// Accepted forms (first two unchanged, the rest additive):
+			//   peer connect <pubkey>                      resolve via gossip/DNS
+			//   peer connect <pubkey> <host> <port>        TCP
+			//   peer connect <pubkey> <ws[s]://host:port>  WebSocket
+			//   peer connect <pubkey@host:port>            TCP (URI form)
+			//   peer connect <pubkey@ws[s]://host:port>    WebSocket (URI form)
+			let connectBody: Record<string, unknown>;
+			const target = filteredArgs[2];
+			if (target !== undefined && target.includes('@')) {
+				const at = target.indexOf('@');
+				const pubkey = target.slice(0, at);
+				const address = target.slice(at + 1);
+				if (/^wss?:\/\//i.test(address)) {
+					connectBody = { pubkey, url: address };
+				} else {
+					const lastColon = address.lastIndexOf(':');
+					connectBody = {
+						pubkey,
+						host: address.slice(0, lastColon),
+						port: parseInt(address.slice(lastColon + 1), 10)
+					};
+				}
+			} else if (
+				filteredArgs[3] !== undefined &&
+				/^wss?:\/\//i.test(filteredArgs[3])
+			) {
+				connectBody = { pubkey: target, url: filteredArgs[3] };
+			} else if (filteredArgs[3] !== undefined) {
+				connectBody = {
+					pubkey: target,
+					host: filteredArgs[3],
+					port: parseInt(filteredArgs[4], 10)
+				};
+			} else {
+				// host/port omitted: the node resolves the address from the gossip
+				// graph / DNS bootstrap.
+				connectBody = { pubkey: target };
+			}
+			return outputResult(
+				await httpRequest('POST', '/peer/connect', connectBody)
+			);
+		}
+		case 'disconnect':
+			return outputResult(
+				await httpRequest('POST', '/peer/disconnect', {
+					pubkey: filteredArgs[2]
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/peers'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet peer [connect|disconnect|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleChannel(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'open': {
+			const openRate = parseFlag('--sats-per-vbyte');
+			return outputResult(
+				await httpRequest('POST', '/channel/open', {
+					pubkey: filteredArgs[2],
+					amountSats: parseInt(filteredArgs[3], 10),
+					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					satsPerVbyte: openRate ? parseInt(openRate, 10) : undefined,
+					// Sweep the whole on-chain balance into the channel (no change).
+					max: hasFlag('--max') || undefined
+				})
+			);
+		}
+		case 'close':
+			return outputResult(
+				await httpRequest('POST', '/channel/close', {
+					channelId: filteredArgs[2],
+					// A channel restored from a Recovery Capsule refuses an
+					// unacknowledged cooperative close too: a mutual close pays
+					// out the restored balances, which cannot be proven
+					// current. Same labelled escape hatch as the force close.
+					...(hasFlag('--accept-stale-state-risk')
+						? { acceptStaleStateRisk: true }
+						: {})
+				})
+			);
+		case 'forceclose':
+			return outputResult(
+				await httpRequest('POST', '/channel/forceclose', {
+					channelId: filteredArgs[2],
+					// A channel restored from a Recovery Capsule refuses an
+					// unacknowledged force close, because its commitment may be
+					// one the peer already holds a revocation for. Without a
+					// way to say so the documented escape hatch was
+					// unreachable from the CLI.
+					...(hasFlag('--accept-stale-state-risk')
+						? { acceptStaleStateRisk: true }
+						: {})
+				})
+			);
+		case 'rebroadcast-close':
+			return outputResult(
+				await httpRequest('POST', '/channel/rebroadcast-close', {
+					channelId: filteredArgs[2]
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/channels'));
+		case 'get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel?channelId=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'open-zeroconf':
+			return outputResult(
+				await httpRequest('POST', '/channel/open-zeroconf', {
+					pubkey: filteredArgs[2],
+					amountSats: parseInt(filteredArgs[3], 10),
+					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined
+				})
+			);
+		case 'open-v2': {
+			// Liquidity ads buyer flags (issue #532 1B). These are command-local
+			// value flags, so they must be stripped from the positionals like
+			// the global ones or `open-v2 <pubkey> <sats> --request-funds n`
+			// reads the flag token as the feerate (the issue #534 bug class).
+			const pos = positionalArgs(
+				new Set(['--request-funds', '--blockheight', '--max-lease-rates'])
+			);
+			const requestFundsArg = parseFlag('--request-funds');
+			const maxLeaseRatesArg = parseFlag('--max-lease-rates');
+			let requestFunds:
+				| { requestedSats: number; blockheight: number }
+				| undefined;
+			if (requestFundsArg !== undefined) {
+				// Number(), not parseInt: parseInt would silently truncate
+				// "50000.5" to 50000; Number preserves it so the daemon's
+				// whole-number check refuses it instead.
+				const requestedSats = Number(requestFundsArg);
+				const blockheightArg = parseFlag('--blockheight');
+				let blockheight: number;
+				if (blockheightArg !== undefined) {
+					blockheight = Number(blockheightArg);
+				} else {
+					// request_funds carries the buyer's current chain tip; fetch
+					// it like the daemon's other clients do rather than making
+					// the operator look it up.
+					const info = await httpRequest('GET', '/info');
+					if (!info.ok) {
+						// A failed /info (auth refusal, daemon fault) must surface
+						// as itself; rewriting it into a blockheight complaint
+						// hides the actual problem (issue #536 review).
+						return outputResult(info);
+					}
+					const height =
+						typeof (info.result as { blockHeight?: unknown })?.blockHeight ===
+						'number'
+							? (info.result as { blockHeight: number }).blockHeight
+							: 0;
+					if (!(height > 0)) {
+						output({
+							ok: false,
+							error: {
+								code: 'INVALID_PARAMS',
+								message:
+									'Node block height unavailable; pass --blockheight <n> ' +
+									'with --request-funds'
+							}
+						});
+						process.exitCode = 1;
+						return;
+					}
+					blockheight = height;
+				}
+				requestFunds = { requestedSats, blockheight };
+			}
+			let maxLeaseRates: unknown;
+			if (maxLeaseRatesArg !== undefined) {
+				try {
+					maxLeaseRates = JSON.parse(maxLeaseRatesArg);
+				} catch {
+					output({
+						ok: false,
+						error: {
+							code: 'INVALID_PARAMS',
+							message:
+								'--max-lease-rates is not valid JSON; expected an object ' +
+								'with the five lease_rates fields'
+						}
+					});
+					process.exitCode = 1;
+					return;
+				}
+			}
+			return outputResult(
+				await httpRequest('POST', '/channel/open-v2', {
+					pubkey: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					fundingFeeratePerkw: pos[4] ? parseInt(pos[4], 10) : undefined,
+					requestFunds,
+					maxLeaseRates
+				})
+			);
+		}
+		case 'funding-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/funding-quote', {
+					peerPubkey: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseFloat(filteredArgs[3])
+						: undefined
+				})
+			);
+		case 'splice-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/splice-quote', {
+					channelId: filteredArgs[2],
+					direction: filteredArgs[3],
+					feeratePerkw: parseInt(filteredArgs[4], 10)
+				})
+			);
+		case 'splice-in':
+			return outputResult(
+				await httpRequest('POST', '/channel/splice-in', {
+					channelId: filteredArgs[2],
+					amountSats: parseInt(filteredArgs[3], 10),
+					feeratePerkw: parseInt(filteredArgs[4], 10)
+				})
+			);
+		case 'splice-out': {
+			// Optional external destination (issue #534); omitted, the
+			// spliced-out funds go to the wallet. Resolved from the flag-free
+			// positionals so a trailing --api-key never becomes the address.
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel/splice-out', {
+					channelId: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					feeratePerkw: parseInt(pos[4], 10),
+					...(pos[5] !== undefined ? { address: pos[5] } : {})
+				})
+			);
+		}
+		case 'ensure-minimum':
+			return outputResult(
+				await httpRequest('POST', '/channels/ensure-minimum', {
+					count: parseInt(filteredArgs[2], 10),
+					satsPerChannel: parseInt(filteredArgs[3], 10)
+				})
+			);
+		case 'diagnostics':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/diagnostics?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'health':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/health?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'policy':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/policy?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'suggestions':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					filteredArgs[2]
+						? `/channel/suggestions?count=${encodeURIComponent(
+								filteredArgs[2]
+						  )}`
+						: '/channel/suggestions'
+				)
+			);
+		case 'ready':
+			return outputResult(await httpRequest('GET', '/channels/ready'));
+		case 'connect-and-open': {
+			const cnoRate = parseFlag('--sats-per-vbyte');
+			return outputResult(
+				await httpRequest('POST', '/channel/connect-and-open', {
+					pubkey: filteredArgs[2],
+					host: filteredArgs[3],
+					port: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					amountSats: filteredArgs[5]
+						? parseInt(filteredArgs[5], 10)
+						: undefined,
+					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined,
+					satsPerVbyte: cnoRate ? parseInt(cnoRate, 10) : undefined,
+					// Sweep the whole on-chain balance into the channel (no change).
+					max: hasFlag('--max') || undefined,
+					// Trusted peer: zero-conf, usable before the funding confirms.
+					trusted: hasFlag('--trusted') || undefined
+				})
+			);
+		}
+		case 'open-and-wait': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/channel/open-and-wait', {
+					pubkey: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		case 'wait-ready': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/channel/wait-ready', {
+					channelId: filteredArgs[2],
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		// COMMITMENT feerate (BOLT 2 update_fee), not the routing fee policy.
+		case 'update-commitment-feerate':
+			return outputResult(
+				await httpRequest('POST', '/channel/update-commitment-feerate', {
+					channelId: filteredArgs[2],
+					feeratePerKw: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'update-policy': {
+			const target = filteredArgs[2];
+			if (!target) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const body: Record<string, unknown> =
+				target === 'all' ? { all: true } : { channelId: target };
+			const baseFee = parseFlag('--base-fee-msat');
+			if (baseFee !== undefined) body.feeBaseMsat = parseInt(baseFee, 10);
+			const ppm = parseFlag('--ppm');
+			if (ppm !== undefined) body.feeProportionalMillionths = parseInt(ppm, 10);
+			const cltvDelta = parseFlag('--cltv-delta');
+			if (cltvDelta !== undefined)
+				body.cltvExpiryDelta = parseInt(cltvDelta, 10);
+			// Msat bounds travel as strings so values above 2^53 survive JSON
+			const htlcMin = parseFlag('--htlc-min-msat');
+			if (htlcMin !== undefined) body.htlcMinimumMsat = htlcMin;
+			const htlcMax = parseFlag('--htlc-max-msat');
+			if (htlcMax !== undefined) body.htlcMaximumMsat = htlcMax;
+			return outputResult(
+				await httpRequest('POST', '/channel/update-policy', body)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleJit(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'status':
+			return outputResult(await httpRequest('GET', '/jit/status'));
+		case 'quote': {
+			// What a JIT receive would cost, before any invoice exists.
+			const lspPubkey = filteredArgs[2];
+			if (!lspPubkey) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet jit quote <lspPubkey> [amountSats] [--target-inbound sats]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const params = new URLSearchParams({ lspPubkey });
+			if (filteredArgs[3]) params.set('amountSats', filteredArgs[3]);
+			const target = parseFlag('--target-inbound');
+			if (target !== undefined) params.set('targetRemainingInboundSat', target);
+			return outputResult(
+				await httpRequest('GET', `/jit/quote?${params.toString()}`)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet jit [status|quote]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleInvoice(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'create': {
+			const minFinalCltv = parseFlag('--min-final-cltv');
+			return outputResult(
+				await httpRequest('POST', '/invoice/create', {
+					amountSats: parseInt(filteredArgs[2], 10),
+					description: filteredArgs[3] || '',
+					minFinalCltvExpiry: minFinalCltv
+						? parseInt(minFinalCltv, 10)
+						: undefined
+				})
+			);
+		}
+		case 'jit': {
+			// Payable with no channel: the LSP holds the HTLC, funds a channel
+			// and forwards, taking the quoted opening fee out of the delivery.
+			const lspPubkey = filteredArgs[2];
+			if (!lspPubkey) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet invoice jit <lspPubkey> [amountSats] [description] ' +
+							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n] ' +
+							'[--fee-mode skim|hop]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const numberFlag = (name: string): number | undefined => {
+				const raw = parseFlag(name);
+				return raw === undefined ? undefined : parseInt(raw, 10);
+			};
+			return outputResult(
+				await httpRequest('POST', '/jit/invoice', {
+					lspPubkey,
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					description: filteredArgs[4] || '',
+					expirySecs: numberFlag('--expiry'),
+					targetRemainingInboundSat: numberFlag('--target-inbound'),
+					maxFlatFeeSat: numberFlag('--max-flat-fee-sat'),
+					maxFeePpm: numberFlag('--max-fee-ppm'),
+					feeMode: parseFlag('--fee-mode')
+				})
+			);
+		}
+		case 'create-hold': {
+			// The caller supplies sha256(preimage) and keeps the preimage until
+			// `invoice settle-hold`. The incoming HTLC parks instead of settling.
+			const paymentHash = filteredArgs[2];
+			if (!paymentHash) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet invoice create-hold <paymentHash> [amountSats] [description] [--expiry secs] [--min-final-cltv blocks]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const expiryFlag = parseFlag('--expiry');
+			const minFinalCltv = parseFlag('--min-final-cltv');
+			return outputResult(
+				await httpRequest('POST', '/invoice/create-hold', {
+					paymentHash,
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					description: filteredArgs[4] || '',
+					expiry: expiryFlag ? parseInt(expiryFlag, 10) : undefined,
+					minFinalCltvExpiry: minFinalCltv
+						? parseInt(minFinalCltv, 10)
+						: undefined
+				})
+			);
+		}
+		case 'settle-hold':
+			return outputResult(
+				await httpRequest('POST', '/invoice/settle-hold', {
+					preimage: filteredArgs[2]
+				})
+			);
+		case 'cancel-hold':
+			return outputResult(
+				await httpRequest('POST', '/invoice/cancel-hold', {
+					paymentHash: filteredArgs[2]
+				})
+			);
+		case 'held':
+			return outputResult(await httpRequest('GET', '/invoices/held'));
+		case 'decode':
+			return outputResult(
+				await httpRequest('POST', '/invoice/decode', {
+					bolt11: filteredArgs[2]
+				})
+			);
+		case 'validate':
+			return outputResult(
+				await httpRequest('POST', '/invoice/validate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/invoice?paymentHash=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'pay':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay', {
+					bolt11: filteredArgs[2]
+				})
+			);
+		case 'pay-safe':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-safe', {
+					bolt11: filteredArgs[2],
+					maxFeeSats: parseFlag('--max-fee')
+						? parseInt(parseFlag('--max-fee')!, 10)
+						: undefined,
+					amountSats: parseFlag('--amount')
+						? parseInt(parseFlag('--amount')!, 10)
+						: undefined,
+					timeoutMs: parseFlag('--timeout')
+						? parseInt(parseFlag('--timeout')!, 10)
+						: undefined
+				})
+			);
+		case 'pay-async':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-async', {
+					bolt11: filteredArgs[2],
+					maxFeeSats: parseFlag('--max-fee')
+						? parseInt(parseFlag('--max-fee')!, 10)
+						: undefined,
+					amountSats: parseFlag('--amount')
+						? parseInt(parseFlag('--amount')!, 10)
+						: undefined
+				})
+			);
+		case 'pay-retry':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-retry', {
+					bolt11: filteredArgs[2],
+					maxRetries: parseFlag('--max-retries')
+						? parseInt(parseFlag('--max-retries')!, 10)
+						: undefined,
+					backoffMs: parseFlag('--backoff-ms')
+						? parseInt(parseFlag('--backoff-ms')!, 10)
+						: undefined,
+					maxFeeSats: parseFlag('--max-fee')
+						? parseInt(parseFlag('--max-fee')!, 10)
+						: undefined
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/invoices'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet invoice [create|jit|create-hold|settle-hold|cancel-hold|held|decode|validate|get|pay|pay-safe|pay-async|pay-retry|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleSwaps(): Promise<void> {
+	// The swap provider role (issues #737 and #743): its terms and exposure
+	// in both directions, its ledger, and the one operator action that is
+	// safe before funds move.
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'status':
+			return outputResult(await httpRequest('GET', '/swaps/status'));
+		case 'list': {
+			const idIndex = filteredArgs.indexOf('--id');
+			const id = idIndex >= 0 ? filteredArgs[idIndex + 1] : undefined;
+			return outputResult(
+				await httpRequest(
+					'GET',
+					id ? `/swaps?id=${encodeURIComponent(id)}` : '/swaps'
+				)
+			);
+		}
+		case 'cancel': {
+			const id = filteredArgs[2];
+			if (!id) {
+				output({
+					ok: false,
+					error: { code: 'INVALID_PARAMS', message: 'usage: swaps cancel <id>' }
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(await httpRequest('POST', '/swaps/cancel', { id }));
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'usage: swaps status | list [--id <hex>] | cancel <id>'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handlePayment(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'list':
+			return outputResult(await httpRequest('GET', '/payments'));
+		case 'get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/payment?paymentHash=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'send-to-route': {
+			// Route comes from `beignet route query`: inline JSON or a file path.
+			const paymentHash = filteredArgs[2];
+			const routeArg = filteredArgs[3];
+			if (!paymentHash || !routeArg) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet payment send-to-route <paymentHash> <routeJson|routeFile> [--payment-secret <hex>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			let routeStr = routeArg;
+			if (!routeArg.trimStart().startsWith('{')) {
+				try {
+					routeStr = fs.readFileSync(routeArg, 'utf8');
+				} catch (err: unknown) {
+					output({
+						ok: false,
+						error: {
+							code: 'INVALID_PARAMS',
+							message: `Cannot read route file: ${(err as Error).message}`
+						}
+					});
+					process.exitCode = 1;
+					return;
+				}
+			}
+			let route: { hops?: unknown };
+			try {
+				route = JSON.parse(routeStr);
+			} catch {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Route is not valid JSON'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			// Accept the full `route query` result (it has hops) or { hops: [...] }
+			const result =
+				route && typeof route === 'object' && 'result' in route
+					? (route as { result: { hops?: unknown } }).result
+					: route;
+			return outputResult(
+				await httpRequest('POST', '/payment/send-to-route', {
+					paymentHash,
+					route: { hops: result.hops },
+					paymentSecret: parseFlag('--payment-secret')
+				})
+			);
+		}
+		case 'cancel':
+			return outputResult(
+				await httpRequest('POST', '/payment/cancel', {
+					paymentHash: filteredArgs[2]
+				})
+			);
+		case 'wait': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/payment/wait', {
+					paymentHash: filteredArgs[2],
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		case 'proof':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/payment/proof?paymentHash=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'verify-proof':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/payment/verify-proof?paymentHash=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'estimate':
+			return outputResult(
+				await httpRequest('POST', '/payment/estimate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'metadata': {
+			// Metadata is passed as inline JSON: '{"key":"value"}'
+			const paymentHash = filteredArgs[2];
+			const metadataArg = filteredArgs[3];
+			if (!paymentHash || !metadataArg) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet payment metadata <paymentHash> \'{"key":"value"}\''
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			let metadata: Record<string, string>;
+			try {
+				metadata = JSON.parse(metadataArg);
+			} catch {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Metadata is not valid JSON'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/payment/metadata', {
+					paymentHash,
+					metadata
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet payment [list|get|cancel|wait|proof|verify-proof|estimate|metadata|send-to-route]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleKeysend(): Promise<void> {
+	// "keysend safe <pubkey> <sats>" maps to POST /keysend/safe (never throws;
+	// resolves with status FAILED instead).
+	const safe = filteredArgs[1] === 'safe';
+	const base = safe ? 2 : 1;
+	const pubkey = filteredArgs[base];
+	const sats = filteredArgs[base + 1];
+	if (!pubkey || !sats) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet keysend [safe] <pubkey> <sats> [--max-fee <sats>] [--timeout <ms>]'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	const maxFee = parseFlag('--max-fee');
+	const timeout = parseFlag('--timeout');
+	return outputResult(
+		await httpRequest('POST', safe ? '/keysend/safe' : '/keysend', {
+			pubkey,
+			amountSats: parseInt(sats, 10),
+			maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined,
+			timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+		})
+	);
+}
+
+async function handleLogs(): Promise<void> {
+	const params = new URLSearchParams();
+	const category = parseFlag('--category');
+	if (category !== undefined) params.set('category', category);
+	const since = parseFlag('--since');
+	if (since !== undefined) params.set('since', since);
+	const limit = parseFlag('--limit');
+	if (limit !== undefined) params.set('limit', limit);
+	const qs = params.toString();
+	return outputResult(await httpRequest('GET', qs ? `/logs?${qs}` : '/logs'));
+}
+
+async function handleWallet(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'refresh':
+			return outputResult(await httpRequest('POST', '/wallet/refresh'));
+		case 'descriptors':
+			return outputResult(await httpRequest('GET', '/wallet/descriptors'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet wallet [refresh|descriptors]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleUtxo(): Promise<void> {
+	const sub = filteredArgs[1];
+	const outpoint = (): { txid: string; index: number } => ({
+		txid: filteredArgs[2],
+		index: parseInt(filteredArgs[3], 10)
+	});
+	switch (sub) {
+		case 'freeze':
+			return outputResult(
+				await httpRequest('POST', '/utxo/freeze', outpoint())
+			);
+		case 'unfreeze':
+			return outputResult(
+				await httpRequest('POST', '/utxo/unfreeze', outpoint())
+			);
+		case 'frozen': {
+			const res = await httpRequest('GET', '/utxos');
+			if (res.ok && Array.isArray(res.result)) {
+				return output({
+					ok: true,
+					result: (res.result as Array<{ frozen?: boolean }>).filter(
+						(u) => u.frozen
+					)
+				});
+			}
+			return outputResult(res);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet utxo [freeze <txid> <index>|unfreeze <txid> <index>|frozen]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleNode(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'uri': {
+			const host = parseFlag('--host');
+			return outputResult(
+				await httpRequest(
+					'GET',
+					host !== undefined
+						? `/node/uri?host=${encodeURIComponent(host)}`
+						: '/node/uri'
+				)
+			);
+		}
+		case 'wait-ready': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/node/wait-ready', {
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet node [uri [--host <addr>]|wait-ready [--timeout <ms>]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleWebhooks(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'register': {
+			// Events are comma-separated, e.g. "payment:received,channel:ready" or "*"
+			const url = filteredArgs[2];
+			const events = filteredArgs[3];
+			if (!url || !events) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/webhooks/register', {
+					url,
+					events: events
+						.split(',')
+						.map((e) => e.trim())
+						.filter((e) => e.length > 0),
+					secret: parseFlag('--secret')
+				})
+			);
+		}
+		case 'unregister':
+			return outputResult(
+				await httpRequest('DELETE', '/webhooks/unregister', {
+					id: filteredArgs[2]
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/webhooks'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet webhooks [register <url> <events>|unregister <id>|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleAuth(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'keys':
+			return outputResult(await httpRequest('GET', '/auth/keys'));
+		case 'revoke': {
+			const name = filteredArgs[2];
+			if (!name) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet auth revoke <name>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/auth/keys/revoke', { name })
+			);
+		}
+		case 'rotate': {
+			const name = filteredArgs[2];
+			if (!name) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet auth rotate <name>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			// The new secret appears ONCE in this response; it is never stored
+			// in plaintext and cannot be retrieved again.
+			return outputResult(
+				await httpRequest('POST', '/auth/keys/rotate', { name })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet auth [keys|revoke <name>|rotate <name>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleL402(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'fetch': {
+			const url = filteredArgs[2];
+			const maxPrice = parseFlag('--max-price');
+			if (!url || maxPrice === undefined) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet l402 fetch <url> --max-price <sats> [--max-fee <sats>] [--method GET] [--header "K: V"] [--body <string>] [--scope-per-path] [--allow-unverified-macaroon] [--allow-private-network]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const maxFee = parseFlag('--max-fee');
+			const timeout = parseFlag('--timeout');
+			// Repeatable --header "Name: value", the curl convention.
+			const headers: Record<string, string> = {};
+			for (let i = 0; i < filteredArgs.length; i++) {
+				if (filteredArgs[i] !== '--header') continue;
+				const raw = filteredArgs[i + 1];
+				if (!raw) continue;
+				const split = raw.indexOf(':');
+				if (split <= 0) continue;
+				headers[raw.slice(0, split).trim()] = raw.slice(split + 1).trim();
+			}
+			return outputResult(
+				await httpRequest('POST', '/l402/fetch', {
+					url,
+					method: parseFlag('--method'),
+					headers: Object.keys(headers).length > 0 ? headers : undefined,
+					body: parseFlag('--body'),
+					maxPriceSats: parseInt(maxPrice, 10),
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined,
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined,
+					scopePerPath: filteredArgs.includes('--scope-per-path') || undefined,
+					allowUnverifiedMacaroon:
+						filteredArgs.includes('--allow-unverified-macaroon') || undefined,
+					allowPrivateNetwork:
+						filteredArgs.includes('--allow-private-network') || undefined
+				})
+			);
+		}
+		case 'credentials':
+			return outputResult(await httpRequest('GET', '/l402/credentials'));
+		case 'forget': {
+			const scope = filteredArgs[2];
+			if (!scope) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet l402 forget <scope>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest(
+					'DELETE',
+					`/l402/credential?scope=${encodeURIComponent(scope)}`
+				)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet l402 [fetch <url> --max-price <sats>|credentials|forget <scope>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleQueue(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'add': {
+			const bolt11 = filteredArgs[2];
+			if (!bolt11) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet queue add <bolt11> [--priority <1-10>] [--amount <sats>] [--max-fee <sats>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const priority = parseFlag('--priority');
+			const amount = parseFlag('--amount');
+			const maxFee = parseFlag('--max-fee');
+			return outputResult(
+				await httpRequest('POST', '/queue/add', {
+					bolt11,
+					priority: priority !== undefined ? parseInt(priority, 10) : undefined,
+					amountSats: amount !== undefined ? parseInt(amount, 10) : undefined,
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
+				})
+			);
+		}
+		case 'cancel':
+			return outputResult(
+				await httpRequest('POST', '/queue/cancel', { id: filteredArgs[2] })
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/queue'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet queue [add <bolt11>|cancel <id>|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+/**
+ * Third-party direct funding (issue #613): a payer's ordinary on-chain payment
+ * becomes this node's channel funding.
+ */
+async function handleDirectFunding(): Promise<void> {
+	const sub = filteredArgs[1];
+	const numberFlag = (name: string): number | undefined => {
+		const raw = parseFlag(name);
+		return raw === undefined ? undefined : parseInt(raw, 10);
+	};
+	// Both `request` and `send` end in an OPTIONAL amount, so the positionals
+	// have to come with every local value flag stripped: a raw index read turns
+	// `request --host h` into an amount of "--host" (the issue #534 bug class).
+	const pos = positionalArgs(
+		new Set([
+			'--lsp',
+			'--lsp-host',
+			'--lsp-port',
+			'--target-inbound',
+			'--trusted',
+			'--min-amount',
+			'--host',
+			'--port',
+			'--max-total-fee'
+		]),
+		// Boolean, so it is dropped rather than skipped with a value: left in,
+		// `send <request> --recover-receipt` made the flag the amount.
+		new Set(['--recover-receipt'])
+	);
+	switch (sub) {
+		case 'configure': {
+			// Every field is optional and the daemon MERGES: naming one leaves the
+			// rest as they were.
+			const trusted = parseFlag('--trusted');
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/configure', {
+					lspPubkey: parseFlag('--lsp'),
+					lspHost: parseFlag('--lsp-host'),
+					lspPort: numberFlag('--lsp-port'),
+					targetInboundSat: numberFlag('--target-inbound'),
+					trusted: trusted === undefined ? undefined : trusted === 'true',
+					minAmountSat: numberFlag('--min-amount')
+				})
+			);
+		}
+		case 'config':
+			return outputResult(await httpRequest('GET', '/direct-funding/config'));
+		case 'request': {
+			// host/port are the operator's: they are signed into the request as the
+			// address a payer can reach this node on, and the daemon never guesses.
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/request', {
+					host: parseFlag('--host'),
+					port: numberFlag('--port'),
+					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined
+				})
+			);
+		}
+		case 'prepare': {
+			const request = pos[2];
+			if (!request) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet direct-funding prepare <request>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/prepare', { request })
+			);
+		}
+		case 'send': {
+			const request = pos[2];
+			if (!request) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet direct-funding send <request> [sats] ' +
+							'[--max-total-fee sats] [--recover-receipt]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/direct-funding/send', {
+					request,
+					amountSats: pos[3] ? parseInt(pos[3], 10) : undefined,
+					maxTotalFeeSat: numberFlag('--max-total-fee'),
+					// Fish out a receipt a delivered payment never returned, without a
+					// second coin, signature or freeze (issue #767).
+					...(hasFlag('--recover-receipt') ? { recoverReceipt: true } : {})
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet direct-funding [configure|config|request|prepare|send]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleGraph(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'info':
+			return outputResult(await httpRequest('GET', '/graph/info'));
+		case 'node':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/graph/node?pubkey=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'channel':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/graph/channel?scid=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'describe': {
+			const params = new URLSearchParams();
+			const limit = parseFlag('--limit');
+			if (limit !== undefined) params.set('limit', limit);
+			const offset = parseFlag('--offset');
+			if (offset !== undefined) params.set('offset', offset);
+			const qs = params.toString();
+			return outputResult(
+				await httpRequest(
+					'GET',
+					qs ? `/graph/describe?${qs}` : '/graph/describe'
+				)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet graph [info|node <pubkey>|channel <scid>|describe [--limit N] [--offset N]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleWatchtower(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'list':
+			return outputResult(await httpRequest('GET', '/watchtowers'));
+		case 'add': {
+			const uri = filteredArgs[2];
+			if (!uri) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet watchtower add <pubkey@host:port>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/watchtower/add', { uri })
+			);
+		}
+		case 'remove': {
+			const uri = filteredArgs[2];
+			if (!uri) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet watchtower remove <pubkey@host:port>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('DELETE', '/watchtower/remove', { uri })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet watchtower [list|add <uri>|remove <uri>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleRoute(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'query': {
+			const destination = filteredArgs[2];
+			const sats = filteredArgs[3];
+			if (!destination || !sats) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet route query <destination> <sats> [--max-fee <sats>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const maxFee = parseFlag('--max-fee');
+			return outputResult(
+				await httpRequest('POST', '/route/query', {
+					destination,
+					amountSats: parseInt(sats, 10),
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
+				})
+			);
+		}
+		case 'estimate':
+			return outputResult(
+				await httpRequest('POST', '/route/estimate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'probe': {
+			const destination = filteredArgs[2];
+			const sats = filteredArgs[3];
+			if (!destination || !sats) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet route probe <destination> <sats>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/route/probe', {
+					destination,
+					amountSats: parseInt(sats, 10)
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet route [query <destination> <sats>|estimate <bolt11> [sats]|probe <destination> <sats>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleForwards(): Promise<void> {
+	const params = new URLSearchParams();
+	const since = parseFlag('--since');
+	if (since !== undefined) params.set('since', since);
+	if (filteredArgs[1] === 'summary') {
+		const qs = params.toString();
+		return outputResult(
+			await httpRequest('GET', `/forwards/summary${qs ? `?${qs}` : ''}`)
+		);
+	}
+	const limit = parseFlag('--limit');
+	if (limit !== undefined) params.set('limit', limit);
+	const qs = params.toString();
+	return outputResult(
+		await httpRequest('GET', `/forwards${qs ? `?${qs}` : ''}`)
+	);
+}
+
+async function handleRebalance(): Promise<void> {
+	const fromChannelId = filteredArgs[1];
+	const toChannelId = filteredArgs[2];
+	const amountSats = filteredArgs[3];
+	const maxFee = parseFlag('--max-fee');
+	// --max-fee is mandatory: the CLI never invents a routing-fee cap.
+	if (!fromChannelId || !toChannelId || !amountSats || maxFee === undefined) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet rebalance <fromChannelId> <toChannelId> <amountSats> --max-fee <sats>'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	return outputResult(
+		await httpRequest('POST', '/rebalance', {
+			fromChannelId,
+			toChannelId,
+			amountSats: parseInt(amountSats, 10),
+			maxFeeSats: parseInt(maxFee, 10)
+		})
+	);
+}
+
+async function handleAdvisor(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'recommendations':
+			return outputResult(await httpRequest('GET', '/advisor/recommendations'));
+		case 'execute-rebalances': {
+			const budget = parseFlag('--budget');
+			return outputResult(
+				await httpRequest('POST', '/advisor/execute-rebalances', {
+					budgetSatsPerDay:
+						budget !== undefined ? parseInt(budget, 10) : undefined
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet advisor [recommendations|execute-rebalances [--budget <sats>]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleBootstrap(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'discover':
+			return outputResult(await httpRequest('POST', '/peers/bootstrap'));
+		case 'connect':
+			return outputResult(
+				await httpRequest('POST', '/peers/connect-seeds', {
+					maxPeers: filteredArgs[2] ? parseInt(filteredArgs[2], 10) : undefined
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet bootstrap [discover|connect [maxPeers]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleTrustedPeer(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'add':
+			return outputResult(
+				await httpRequest('POST', '/trusted-peer/add', {
+					pubkey: filteredArgs[2]
+				})
+			);
+		case 'remove':
+			return outputResult(
+				await httpRequest('POST', '/trusted-peer/remove', {
+					pubkey: filteredArgs[2]
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/trusted-peers'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet trusted-peer [add|remove|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleOffer(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'create':
+			return outputResult(
+				await httpRequest('POST', '/offer/create', {
+					description: filteredArgs[2] || '',
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/offers'));
+		case 'remove':
+			return outputResult(
+				await httpRequest(
+					'DELETE',
+					`/offer?offerId=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'decode':
+			return outputResult(
+				await httpRequest('POST', '/offer/decode', {
+					offer: filteredArgs[2]
+				})
+			);
+		case 'pay':
+			return outputResult(
+				await httpRequest('POST', '/offer/pay', {
+					offer: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet offer [create|list|remove|decode|pay]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleGossip(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'sync':
+			return outputResult(
+				await httpRequest('POST', '/gossip/sync', {
+					pubkey: filteredArgs[2] || undefined
+				})
+			);
+		case 'sync-rapid':
+			return outputResult(await httpRequest('POST', '/gossip/sync-rapid'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet gossip [sync [pubkey]|sync-rapid]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleMessage(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'sign':
+			return outputResult(
+				await httpRequest('POST', '/message/sign', {
+					message: filteredArgs[2]
+				})
+			);
+		case 'verify':
+			return outputResult(
+				await httpRequest('POST', '/message/verify', {
+					message: filteredArgs[2],
+					signature: filteredArgs[3]
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet message [sign <message>|verify <message> <signature>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleBackup(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'trigger') {
+		// On-demand encrypted database backup to the configured backupPath.
+		return outputResult(await httpRequest('POST', '/backup/trigger'));
+	}
+	if (sub === 'peer-retrieved') {
+		// `beignet backup peer-retrieved`: newest valid SCB a peer returned via
+		// BOLT 1 peer storage. Restore explicitly with `beignet restore scb`.
+		return outputResult(await httpRequest('GET', '/backup/peer-retrieved'));
+	}
+	if (sub === 'scb') {
+		// `beignet backup scb [destPath]`: fetch the encrypted static channel
+		// backup; with destPath, write the encoded blob there instead of printing.
+		const result = await httpRequest('GET', '/backup/scb');
+		const destPath = filteredArgs[2];
+		if (!result.ok || !destPath) return outputResult(result);
+		const { encoded, channelCount } = result.result as {
+			encoded: string;
+			channelCount: number;
+		};
+		fs.writeFileSync(destPath, encoded);
+		return output({
+			ok: true,
+			result: { written: true, path: destPath, channelCount }
+		});
+	}
+	// `beignet backup <destPath>`: legacy full-database copy.
+	if (!sub) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet backup <destPath> | beignet backup scb [destPath] | beignet backup trigger'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
+}
+
+async function handleGuardian(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'status') {
+		// The guardian this node serves to others (issue #699): the sets, their
+		// sizes, the sessions, the limits.
+		return outputResult(await httpRequest('GET', '/guardian/status'));
+	}
+	output({
+		ok: false,
+		error: {
+			code: 'INVALID_PARAMS',
+			message: 'Usage: beignet guardian status'
+		}
+	});
+}
+
+async function handleRecovery(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'status') {
+		// Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8): the
+		// mode, the guardian set, the startup gate, and how far replication
+		// provably got.
+		return outputResult(await httpRequest('GET', '/recovery/status'));
+	}
+	if (sub === 'restore') {
+		// Guardian restore, only meaningful while the daemon reports
+		// restore-required (fresh database whose namespace the guardians hold).
+		// The takeover permanently fences any still-running old writer; typing
+		// this command is the operator's confirmation, so the daemon's explicit
+		// confirm gate is satisfied here.
+		return outputResult(
+			await httpRequest('POST', '/recovery/restore', { confirm: true })
+		);
+	}
+	if (sub === 'restore-capsule') {
+		// Peer-storage mode: restore from the Recovery Capsules storage peers
+		// returned this session. Typing the command is the confirmation; a
+		// Tier 2 result asks for a daemon restart. --unfenced is the labelled
+		// escape hatch for a capsule that names a guardian set whose
+		// guardians are gone: it cannot fence the previous writer.
+		return outputResult(
+			await httpRequest('POST', '/recovery/restore-capsule', {
+				confirm: true,
+				...(hasFlag('--unfenced') ? { unfenced: true } : {})
+			})
+		);
+	}
+	if (sub === 'capsule-guardians') {
+		// The best retrieved capsule's guardian set WITH its transport
+		// credentials, as config-file entries for recoveryGuardians. Typing
+		// the command is the confirmation.
+		return outputResult(
+			await httpRequest('POST', '/recovery/capsule-guardians', {
+				confirm: true
+			})
+		);
+	}
+	if (sub === 'rotate-guardians') {
+		// Move this wallet to a new guardian set (wire 5.9): the three entries
+		// after the command. Typing the command is the confirmation.
+		const entries = filteredArgs.slice(2);
+		if (entries.length !== 3) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet recovery rotate-guardians <entry> <entry> <entry>'
+				}
+			});
+			return;
+		}
+		return outputResult(
+			await httpRequest('POST', '/recovery/rotate-guardians', {
+				guardians: entries,
+				confirm: true
+			})
+		);
+	}
+	if (sub === 'resolve-guardian') {
+		// A beignet node's Lightning URI to a guardian entry (issue #699):
+		// asks the node's guardian for its id over a bolt8 session. Adopts
+		// nothing; the entry is for the operator to pin.
+		const uri = filteredArgs[2];
+		if (!uri) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet recovery resolve-guardian <node id>@host:port'
+				}
+			});
+			return;
+		}
+		return outputResult(
+			await httpRequest('POST', '/recovery/resolve-guardian', { uri })
+		);
+	}
+	output({
+		ok: false,
+		error: {
+			code: 'INVALID_PARAMS',
+			message:
+				'Usage: beignet recovery status | beignet recovery restore | ' +
+				'beignet recovery restore-capsule | beignet recovery capsule-guardians | ' +
+				'beignet recovery resolve-guardian <uri> | ' +
+				'beignet recovery rotate-guardians <entry> <entry> <entry>'
+		}
+	});
+	process.exitCode = 1;
+}
+
+async function handleRestore(): Promise<void> {
+	const sub = filteredArgs[1];
+	const file = filteredArgs[2];
+
+	if (sub === 'scb') {
+		// On-chain recovery only: channels are reconstructed in a broadcast-banned
+		// state and funds arrive when each peer force-closes. Requires the daemon.
+		if (!file) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet restore scb <file>'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		let encoded: string;
+		try {
+			encoded = fs.readFileSync(file, 'utf8').trim();
+		} catch (err: unknown) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: `Cannot read SCB file: ${(err as Error).message}`
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		return outputResult(await httpRequest('POST', '/restore/scb', { encoded }));
+	}
+
+	if (sub === 'db') {
+		// OFFLINE full-state restore: copies a database backup into place. The
+		// daemon must be stopped - the restore holds the same single-instance
+		// lock the daemon takes, so a live node is never overwritten.
+		if (!file) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet restore db <backupFile>'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		const config = resolveConfig({});
+		if (!config.mnemonic) {
+			output({
+				ok: false,
+				error: {
+					code: 'NO_MNEMONIC',
+					message:
+						'No mnemonic found. Run "beignet init" first or set BEIGNET_MNEMONIC (the restored DB is seed-encrypted and needs the same mnemonic).'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		// Belt and braces: the PID file catches a daemon started via this CLI
+		// even when it runs on a different data dir than the one resolved here.
+		const pidInfo = readPidFile();
+		if (pidInfo) {
+			try {
+				process.kill(pidInfo.pid, 0);
+				output({
+					ok: false,
+					error: {
+						code: 'DAEMON_RUNNING',
+						message: `Daemon is running (PID ${pidInfo.pid}). Stop it with 'beignet stop' before restoring the database.`
+					}
+				});
+				process.exitCode = 1;
+				return;
+			} catch {
+				// Stale PID file - the instance lock below is the real gate.
+			}
+		}
+		const network = config.network || 'mainnet';
+		const dataDir =
+			config.dataDir || defaultDataDirForMnemonic(config.mnemonic);
+		const dbPath = nodePath.join(dataDir, `${network}.db`);
+		const lockPath = nodePath.join(dataDir, `${network}.lock`);
+		try {
+			fs.mkdirSync(dataDir, { recursive: true });
+			const result = performDbRestore(file, dbPath, lockPath);
+			output({
+				ok: true,
+				result: {
+					restored: true,
+					dbPath: result.dbPath,
+					preRestorePath: result.preRestorePath,
+					network,
+					note: 'DB is encrypted under the wallet seed; start the node with the same mnemonic.'
+				}
+			});
+		} catch (err: unknown) {
+			const code =
+				err instanceof InstanceLockError ? 'DAEMON_RUNNING' : 'RESTORE_FAILED';
+			output({
+				ok: false,
+				error: { code, message: (err as Error).message }
+			});
+			process.exitCode = 1;
+		}
+		return;
+	}
+
+	output({
+		ok: false,
+		error: {
+			code: 'UNKNOWN_COMMAND',
+			message:
+				'Usage: beignet restore scb <file> | beignet restore db <backupFile>'
+		}
+	});
+	process.exitCode = 1;
+}
+
+async function handleMetrics(): Promise<void> {
+	const port = getDaemonPort();
+	const token = getApiToken();
+	return new Promise((resolve, reject) => {
+		const headers: Record<string, string> = {};
+		if (token) headers['Authorization'] = `Bearer ${token}`;
+		const req = http.request(
+			{ hostname: '127.0.0.1', port, path: '/metrics', method: 'GET', headers },
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on('data', (chunk: Buffer) => chunks.push(chunk));
+				res.on('end', () => {
+					process.stdout.write(Buffer.concat(chunks).toString());
+					resolve();
+				});
+			}
+		);
+		req.on('error', (err) => {
+			reject(
+				new Error(
+					`Cannot connect to daemon on port ${port}: ${err.message}. Is it running?`
+				)
+			);
+		});
+		req.end();
+	});
+}
+
+function outputResult(result: ApiResponse<unknown>): void {
+	output(result);
+	if (!result.ok) process.exitCode = 1;
+}
+
+function printHelp(): void {
+	const help = `beignet - AI-friendly Bitcoin + Lightning CLI
+
+Usage: beignet <command> [options]
+
+Setup:
+  init [--network N] [--alias A]         Generate mnemonic + config
+  start [flags]                          Start node daemon
+  stop                                   Stop daemon
+
+Info:
+  info                                   Node info
+  balance                                On-chain + Lightning balance
+  address                                New receive address
+  address --bip21 [--amount <sats>] [--label L] [--message M]
+                                         New address as a BIP21 URI
+  address validate <address>             Validate a Bitcoin address
+  address label <address> [label]        Set a user label for an address
+                                         (omit the label to clear it)
+  address labels                         List all user address labels
+  mnemonic                               Show mnemonic
+  health                                 Node health status
+  ready                                  Whether the node is operational
+  readiness                              Mainnet readiness checklist
+  metrics                                Prometheus-format metrics (text/plain)
+  stats [windowMs]                       Node statistics (optional time window)
+  liquidity                              Liquidity snapshot + recommendations
+  fees                                   On-chain fee trend analysis
+  spend-limit                            Combined LN + on-chain daily spend
+                                         limit status (with breakdown)
+  logs [--category C] [--since ts] [--limit n]
+                                         Query the persistent action log
+  can-send [sats]                        Check Lightning send capacity
+  can-receive [sats]                     Check Lightning receive capacity
+  node uri [--host <addr>]               Node connection URI (pubkey@host:port)
+  node wait-ready [--timeout ms]         Block until the node is operational
+
+On-chain:
+  send <address> <sats>                  Send on-chain
+  send-max <address> [satsPerVbyte]      Sweep the whole on-chain balance
+  tx bump-fee <txid> <satsPerVbyte>      RBF an unconfirmed tx at a higher fee
+  tx boost <txid> [satsPerVbyte]         Fee-bump a tx (RBF when possible,
+                                         else CPFP)
+  tx boostable                           List unconfirmed txs eligible for
+                                         RBF/CPFP
+  consolidate [satsPerVbyte]             Merge all UTXOs into one output at a
+                                         fresh wallet address
+  psbt build <address> <sats> [satsPerVbyte]
+                                         Build an UNSIGNED PSBT for an external
+                                         signer (hardware wallet)
+  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast
+  psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
+  transactions [limit]                   List on-chain transactions (newest first)
+  utxos                                  List wallet UTXOs (includes frozen flag)
+  utxo freeze <txid> <index>             Freeze a UTXO (excluded from coin
+                                         selection until unfrozen)
+  utxo unfreeze <txid> <index>           Unfreeze a UTXO
+  utxo frozen                            List frozen UTXOs
+  fee-estimates                          Current fee estimates (sats/vbyte)
+  wallet refresh                         Re-sync the on-chain wallet
+  wallet descriptors                     Export BIP 380 output descriptors
+                                         (public keys only, never private)
+  recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
+                                         the wallet
+  backup <destPath>                      Create database backup
+  backup trigger                         Run the configured scheduled backup now
+  backup scb [destPath]                  Export encrypted static channel backup
+  backup peer-retrieved                  Show newest SCB returned by a peer
+                                         (BOLT 1 peer storage)
+  restore scb <file>                     Restore channels from an SCB (on-chain
+                                         recovery only: peers force-close and
+                                         funds are swept to the wallet)
+  restore db <backupFile>                Restore a database backup (full state;
+                                         OFFLINE - stop the daemon first; needs
+                                         the same mnemonic, DB is seed-encrypted)
+  recovery status                        Recovery Protocol status: mode, guardian
+                                         set, startup gate, durable sequence
+  recovery restore                       Restore this node from its guardian
+                                         replicas (daemon must be in the
+                                         restore-required state: fresh database,
+                                         namespace held by the guardians; channels
+                                         RESUME instead of force-closing)
+  recovery restore-capsule [--unfenced]  Peer-storage mode: restore from the
+                                         Recovery Capsules storage peers returned
+                                         (connect to the old channel peers first;
+                                         Tier 2 asks for a daemon restart).
+                                         --unfenced restores a capsule that names
+                                         guardians WITHOUT fencing the old writer
+                                         (guardian set gone; never for quorum)
+  recovery capsule-guardians             The guardian set the best retrieved
+                                         capsule names, credentials included, as
+                                         config entries for recoveryGuardians
+  recovery resolve-guardian <uri>        A beignet node's Lightning URI
+                                         (<node id>@host:port) to a guardian entry
+                                         <guardianId>@bolt8://<node id>@host:port,
+                                         by asking its guardian over a bolt8
+                                         session. Adopts nothing
+  recovery rotate-guardians <e> <e> <e>  Move this wallet to a new guardian set
+                                         (one member or all three) with the
+                                         channels running: registers with the new
+                                         set under the current lease, backfills,
+                                         switches, retires the old set. The old
+                                         set is retired for good
+  guardian status                        The guardian this node serves to others:
+                                         sets, sizes, sessions, limits (needs
+                                         --guardian-serve)
+
+Peers:
+  peer connect <pubkey> <host> <port>    Connect to peer
+  peer connect <pubkey> <ws://host:port> Connect over WebSocket (ws:// or wss://)
+  peer connect <pubkey@[ws://]host:port> Connect by URI
+  peer disconnect <pubkey>               Disconnect peer
+  peer list                              List peers
+
+DNS Bootstrap (BOLT 10):
+  bootstrap discover                     Discover peers via DNS seeds
+  bootstrap connect [maxPeers]           Connect to discovered peers
+
+Trusted Peers (Zero-Conf):
+  trusted-peer add <pubkey>              Trust peer for zero-conf channels
+  trusted-peer remove <pubkey>           Remove peer from trusted set
+  trusted-peer list                      List trusted peers
+
+Channels:
+  channel open <pubkey> <sats> [push] [--sats-per-vbyte N] [--max]
+                                         Open channel (auto-funded)
+  channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
+  channel open-v2 <pubkey> <sats> [feerate] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+                                         Open dual-funded v2 channel; the
+                                         lease flags buy inbound liquidity
+                                         (option_will_fund) at or under the
+                                         given rate ceiling
+  channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
+                                         Open channel + block until NORMAL
+  channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max] [--trusted]
+                                         Connect to peer + open in one call
+                                         --trusted: zero-conf, usable before
+                                         confirmation (trusted peers only)
+  channel close <id>                     Cooperative close
+                                         --accept-stale-state-risk: required
+                                         for a channel restored from a
+                                         Recovery Capsule, whose balances a
+                                         mutual close would pay out unproven
+  channel forceclose <id>                Force close
+                                         --accept-stale-state-risk: required
+                                         for a channel restored from a
+                                         Recovery Capsule, whose commitment
+                                         the peer may have already revoked
+  channel rebroadcast-close <id>         Rebroadcast recorded close tx
+  channel funding-quote <pubkey> [satsPerVbyte]
+                                         Peer-aware max open preview: v1 or
+                                         v2 decided like openChannel would
+  channel splice-quote <id> <in|out> <feerate>
+                                         Quote a splice: fee + max amount
+  channel splice-in <id> <sats> <feerate>   Add funds to channel
+  channel splice-out <id> <sats> <feerate> [address]
+                                         Withdraw funds from channel, to the
+                                         wallet or an external address
+  channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
+  channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
+                        [--htlc-min-msat N] [--htlc-max-msat N]
+                                         Set routing fee policy (channel_update)
+  channel update-commitment-feerate <id> <feeratePerKw>
+                                         Set COMMITMENT feerate (BOLT 2
+                                         update_fee), not the routing policy
+  channel policy <id>                    Effective routing policy for a channel
+  channel list                           List channels
+  channel ready                          List channels in NORMAL state
+  channel get <id>                       Channel details (includes routing policy)
+  channel health <id>                    Channel health + liquidity warnings
+  channel diagnostics <id>               Routing-readiness diagnostics for a channel
+  channel suggestions [count]            Graph-based channel open suggestions
+  channel wait-ready <id> [--timeout ms] Block until a channel reaches NORMAL
+
+Invoices & Payments:
+  invoice create <sats> [description] [--min-final-cltv blocks]
+                                         Create BOLT 11 invoice
+  invoice jit <lspPubkey> [sats] [description] [--expiry secs]
+             [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]
+             [--fee-mode skim|hop]       Create an invoice payable with no
+                                         channel: the LSP funds one mid-payment
+                                         and takes the agreed opening fee out
+                                         of the delivery (skim, default) or
+                                         from the sender via the hint (hop)
+  jit status                             The JIT receive role as it stands:
+                                         fee, exposure caps, sats reserved and
+                                         fronted, live intents
+  jit quote <lspPubkey> [sats] [--target-inbound sats]
+                                         What a JIT receive would cost at that
+                                         LSP and whether it would be served
+                                         right now; registers nothing
+
+Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
+       submarine: a peer funds a contract, we pay its invoice and claim):
+  swaps status                           The provider role as it stands: fee,
+                                         exposure caps, timing, swaps per
+                                         state, principal at risk, and the
+                                         submarine direction under "submarine"
+  swaps list [--id <hex>]                The swap ledger (or one swap)
+  swaps cancel <id>                      Cancel a swap nothing has moved for
+                                         yet (reverse: closes its hold invoice;
+                                         submarine: before this node pays)
+  invoice create-hold <hash> [sats] [description] [--expiry secs]
+                                         Create hold invoice for a payment hash
+                                         you supply (keep the preimage; HTLCs
+                                         park until settle-hold/cancel-hold).
+                                         --min-final-cltv <blocks> sets the
+                                         final CLTV a swap leg needs to outlive
+                                         its on-chain leg
+  invoice settle-hold <preimage>         Settle a parked hold invoice
+  invoice cancel-hold <hash>             Cancel a hold invoice (fails HTLCs back)
+  invoice held                           List hold invoices + their state
+  invoice decode <bolt11>                Decode invoice
+  invoice validate <bolt11> [sats]       Pre-flight checks: should this be paid?
+  invoice get <hash>                     Details of an invoice we created
+  invoice pay <bolt11>                   Pay invoice (blocks until settled)
+  invoice pay-safe <bolt11> [--max-fee N] [--amount N] [--timeout ms]
+                                         Pay; resolves with status FAILED
+                                         instead of erroring
+  invoice pay-async <bolt11> [--max-fee N] [--amount N]
+                                         Fire-and-forget pay; poll 'payment get'
+  invoice pay-retry <bolt11> [flags]     Pay with exponential backoff retry
+  invoice list                           List created invoices
+  keysend [safe] <pubkey> <sats> [--max-fee N] [--timeout ms]
+                                         Spontaneous payment, no invoice needed
+                                         ('safe' resolves FAILED, never errors)
+  payment list                           List payments
+  payment get <hash>                     Payment details
+  payment cancel <hash>                  Cancel a pending outbound payment
+  payment wait <hash> [--timeout ms]     Block until a payment settles
+  payment proof <hash>                   Cryptographic payment proof
+  payment verify-proof <hash>            Verify a stored payment proof
+  payment estimate <bolt11> [sats]       Success probability + fee estimate
+  payment metadata <hash> <json>         Attach key-value metadata to a payment
+  payment send-to-route <hash> <route>   Pay along an explicit route (inline
+                                         JSON or a file with 'route query'
+                                         output) [--payment-secret <hex>]
+  queue add <bolt11> [--priority N] [--amount N] [--max-fee N]
+                                         Enqueue a payment for ordered dispatch
+  queue cancel <id>                      Cancel a queued payment
+  queue list                             List the payment queue
+  l402 fetch <url> --max-price N         Fetch an L402-gated URL, paying up to N sats
+  l402 credentials                       List paid L402 credentials
+  l402 forget <scope>                    Drop a credential so the next fetch pays again
+
+Graph Queries:
+  graph info                             Graph summary (node/channel counts)
+  graph node <pubkey>                    Node announcement info + its channels
+  graph channel <scid>                   Channel endpoints + both fee policies
+                                         (scid: <block>x<tx>x<out> or hex)
+  graph describe [--limit N] [--offset N]  Paged channel dump (default 500)
+  gossip sync [pubkey]                   Sync gossip from peers (or one peer)
+  gossip sync-rapid                      Rapid Gossip Sync snapshot (mainnet)
+  route query <destination> <sats>       Compute a route without paying
+                                         [--max-fee <sats>]
+  route estimate <bolt11> [sats]         Estimate route fee for an invoice
+  route probe <destination> <sats>       Probe route viability (no payment)
+
+Routing:
+  forwards [--since ts] [--limit n]      List settled forwards (fees earned)
+  forwards summary [--since ts]          Forwarding totals (count, volume, fees)
+  rebalance <fromId> <toId> <sats> --max-fee <sats>
+                                         Circular rebalance between two of our
+                                         channels (aborts if fee exceeds cap)
+  advisor recommendations                Liquidity analysis + rebalance plan
+  advisor execute-rebalances [--budget <sats>]
+                                         Run the advisor's rebalance plan under
+                                         a per-day fee budget
+
+Messages:
+  message sign <message>                 Sign with the node key (LND-compatible)
+  message verify <message> <signature>   Recover + check the signer pubkey
+Watchtowers:
+  watchtower list                        Per-tower session + backlog health
+  watchtower add <pubkey@host:port>      Add an LND altruist watchtower
+  watchtower remove <pubkey@host:port>   Remove a watchtower
+
+BOLT 12 Offers:
+  offer create <description> [amountSats]  Create reusable offer
+  offer list                             List local offers
+  offer decode <offer>                   Decode a BOLT 12 offer string
+  offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+
+Direct funding (a payer's on-chain payment IS this node's channel funding):
+  direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]
+                           [--min-amount sats] [--trusted true|false]
+                           [--target-inbound sats]
+                                         Set the liquidity peer and policy.
+                                         MERGES: a field you do not name keeps
+                                         its value
+  direct-funding config                  Read the effective policy back
+  direct-funding request [sats] [--host H] [--port P]
+                                         Mint a payment request; the receipt
+                                         preimage stays here. --host/--port are
+                                         where a payer can reach this node
+  direct-funding prepare <request>       Decode a request and start connecting
+                                         to the node a send would use, without
+                                         spending anything
+  direct-funding send <request> [sats] [--max-total-fee sats]
+                                         Pay a request from one of our coins.
+                                         Refuses only before our witness leaves
+                                         the device; after that it reports what
+                                         is known rather than failing
+
+Webhooks (event push; see also GET /events SSE):
+  webhooks register <url> <events> [--secret S]
+                                         Register a callback URL; <events> is
+                                         comma-separated (or '*' for all)
+  webhooks unregister <id>               Remove a webhook
+  webhooks list                          List registered webhooks
+
+API auth (scoped keys; see apiKeys config):
+  auth keys                              List named API keys (names, scopes,
+                                         revoked/expired, expiresAt, rotatedAt;
+                                         never secrets)
+  auth revoke <name>                     Disable a named key immediately;
+                                         persisted, survives restarts
+  auth rotate <name>                     Mint a new random secret for a named
+                                         key (printed ONCE, never again); the
+                                         old secret stops working immediately
+
+Start flags:
+  --network <name>                       mainnet | testnet | signet | regtest
+  --fee-source <src>                     Fee estimate source: electrum | http |
+                                         auto (default: auto = Electrum first,
+                                         HTTP fallback)
+  --port <N>                             HTTP daemon port (default: 2112)
+  --log-level <level>                    Daemon stderr log level: debug | info |
+                                         warn | error | silent (default: silent;
+                                         env BEIGNET_LOG_LEVEL, config logLevel)
+  --host <addr>                          HTTP daemon bind address (default: 127.0.0.1)
+  --daemon                               Run in background
+  --anchors                              Prefer anchor channels (zero-fee HTLC)
+  --api-token <token>                    API authentication token (legacy single
+                                         token, implicit admin scope; named
+                                         scoped keys go in the apiKeys config
+                                         or BEIGNET_API_KEYS env JSON)
+  --api-key <key>                        Alias of --api-token for sending a
+                                         named key's secret with any command
+  --backup-path <path>                   Enable automated backups to path
+  --backup-interval <ms>                 Backup interval (default: 21600000 = 6h)
+  --daily-spend-limit <sats>             Combined daily spending limit in sats
+                                         (Lightning payments AND external
+                                         on-chain sends share one budget)
+  --tls-cert <path>                      TLS certificate file (enables HTTPS)
+  --tls-key <path>                       TLS private key file (requires --tls-cert)
+  --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
+                                         connections (e.g. Tor at 127.0.0.1:9050)
+  --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
+                                         (IPv4, [ipv6]:port, .onion v3, or hostname;
+                                         port defaults to 9735)
+  --htlc-events                          Relay per-HTLC events (htlc:forwarded/
+                                         fulfilled/failed) over SSE + webhooks
+                                         (off by default: high volume on routers)
+  --no-forwarding                        Decline to relay third-party HTLCs, i.e.
+                                         do not act as a routing hop (forwarding
+                                         is on by default)
+  --eager-gossip-verify                  Verify foreign gossip signatures at intake
+                                         instead of lazily at serve time (off by
+                                         default; for relay-class nodes)
+  --no-auto-reconnect                    Do not dial known peers, channel partners
+                                         included, on start or disconnect. With no
+                                         listen/websocket port either, the node is
+                                         genuinely quiet (reconnect is on by default)
+  --recovery-mode <mode>                 Recovery Protocol mode: off | peer-storage |
+                                         async-remote | quorum (default: off; env
+                                         BEIGNET_RECOVERY_MODE; unknown values are
+                                         ignored and off rules)
+  --recovery-guardian <pubkey@url>       One guardian of the crash-v1 set, as a
+                                         64-hex x-only pubkey @ http(s) URL. Repeat
+                                         exactly three times for async-remote/quorum
+                                         (env BEIGNET_RECOVERY_GUARDIANS, comma list)
+  --recovery-profile <name>              Recovery fault-model profile; crash-v1 is
+                                         the only accepted value and the default
+                                         (env BEIGNET_RECOVERY_PROFILE)
+  --guardian-serve                       Serve the reference guardian to other
+                                         beignet nodes at this node's Lightning
+                                         address, over bolt8 sessions; needs
+                                         --listen-port (env BEIGNET_GUARDIAN_SERVE;
+                                         BEIGNET_GUARDIAN_TOKEN, _MAX_BYTES,
+                                         _MAX_SETS, _MAX_CIPHERTEXT_BYTES tune it)
+  --guardian-token <token>               Bearer token guardian sessions must present
+                                         (default: open; env BEIGNET_GUARDIAN_TOKEN)
+  --recovery-auto-apply                  peer-storage mode: on a boot whose database
+                                         is empty, apply the best Recovery Capsule the
+                                         storage peers return with no operator call,
+                                         then resume the channels in-process. Cannot
+                                         fence a previous device that still runs
+                                         (default: off; env BEIGNET_RECOVERY_AUTO_APPLY;
+                                         BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS and
+                                         _MAX_WAIT_MS bound the wait for replicas)
+
+Pay-retry flags:
+  --max-retries <N>                      Max retry attempts (default: 3)
+  --backoff-ms <N>                       Base backoff delay (default: 2000)
+  --max-fee <sats>                       Max routing fee cap
+
+Global options:
+  --pretty                               Pretty-print JSON output
+
+All output is JSON (except 'metrics'). The CLI sends HTTP requests to the daemon on 127.0.0.1:2112.`;
+
+	process.stdout.write(help + '\n');
+}
+
+main().catch((err) => {
+	output({
+		ok: false,
+		error: { code: 'FATAL', message: err.message || String(err) }
+	});
+	process.exitCode = 1;
+});

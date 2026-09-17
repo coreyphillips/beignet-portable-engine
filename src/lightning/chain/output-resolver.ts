@@ -1,0 +1,3738 @@
+/**
+ * BOLT 5: Output resolver.
+ *
+ * Given a commitment transaction on-chain + channel state, classifies
+ * each output and builds appropriate spend transactions.
+ */
+
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import crypto from 'crypto';
+import {
+	CommitmentType,
+	OutputType,
+	ITrackedOutput,
+	OutputStatus
+} from './types';
+import {
+	buildToLocalSweepTx,
+	buildToLocalDelayedWitness,
+	buildSecondLevelSweepTx,
+	buildToRemoteClaimTx,
+	buildToRemoteWitness,
+	buildToRemoteAnchorWitness,
+	buildRemoteHtlcPreimageClaimTx,
+	buildRemoteHtlcPreimageWitness,
+	buildRemoteHtlcTimeoutClaimTx,
+	buildRemoteHtlcTimeoutWitness,
+	buildHtlcSuccessWitness,
+	buildHtlcTimeoutWitness,
+	signSweepInput,
+	signP2wpkhInput,
+	estimateSweepVbytes,
+	encodeWitnessSignature
+} from './sweep';
+import { buildToLocalScript, csvFromToLocalScript } from '../script/commitment';
+import { isDustOutput } from './closing';
+import {
+	buildToRemoteAnchorOutput,
+	leaseCsvFromToRemoteScript
+} from '../script/anchor';
+import {
+	buildOfferedHtlcScript,
+	buildReceivedHtlcScript,
+	buildHtlcSuccessTx,
+	buildHtlcTimeoutTx
+} from '../script/htlc';
+import {
+	buildTaprootToLocalOutput,
+	buildTaprootToRemoteOutput,
+	buildTaprootOfferedHtlcOutput,
+	buildTaprootReceivedHtlcOutput,
+	buildTaprootSecondLevelOutput,
+	tweakTaprootKeyPathPrivkey,
+	TAPLEAF_VERSION
+} from '../script/commitment-taproot';
+import {
+	buildTaprootHtlcSuccessTx,
+	buildTaprootHtlcTimeoutTx,
+	taprootHtlcLeafSighash,
+	tapleafHash,
+	signTaprootHtlcLeaf,
+	TAPROOT_HTLC_SIGHASH_TYPE
+} from '../script/htlc-taproot';
+import {
+	buildPenaltyTx,
+	estimatePenaltyTxFee,
+	signPenaltyInput,
+	buildToLocalPenaltyWitness,
+	buildHtlcPenaltyWitness
+} from '../script/revocation';
+import {
+	derivePublicKey,
+	deriveRevocationPubkey,
+	deriveRevocationPrivkey,
+	derivePrivateKey,
+	perCommitmentPointFromSecret
+} from '../keys/derivation';
+import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
+import { IChannelState } from '../channel/channel-state';
+import { leaseCsvBlocks } from '../channel/liquidity-ads';
+import {
+	ChannelRole,
+	HtlcDirection,
+	HtlcState,
+	IHtlcEntry,
+	isAnchorChannel,
+	isTaprootChannel
+} from '../channel/types';
+import {
+	getCommitmentFeeRate,
+	HTLC_SUCCESS_WEIGHT,
+	HTLC_TIMEOUT_WEIGHT
+} from '../channel/commitment-builder';
+
+const SIGHASH_ALL = bitcoin.Transaction.SIGHASH_ALL;
+const SIGHASH_ANCHOR =
+	bitcoin.Transaction.SIGHASH_SINGLE | bitcoin.Transaction.SIGHASH_ANYONECANPAY;
+
+/**
+ * The exact fee a pre-signed second-level HTLC transaction commits to. The
+ * remote party signed this amount in commitment_signed, so the on-chain claim
+ * MUST reproduce it byte-for-byte or the signature is invalid. Anchor channels
+ * use zero-fee second-level txs (bumped later via CPFP / extra inputs).
+ */
+function secondLevelHtlcFee(state: IChannelState, isSuccess: boolean): bigint {
+	if (isAnchorChannel(state.channelType)) return 0n;
+	// Rebuild at the rate the signature covers (signedLocal), never the
+	// in-flight rate a half-finished fee round may have staged.
+	const feeratePerKw = getCommitmentFeeRate(state, true);
+	const weight = isSuccess ? HTLC_SUCCESS_WEIGHT : HTLC_TIMEOUT_WEIGHT;
+	return BigInt(Math.floor((weight * feeratePerKw) / 1000));
+}
+
+bitcoin.initEccLib(ecc);
+
+/**
+ * Classified commitment transaction info.
+ */
+export interface IClassifiedCommitment {
+	type: CommitmentType;
+	commitmentNumber: bigint;
+}
+
+/**
+ * A resolved output with its spend transaction and witness.
+ */
+export interface IResolvedOutput {
+	trackedOutput: ITrackedOutput;
+	spendTx?: bitcoin.Transaction;
+	witness?: Buffer[];
+	/** The spend was fully constructible but could not cover its fee and dust. */
+	declinedAsUneconomic?: boolean;
+	/** CSV delay before this output can be spent */
+	csvDelay?: number;
+	/** CLTV expiry before this output can be spent */
+	cltvExpiry?: number;
+}
+
+// ─────────────── Commitment Number Extraction ───────────────
+
+/**
+ * Extract the commitment number from a commitment transaction.
+ * Reverses the obscured commitment number encoded in locktime + sequence.
+ *
+ * BOLT 3: obscured = ((upper 24 bits from sequence) << 24) | (lower 24 bits from locktime)
+ */
+export function extractCommitmentNumber(
+	tx: bitcoin.Transaction,
+	openPaymentBasepoint: Buffer,
+	acceptPaymentBasepoint: Buffer
+): bigint {
+	const locktime = tx.locktime;
+	const sequence = tx.ins[0].sequence;
+
+	// Extract obscured number: lower 24 bits of locktime + upper 24 bits from (sequence & 0xFFFFFF)
+	const lower24 = BigInt(locktime & 0xffffff);
+	const upper24 = BigInt(sequence & 0xffffff);
+	const obscured = (upper24 << 24n) | lower24;
+
+	// Compute the mask to un-obscure
+	const hash = crypto
+		.createHash('sha256')
+		.update(openPaymentBasepoint)
+		.update(acceptPaymentBasepoint)
+		.digest();
+
+	let mask = 0n;
+	for (let i = 26; i < 32; i++) {
+		mask = (mask << 8n) | BigInt(hash[i]);
+	}
+
+	return obscured ^ mask;
+}
+
+// ─────────────── Commitment Classification ───────────────
+
+/**
+ * BOLT 3 commitment transactions stamp the obscured commitment number into
+ * locktime and sequence with fixed type bytes: locktime = 0x20000000 | lower24
+ * and sequence = 0x80000000 | upper24 (script/commitment.ts, one stamping site
+ * shared by segwit and taproot commitments). No cooperative close can carry
+ * both: accepted close locktimes are block heights below 500_000_000 (never
+ * prefix 0x20) and close sequences are 0xffffffff or the RBF-signalling
+ * 0xfffffffd (prefix 0xff, never 0x80).
+ */
+const COMMITMENT_LOCKTIME_PREFIX = 0x20;
+const COMMITMENT_SEQUENCE_PREFIX = 0x80;
+
+/**
+ * Classify a commitment transaction by comparing it against expected values.
+ */
+export function classifyCommitmentTx(
+	tx: bitcoin.Transaction,
+	state: IChannelState
+): IClassifiedCommitment {
+	// A funding spend with no inputs is not evidence of anything; route it to
+	// the ERROR arm rather than throwing or silently resolving the channel.
+	if (tx.ins.length === 0) {
+		return { type: CommitmentType.UNKNOWN, commitmentNumber: 0n };
+	}
+	// Cooperative close needs no key material to identify: commitments are the
+	// only funding spends carrying the BOLT 3 type stamp, and every funding
+	// spend reaching this classifier is one we co-signed, so anything unstamped
+	// is a mutual close (legacy 0/0xffffffff, taproot legacy 0xfffffffd, simple
+	// close negotiated-locktime/0xfffffffd). Splice transactions also lack the
+	// stamp but never reach here: the chain watcher filters them by txid via
+	// the pre-splice leg's ignoreSpendTxid (expectedSpenderFor) before
+	// reporting a funding spend, and this classifier depends on that filter.
+	// Checked before the key-material guard so a recovery state without remote
+	// basepoints still recognizes a mutual close.
+	const isCommitmentStamped =
+		tx.locktime >>> 24 === COMMITMENT_LOCKTIME_PREFIX &&
+		tx.ins[0].sequence >>> 24 === COMMITMENT_SEQUENCE_PREFIX;
+	if (!isCommitmentStamped) {
+		return { type: CommitmentType.COOPERATIVE_CLOSE, commitmentNumber: 0n };
+	}
+
+	if (!state.remoteBasepoints || !state.fundingTxid) {
+		// Static-channel-backup recovery: the reconstructed state has no remote
+		// basepoints, so the obscured commitment number cannot be extracted. With
+		// dataLossDetected set we can never have broadcast a commitment ourselves
+		// (Channel.forceClose refuses and scanStuckChannels skips), so any
+		// non-cooperative spend of the funding output is necessarily the peer's
+		// commitment: treat it as THEIR_FUTURE_COMMITMENT and resolve only our
+		// to_remote, which derives from our STATIC payment basepoint and needs no
+		// peer key material.
+		if (state.dataLossDetected) {
+			return {
+				type: CommitmentType.THEIR_FUTURE_COMMITMENT,
+				commitmentNumber: 0n
+			};
+		}
+		return { type: CommitmentType.UNKNOWN, commitmentNumber: 0n };
+	}
+
+	const isOpener = state.role === ChannelRole.OPENER;
+	const openPaymentBasepoint = isOpener
+		? state.localBasepoints.paymentBasepoint
+		: state.remoteBasepoints.paymentBasepoint;
+	const acceptPaymentBasepoint = isOpener
+		? state.remoteBasepoints.paymentBasepoint
+		: state.localBasepoints.paymentBasepoint;
+
+	const commitmentNumber = extractCommitmentNumber(
+		tx,
+		openPaymentBasepoint,
+		acceptPaymentBasepoint
+	);
+
+	const matchesLocal = commitmentNumber === state.localCommitmentNumber;
+	const matchesRemote = commitmentNumber === state.remoteCommitmentNumber;
+	const possibleLivePeerPrevious =
+		commitmentNumber < state.remoteCommitmentNumber &&
+		(state.remoteRevocationNumber !== undefined
+			? commitmentNumber === state.remoteRevocationNumber
+			: commitmentNumber + 1n === state.remoteCommitmentNumber);
+
+	if (matchesLocal && matchesRemote) {
+		// Both commitment numbers are equal — differentiate by comparing
+		// the to_local output script against expected local vs remote commitment.
+		// On our commitment, to_local uses our delayed key with their revocation.
+		// On their commitment, to_local uses their delayed key with our revocation.
+		const type = disambiguateCommitmentTx(tx, state, commitmentNumber);
+		return { type, commitmentNumber };
+	}
+
+	if (matchesLocal) {
+		// The index also equals OUR local commitment number, but that is not proof
+		// of ownership: during an in-flight round localCommitmentNumber lags
+		// remoteCommitmentNumber by one, so a peer's REVOKED commitment can share
+		// this exact index. If we hold the revocation secret for it, decide ownership
+		// by matching the actual to_local script — never by index equality alone.
+		// (Fund-safety: otherwise a revoked breach at this index is misread as ours
+		// and never penalized, letting the peer sweep a stale, self-favorable state.)
+		const revokedSecret =
+			commitmentNumber < state.remoteCommitmentNumber
+				? state.shaChainStore.getSecret(MAX_INDEX - commitmentNumber)
+				: undefined;
+		// The peer's still-UNREVOKED previous commitment can share this index
+		// too (issue #573): during the commitment_signed -> revoke_and_ack
+		// window the peer legitimately holds both its previous commitment
+		// (at remoteRevocationNumber, no secret stored yet) and the newly
+		// signed one. Index equality alone must never decide ownership here
+		// either, or the peer broadcasting that fully valid commitment is
+		// misread as OUR close: zero outputs match our keys, the whole
+		// balance sits unwatched, and preimage-held HTLCs time out back to
+		// the peer.
+		const livePeerPrevious = !revokedSecret && possibleLivePeerPrevious;
+		if (revokedSecret || livePeerPrevious) {
+			const byScript = disambiguateCommitmentTx(tx, state, commitmentNumber);
+			if (revokedSecret && byScript !== CommitmentType.OUR_COMMITMENT) {
+				// Our outputs are absent from this tx, so route the peer's revoked
+				// commitment sharing our index to the penalty path.
+				return {
+					type: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					commitmentNumber
+				};
+			}
+			if (
+				livePeerPrevious &&
+				byScript === CommitmentType.THEIR_CURRENT_COMMITMENT
+			) {
+				return {
+					type: CommitmentType.THEIR_CURRENT_COMMITMENT,
+					commitmentNumber
+				};
+			}
+		}
+		return { type: CommitmentType.OUR_COMMITMENT, commitmentNumber };
+	}
+
+	if (matchesRemote) {
+		return { type: CommitmentType.THEIR_CURRENT_COMMITMENT, commitmentNumber };
+	}
+
+	// Check if this is a revoked commitment (older than current remote)
+	if (commitmentNumber < state.remoteCommitmentNumber) {
+		// Verify we have the revocation secret
+		const secretIndex = MAX_INDEX - commitmentNumber;
+		const secret = state.shaChainStore.getSecret(secretIndex);
+		if (secret) {
+			return {
+				type: CommitmentType.THEIR_REVOKED_COMMITMENT,
+				commitmentNumber
+			};
+		}
+	}
+
+	// The peer's still-unrevoked previous commitment when OUR local counter
+	// has ALSO advanced past it (issue #573): same window as the
+	// matchesLocal arm above, reached when neither counter equals the
+	// index any more. No secret exists (the revoked arm above returned),
+	// so this is a live, fully valid peer commitment, never UNKNOWN.
+	{
+		if (possibleLivePeerPrevious) {
+			const byScript = disambiguateCommitmentTx(tx, state, commitmentNumber);
+			if (byScript === CommitmentType.THEIR_CURRENT_COMMITMENT) {
+				return {
+					type: CommitmentType.THEIR_CURRENT_COMMITMENT,
+					commitmentNumber
+				};
+			}
+		}
+	}
+
+	// A commitment index beyond our recorded remote state means the peer
+	// legitimately advanced past us (data loss on our side); we can only
+	// claim our to_remote output from it.
+	if (commitmentNumber > state.remoteCommitmentNumber) {
+		return { type: CommitmentType.THEIR_FUTURE_COMMITMENT, commitmentNumber };
+	}
+
+	return { type: CommitmentType.UNKNOWN, commitmentNumber };
+}
+
+/**
+ * Every per-commitment point the PEER may legitimately have used for
+ * commitment `commitmentNumber`, in preference order (issues #573/#574).
+ *
+ * During the commitment_signed -> revoke_and_ack window the peer holds TWO
+ * valid commitments: the still-unrevoked previous one at
+ * remoteRevocationNumber, whose point is remoteCurrentPerCommitmentPoint
+ * (the field only rotates when the revoke_and_ack arrives), and the newly
+ * signed one at remoteCommitmentNumber, which was built with
+ * remoteNextPerCommitmentPoint. A revoked number's point derives from its
+ * stored secret. Byte-matching derived scripts against the actual outputs
+ * remains the final arbiter everywhere these candidates are used, so a
+ * wrong candidate can never misattribute an output - it simply fails to
+ * match. Legacy states without remoteRevocationNumber try both the in-sync
+ * and in-flight shapes, then use the actual output scripts to select one.
+ */
+function candidateTheirPerCommitmentPoints(
+	state: IChannelState,
+	commitmentNumber: bigint
+): Buffer[] {
+	const candidates: Buffer[] = [];
+	const push = (p: Buffer | null | undefined): void => {
+		if (p && !candidates.some((c) => c.equals(p))) candidates.push(p);
+	};
+	const secret = state.shaChainStore.getSecret(MAX_INDEX - commitmentNumber);
+	if (secret) push(perCommitmentPointFromSecret(secret));
+	const explicitRevCount = state.remoteRevocationNumber;
+	const revCount = explicitRevCount ?? state.remoteCommitmentNumber;
+	// remoteCurrentPerCommitmentPoint IS point(remoteRevocationNumber): the
+	// unrevoked previous commitment during the window, or the current one
+	// when the counters are in sync.
+	if (
+		commitmentNumber === revCount ||
+		(explicitRevCount === undefined &&
+			commitmentNumber + 1n === state.remoteCommitmentNumber)
+	) {
+		push(state.remoteCurrentPerCommitmentPoint);
+	}
+	if (commitmentNumber === state.remoteCommitmentNumber) {
+		// The newly signed, not-yet-revoked commitment (issue #574): built
+		// with the NEXT point. A legacy row without the revocation counter may
+		// be either in sync or in this window, so retain both orders and let
+		// byte-matching decide.
+		if (explicitRevCount === undefined) {
+			push(state.remoteCurrentPerCommitmentPoint);
+			push(state.remoteNextPerCommitmentPoint);
+		} else if (commitmentNumber !== revCount) {
+			push(state.remoteNextPerCommitmentPoint);
+			push(state.remoteCurrentPerCommitmentPoint);
+		}
+	}
+	return candidates;
+}
+
+/**
+ * The peer's to_local scriptPubKeys under `point`, for probing which
+ * candidate point actually built an on-chain commitment. Mirrors the
+ * derivation disambiguateCommitmentTx and classifyTheirCommitmentOutputs
+ * apply (taproot-aware, lease CLTV when the peer is the lessor).
+ */
+function theirToLocalSpksFor(state: IChannelState, point: Buffer): Buffer[] {
+	if (!state.remoteBasepoints) return [];
+	const theirRevocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		point
+	);
+	const theirDelayedPubkey = derivePublicKey(
+		state.remoteBasepoints.delayedPaymentBasepoint,
+		point
+	);
+	if (isTaprootChannel(state.channelType)) {
+		const spk = buildTaprootToLocalOutput(
+			theirRevocationPubkey,
+			theirDelayedPubkey,
+			state.localConfig.toSelfDelay
+		).output;
+		return spk ? [spk] : [];
+	}
+	const spks: Buffer[] = [];
+	const csvVariants = state.isLessor
+		? [undefined]
+		: [undefined, ...leaseCsvCandidates(state).filter((c) => c !== undefined)];
+	for (const csv of csvVariants) {
+		const spk = bitcoin.payments.p2wsh({
+			redeem: {
+				output: buildToLocalScript(
+					theirRevocationPubkey,
+					theirDelayedPubkey,
+					state.localConfig.toSelfDelay,
+					csv
+				)
+			}
+		}).output;
+		if (spk) spks.push(spk);
+	}
+	return spks;
+}
+
+/** Count peer HTLC outputs whose scripts were derived from `point`. */
+function countTheirHtlcMatches(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	point: Buffer
+): number {
+	if (!state.remoteBasepoints) return 0;
+	const claimedKeys = new Set<string>();
+	let matches = 0;
+	if (isTaprootChannel(state.channelType)) {
+		const keys = deriveTaprootCommitKeys(state, point, false);
+		for (const out of tx.outs) {
+			if (
+				matchTaprootHtlcOutput(
+					Buffer.from(out.script),
+					BigInt(out.value),
+					state,
+					keys,
+					false,
+					claimedKeys
+				)
+			) {
+				matches++;
+			}
+		}
+		return matches;
+	}
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		point
+	);
+	const theirHtlcPubkey = derivePublicKey(
+		state.remoteBasepoints.htlcBasepoint,
+		point
+	);
+	const ourHtlcPubkey = derivePublicKey(
+		state.localBasepoints.htlcBasepoint,
+		point
+	);
+	for (const out of tx.outs) {
+		if (
+			matchHtlcOutput(
+				Buffer.from(out.script),
+				BigInt(out.value),
+				state,
+				revocationPubkey,
+				theirHtlcPubkey,
+				ourHtlcPubkey,
+				false,
+				claimedKeys
+			)
+		) {
+			matches++;
+		}
+	}
+	return matches;
+}
+
+/**
+ * The per-commitment point that actually built a PEER commitment now on
+ * chain (issues #573/#574): probes each candidate's to_local and HTLC scripts
+ * against the tx outputs. HTLC matching handles a trimmed to_local, including
+ * legacy rows whose missing revocation counter leaves both point orders
+ * possible. If no point-dependent output exists, only the static to_remote is
+ * claimable and the first candidate is sufficient.
+ */
+export function selectTheirPerCommitmentPoint(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	commitmentNumber: bigint
+): Buffer | undefined {
+	const candidates = candidateTheirPerCommitmentPoints(state, commitmentNumber);
+	if (candidates.length <= 1) return candidates[0];
+	for (const point of candidates) {
+		const spks = theirToLocalSpksFor(state, point);
+		for (const out of tx.outs) {
+			if (spks.some((spk) => Buffer.from(out.script).equals(spk))) {
+				return point;
+			}
+		}
+	}
+	let bestHtlcPoint: Buffer | undefined;
+	let bestHtlcMatches = 0;
+	for (const point of candidates) {
+		const matches = countTheirHtlcMatches(tx, state, point);
+		if (matches > bestHtlcMatches) {
+			bestHtlcPoint = point;
+			bestHtlcMatches = matches;
+		}
+	}
+	if (bestHtlcPoint) return bestHtlcPoint;
+	return candidates[0];
+}
+
+/**
+ * When local and remote commitment numbers are equal, differentiate by
+ * comparing the to_local output scripts.
+ */
+/**
+ * Every lease CSV this channel may have baked into a commitment script. The
+ * agreed blockheight advances over the channel's life (update_blockheight
+ * rounds, lessor side), so an OLD commitment appearing on-chain (force-close,
+ * breach) can carry any previously committed height's CSV — matchers must try
+ * them all. Includes the committed, staged, and last-signed heights plus the
+ * full promotion history; falls back to the full lease duration for legacy
+ * states that never recorded a height.
+ */
+function leaseCsvCandidates(state: IChannelState): number[] {
+	const csvs = new Set<number>();
+	const add = (h: number | undefined): void => {
+		const csv = leaseCsvBlocks(state.leaseExpiry, h);
+		if (csv !== undefined) csvs.add(csv);
+	};
+	add(state.leaseCommitBlockheight);
+	add(state.pendingLeaseBlockheight);
+	add(state.lastSignedCommitLeaseBlockheight);
+	for (const h of state.leaseHeightHistory ?? []) add(h);
+	if (csvs.size === 0) add(undefined); // legacy: full duration
+	return [...csvs];
+}
+
+function disambiguateCommitmentTx(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	commitmentNumber: bigint
+): CommitmentType {
+	if (!state.remoteBasepoints) return CommitmentType.UNKNOWN;
+
+	// Build expected to_local script for OUR commitment
+	const localPerCommitmentSecret = generateFromSeed(
+		state.localPerCommitmentSeed,
+		MAX_INDEX - commitmentNumber
+	);
+	const localPerCommitmentPoint = perCommitmentPointFromSecret(
+		localPerCommitmentSecret
+	);
+
+	const ourRevocationPubkey = deriveRevocationPubkey(
+		state.remoteBasepoints.revocationBasepoint,
+		localPerCommitmentPoint
+	);
+	const ourDelayedPubkey = derivePublicKey(
+		state.localBasepoints.delayedPaymentBasepoint,
+		localPerCommitmentPoint
+	);
+	// Our to_local scriptPubKey candidates: P2TR for taproot, P2WSH otherwise.
+	// Liquidity ads: when WE are the lessor our to_local carries the lease CSV
+	// (mirrors buildLocalCommitment); the CSV depends on the agreed blockheight
+	// which update_blockheight advances, so every committed height's variant
+	// (plus the plain post-expiry form) must be tried for the match.
+	const ourToLocalSpks: Buffer[] = [];
+	if (isTaprootChannel(state.channelType)) {
+		const out = buildTaprootToLocalOutput(
+			ourRevocationPubkey,
+			ourDelayedPubkey,
+			state.remoteConfig.toSelfDelay
+		).output;
+		if (out) ourToLocalSpks.push(out);
+	} else {
+		const csvVariants: (number | undefined)[] =
+			state.isLessor && state.leaseExpiry
+				? [undefined, ...leaseCsvCandidates(state)]
+				: [undefined];
+		for (const csv of csvVariants) {
+			const out = bitcoin.payments.p2wsh({
+				redeem: {
+					output: buildToLocalScript(
+						ourRevocationPubkey,
+						ourDelayedPubkey,
+						state.remoteConfig.toSelfDelay,
+						csv
+					)
+				}
+			}).output;
+			if (out) ourToLocalSpks.push(out);
+		}
+	}
+
+	// Check if any tx output matches our to_local script
+	for (const out of tx.outs) {
+		for (const spk of ourToLocalSpks) {
+			if (Buffer.from(out.script).equals(spk)) {
+				return CommitmentType.OUR_COMMITMENT;
+			}
+		}
+	}
+
+	// Not ours — positively test THEIR to_local (their delayed key + our revocation)
+	// for this index rather than guessing. The candidate set covers every
+	// point the peer may legitimately have used for this index, including
+	// both live commitments of the commitment_signed -> revoke_and_ack
+	// window (issues #573/#574). A THEIR_CURRENT_COMMITMENT result here
+	// means only "this is a remote commitment by script"; the caller
+	// decides current vs revoked from the index (whether we hold its
+	// revocation secret).
+	for (const theirPerCommitmentPoint of candidateTheirPerCommitmentPoints(
+		state,
+		commitmentNumber
+	)) {
+		const theirRevocationPubkey = deriveRevocationPubkey(
+			state.localBasepoints.revocationBasepoint,
+			theirPerCommitmentPoint
+		);
+		const theirDelayedPubkey = derivePublicKey(
+			state.remoteBasepoints.delayedPaymentBasepoint,
+			theirPerCommitmentPoint
+		);
+		const theirToLocalSpk = isTaprootChannel(state.channelType)
+			? buildTaprootToLocalOutput(
+					theirRevocationPubkey,
+					theirDelayedPubkey,
+					state.localConfig.toSelfDelay
+			  ).output
+			: bitcoin.payments.p2wsh({
+					redeem: {
+						// Their to_local carries the lease CLTV lock when THEY are the
+						// lessor (mirrors buildRemoteCommitment).
+						output: buildToLocalScript(
+							theirRevocationPubkey,
+							theirDelayedPubkey,
+							state.localConfig.toSelfDelay,
+							state.isLessor
+								? undefined
+								: leaseCsvBlocks(
+										state.leaseExpiry,
+										state.leaseCommitBlockheight
+								  )
+						)
+					}
+			  }).output;
+		for (const out of tx.outs) {
+			if (theirToLocalSpk && Buffer.from(out.script).equals(theirToLocalSpk)) {
+				return CommitmentType.THEIR_CURRENT_COMMITMENT;
+			}
+		}
+	}
+
+	// A valid commitment can trim to_local while retaining a static to_remote or
+	// an HTLC worth much more than dust. Compare every other output before the
+	// caller applies its index fallback, or our HTLC-bearing commitment can be
+	// mistaken for the peer's live previous commitment.
+	const txid = tx.getId();
+	const ourMatches = classifyOurCommitmentOutputs(
+		tx,
+		state,
+		txid,
+		commitmentNumber
+	);
+	const theirMatches = classifyTheirCommitmentOutputs(
+		tx,
+		state,
+		txid,
+		commitmentNumber
+	);
+	if (ourMatches.length > 0 && theirMatches.length === 0) {
+		return CommitmentType.OUR_COMMITMENT;
+	}
+	if (theirMatches.length > 0 && ourMatches.length === 0) {
+		return CommitmentType.THEIR_CURRENT_COMMITMENT;
+	}
+
+	// No output gives exclusive ownership evidence. The caller applies the
+	// commitment-index fallback appropriate to the counter state.
+	return CommitmentType.UNKNOWN;
+}
+
+// ─────────────── Output Classification ───────────────
+
+/**
+ * Classify each output of a commitment transaction.
+ * Returns tracked outputs for each classified output.
+ */
+export function classifyOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	commitmentType: CommitmentType,
+	commitmentNumber: bigint
+): ITrackedOutput[] {
+	// THEIR_FUTURE_COMMITMENT (data-loss / SCB recovery) matches only our
+	// to_remote output, which derives from our STATIC payment basepoint - the
+	// one classification that works without the peer's basepoints.
+	if (
+		!state.remoteBasepoints &&
+		commitmentType !== CommitmentType.THEIR_FUTURE_COMMITMENT
+	) {
+		return [];
+	}
+
+	const txid = tx.getId();
+	const outputs: ITrackedOutput[] = [];
+
+	if (commitmentType === CommitmentType.OUR_COMMITMENT) {
+		return classifyOurCommitmentOutputs(tx, state, txid, commitmentNumber);
+	} else if (
+		commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT ||
+		commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT
+	) {
+		return classifyTheirCommitmentOutputs(tx, state, txid, commitmentNumber);
+	} else if (commitmentType === CommitmentType.THEIR_FUTURE_COMMITMENT) {
+		return classifyTheirFutureCommitmentOutputs(tx, state, txid);
+	}
+
+	// For cooperative close, track outputs but they're already resolved
+	for (let i = 0; i < tx.outs.length; i++) {
+		outputs.push({
+			txid,
+			outputIndex: i,
+			amount: BigInt(tx.outs[i].value),
+			outputType: OutputType.TO_LOCAL, // best guess for cooperative
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0
+		});
+	}
+
+	return outputs;
+}
+
+function classifyOurCommitmentOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	txid: string,
+	commitmentNumber: bigint
+): ITrackedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	if (isTaprootChannel(state.channelType)) {
+		return classifyTaprootCommitmentOutputs(
+			tx,
+			state,
+			txid,
+			commitmentNumber,
+			true
+		);
+	}
+
+	const outputs: ITrackedOutput[] = [];
+
+	// Derive keys for our commitment
+	const perCommitmentSecret = generateFromSeed(
+		state.localPerCommitmentSeed,
+		MAX_INDEX - commitmentNumber
+	);
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.remoteBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const localDelayedPubkey = derivePublicKey(
+		state.localBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const remotePaymentPubkey = state.remoteBasepoints.paymentBasepoint;
+
+	const toSelfDelay = state.remoteConfig.toSelfDelay;
+	// Liquidity ads: when WE are the lessor our to_local carries the lease CSV
+	// (mirrors buildLocalCommitment); without it the byte-equality match below
+	// never fires and the output would go untracked and unswept. The CSV
+	// depends on the agreed blockheight, which update_blockheight advances, so
+	// every committed height's variant (plus the plain post-expiry form) is a
+	// candidate.
+	const toLocalCsvVariants: (number | undefined)[] =
+		state.isLessor && state.leaseExpiry
+			? [undefined, ...leaseCsvCandidates(state)]
+			: [undefined];
+	const toLocalCandidates = toLocalCsvVariants.map((csv) => {
+		const witnessScript = buildToLocalScript(
+			revocationPubkey,
+			localDelayedPubkey,
+			toSelfDelay,
+			csv
+		);
+		return {
+			witnessScript,
+			spk: bitcoin.payments.p2wsh({ redeem: { output: witnessScript } }).output
+		};
+	});
+	const remoteP2wpkh = bitcoin.payments.p2wpkh({ pubkey: remotePaymentPubkey });
+	// Anchor channels carry the PEER's to_remote on our commitment as a P2WSH
+	// with a 1-block CSV, not a plain P2WPKH. Without these variants the
+	// output was silently skipped (never tracked), leaving a gap in
+	// classification/balance events for every anchor channel.
+	const remoteToRemoteAnchor = isAnchorChannel(state.channelType)
+		? buildToRemoteAnchorOutput(remotePaymentPubkey)
+		: null;
+	// Liquidity ads: when WE are the lessee the peer (lessor)'s balance on OUR
+	// commitment is the lease-locked CSV variant (mirrors
+	// buildLocalCommitment's toRemoteLeaseCsv gate).
+	const remoteToRemoteAnchorLease =
+		remoteToRemoteAnchor && !state.isLessor && state.leaseExpiry
+			? buildToRemoteAnchorOutput(
+					remotePaymentPubkey,
+					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			  )
+			: null;
+
+	// Derive HTLC keys
+	const localHtlcPubkey = derivePublicKey(
+		state.localBasepoints.htlcBasepoint,
+		perCommitmentPoint
+	);
+	const remoteHtlcPubkey = derivePublicKey(
+		state.remoteBasepoints.htlcBasepoint,
+		perCommitmentPoint
+	);
+
+	let htlcSigCounter = 0;
+	const claimedHtlcKeys = new Set<string>();
+	for (let i = 0; i < tx.outs.length; i++) {
+		const outScript = tx.outs[i].script;
+
+		const toLocalMatch = toLocalCandidates.find(
+			(c) => c.spk && outScript.equals(c.spk)
+		);
+		if (toLocalMatch) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: toLocalMatch.witnessScript
+			});
+			continue;
+		}
+
+		if (
+			remoteToRemoteAnchorLease &&
+			outScript.equals(remoteToRemoteAnchorLease.script)
+		) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: remoteToRemoteAnchorLease.witnessScript
+			});
+			continue;
+		}
+
+		if (remoteToRemoteAnchor && outScript.equals(remoteToRemoteAnchor.script)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: remoteToRemoteAnchor.witnessScript
+			});
+			continue;
+		}
+
+		if (remoteP2wpkh.output && outScript.equals(remoteP2wpkh.output)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0
+			});
+			continue;
+		}
+
+		// Try to match HTLC outputs
+		const htlcMatch = matchHtlcOutput(
+			outScript,
+			BigInt(tx.outs[i].value),
+			state,
+			revocationPubkey,
+			localHtlcPubkey,
+			remoteHtlcPubkey,
+			true,
+			claimedHtlcKeys
+		);
+		if (htlcMatch) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType:
+					htlcMatch.direction === HtlcDirection.OFFERED
+						? OutputType.OFFERED_HTLC
+						: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				paymentHash: htlcMatch.paymentHash,
+				htlcId: htlcMatch.htlcId,
+				cltvExpiry: htlcMatch.cltvExpiry,
+				witnessScript: htlcMatch.witnessScript,
+				htlcSigIndex: htlcSigCounter++
+			});
+		}
+	}
+
+	return outputs;
+}
+
+function classifyTheirCommitmentOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	txid: string,
+	commitmentNumber: bigint
+): ITrackedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	if (isTaprootChannel(state.channelType)) {
+		return classifyTaprootCommitmentOutputs(
+			tx,
+			state,
+			txid,
+			commitmentNumber,
+			false
+		);
+	}
+
+	const outputs: ITrackedOutput[] = [];
+
+	// For their commitment, we need the point that actually BUILT it: in
+	// the commitment_signed -> revoke_and_ack window the newest signed
+	// commitment predates the rotation of remoteCurrentPerCommitmentPoint,
+	// and the unrevoked previous one has no stored secret (issues
+	// #573/#574). The selector probes every legitimate candidate against
+	// the tx and falls back to the counter-correct one.
+	const perCommitmentPoint = selectTheirPerCommitmentPoint(
+		tx,
+		state,
+		commitmentNumber
+	);
+	if (!perCommitmentPoint) return outputs;
+
+	// On their commitment, from their perspective:
+	// - their to_local uses their delayed key + our revocation
+	// - their to_remote is our payment key (P2WPKH)
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const theirDelayedPubkey = derivePublicKey(
+		state.remoteBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const ourPaymentPubkey = state.localBasepoints.paymentBasepoint;
+
+	const toSelfDelay = state.localConfig.toSelfDelay;
+	// Their to_local carries the lease CLTV lock when THEY are the lessor
+	// (mirrors buildRemoteCommitment); the penalty path also depends on this
+	// match to store the correct witnessScript for a revoked leased commitment.
+	const toLocalScript = buildToLocalScript(
+		revocationPubkey,
+		theirDelayedPubkey,
+		toSelfDelay,
+		state.isLessor
+			? undefined
+			: leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+	);
+	const toLocalP2wsh = bitcoin.payments.p2wsh({
+		redeem: { output: toLocalScript }
+	});
+	const ourP2wpkh = bitcoin.payments.p2wpkh({ pubkey: ourPaymentPubkey });
+	// Anchor channels carry our to_remote as a P2WSH with a 1-block CSV rather
+	// than a plain P2WPKH. Match both so we can claim our balance either way.
+	const ourToRemoteAnchor = isAnchorChannel(state.channelType)
+		? buildToRemoteAnchorOutput(ourPaymentPubkey)
+		: null;
+	// Liquidity ads: when WE are the lessor, our balance on THEIR commitment is
+	// the lease-locked to_remote variant. Match every CSV this channel may
+	// have committed (update_blockheight advances the agreed height, and a
+	// REVOKED commitment carries the height in effect when it was signed);
+	// the plain variant stays matched for pre-lease/legacy/post-expiry outputs.
+	const ourToRemoteAnchorLeases =
+		ourToRemoteAnchor && state.isLessor && state.leaseExpiry
+			? leaseCsvCandidates(state).map((csv) =>
+					buildToRemoteAnchorOutput(ourPaymentPubkey, csv)
+			  )
+			: [];
+
+	// HTLC keys from their perspective
+	const theirHtlcPubkey = derivePublicKey(
+		state.remoteBasepoints.htlcBasepoint,
+		perCommitmentPoint
+	);
+	const ourHtlcPubkey = derivePublicKey(
+		state.localBasepoints.htlcBasepoint,
+		perCommitmentPoint
+	);
+
+	const claimedHtlcKeys = new Set<string>();
+	for (let i = 0; i < tx.outs.length; i++) {
+		const outScript = tx.outs[i].script;
+
+		if (toLocalP2wsh.output && outScript.equals(toLocalP2wsh.output)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: toLocalScript
+			});
+			continue;
+		}
+
+		const toRemoteLeaseMatch = ourToRemoteAnchorLeases.find((c) =>
+			outScript.equals(c.script)
+		);
+		if (toRemoteLeaseMatch) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				// The lease-locked witnessScript: the resolver reads the CSV out
+				// of it to set the sweep's input sequence.
+				witnessScript: toRemoteLeaseMatch.witnessScript
+			});
+			continue;
+		}
+
+		if (ourToRemoteAnchor && outScript.equals(ourToRemoteAnchor.script)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				// Presence of a witnessScript signals the anchor (CSV-1) variant
+				// to the resolver, which must spend via the P2WSH script path.
+				witnessScript: ourToRemoteAnchor.witnessScript
+			});
+			continue;
+		}
+
+		if (ourP2wpkh.output && outScript.equals(ourP2wpkh.output)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0
+			});
+			continue;
+		}
+
+		// Match HTLC outputs from their perspective
+		// On their commitment: their offered = our received, their received = our offered
+		const htlcMatch = matchHtlcOutput(
+			outScript,
+			BigInt(tx.outs[i].value),
+			state,
+			revocationPubkey,
+			theirHtlcPubkey,
+			ourHtlcPubkey,
+			false,
+			claimedHtlcKeys
+		);
+		if (htlcMatch) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType:
+					htlcMatch.direction === HtlcDirection.OFFERED
+						? OutputType.OFFERED_HTLC
+						: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				paymentHash: htlcMatch.paymentHash,
+				htlcId: htlcMatch.htlcId,
+				cltvExpiry: htlcMatch.cltvExpiry,
+				witnessScript: htlcMatch.witnessScript
+			});
+		}
+	}
+
+	return outputs;
+}
+
+/**
+ * to_remote-only scan for a commitment the peer advanced past our recorded
+ * state (data loss on our side). We never learned its per-commitment point,
+ * so to_local/HTLC scripts cannot be derived - and we could not claim them
+ * anyway. Our to_remote pays our STATIC payment basepoint on every channel
+ * type we run (static_remotekey P2WPKH, anchors CSV-1 P2WSH, taproot leaf)
+ * and needs no per-commitment point.
+ */
+function classifyTheirFutureCommitmentOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	txid: string
+): ITrackedOutput[] {
+	// Intentionally NO remoteBasepoints guard: every to_remote variant below
+	// derives from our STATIC payment basepoint only, so this must also work
+	// for SCB-recovery states where the peer's basepoints are unknown.
+	const outputs: ITrackedOutput[] = [];
+	const ourPaymentPubkey = state.localBasepoints.paymentBasepoint;
+
+	const taprootToRemote = isTaprootChannel(state.channelType)
+		? buildTaprootToRemoteOutput(ourPaymentPubkey).output
+		: null;
+	const anchorToRemote =
+		!taprootToRemote && isAnchorChannel(state.channelType)
+			? buildToRemoteAnchorOutput(ourPaymentPubkey)
+			: null;
+	// Liquidity ads: a lessor's to_remote is the lease-locked variant. The
+	// lease fields ride along in the SCB, so this also works after recovery.
+	// Try every CSV this channel may have committed (update_blockheight
+	// advances the agreed height over the channel's life).
+	const anchorToRemoteLeases =
+		anchorToRemote && state.isLessor && state.leaseExpiry
+			? leaseCsvCandidates(state).map((csv) =>
+					buildToRemoteAnchorOutput(ourPaymentPubkey, csv)
+			  )
+			: [];
+	const plainToRemote =
+		!taprootToRemote && !anchorToRemote
+			? bitcoin.payments.p2wpkh({ pubkey: ourPaymentPubkey }).output
+			: null;
+
+	for (let i = 0; i < tx.outs.length; i++) {
+		const outScript = tx.outs[i].script;
+		const leaseMatch = anchorToRemoteLeases.find((c) =>
+			outScript.equals(c.script)
+		);
+		const isOurs =
+			!!leaseMatch ||
+			(taprootToRemote
+				? outScript.equals(taprootToRemote)
+				: anchorToRemote
+				? outScript.equals(anchorToRemote.script)
+				: !!plainToRemote && outScript.equals(plainToRemote));
+		if (!isOurs) continue;
+		outputs.push({
+			txid,
+			outputIndex: i,
+			amount: BigInt(tx.outs[i].value),
+			outputType: OutputType.TO_REMOTE,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0,
+			// witnessScript signals the anchor (CSV-1) variant to the resolver;
+			// the lease variant additionally carries the CSV the sweep must honor.
+			witnessScript: leaseMatch
+				? leaseMatch.witnessScript
+				: anchorToRemote?.witnessScript
+		});
+	}
+
+	return outputs;
+}
+
+interface IHtlcMatch {
+	direction: HtlcDirection;
+	paymentHash: Buffer;
+	cltvExpiry: number;
+	witnessScript: Buffer;
+	/** The channel HTLC id of the entry this output was attributed to. */
+	htlcId: bigint;
+}
+
+/**
+ * Whether an HTLC entry's output can be PRESENT in the commitment being
+ * classified (issue #561). PENDING/COMMITTED entries are candidates as
+ * before. A FULFILLED/FAILED entry is a candidate exactly while the
+ * removal is not irrevocably committed on the classified side (the
+ * two-phase removal window):
+ *
+ * - OUR commitment: a RECEIVED entry until the peer revokes for the
+ *   removal (removalRemoteCommitted === false, mirroring
+ *   buildHtlcOutputsForLocal, which is also what prepareForceClose
+ *   broadcasts), AND an OFFERED entry the peer settled, until WE
+ *   revoke for it (removalLocallyRevoked === false) with an add the
+ *   stored signature covers (addRemoteSigned !== false): the commitment
+ *   we broadcast is the one that signature covers, which predates the
+ *   peer's update_fulfill/fail and still carries the output
+ *   (issue #634, mirroring signedLocalCarriesRemoval). A row whose
+ *   rebuild ends up dropping that output stays a candidate here: it
+ *   then matches no output script, which is what the additive rule
+ *   below asks for.
+ * - THEIR commitment: an OFFERED entry the peer settled and a RECEIVED
+ *   entry WE settled, both until THE PEER revokes the commitment that
+ *   carried the output (removalRemoteCommitted === false). The remote
+ *   builder describes the NEXT commitment we would sign, which drops
+ *   the settle immediately; the commitment the peer can put ON CHAIN is
+ *   its CURRENT signed one, which predates the removal and still
+ *   carries the output until the peer's revoke_and_ack for our covering
+ *   commitment_signed. Without this, a peer force-closing right after
+ *   we fulfilled kept the preimage-paid output unclaimed until its own
+ *   timeout sweep, and an offered HTLC the peer settled went untracked
+ *   for the whole second phase of its removal: our revoke_and_ack
+ *   flips removalLocallyRevoked one round EARLIER, while the peer's
+ *   previous commitment is still broadcastable (issue #641).
+ *
+ * Without the window arms, a force-close right after fulfilling an
+ * inbound HTLC left its output untracked on EITHER side's commitment:
+ * no claim despite holding the preimage (and, on ours, the peer's
+ * signature), and on our commitment every later HTLC output's
+ * htlcSigIndex shifted onto the wrong remote signature (issue #556).
+ *
+ * Deliberately ADDITIVE relative to the old PENDING/COMMITTED gate:
+ * classifyTheirCommitmentOutputs also serves revoked commitments, where
+ * the live flags describe a newer commitment than the one on chain, so
+ * nothing that matched before may stop matching. The byte-equality
+ * script comparison stays the final arbiter either way.
+ */
+function htlcEntryCanBePresent(
+	entry: IHtlcEntry,
+	isLocalCommitment: boolean
+): boolean {
+	if (
+		entry.state === HtlcState.PENDING ||
+		entry.state === HtlcState.COMMITTED
+	) {
+		return true;
+	}
+	if (entry.state !== HtlcState.FULFILLED && entry.state !== HtlcState.FAILED) {
+		return false;
+	}
+	if (isLocalCommitment) {
+		return (
+			(entry.direction === HtlcDirection.RECEIVED &&
+				entry.removalRemoteCommitted === false) ||
+			(entry.direction === HtlcDirection.OFFERED &&
+				entry.removalLocallyRevoked === false &&
+				entry.addRemoteSigned !== false)
+		);
+	}
+	return (
+		entry.removalRemoteCommitted === false ||
+		// Second arm only for states that carry the first-phase flag alone.
+		(entry.direction === HtlcDirection.OFFERED &&
+			entry.removalLocallyRevoked === false)
+	);
+}
+
+/**
+ * The entries an output of `amount` is attributed from, best first.
+ *
+ * An offered HTLC script commits to neither amount nor expiry, so the parts of
+ * one payment share it byte for byte and the script comparison cannot say which
+ * part an output belongs to. The commitment orders identical HTLC scripts by
+ * amount and then by cltv_expiry ascending (BOLT 3) and the callers walk the
+ * outputs in that order, so the entry of the output's OWN amount with the
+ * lowest expiry is the one it was built from. Attributing across parts records
+ * the other part's id and expiry, and the HTLC-timeout tx built from that
+ * carries a locktime the stored signature was never made over.
+ *
+ * Entries of another amount stay on as a fallback rather than being filtered
+ * out: the script comparison is still the arbiter, and this classification also
+ * serves revoked commitments, where nothing that matched before may stop
+ * matching.
+ */
+function htlcMatchOrder(
+	state: IChannelState,
+	amount: bigint
+): [string, IHtlcEntry][] {
+	const entries = [...state.htlcs.entries()].sort(
+		([, a], [, b]) => a.cltvExpiry - b.cltvExpiry
+	);
+	const sameAmount = ([, entry]: [string, IHtlcEntry]): boolean =>
+		entry.amountMsat / 1000n === amount;
+	return [
+		...entries.filter(sameAmount),
+		...entries.filter((e) => !sameAmount(e))
+	];
+}
+
+function matchHtlcOutput(
+	outScript: Buffer,
+	outAmount: bigint,
+	state: IChannelState,
+	revocationPubkey: Buffer,
+	localHtlcPubkey: Buffer,
+	remoteHtlcPubkey: Buffer,
+	isLocal: boolean,
+	// Entry keys already attributed to an earlier output of the SAME
+	// commitment. Same-hash HTLCs (MPP parts, retries) have IDENTICAL
+	// scripts, so without this each identical output would claim the same
+	// first entry and the recorded htlcId would double-count one leg.
+	claimedKeys?: Set<string>
+): IHtlcMatch | null {
+	// Anchor channels add a 1-block CSV to every HTLC output script, so the
+	// scripts (and thus the P2WSH we match against) differ. Build the variant
+	// that matches the on-chain commitment.
+	const useAnchors = isAnchorChannel(state.channelType);
+
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
+		if (claimedKeys?.has(entryKey)) {
+			continue;
+		}
+		if (!htlcEntryCanBePresent(entry, isLocal)) {
+			continue;
+		}
+
+		let script: Buffer;
+		let direction: HtlcDirection;
+
+		if (isLocal) {
+			// Our commitment: offered uses buildOfferedHtlcScript, received uses buildReceivedHtlcScript
+			if (entry.direction === HtlcDirection.OFFERED) {
+				script = buildOfferedHtlcScript(
+					revocationPubkey,
+					localHtlcPubkey,
+					remoteHtlcPubkey,
+					entry.paymentHash,
+					useAnchors
+				);
+				direction = HtlcDirection.OFFERED;
+			} else {
+				script = buildReceivedHtlcScript(
+					revocationPubkey,
+					localHtlcPubkey,
+					remoteHtlcPubkey,
+					entry.paymentHash,
+					entry.cltvExpiry,
+					useAnchors
+				);
+				direction = HtlcDirection.RECEIVED;
+			}
+		} else {
+			// Their commitment: swap direction
+			if (entry.direction === HtlcDirection.OFFERED) {
+				// Our offered = their received
+				script = buildReceivedHtlcScript(
+					revocationPubkey,
+					localHtlcPubkey,
+					remoteHtlcPubkey,
+					entry.paymentHash,
+					entry.cltvExpiry,
+					useAnchors
+				);
+				direction = HtlcDirection.OFFERED;
+			} else {
+				// Our received = their offered
+				script = buildOfferedHtlcScript(
+					revocationPubkey,
+					localHtlcPubkey,
+					remoteHtlcPubkey,
+					entry.paymentHash,
+					useAnchors
+				);
+				direction = HtlcDirection.RECEIVED;
+			}
+		}
+
+		const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
+		if (p2wsh.output && outScript.equals(p2wsh.output)) {
+			claimedKeys?.add(entryKey);
+			return {
+				direction,
+				paymentHash: entry.paymentHash,
+				cltvExpiry: entry.cltvExpiry,
+				witnessScript: script,
+				htlcId: entry.id
+			};
+		}
+	}
+
+	return null;
+}
+
+// ── option_taproot output classification ─────────────────────────────────────
+// Mirrors classifyOur/TheirCommitmentOutputs but matches the P2TR commitment
+// scriptPubKeys. Kept separate so the proven witness-v0 path is untouched. The
+// per-output leaf data is NOT stored — resolution re-derives it deterministically
+// from (state, commitmentNumber), exactly like the witness-v0 path re-derives
+// keys; only outputType + HTLC metadata + htlcSigIndex are recorded.
+
+/**
+ * Rough taproot penalty transaction sizing. A penalty input is either a
+ * key-path spend (~58 vB) or a script-path spend (~70 vB); 75 covers both with
+ * a little slack so the result clears min-relay rather than falling under it.
+ */
+const TAPROOT_PENALTY_BASE_VBYTES = 50;
+const TAPROOT_PENALTY_PER_INPUT_VBYTES = 75;
+const TAPROOT_PENALTY_OUTPUT_VBYTES = 43;
+
+/**
+ * Value left for the destination after fees, or null when the fee eats the
+ * output or leaves only dust.
+ *
+ * bitcoinjs `addOutput` typeforces a non-negative Satoshi, so handing it
+ * `amount - fee` when the fee is larger throws. Several of the taproot
+ * builders below run inside a loop over one commitment's outputs, so an
+ * unguarded throw abandoned the sweeps for every output AFTER the offending
+ * one, not just that output's own.
+ *
+ * The dust check is the second half: a positive but sub-dust sweep is a
+ * transaction no node will relay, which fails just as silently. isDustOutput
+ * picks the threshold from the destination script type, the same way the
+ * watchtower justice builder and the simple-close path do.
+ *
+ * Mirrors the guards already present in sweep.ts (buildToLocalSweepTx and
+ * siblings) and in the revoked-path taproot resolvers further down this file.
+ */
+function sweepOutputValue(
+	amount: bigint,
+	feeSatoshis: bigint,
+	destinationScript: Buffer
+): number | null {
+	const value = amount - feeSatoshis;
+	if (value <= 0n) return null;
+	if (isDustOutput(destinationScript, value)) return null;
+	return Number(value);
+}
+
+interface ITaprootCommitKeys {
+	revocationPubkey: Buffer;
+	delayedPubkey: Buffer;
+	paymentPubkey: Buffer;
+	localHtlcPubkey: Buffer;
+	remoteHtlcPubkey: Buffer;
+	toSelfDelay: number;
+}
+
+function deriveTaprootCommitKeys(
+	state: IChannelState,
+	perCommitmentPoint: Buffer,
+	isOurs: boolean
+): ITaprootCommitKeys {
+	const remote = state.remoteBasepoints!;
+	if (isOurs) {
+		return {
+			revocationPubkey: deriveRevocationPubkey(
+				remote.revocationBasepoint,
+				perCommitmentPoint
+			),
+			delayedPubkey: derivePublicKey(
+				state.localBasepoints.delayedPaymentBasepoint,
+				perCommitmentPoint
+			),
+			paymentPubkey: remote.paymentBasepoint,
+			localHtlcPubkey: derivePublicKey(
+				state.localBasepoints.htlcBasepoint,
+				perCommitmentPoint
+			),
+			remoteHtlcPubkey: derivePublicKey(
+				remote.htlcBasepoint,
+				perCommitmentPoint
+			),
+			toSelfDelay: state.remoteConfig.toSelfDelay
+		};
+	}
+	return {
+		revocationPubkey: deriveRevocationPubkey(
+			state.localBasepoints.revocationBasepoint,
+			perCommitmentPoint
+		),
+		delayedPubkey: derivePublicKey(
+			remote.delayedPaymentBasepoint,
+			perCommitmentPoint
+		),
+		paymentPubkey: state.localBasepoints.paymentBasepoint,
+		// On their commitment "local" = them, "remote" = us.
+		localHtlcPubkey: derivePublicKey(remote.htlcBasepoint, perCommitmentPoint),
+		remoteHtlcPubkey: derivePublicKey(
+			state.localBasepoints.htlcBasepoint,
+			perCommitmentPoint
+		),
+		toSelfDelay: state.localConfig.toSelfDelay
+	};
+}
+
+function matchTaprootHtlcOutput(
+	outScript: Buffer,
+	outAmount: bigint,
+	state: IChannelState,
+	keys: ITaprootCommitKeys,
+	isOurs: boolean,
+	// Same one-to-one attribution as matchHtlcOutput: identical same-hash
+	// scripts must each claim a DISTINCT entry.
+	claimedKeys?: Set<string>
+): IHtlcMatch | null {
+	for (const [entryKey, entry] of htlcMatchOrder(state, outAmount)) {
+		if (claimedKeys?.has(entryKey)) {
+			continue;
+		}
+		if (!htlcEntryCanBePresent(entry, isOurs)) {
+			continue;
+		}
+
+		// Pick the taproot HTLC output the same way matchHtlcOutput picks the
+		// witness-v0 script: on our commitment offered→offered/received→received;
+		// on their commitment the direction swaps.
+		const asOffered = isOurs
+			? entry.direction === HtlcDirection.OFFERED
+			: entry.direction === HtlcDirection.RECEIVED;
+
+		const built = asOffered
+			? buildTaprootOfferedHtlcOutput(
+					keys.revocationPubkey,
+					keys.localHtlcPubkey,
+					keys.remoteHtlcPubkey,
+					entry.paymentHash
+			  )
+			: buildTaprootReceivedHtlcOutput(
+					keys.revocationPubkey,
+					keys.localHtlcPubkey,
+					keys.remoteHtlcPubkey,
+					entry.paymentHash,
+					entry.cltvExpiry
+			  );
+
+		if (outScript.equals(built.output)) {
+			claimedKeys?.add(entryKey);
+			return {
+				// outputType reflects OUR perspective on the HTLC.
+				direction: entry.direction,
+				paymentHash: entry.paymentHash,
+				cltvExpiry: entry.cltvExpiry,
+				witnessScript: built.output,
+				htlcId: entry.id
+			};
+		}
+	}
+	return null;
+}
+
+function classifyTaprootCommitmentOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	txid: string,
+	commitmentNumber: bigint,
+	isOurs: boolean
+): ITrackedOutput[] {
+	const outputs: ITrackedOutput[] = [];
+
+	let perCommitmentPoint: Buffer;
+	if (isOurs) {
+		const secret = generateFromSeed(
+			state.localPerCommitmentSeed,
+			MAX_INDEX - commitmentNumber
+		);
+		perCommitmentPoint = perCommitmentPointFromSecret(secret);
+	} else {
+		// Same window-aware selection as the non-taproot path (issues
+		// #573/#574): the point that actually built the peer's commitment.
+		const selected = selectTheirPerCommitmentPoint(tx, state, commitmentNumber);
+		if (!selected) return outputs;
+		perCommitmentPoint = selected;
+	}
+
+	const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, isOurs);
+	const toLocalSpk = buildTaprootToLocalOutput(
+		keys.revocationPubkey,
+		keys.delayedPubkey,
+		keys.toSelfDelay
+	).output;
+	const toRemoteSpk = buildTaprootToRemoteOutput(keys.paymentPubkey).output;
+
+	let htlcSigCounter = 0;
+	const claimedHtlcKeys = new Set<string>();
+	for (let i = 0; i < tx.outs.length; i++) {
+		const outScript = tx.outs[i].script;
+		const base = {
+			txid,
+			outputIndex: i,
+			amount: BigInt(tx.outs[i].value),
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0
+		};
+
+		if (outScript.equals(toLocalSpk)) {
+			outputs.push({ ...base, outputType: OutputType.TO_LOCAL });
+			continue;
+		}
+		if (outScript.equals(toRemoteSpk)) {
+			outputs.push({ ...base, outputType: OutputType.TO_REMOTE });
+			continue;
+		}
+		const htlc = matchTaprootHtlcOutput(
+			outScript,
+			base.amount,
+			state,
+			keys,
+			isOurs,
+			claimedHtlcKeys
+		);
+		if (htlc) {
+			outputs.push({
+				...base,
+				outputType:
+					htlc.direction === HtlcDirection.OFFERED
+						? OutputType.OFFERED_HTLC
+						: OutputType.RECEIVED_HTLC,
+				paymentHash: htlc.paymentHash,
+				htlcId: htlc.htlcId,
+				cltvExpiry: htlc.cltvExpiry,
+				htlcSigIndex: htlcSigCounter++
+			});
+		}
+		// Anchor outputs (and anything else) are left untracked — they are CPFP
+		// helpers, not value to sweep here.
+	}
+
+	return outputs;
+}
+
+// ─────────────── Output Resolution ───────────────
+
+/**
+ * Resolve outputs from our own commitment transaction.
+ * - to_local: sweep after CSV delay
+ * - offered HTLC: HTLC-timeout after CLTV
+ * - received HTLC: HTLC-success with preimage
+ */
+export function resolveOurCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	commitmentNumber: bigint,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	knownPreimages: Map<string, Buffer>,
+	delayedPaymentBasepointSecret?: Buffer,
+	htlcBasepointSecret?: Buffer,
+	remoteHtlcSignatures?: Buffer[]
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	if (isTaprootChannel(state.channelType)) {
+		return resolveOurTaprootCommitmentOutputs(
+			state,
+			trackedOutputs,
+			commitmentNumber,
+			destinationScript,
+			feeRatePerVbyte,
+			knownPreimages,
+			delayedPaymentBasepointSecret,
+			htlcBasepointSecret,
+			remoteHtlcSignatures
+		);
+	}
+
+	const perCommitmentSecret = generateFromSeed(
+		state.localPerCommitmentSeed,
+		MAX_INDEX - commitmentNumber
+	);
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.remoteBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const localDelayedPubkey = derivePublicKey(
+		state.localBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const toSelfDelay = state.remoteConfig.toSelfDelay;
+	const useAnchors = isAnchorChannel(state.channelType);
+	const htlcSighash = useAnchors ? SIGHASH_ANCHOR : SIGHASH_ALL;
+
+	const resolved: IResolvedOutput[] = [];
+
+	for (const output of trackedOutputs) {
+		const feeSatoshis = BigInt(
+			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+		);
+
+		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
+			// Liquidity ads (CLN pure-CSV): a lessor's to_local CSV is
+			// max(to_self_delay, lease_csv), so the sweep's input nSequence must
+			// satisfy that larger value, not just to_self_delay. Parse the CSV
+			// out of the ON-CHAIN script (update_blockheight can have advanced
+			// the height since this commitment was signed); the state-derived
+			// value stays as the fallback for non-parseable legacy scripts.
+			const scriptCsv = csvFromToLocalScript(output.witnessScript);
+			const leaseCsv = state.isLessor
+				? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+				: undefined;
+			const toLocalCsv =
+				scriptCsv ??
+				(leaseCsv !== undefined && leaseCsv > toSelfDelay
+					? leaseCsv
+					: toSelfDelay);
+			const sweepTx = buildToLocalSweepTx({
+				commitmentTxid: output.txid,
+				outputIndex: output.outputIndex,
+				amount: output.amount,
+				witnessScript: output.witnessScript,
+				toSelfDelay: toLocalCsv,
+				destinationScript,
+				feeSatoshis
+			});
+
+			// Derive the delayed payment private key for signing
+			const basepointSecret =
+				delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
+			const delayedPrivkey = derivePrivateKey(
+				basepointSecret,
+				perCommitmentPoint,
+				state.localBasepoints.delayedPaymentBasepoint
+			);
+
+			const sig = signSweepInput(
+				sweepTx,
+				0,
+				output.witnessScript,
+				Number(output.amount),
+				delayedPrivkey
+			);
+			const witness = buildToLocalDelayedWitness(sig, output.witnessScript);
+
+			resolved.push({
+				trackedOutput: output,
+				spendTx: sweepTx,
+				witness,
+				csvDelay: toLocalCsv
+			});
+		} else if (output.outputType === OutputType.TO_REMOTE) {
+			// to_remote on our commitment belongs to remote — we don't spend it
+			resolved.push({ trackedOutput: output });
+		} else if (
+			output.outputType === OutputType.OFFERED_HTLC &&
+			output.witnessScript
+		) {
+			// We offered this HTLC — claim via HTLC-timeout after CLTV expiry.
+			// The second-level tx is pre-signed by the remote, so it must reproduce
+			// exactly what they signed: the committed fee (or zero for anchors) and,
+			// for anchors, the zero-fee variant (seq=1) + ANYONECANPAY sighash.
+			const htlcTimeoutTx = buildHtlcTimeoutTx(
+				output.txid,
+				output.outputIndex,
+				output.amount,
+				output.cltvExpiry || 0,
+				revocationPubkey,
+				localDelayedPubkey,
+				toSelfDelay,
+				secondLevelHtlcFee(state, false),
+				useAnchors
+			);
+
+			// Sign HTLC-timeout if we have the htlc basepoint secret and remote sig
+			let witness: Buffer[] | undefined;
+			if (
+				htlcBasepointSecret &&
+				remoteHtlcSignatures &&
+				output.htlcSigIndex !== undefined &&
+				output.htlcSigIndex < remoteHtlcSignatures.length
+			) {
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret,
+					perCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+				const localSig = signSweepInput(
+					htlcTimeoutTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					localHtlcPrivkey,
+					htlcSighash
+				);
+				const remoteSig = encodeWitnessSignature(
+					remoteHtlcSignatures[output.htlcSigIndex],
+					htlcSighash
+				);
+				witness = buildHtlcTimeoutWitness(
+					remoteSig,
+					localSig,
+					output.witnessScript
+				);
+			}
+
+			resolved.push({
+				trackedOutput: output,
+				spendTx: htlcTimeoutTx,
+				witness,
+				cltvExpiry: output.cltvExpiry,
+				csvDelay: toSelfDelay
+			});
+		} else if (
+			output.outputType === OutputType.RECEIVED_HTLC &&
+			output.witnessScript
+		) {
+			// We received this HTLC — claim via HTLC-success with preimage
+			const hashHex = output.paymentHash?.toString('hex');
+			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+
+			if (preimage) {
+				const htlcSuccessTx = buildHtlcSuccessTx(
+					output.txid,
+					output.outputIndex,
+					output.amount,
+					revocationPubkey,
+					localDelayedPubkey,
+					toSelfDelay,
+					secondLevelHtlcFee(state, true),
+					useAnchors
+				);
+
+				// Sign HTLC-success if we have the htlc basepoint secret and remote sig
+				let witness: Buffer[] | undefined;
+				if (
+					htlcBasepointSecret &&
+					remoteHtlcSignatures &&
+					output.htlcSigIndex !== undefined &&
+					output.htlcSigIndex < remoteHtlcSignatures.length
+				) {
+					const localHtlcPrivkey = derivePrivateKey(
+						htlcBasepointSecret,
+						perCommitmentPoint,
+						state.localBasepoints.htlcBasepoint
+					);
+					const localSig = signSweepInput(
+						htlcSuccessTx,
+						0,
+						output.witnessScript,
+						Number(output.amount),
+						localHtlcPrivkey,
+						htlcSighash
+					);
+					const remoteSig = encodeWitnessSignature(
+						remoteHtlcSignatures[output.htlcSigIndex],
+						htlcSighash
+					);
+					witness = buildHtlcSuccessWitness(
+						remoteSig,
+						localSig,
+						preimage,
+						output.witnessScript
+					);
+				}
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: htlcSuccessTx,
+					witness,
+					csvDelay: toSelfDelay
+				});
+			} else {
+				// No preimage yet — track but can't resolve
+				resolved.push({ trackedOutput: output });
+			}
+		}
+	}
+
+	return resolved;
+}
+
+/**
+ * M2: sweep the CSV-delayed output of one of OUR second-level HTLC txs
+ * (HTLC-timeout / HTLC-success on our own commitment). That tx creates a fresh
+ * `to_local`-format output (revocation-OR-delayed+CSV) that is NOT one of the
+ * commitment outputs and was therefore never tracked or swept — the value sat
+ * unspent (recoverable, since it pays our own delayed key). This reconstructs the
+ * output's script from our commitment keys, then builds+signs the CSV sweep to
+ * our destination. Handles BOTH witness-v0 (to_local script) and option_taproot
+ * (TaprootSecondLevelScriptTree delay leaf). Returns null if `htlcTx.outs[0]` is
+ * not our expected second-level output.
+ */
+export function resolveSecondLevelHtlcOutput(
+	state: IChannelState,
+	htlcTx: bitcoin.Transaction,
+	confirmationHeight: number,
+	commitmentNumber: bigint,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	delayedPaymentBasepointSecret: Buffer | undefined,
+	network: bitcoin.Network = bitcoin.networks.bitcoin
+): IResolvedOutput | null {
+	if (!state.remoteBasepoints) return null;
+	const out = htlcTx.outs[0];
+	if (!out) return null;
+
+	// option_taproot: the second-level output is a TaprootSecondLevelScriptTree
+	// (revocation key INTERNAL + a single delay leaf). Sweep the delay leaf
+	// (script-path) with our delayed key after the CSV.
+	//
+	// NB: unlike the witness-v0 branch below, this deliberately does NOT add a
+	// lessor lease CLTV lock. Script-enforced lease and simple taproot are
+	// mutually-exclusive commitment types (LND's taproot builders take no
+	// lease_expiry; there is no taproot lease script), so beignet rejects a leased
+	// taproot channel at negotiation (channel.ts handleOpenChannel2 /
+	// handleAcceptChannel2). A taproot channel is therefore never a lessor and its
+	// second-level output is never lease-locked, so this lock-free reconstruction
+	// matches the on-chain output. Adding a lock would change the script, fail the
+	// `sl.output.equals(out.script)` match, and strand the funds.
+	if (isTaprootChannel(state.channelType)) {
+		const point = perCommitmentPointFromSecret(
+			generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - commitmentNumber
+			)
+		);
+		const keys = deriveTaprootCommitKeys(state, point, true);
+		const toSelfDelay = keys.toSelfDelay;
+		const sl = buildTaprootSecondLevelOutput(
+			keys.revocationPubkey,
+			keys.delayedPubkey,
+			toSelfDelay,
+			network
+		);
+		if (!sl.output.equals(out.script)) return null;
+		const amount = BigInt(out.value);
+		const feeSatoshis = BigInt(
+			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+		);
+		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		// Nothing left after fees: there is no sweep to build.
+		if (sweepValue === null) return null;
+		const htlcTxid = htlcTx.getId();
+		const sweepTx = new bitcoin.Transaction();
+		sweepTx.version = 2;
+		sweepTx.addInput(Buffer.from(htlcTxid, 'hex').reverse(), 0, toSelfDelay);
+		sweepTx.addOutput(destinationScript, sweepValue);
+		const delayedBasepointSecret =
+			delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
+		const delayedPrivkey = derivePrivateKey(
+			delayedBasepointSecret,
+			point,
+			state.localBasepoints.delayedPaymentBasepoint
+		);
+		const sighash = sweepTx.hashForWitnessV1(
+			0,
+			[sl.output],
+			[Number(amount)],
+			bitcoin.Transaction.SIGHASH_DEFAULT,
+			tapleafHash(sl.delay.script, sl.delay.leafVersion)
+		);
+		const sig = signTaprootHtlcLeaf(sighash, delayedPrivkey);
+		return {
+			trackedOutput: {
+				txid: htlcTxid,
+				outputIndex: 0,
+				amount,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight,
+				witnessScript: sl.output,
+				// Tag so a later rebuild reconstructs the second-level tree (revocation
+				// internal + single delay leaf), not the commitment to_local tree.
+				isSecondLevelHtlc: true
+			},
+			spendTx: sweepTx,
+			witness: [sig, sl.delay.script, sl.delay.controlBlock],
+			csvDelay: toSelfDelay
+		};
+	}
+
+	const perCommitmentSecret = generateFromSeed(
+		state.localPerCommitmentSeed,
+		MAX_INDEX - commitmentNumber
+	);
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const revocationPubkey = deriveRevocationPubkey(
+		state.remoteBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const delayedPubkey = derivePublicKey(
+		state.localBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const toSelfDelay = state.remoteConfig.toSelfDelay;
+	// The second-level output uses the SAME to_local-format script the
+	// HTLC-timeout/success tx produced (buildHtlcTimeoutTx / buildHtlcSuccessTx):
+	// revocation-OR-(delayed + CSV). BOLT 3 / CLN: never lease-locked.
+	const witnessScript = buildToLocalScript(
+		revocationPubkey,
+		delayedPubkey,
+		toSelfDelay
+	);
+	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: witnessScript } });
+	if (!p2wsh.output || !p2wsh.output.equals(out.script)) return null;
+
+	const amount = BigInt(out.value);
+	const feeSatoshis = BigInt(
+		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+	);
+	const htlcTxid = htlcTx.getId();
+	const sweepTx = buildSecondLevelSweepTx({
+		htlcTxid,
+		outputIndex: 0,
+		amount,
+		witnessScript,
+		toSelfDelay,
+		destinationScript,
+		feeSatoshis
+	});
+
+	const basepointSecret =
+		delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
+	const delayedPrivkey = derivePrivateKey(
+		basepointSecret,
+		perCommitmentPoint,
+		state.localBasepoints.delayedPaymentBasepoint
+	);
+	const sig = signSweepInput(
+		sweepTx,
+		0,
+		witnessScript,
+		Number(amount),
+		delayedPrivkey
+	);
+	const witness = buildToLocalDelayedWitness(sig, witnessScript);
+
+	return {
+		trackedOutput: {
+			txid: htlcTxid,
+			outputIndex: 0,
+			amount,
+			outputType: OutputType.TO_LOCAL,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight,
+			witnessScript
+		},
+		spendTx: sweepTx,
+		witness,
+		csvDelay: toSelfDelay
+	};
+}
+
+/**
+ * option_taproot: resolve outputs from OUR own commitment.
+ * - to_local: CSV-delayed self-spend via the delay tapleaf (we sign, deduct fee).
+ * - offered HTLC: zero-fee HTLC-timeout via the 2-of-2 timeout leaf (our sig +
+ *   the remote's pre-signed sig); fee attached downstream by the wallet.
+ * - received HTLC: zero-fee HTLC-success via the 2-of-2 success leaf (+ preimage).
+ */
+function resolveOurTaprootCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	commitmentNumber: bigint,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	knownPreimages: Map<string, Buffer>,
+	delayedPaymentBasepointSecret?: Buffer,
+	htlcBasepointSecret?: Buffer,
+	remoteHtlcSignatures?: Buffer[]
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	const perCommitmentSecret = generateFromSeed(
+		state.localPerCommitmentSeed,
+		MAX_INDEX - commitmentNumber
+	);
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, true);
+	const toSelfDelay = keys.toSelfDelay;
+	const sighashByte = Buffer.from([TAPROOT_HTLC_SIGHASH_TYPE]);
+
+	const hasHtlcSig = (o: ITrackedOutput): boolean =>
+		!!htlcBasepointSecret &&
+		!!remoteHtlcSignatures &&
+		o.htlcSigIndex !== undefined &&
+		o.htlcSigIndex < remoteHtlcSignatures.length;
+
+	const resolved: IResolvedOutput[] = [];
+	for (const output of trackedOutputs) {
+		if (output.outputType === OutputType.TO_LOCAL) {
+			// A second-level-derived output uses the TaprootSecondLevelScriptTree
+			// (revocation-key internal + single delay leaf), NOT the commitment
+			// to_local tree (NUMS internal + delay/revoke leaves). Reconstruct the
+			// matching one or the prevout scriptPubKey + control block are wrong and
+			// the sweep is invalid (stranding the second-level funds on rebuild).
+			const toLocal = output.isSecondLevelHtlc
+				? buildTaprootSecondLevelOutput(
+						keys.revocationPubkey,
+						keys.delayedPubkey,
+						toSelfDelay
+				  )
+				: buildTaprootToLocalOutput(
+						keys.revocationPubkey,
+						keys.delayedPubkey,
+						toSelfDelay
+				  );
+			const feeSatoshis = BigInt(
+				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+			);
+			const sweepValue = sweepOutputValue(
+				output.amount,
+				feeSatoshis,
+				destinationScript
+			);
+			if (sweepValue === null) {
+				// Not economical to sweep. Track it without a spend so the rest of
+				// this commitment's outputs still resolve.
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
+			const sweepTx = new bitcoin.Transaction();
+			sweepTx.version = 2;
+			sweepTx.addInput(
+				Buffer.from(output.txid, 'hex').reverse(),
+				output.outputIndex,
+				toSelfDelay // CSV: the to_local delay leaf requires this relative timelock
+			);
+			sweepTx.addOutput(destinationScript, sweepValue);
+			const delayedBasepointSecret =
+				delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
+			const delayedPrivkey = derivePrivateKey(
+				delayedBasepointSecret,
+				perCommitmentPoint,
+				state.localBasepoints.delayedPaymentBasepoint
+			);
+			const sighash = sweepTx.hashForWitnessV1(
+				0,
+				[toLocal.output],
+				[Number(output.amount)],
+				bitcoin.Transaction.SIGHASH_DEFAULT,
+				tapleafHash(toLocal.delay.script, toLocal.delay.leafVersion)
+			);
+			const sig = signTaprootHtlcLeaf(sighash, delayedPrivkey);
+			resolved.push({
+				trackedOutput: output,
+				spendTx: sweepTx,
+				witness: [sig, toLocal.delay.script, toLocal.delay.controlBlock],
+				csvDelay: toSelfDelay
+			});
+		} else if (output.outputType === OutputType.TO_REMOTE) {
+			// On our commitment to_remote belongs to the peer — nothing to do.
+			resolved.push({ trackedOutput: output });
+		} else if (output.outputType === OutputType.OFFERED_HTLC) {
+			const htlcOut = buildTaprootOfferedHtlcOutput(
+				keys.revocationPubkey,
+				keys.localHtlcPubkey,
+				keys.remoteHtlcPubkey,
+				output.paymentHash!
+			);
+			const htlcTx = buildTaprootHtlcTimeoutTx(
+				output.txid,
+				output.outputIndex,
+				output.amount,
+				output.cltvExpiry || 0,
+				keys.revocationPubkey,
+				keys.delayedPubkey,
+				toSelfDelay
+			);
+			let witness: Buffer[] | undefined;
+			if (hasHtlcSig(output)) {
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret!,
+					perCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+				const sighash = taprootHtlcLeafSighash(
+					htlcTx,
+					htlcOut.output,
+					Number(output.amount),
+					htlcOut.timeout.script,
+					htlcOut.timeout.leafVersion
+				);
+				const localSig = signTaprootHtlcLeaf(sighash, localHtlcPrivkey);
+				const remoteSig = remoteHtlcSignatures![output.htlcSigIndex!];
+				// Offered-timeout leaf is <local> CHECKSIGVERIFY <remote> CHECKSIG →
+				// local consumed first (top of stack): witness bottom→top = remote, local.
+				witness = [
+					Buffer.concat([remoteSig, sighashByte]),
+					Buffer.concat([localSig, sighashByte]),
+					htlcOut.timeout.script,
+					htlcOut.timeout.controlBlock
+				];
+			}
+			resolved.push({
+				trackedOutput: output,
+				spendTx: htlcTx,
+				witness,
+				cltvExpiry: output.cltvExpiry,
+				csvDelay: toSelfDelay
+			});
+		} else if (output.outputType === OutputType.RECEIVED_HTLC) {
+			const hashHex = output.paymentHash?.toString('hex');
+			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+			if (!preimage) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
+			const htlcOut = buildTaprootReceivedHtlcOutput(
+				keys.revocationPubkey,
+				keys.localHtlcPubkey,
+				keys.remoteHtlcPubkey,
+				output.paymentHash!,
+				output.cltvExpiry || 0
+			);
+			const htlcTx = buildTaprootHtlcSuccessTx(
+				output.txid,
+				output.outputIndex,
+				output.amount,
+				keys.revocationPubkey,
+				keys.delayedPubkey,
+				toSelfDelay
+			);
+			let witness: Buffer[] | undefined;
+			if (hasHtlcSig(output)) {
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret!,
+					perCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+				const sighash = taprootHtlcLeafSighash(
+					htlcTx,
+					htlcOut.output,
+					Number(output.amount),
+					htlcOut.success.script,
+					htlcOut.success.leafVersion
+				);
+				const localSig = signTaprootHtlcLeaf(sighash, localHtlcPrivkey);
+				const remoteSig = remoteHtlcSignatures![output.htlcSigIndex!];
+				// Received-success leaf is ...<local> CHECKSIGVERIFY <remote> CHECKSIG →
+				// consume preimage (top), then local, then remote: bottom→top =
+				// remote, local, preimage.
+				witness = [
+					Buffer.concat([remoteSig, sighashByte]),
+					Buffer.concat([localSig, sighashByte]),
+					preimage,
+					htlcOut.success.script,
+					htlcOut.success.controlBlock
+				];
+			}
+			resolved.push({
+				trackedOutput: output,
+				spendTx: htlcTx,
+				witness,
+				csvDelay: toSelfDelay
+			});
+		}
+	}
+	return resolved;
+}
+
+/**
+ * option_taproot: resolve outputs from their CURRENT (non-revoked) commitment.
+ * - to_remote (our funds): claim the 1-block-CSV to_remote tapleaf with our key.
+ * - our offered HTLC (their received output): reclaim via the CLTV-timeout leaf
+ *   (single sig, once expired) — we hold no preimage.
+ * - our received HTLC (their offered output): claim via the preimage success leaf
+ *   (single sig + preimage). All are direct single-sig tapleaf spends (no
+ *   second-level tx — on the peer's commitment we are the claiming party).
+ */
+function resolveTheirCurrentTaprootCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	knownPreimages: Map<string, Buffer>,
+	paymentPrivkey: Buffer,
+	htlcBasepointSecret?: Buffer,
+	remotePerCommitmentPoint?: Buffer
+): IResolvedOutput[] {
+	// Our to_remote on their commitment is a NUMS-internal-key P2TR whose single
+	// 1-CSV leaf pays our STATIC payment basepoint - it needs NO peer key
+	// material and NO per-commitment point, exactly like the static_remotekey /
+	// anchor variants. The full taproot key set (which requires the peer's
+	// basepoints and a per-commitment point) is only needed for the HTLC leaves,
+	// so derive it opportunistically: an SCB-recovery state (remoteBasepoints
+	// null, no point ever learned - THEIR_FUTURE_COMMITMENT) must still resolve
+	// the to_remote sweep instead of returning nothing.
+	const point =
+		remotePerCommitmentPoint || state.remoteCurrentPerCommitmentPoint;
+	const keys =
+		state.remoteBasepoints && point
+			? deriveTaprootCommitKeys(state, point, false)
+			: null;
+	const htlcPrivkey =
+		htlcBasepointSecret && point
+			? derivePrivateKey(
+					htlcBasepointSecret,
+					point,
+					state.localBasepoints.htlcBasepoint
+			  )
+			: undefined;
+	const resolved: IResolvedOutput[] = [];
+
+	const spendLeaf = (
+		output: ITrackedOutput,
+		spk: Buffer,
+		leafScript: Buffer,
+		controlBlock: Buffer,
+		leafVersion: number,
+		privkey: Buffer,
+		extraWitness: Buffer[],
+		nLockTime: number,
+		nSequence: number
+	): bitcoin.Transaction | null => {
+		const feeSatoshis = BigInt(
+			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+		);
+		const sweepValue = sweepOutputValue(
+			output.amount,
+			feeSatoshis,
+			destinationScript
+		);
+		// Not economical to spend; the caller tracks the output without a spend.
+		if (sweepValue === null) return null;
+		const tx = new bitcoin.Transaction();
+		tx.version = 2;
+		tx.locktime = nLockTime;
+		tx.addInput(
+			Buffer.from(output.txid, 'hex').reverse(),
+			output.outputIndex,
+			nSequence
+		);
+		tx.addOutput(destinationScript, sweepValue);
+		const sighash = tx.hashForWitnessV1(
+			0,
+			[spk],
+			[Number(output.amount)],
+			bitcoin.Transaction.SIGHASH_DEFAULT,
+			tapleafHash(leafScript, leafVersion)
+		);
+		const sig = signTaprootHtlcLeaf(sighash, privkey);
+		tx.ins[0].witness = [sig, ...extraWitness, leafScript, controlBlock];
+		return tx;
+	};
+
+	for (const output of trackedOutputs) {
+		if (output.outputType === OutputType.TO_REMOTE) {
+			// Static key: identical to keys.paymentPubkey when keys are derivable,
+			// but also available on an SCB-recovery state (paymentPrivkey is its
+			// secret in both cases - the monitor supplies the per-channel
+			// paymentBasepointSecret located by the SCB's channelKeyIndex).
+			const tr = buildTaprootToRemoteOutput(
+				state.localBasepoints.paymentBasepoint
+			);
+			const tx = spendLeaf(
+				output,
+				tr.output,
+				tr.spend.script,
+				tr.spend.controlBlock,
+				tr.spend.leafVersion,
+				paymentPrivkey,
+				[],
+				0,
+				1 // 1-block CSV
+			);
+			if (!tx) {
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
+				continue;
+			}
+			resolved.push({
+				trackedOutput: output,
+				spendTx: tx,
+				witness: tx.ins[0].witness,
+				csvDelay: 1
+			});
+		} else if (output.outputType === OutputType.TO_LOCAL) {
+			// Their to_local — not ours unless revoked (handled elsewhere).
+			resolved.push({ trackedOutput: output });
+		} else if (
+			output.outputType === OutputType.OFFERED_HTLC &&
+			output.paymentHash &&
+			output.cltvExpiry !== undefined &&
+			htlcPrivkey &&
+			keys
+		) {
+			// Our offered = their received output → reclaim via the CLTV-timeout leaf.
+			const h = buildTaprootReceivedHtlcOutput(
+				keys.revocationPubkey,
+				keys.localHtlcPubkey,
+				keys.remoteHtlcPubkey,
+				output.paymentHash!,
+				output.cltvExpiry || 0
+			);
+			const tx = spendLeaf(
+				output,
+				h.output,
+				h.timeout.script,
+				h.timeout.controlBlock,
+				h.timeout.leafVersion,
+				htlcPrivkey,
+				[],
+				output.cltvExpiry || 0,
+				1 // received-timeout leaf now has OP_1 CSV (+ CLTV via nLockTime)
+			);
+			if (!tx) {
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
+				continue;
+			}
+			resolved.push({
+				trackedOutput: output,
+				spendTx: tx,
+				witness: tx.ins[0].witness,
+				cltvExpiry: output.cltvExpiry
+			});
+		} else if (
+			output.outputType === OutputType.RECEIVED_HTLC &&
+			output.paymentHash &&
+			htlcPrivkey &&
+			keys
+		) {
+			// Our received = their offered output → claim via the preimage success leaf.
+			const hashHex = output.paymentHash?.toString('hex');
+			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
+			if (!preimage) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
+			const h = buildTaprootOfferedHtlcOutput(
+				keys.revocationPubkey,
+				keys.localHtlcPubkey,
+				keys.remoteHtlcPubkey,
+				output.paymentHash!
+			);
+			const tx = spendLeaf(
+				output,
+				h.output,
+				h.success.script,
+				h.success.controlBlock,
+				h.success.leafVersion,
+				htlcPrivkey,
+				[preimage],
+				0,
+				1 // offered-success leaf now has OP_1 CSV
+			);
+			if (!tx) {
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
+				continue;
+			}
+			resolved.push({
+				trackedOutput: output,
+				spendTx: tx,
+				witness: tx.ins[0].witness
+			});
+		}
+	}
+	return resolved;
+}
+
+/**
+ * Resolve outputs from their current (non-revoked) commitment transaction.
+ * - to_remote (our funds): claim immediately with P2WPKH
+ * - HTLC outputs: claim with preimage or wait for CLTV timeout
+ */
+export function resolveTheirCurrentCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	knownPreimages: Map<string, Buffer>,
+	paymentPrivkey: Buffer,
+	htlcBasepointSecret?: Buffer,
+	remotePerCommitmentPoint?: Buffer
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) {
+		// SCB recovery (THEIR_FUTURE_COMMITMENT on a reconstructed state): only
+		// our to_remote is resolvable - it pays our STATIC payment basepoint and
+		// needs no peer key material. Every other output type requires the
+		// peer's basepoints, so drop them rather than refusing the sweep.
+		trackedOutputs = trackedOutputs.filter(
+			(o) => o.outputType === OutputType.TO_REMOTE
+		);
+		if (trackedOutputs.length === 0) return [];
+	}
+
+	if (isTaprootChannel(state.channelType)) {
+		return resolveTheirCurrentTaprootCommitmentOutputs(
+			state,
+			trackedOutputs,
+			destinationScript,
+			feeRatePerVbyte,
+			knownPreimages,
+			paymentPrivkey,
+			htlcBasepointSecret,
+			remotePerCommitmentPoint
+		);
+	}
+
+	const resolved: IResolvedOutput[] = [];
+
+	for (const output of trackedOutputs) {
+		// A lease-locked to_remote (liquidity ads, we are the lessor) carries a
+		// CSV number > 1 in the witness script (CLN model); the claim's input
+		// nSequence must satisfy it.
+		const toRemoteLeaseCsv =
+			output.outputType === OutputType.TO_REMOTE && output.witnessScript
+				? leaseCsvFromToRemoteScript(output.witnessScript)
+				: undefined;
+		const feeSatoshis = BigInt(
+			Math.ceil(
+				feeRatePerVbyte *
+					estimateSweepVbytes(output.outputType, toRemoteLeaseCsv !== undefined)
+			)
+		);
+
+		if (output.outputType === OutputType.TO_REMOTE) {
+			// This is our balance on their commitment — claim it with our payment key.
+			const paymentPubkey = state.localBasepoints.paymentBasepoint;
+
+			// Both builders below throw when the fee exceeds the output (the guards
+			// inside buildToLocalSweepTx / buildToRemoteClaimTx), and this loop runs
+			// over every output of one commitment, so an uneconomic to_remote used
+			// to abandon the HTLC claims that follow it. Decide affordability here
+			// instead, the way #241 did for the penalty batch, and track the output
+			// without a spend so the retry can claim it once fees fall.
+			if (
+				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
+			) {
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
+				continue;
+			}
+
+			if (output.witnessScript) {
+				// Anchor channel: to_remote is a P2WSH with a 1-block CSV. Spend via
+				// the script path with nSequence=1 instead of the legacy P2WPKH path.
+				const claimTx = buildToLocalSweepTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					toSelfDelay: toRemoteLeaseCsv ?? 1,
+					destinationScript,
+					feeSatoshis
+				});
+
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteAnchorWitness(sig, output.witnessScript);
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness,
+					csvDelay: toRemoteLeaseCsv ?? 1
+				});
+			} else {
+				// Non-anchor (static_remotekey): P2WPKH, claimable immediately.
+				const claimTx = buildToRemoteClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					destinationScript,
+					feeSatoshis
+				});
+
+				const sig = signP2wpkhInput(
+					claimTx,
+					0,
+					paymentPubkey,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteWitness(sig, paymentPubkey);
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness
+				});
+			}
+		} else if (output.outputType === OutputType.TO_LOCAL) {
+			// Their to_local — we cannot spend (unless revoked, handled separately)
+			resolved.push({ trackedOutput: output });
+		} else if (
+			output.outputType === OutputType.OFFERED_HTLC &&
+			output.paymentHash &&
+			output.cltvExpiry !== undefined
+		) {
+			// Output types are labelled from OUR perspective (see classifyOutputs /
+			// matchHtlcOutput). An OFFERED_HTLC is one WE offered (outbound) — on
+			// their commitment it uses the received-HTLC script and we reclaim it via
+			// the CLTV-timeout path once the HTLC has expired (the downstream never
+			// settled, so we hold no preimage). Build the single-sig timeout claim
+			// using our HTLC key; the monitor schedules it at cltv maturity. Without
+			// this the output was tracked but never swept — the funds (neither party
+			// can claim before timeout) were stranded after a remote force-close.
+			if (
+				output.witnessScript &&
+				htlcBasepointSecret &&
+				remotePerCommitmentPoint
+			) {
+				if (
+					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
+					null
+				) {
+					resolved.push({
+						trackedOutput: output,
+						declinedAsUneconomic: true,
+						cltvExpiry: output.cltvExpiry
+					});
+					continue;
+				}
+				const claimTx = buildRemoteHtlcTimeoutClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					destinationScript,
+					feeSatoshis,
+					cltvExpiry: output.cltvExpiry ?? 0,
+					inputSequence: isAnchorChannel(state.channelType) ? 1 : 0xfffffffd
+				});
+
+				// Our HTLC private key is the timeout-path signer (the script's
+				// remote_htlcpubkey on their commitment is our HTLC key).
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret,
+					remotePerCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					localHtlcPrivkey
+				);
+				const witness = buildRemoteHtlcTimeoutWitness(
+					sig,
+					output.witnessScript
+				);
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness,
+					cltvExpiry: output.cltvExpiry
+				});
+			} else {
+				resolved.push({
+					trackedOutput: output,
+					cltvExpiry: output.cltvExpiry
+				});
+			}
+		} else if (
+			output.outputType === OutputType.RECEIVED_HTLC &&
+			output.paymentHash
+		) {
+			// A RECEIVED_HTLC is one WE received (inbound). On their commitment this
+			// is their offered-HTLC script, which we sweep immediately with the
+			// payment preimage using our HTLC key.
+			const hashHex = output.paymentHash.toString('hex');
+			const preimage = knownPreimages.get(hashHex);
+
+			if (
+				preimage &&
+				output.witnessScript &&
+				htlcBasepointSecret &&
+				remotePerCommitmentPoint
+			) {
+				if (
+					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
+					null
+				) {
+					resolved.push({
+						trackedOutput: output,
+						declinedAsUneconomic: true
+					});
+					continue;
+				}
+				// Build and sign the preimage claim transaction. Anchor channels add
+				// a 1-block CSV to the HTLC output's claim path, so the input must use
+				// sequence 1 (the immediate-path RBF sequence would fail OP_CSV).
+				const claimTx = buildRemoteHtlcPreimageClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					destinationScript,
+					feeSatoshis,
+					inputSequence: isAnchorChannel(state.channelType) ? 1 : 0xfffffffd
+				});
+
+				// Derive local HTLC private key for signing
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret,
+					remotePerCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					localHtlcPrivkey
+				);
+				const witness = buildRemoteHtlcPreimageWitness(
+					sig,
+					preimage,
+					output.witnessScript
+				);
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness
+				});
+			} else if (preimage) {
+				// Have preimage but missing key material — track but can't claim yet
+				resolved.push({ trackedOutput: output });
+			} else {
+				resolved.push({ trackedOutput: output });
+			}
+		}
+	}
+
+	return resolved;
+}
+
+/**
+ * Resolve outputs from a revoked commitment transaction.
+ * All outputs can be claimed using the revocation key.
+ */
+/**
+ * A penalty input whose HTLC cltv_expiry is within this many blocks of the
+ * current height is claimed in its OWN single-input penalty tx instead of the
+ * batch: near the deadline the cheater's pre-signed HTLC-timeout (or a
+ * preimage claim) competes for that one outpoint, and if it wins it would
+ * invalidate the WHOLE batched penalty, stalling every other claim until the
+ * rebroadcast interval rebuilds them. Isolating the contested input caps the
+ * blast radius and lets its fee be bumped independently.
+ */
+export const PENALTY_SPLIT_DEADLINE_BLOCKS = 18;
+
+/**
+ * Output indices of the revoked commitment that already have a live claim of
+ * ours. A retry resolves only the outputs left unclaimed, so without this the
+ * settled-HTLC rescan below (which reads the snapshot, not the tracked set)
+ * would pull an already-claimed outpoint back into the new batch and build a
+ * transaction conflicting with our own live penalty. One paying a higher
+ * absolute fee, would REPLACE the batch holding their to_local.
+ */
+export type ClaimedOutputIndices = ReadonlySet<number>;
+
+export interface IRevokedHtlcSnapshotOutput {
+	outputType: OutputType.OFFERED_HTLC | OutputType.RECEIVED_HTLC;
+	paymentHash: Buffer;
+	cltvExpiry: number;
+	witnessScript?: Buffer;
+}
+
+/**
+ * Match revoked-commitment outputs against the HTLC snapshot that was saved
+ * when the commitment was signed. This is also used during monitor restore to
+ * repair metadata persisted by older snapshot-adoption code.
+ */
+export function matchRevokedHtlcSnapshotOutputs(
+	state: IChannelState,
+	commitmentNumber: bigint,
+	revokedTx: bitcoin.Transaction,
+	network: bitcoin.Network = bitcoin.networks.bitcoin
+): Map<number, IRevokedHtlcSnapshotOutput> {
+	const matched = new Map<number, IRevokedHtlcSnapshotOutput>();
+	if (!state.remoteBasepoints) return matched;
+	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
+	if (!snapshot || snapshot.length === 0) return matched;
+	const perCommitmentSecret = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+	if (!perCommitmentSecret) return matched;
+
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const taproot = isTaprootChannel(state.channelType);
+	const taprootKeys = taproot
+		? deriveTaprootCommitKeys(state, perCommitmentPoint, false)
+		: undefined;
+	const revocationPubkey = taproot
+		? undefined
+		: deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				perCommitmentPoint
+		  );
+	const theirHtlcPubkey = taproot
+		? undefined
+		: derivePublicKey(state.remoteBasepoints.htlcBasepoint, perCommitmentPoint);
+	const ourHtlcPubkey = taproot
+		? undefined
+		: derivePublicKey(state.localBasepoints.htlcBasepoint, perCommitmentPoint);
+	const useAnchors = isAnchorChannel(state.channelType);
+	interface ISnapshotMatchCandidate {
+		amountSats: number;
+		scriptPubkey: Buffer;
+		metadata: IRevokedHtlcSnapshotOutput;
+	}
+	const matchGroups = new Map<string, ISnapshotMatchCandidate[]>();
+
+	for (const entry of snapshot) {
+		// On their commitment our offered HTLC uses their received script, and
+		// our received HTLC uses their offered script.
+		let witnessScript: Buffer | undefined;
+		let scriptPubkey: Buffer | undefined;
+		if (taprootKeys) {
+			const asOffered = entry.direction === HtlcDirection.RECEIVED;
+			scriptPubkey = asOffered
+				? buildTaprootOfferedHtlcOutput(
+						taprootKeys.revocationPubkey,
+						taprootKeys.localHtlcPubkey,
+						taprootKeys.remoteHtlcPubkey,
+						entry.paymentHash,
+						network
+				  ).output
+				: buildTaprootReceivedHtlcOutput(
+						taprootKeys.revocationPubkey,
+						taprootKeys.localHtlcPubkey,
+						taprootKeys.remoteHtlcPubkey,
+						entry.paymentHash,
+						entry.cltvExpiry,
+						network
+				  ).output;
+		} else {
+			witnessScript =
+				entry.direction === HtlcDirection.OFFERED
+					? buildReceivedHtlcScript(
+							revocationPubkey!,
+							theirHtlcPubkey!,
+							ourHtlcPubkey!,
+							entry.paymentHash,
+							entry.cltvExpiry,
+							useAnchors
+					  )
+					: buildOfferedHtlcScript(
+							revocationPubkey!,
+							theirHtlcPubkey!,
+							ourHtlcPubkey!,
+							entry.paymentHash,
+							useAnchors
+					  );
+			scriptPubkey = bitcoin.payments.p2wsh({
+				redeem: { output: witnessScript }
+			}).output;
+		}
+		if (!scriptPubkey) continue;
+
+		const amountSats = Number(entry.amountMsat / 1000n);
+		const key = amountSats + ':' + scriptPubkey.toString('hex');
+		const candidates = matchGroups.get(key) ?? [];
+		candidates.push({
+			amountSats,
+			scriptPubkey,
+			metadata: {
+				outputType:
+					entry.direction === HtlcDirection.OFFERED
+						? OutputType.OFFERED_HTLC
+						: OutputType.RECEIVED_HTLC,
+				paymentHash: entry.paymentHash,
+				cltvExpiry: entry.cltvExpiry,
+				witnessScript
+			}
+		});
+		matchGroups.set(key, candidates);
+	}
+
+	for (const candidates of matchGroups.values()) {
+		// Equal-value offered HTLC outputs can have identical scripts because the
+		// script omits CLTV. BOLT 3 orders that tie by CLTV ascending, independent
+		// of snapshot insertion order, so restore must pair metadata the same way.
+		candidates.sort((a, b) => a.metadata.cltvExpiry - b.metadata.cltvExpiry);
+		const outputIndices: number[] = [];
+		for (let i = 0; i < revokedTx.outs.length; i++) {
+			if (
+				revokedTx.outs[i].value === candidates[0].amountSats &&
+				revokedTx.outs[i].script.equals(candidates[0].scriptPubkey)
+			) {
+				outputIndices.push(i);
+			}
+		}
+		for (let i = 0; i < candidates.length && i < outputIndices.length; i++) {
+			matched.set(outputIndices[i], candidates[i].metadata);
+		}
+	}
+
+	return matched;
+}
+
+export function resolveRevokedCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	commitmentNumber: bigint,
+	revokedTx: bitcoin.Transaction,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	revocationBasepointSecret: Buffer,
+	paymentPrivkey: Buffer,
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	currentHeight?: number,
+	claimedOutputIndices?: ClaimedOutputIndices
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	if (isTaprootChannel(state.channelType)) {
+		return resolveRevokedTaprootCommitmentOutputs(
+			state,
+			trackedOutputs,
+			commitmentNumber,
+			revokedTx,
+			destinationScript,
+			feeRatePerVbyte,
+			revocationBasepointSecret,
+			paymentPrivkey,
+			network,
+			currentHeight,
+			claimedOutputIndices
+		);
+	}
+
+	const alreadyClaimed = claimedOutputIndices ?? new Set<number>();
+
+	// Get the per-commitment secret for the revoked commitment
+	const secretIndex = MAX_INDEX - commitmentNumber;
+	const perCommitmentSecret = state.shaChainStore.getSecret(secretIndex);
+	if (!perCommitmentSecret) return [];
+
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+
+	// Derive the revocation private key
+	const revocationPrivkey = deriveRevocationPrivkey(
+		revocationBasepointSecret,
+		perCommitmentSecret,
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+
+	const resolved: IResolvedOutput[] = [];
+
+	// Collect claimable output indices and witness scripts
+	const claimableIndices: number[] = [];
+	const witnessScripts = new Map<number, Buffer>();
+	// HTLC cltv_expiry per output index: near this height the cheater's
+	// pre-signed HTLC-timeout competes for the outpoint (deadline-split below).
+	const htlcDeadlines = new Map<number, number>();
+	const snapshotHtlcMetadata = matchRevokedHtlcSnapshotOutputs(
+		state,
+		commitmentNumber,
+		revokedTx,
+		network
+	);
+
+	for (const output of trackedOutputs) {
+		const snapshotMetadata = snapshotHtlcMetadata.get(output.outputIndex);
+		if (snapshotMetadata && output.txid === revokedTx.getId()) {
+			output.outputType = snapshotMetadata.outputType;
+			output.paymentHash = snapshotMetadata.paymentHash;
+			output.cltvExpiry = snapshotMetadata.cltvExpiry;
+			output.witnessScript = snapshotMetadata.witnessScript;
+		}
+		if (alreadyClaimed.has(output.outputIndex)) continue;
+		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
+			claimableIndices.push(output.outputIndex);
+			witnessScripts.set(output.outputIndex, output.witnessScript);
+		} else if (
+			(output.outputType === OutputType.OFFERED_HTLC ||
+				output.outputType === OutputType.RECEIVED_HTLC) &&
+			output.witnessScript
+		) {
+			claimableIndices.push(output.outputIndex);
+			witnessScripts.set(output.outputIndex, output.witnessScript);
+			if (
+				output.outputType === OutputType.RECEIVED_HTLC &&
+				output.cltvExpiry !== undefined
+			) {
+				htlcDeadlines.set(output.outputIndex, output.cltvExpiry);
+			}
+		} else if (output.outputType === OutputType.TO_REMOTE) {
+			// to_remote is OUR balance on their revoked commitment. It is not part
+			// of the penalty (we own it outright), but it must still be swept to our
+			// wallet — the previous code only tracked it and never built a claim, so
+			// the funds sat unspent at a channel-specific key (and for anchor
+			// channels the CSV-1 P2WSH needs an explicit script-path spend). Claim
+			// it exactly like the non-revoked remote-commitment path.
+			// A lessor's to_remote is lease-locked (CLTV in the witness script);
+			// the claim must set nLockTime to it even on a revoked commitment.
+			const toRemoteLeaseCsv = output.witnessScript
+				? leaseCsvFromToRemoteScript(output.witnessScript)
+				: undefined;
+			const feeSatoshis = BigInt(
+				Math.ceil(
+					feeRatePerVbyte *
+						estimateSweepVbytes(
+							OutputType.TO_REMOTE,
+							toRemoteLeaseCsv !== undefined
+						)
+				)
+			);
+			// Both builders below throw when the fee exceeds the output, and this
+			// runs BEFORE the penalty batch is built, so an uneconomic to_remote
+			// (dust-sized balance against a spiked feerate) used to abandon the
+			// whole breach remedy, their to_local included. Same guard and same
+			// reasoning as #241, which fixed it for the batch itself. The taproot
+			// revoked path already skips here; this brings witness-v0 in line.
+			if (
+				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
+			) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
+			if (output.witnessScript) {
+				// Anchor channel: P2WSH with a 1-block CSV — spend via script path.
+				const claimTx = buildToLocalSweepTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					toSelfDelay: toRemoteLeaseCsv ?? 1,
+					destinationScript,
+					feeSatoshis
+				});
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteAnchorWitness(sig, output.witnessScript);
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness,
+					csvDelay: 1
+				});
+			} else {
+				// Non-anchor (static_remotekey): plain P2WPKH, claimable immediately.
+				const paymentPubkey = state.localBasepoints.paymentBasepoint;
+				const claimTx = buildToRemoteClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					destinationScript,
+					feeSatoshis
+				});
+				const sig = signP2wpkhInput(
+					claimTx,
+					0,
+					paymentPubkey,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteWitness(sig, paymentPubkey);
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness
+				});
+			}
+		}
+	}
+
+	// H2: include HTLC outputs that were in this (revoked) commitment but have
+	// since settled and left state.htlcs — classifyOutputs only matches live
+	// HTLCs, so without the snapshot those outputs go unpenalized and the cheater
+	// reclaims them after their CLTV/CSV. Reconstruct each snapshot HTLC's script
+	// (using this commitment's keys) and add any matching, not-yet-claimed output.
+	for (const [outputIndex, metadata] of snapshotHtlcMetadata) {
+		if (
+			claimableIndices.includes(outputIndex) ||
+			alreadyClaimed.has(outputIndex)
+		) {
+			continue;
+		}
+		if (!metadata.witnessScript) continue;
+		claimableIndices.push(outputIndex);
+		witnessScripts.set(outputIndex, metadata.witnessScript);
+		if (metadata.outputType === OutputType.RECEIVED_HTLC) {
+			htlcDeadlines.set(outputIndex, metadata.cltvExpiry);
+		}
+	}
+
+	if (claimableIndices.length === 0) {
+		return resolved;
+	}
+
+	// Build the address from destination script
+	const destAddress = bitcoin.address.fromOutputScript(
+		destinationScript,
+		network
+	);
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+
+	// The tracked output for a penalty input, or a stand-in for one the live
+	// classification never saw (an HTLC that settled and left state.htlcs, rebuilt
+	// from the snapshot below). Callers adopt the stand-in so the output is
+	// watched and its claim rebroadcast like any other.
+	const penaltyTrackedOutput = (outputIdx: number): ITrackedOutput => {
+		const tracked = trackedOutputs.find((o) => o.outputIndex === outputIdx);
+		if (tracked) return tracked;
+		const snapshotMetadata = snapshotHtlcMetadata.get(outputIdx);
+		return {
+			txid: revokedTx.getId(),
+			outputIndex: outputIdx,
+			amount: BigInt(revokedTx.outs[outputIdx].value),
+			outputType: snapshotMetadata?.outputType ?? OutputType.OFFERED_HTLC,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0,
+			witnessScript:
+				snapshotMetadata?.witnessScript ?? witnessScripts.get(outputIdx),
+			cltvExpiry: snapshotMetadata?.cltvExpiry ?? htlcDeadlines.get(outputIdx),
+			paymentHash: snapshotMetadata?.paymentHash
+		};
+	};
+
+	// Build ONE penalty tx over the given indices, sign every input, and push
+	// a resolved entry per input (all sharing that tx).
+	const buildAndSignPenalty = (outputIndices: number[]): void => {
+		// buildPenaltyTx throws when the fee exceeds the batch. The deadline split
+		// below calls this once per urgent input and once for the batch, so an
+		// unaffordable expiring HTLC used to throw out of the whole resolver and
+		// take the batched penalty (holding their to_local) with it. Decide here
+		// instead, using the same estimator buildPenaltyTx uses.
+		let totalIn = 0n;
+		for (const idx of outputIndices) {
+			totalIn += BigInt(revokedTx.outs[idx].value);
+		}
+		const fee = BigInt(
+			estimatePenaltyTxFee(
+				outputIndices,
+				witnessScripts,
+				feeRatePerVbyte,
+				destinationScript
+			)
+		);
+		if (sweepOutputValue(totalIn, fee, destinationScript) === null) {
+			// Report the declined inputs rather than returning silently: the caller
+			// cannot otherwise tell a batch it never heard about from one it chose
+			// not to build, and a snapshot-reconstructed input appears nowhere else.
+			for (const idx of outputIndices) {
+				resolved.push({ trackedOutput: penaltyTrackedOutput(idx) });
+			}
+			return;
+		}
+
+		const penaltyTx = buildPenaltyTx({
+			revokedTx,
+			revocationPrivkey,
+			destinationAddress: destAddress,
+			feeRatePerVbyte,
+			outputIndices,
+			witnessScripts,
+			network
+		});
+
+		for (let i = 0; i < outputIndices.length; i++) {
+			const outputIdx = outputIndices[i];
+			const ws = witnessScripts.get(outputIdx)!;
+			const value = revokedTx.outs[outputIdx].value;
+			// Synthesized for an HTLC output reconstructed from the snapshot (it was
+			// not in the live classification because the HTLC had settled).
+			const output = penaltyTrackedOutput(outputIdx);
+
+			const sig = signPenaltyInput(penaltyTx, i, ws, value, revocationPrivkey);
+
+			let witness: Buffer[];
+			if (output.outputType === OutputType.TO_LOCAL) {
+				witness = buildToLocalPenaltyWitness(sig, ws);
+			} else {
+				// Both tracked HTLC outputs and snapshot-reconstructed ones use the
+				// HTLC revocation (penalty) witness.
+				witness = buildHtlcPenaltyWitness(sig, revocationPubkey, ws);
+			}
+
+			penaltyTx.setWitness(i, witness);
+
+			resolved.push({
+				trackedOutput: output,
+				spendTx: penaltyTx,
+				witness
+			});
+		}
+	};
+
+	// Deadline split: an HTLC input near (or past) its cltv_expiry is contested
+	// by the cheater's pre-signed HTLC-timeout, so it gets its OWN penalty tx;
+	// everything else stays in one batch. Only meaningful when more than one
+	// output is claimable and a height is known.
+	const urgent =
+		currentHeight !== undefined && claimableIndices.length > 1
+			? claimableIndices.filter((idx) => {
+					const deadline = htlcDeadlines.get(idx);
+					return (
+						deadline !== undefined &&
+						deadline - currentHeight <= PENALTY_SPLIT_DEADLINE_BLOCKS
+					);
+			  })
+			: [];
+	const batched = claimableIndices.filter((idx) => !urgent.includes(idx));
+
+	for (const idx of urgent) {
+		buildAndSignPenalty([idx]);
+	}
+	if (batched.length > 0) {
+		buildAndSignPenalty(batched);
+	}
+
+	return resolved;
+}
+
+/**
+ * option_taproot: sweep a peer's REVOKED commitment (justice). Builds one penalty
+ * transaction spending every penalty output with the revocation key:
+ * - their to_local: script-path spend of the revoke tapleaf.
+ * - HTLC outputs: key-path spend (the HTLC output's internal key IS the revocation
+ *   key), via the BIP341-tweaked revocation private key.
+ * Our own to_remote balance is claimed in a separate tx (1-block-CSV leaf). All
+ * spend paths were regtest-validated in the P4 taproot spend tests.
+ */
+function resolveRevokedTaprootCommitmentOutputs(
+	state: IChannelState,
+	trackedOutputs: ITrackedOutput[],
+	commitmentNumber: bigint,
+	revokedTx: bitcoin.Transaction,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	revocationBasepointSecret: Buffer,
+	paymentPrivkey: Buffer,
+	network: bitcoin.Network,
+	currentHeight?: number,
+	claimedOutputIndices?: ClaimedOutputIndices
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+	const alreadyClaimed = claimedOutputIndices ?? new Set<number>();
+	const perCommitmentSecret = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+	if (!perCommitmentSecret) return [];
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const revocationPrivkey = deriveRevocationPrivkey(
+		revocationBasepointSecret,
+		perCommitmentSecret,
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, false);
+	const resolved: IResolvedOutput[] = [];
+
+	interface IPenaltyIn {
+		output: ITrackedOutput;
+		spk: Buffer;
+		value: number;
+		leafScript?: Buffer;
+		controlBlock?: Buffer;
+		merkleRoot?: Buffer; // present ⇒ key-path spend
+	}
+	const penaltyIns: IPenaltyIn[] = [];
+
+	for (const o of trackedOutputs) {
+		if (alreadyClaimed.has(o.outputIndex)) continue;
+		if (o.outputType === OutputType.TO_LOCAL) {
+			const tl = buildTaprootToLocalOutput(
+				keys.revocationPubkey,
+				keys.delayedPubkey,
+				keys.toSelfDelay,
+				network
+			);
+			penaltyIns.push({
+				output: o,
+				spk: tl.output,
+				value: Number(o.amount),
+				leafScript: tl.revoke.script,
+				controlBlock: tl.revoke.controlBlock
+			});
+		} else if (
+			o.outputType === OutputType.OFFERED_HTLC ||
+			o.outputType === OutputType.RECEIVED_HTLC
+		) {
+			// On their commitment our RECEIVED = their offered output, our OFFERED =
+			// their received output (the classification swap).
+			const asOffered = o.outputType === OutputType.RECEIVED_HTLC;
+			const h = asOffered
+				? buildTaprootOfferedHtlcOutput(
+						keys.revocationPubkey,
+						keys.localHtlcPubkey,
+						keys.remoteHtlcPubkey,
+						o.paymentHash!,
+						network
+				  )
+				: buildTaprootReceivedHtlcOutput(
+						keys.revocationPubkey,
+						keys.localHtlcPubkey,
+						keys.remoteHtlcPubkey,
+						o.paymentHash!,
+						o.cltvExpiry || 0,
+						network
+				  );
+			penaltyIns.push({
+				output: o,
+				spk: h.output,
+				value: Number(o.amount),
+				merkleRoot: h.merkleRoot
+			});
+		} else if (o.outputType === OutputType.TO_REMOTE) {
+			// Our balance — claim the 1-block-CSV to_remote leaf with our payment key.
+			const tr = buildTaprootToRemoteOutput(keys.paymentPubkey, network);
+			const feeSatoshis = BigInt(
+				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
+			);
+			const claimValue = sweepOutputValue(
+				o.amount,
+				feeSatoshis,
+				destinationScript
+			);
+			// Not economical to claim. Skip it rather than abandoning the penalty
+			// spends for the remaining outputs of this revoked commitment.
+			if (claimValue === null) continue;
+			const claimTx = new bitcoin.Transaction();
+			claimTx.version = 2;
+			claimTx.addInput(
+				Buffer.from(o.txid, 'hex').reverse(),
+				o.outputIndex,
+				1 // 1-block CSV
+			);
+			claimTx.addOutput(destinationScript, claimValue);
+			const sighash = claimTx.hashForWitnessV1(
+				0,
+				[tr.output],
+				[Number(o.amount)],
+				bitcoin.Transaction.SIGHASH_DEFAULT,
+				tapleafHash(tr.spend.script, tr.spend.leafVersion)
+			);
+			const sig = signTaprootHtlcLeaf(sighash, paymentPrivkey);
+			claimTx.ins[0].witness = [sig, tr.spend.script, tr.spend.controlBlock];
+			resolved.push({
+				trackedOutput: o,
+				spendTx: claimTx,
+				witness: claimTx.ins[0].witness,
+				csvDelay: 1
+			});
+		}
+	}
+
+	// H1: include taproot HTLC outputs that were in this (revoked) commitment but
+	// have since settled and left state.htlcs — classifyTaprootCommitmentOutputs
+	// matches only live HTLCs, so without the snapshot those outputs go unpenalized
+	// and the cheater reclaims them after their CLTV/CSV (mirrors the witness-v0
+	// snapshot fallback in resolveRevokedCommitmentOutputs). Each is a
+	// revocation-key-path (merkleRoot) breach spend.
+	const snapshotOutputs = matchRevokedHtlcSnapshotOutputs(
+		state,
+		commitmentNumber,
+		revokedTx,
+		network
+	);
+	if (snapshotOutputs.size > 0) {
+		const handled = new Set<number>([
+			...trackedOutputs.map((o) => o.outputIndex),
+			...alreadyClaimed
+		]);
+		for (const [outputIndex, metadata] of snapshotOutputs) {
+			if (handled.has(outputIndex)) continue;
+			// outputType/direction reflect OUR perspective; on THEIR commitment our
+			// received HTLC is their offered output and vice-versa (the same swap the
+			// tracked-output loop above and matchTaprootHtlcOutput use).
+			const asOffered = metadata.outputType === OutputType.RECEIVED_HTLC;
+			const h = asOffered
+				? buildTaprootOfferedHtlcOutput(
+						keys.revocationPubkey,
+						keys.localHtlcPubkey,
+						keys.remoteHtlcPubkey,
+						metadata.paymentHash,
+						network
+				  )
+				: buildTaprootReceivedHtlcOutput(
+						keys.revocationPubkey,
+						keys.localHtlcPubkey,
+						keys.remoteHtlcPubkey,
+						metadata.paymentHash,
+						metadata.cltvExpiry,
+						network
+				  );
+			handled.add(outputIndex);
+			penaltyIns.push({
+				output: {
+					txid: revokedTx.getId(),
+					outputIndex,
+					amount: BigInt(revokedTx.outs[outputIndex].value),
+					outputType: metadata.outputType,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight: 0,
+					paymentHash: metadata.paymentHash,
+					cltvExpiry: metadata.cltvExpiry
+				},
+				spk: h.output,
+				value: revokedTx.outs[outputIndex].value,
+				merkleRoot: h.merkleRoot
+			});
+		}
+	}
+
+	// Build ONE taproot penalty tx over the given inputs, sign, and push a
+	// resolved entry per input (all sharing that tx).
+	const buildAndSignPenalty = (ins: IPenaltyIn[]): void => {
+		const penaltyTx = new bitcoin.Transaction();
+		penaltyTx.version = 2;
+		// bigint like every other on-chain amount in this file. This was the one
+		// aggregate summed as a number, which is also how it came to be the one
+		// missing an underflow guard.
+		let totalIn = 0n;
+		for (const pin of ins) {
+			penaltyTx.addInput(
+				Buffer.from(pin.output.txid, 'hex').reverse(),
+				pin.output.outputIndex,
+				0xfffffffd
+			);
+			totalIn += BigInt(pin.value);
+		}
+		const estVbytes =
+			TAPROOT_PENALTY_BASE_VBYTES +
+			ins.length * TAPROOT_PENALTY_PER_INPUT_VBYTES +
+			TAPROOT_PENALTY_OUTPUT_VBYTES;
+		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
+		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
+		if (penaltyValue === null) {
+			// This batch cannot pay for itself. Return rather than handing
+			// addOutput a negative value: the caller splits urgent inputs into
+			// their own batch, and a throw here would abandon the remaining
+			// batches (including the one holding their to_local) along with it.
+			// Report the declined inputs so the caller can tell a batch it never
+			// heard about from one we chose not to build.
+			for (const pin of ins) resolved.push({ trackedOutput: pin.output });
+			return;
+		}
+		penaltyTx.addOutput(destinationScript, penaltyValue);
+
+		const prevScripts = ins.map((p) => p.spk);
+		const values = ins.map((p) => p.value);
+
+		for (let i = 0; i < ins.length; i++) {
+			const pin = ins[i];
+			let witness: Buffer[];
+			if (pin.merkleRoot) {
+				// HTLC key-path breach: tweak the revocation key by the output's tree.
+				const sighash = penaltyTx.hashForWitnessV1(
+					i,
+					prevScripts,
+					values,
+					bitcoin.Transaction.SIGHASH_DEFAULT
+				);
+				const tweaked = tweakTaprootKeyPathPrivkey(
+					revocationPrivkey,
+					pin.merkleRoot
+				);
+				witness = [signTaprootHtlcLeaf(sighash, tweaked)];
+			} else {
+				// to_local revoke tapleaf (script-path).
+				const sighash = penaltyTx.hashForWitnessV1(
+					i,
+					prevScripts,
+					values,
+					bitcoin.Transaction.SIGHASH_DEFAULT,
+					tapleafHash(pin.leafScript!, TAPLEAF_VERSION)
+				);
+				witness = [
+					signTaprootHtlcLeaf(sighash, revocationPrivkey),
+					pin.leafScript!,
+					pin.controlBlock!
+				];
+			}
+			penaltyTx.setWitness(i, witness);
+			resolved.push({
+				trackedOutput: pin.output,
+				spendTx: penaltyTx,
+				witness
+			});
+		}
+	};
+
+	if (penaltyIns.length > 0) {
+		// Deadline split (mirrors the witness-v0 path): an HTLC input near its
+		// cltv_expiry is contested by the cheater's pre-signed HTLC-timeout and
+		// gets its own penalty tx so a lost race cannot invalidate the batch.
+		const urgent =
+			currentHeight !== undefined && penaltyIns.length > 1
+				? penaltyIns.filter(
+						(pin) =>
+							pin.output.outputType === OutputType.RECEIVED_HTLC &&
+							pin.output.cltvExpiry !== undefined &&
+							pin.output.cltvExpiry - currentHeight <=
+								PENALTY_SPLIT_DEADLINE_BLOCKS
+				  )
+				: [];
+		const batched = penaltyIns.filter((pin) => !urgent.includes(pin));
+
+		for (const pin of urgent) {
+			buildAndSignPenalty([pin]);
+		}
+		if (batched.length > 0) {
+			buildAndSignPenalty(batched);
+		}
+	}
+
+	return resolved;
+}
+
+/**
+ * Justice on the peer's SECOND-LEVEL HTLC tx after a REVOKED commitment: when
+ * the cheater confirms their pre-signed HTLC-success/HTLC-timeout before our
+ * HTLC penalty, that tx creates a fresh to_local-format output whose revocation
+ * branch WE control (we hold the revoked per-commitment secret) with NO
+ * timelock. BOLT 5: a node SHOULD spend the HTLC-timeout/HTLC-success output
+ * using the revocation private key — without this claim the HTLC value is lost
+ * once the cheater's to_self_delay matures. Sides mirror
+ * resolveSecondLevelHtlcOutput to THEIR commitment: their delayed key, our
+ * revocation basepoint, the to_self_delay we demanded of them. Matches EVERY
+ * output of spendingTx (implementations may batch several HTLC claims into one
+ * tx); returns one immediate revocation-path claim per match, witness set.
+ */
+export function resolveRevokedSecondLevelOutput(
+	state: IChannelState,
+	spendingTx: bitcoin.Transaction,
+	confirmationHeight: number,
+	commitmentNumber: bigint,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	revocationBasepointSecret: Buffer,
+	network: bitcoin.Network = bitcoin.networks.bitcoin
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+	const perCommitmentSecret = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+	if (!perCommitmentSecret) return [];
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const revocationPrivkey = deriveRevocationPrivkey(
+		revocationBasepointSecret,
+		perCommitmentSecret,
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const feeSatoshis = BigInt(
+		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+	);
+	const spendingTxid = spendingTx.getId();
+	const resolved: IResolvedOutput[] = [];
+
+	// option_taproot: the second-level output is a TaprootSecondLevelScriptTree
+	// with the revocation key as INTERNAL key — breach-spend via key path with
+	// the tweaked revocation privkey, exactly like the revoked-commitment HTLC
+	// penalty. Keys mirror resolveRevokedTaprootCommitmentOutputs (isOurs=false:
+	// their delayed key, our revocation basepoint, our demanded to_self_delay).
+	// No lease variant: leased taproot channels are rejected at negotiation.
+	if (isTaprootChannel(state.channelType)) {
+		const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, false);
+		const sl = buildTaprootSecondLevelOutput(
+			keys.revocationPubkey,
+			keys.delayedPubkey,
+			keys.toSelfDelay,
+			network
+		);
+		const merkleRoot = tapleafHash(sl.delay.script, sl.delay.leafVersion);
+		for (let i = 0; i < spendingTx.outs.length; i++) {
+			const out = spendingTx.outs[i];
+			if (!sl.output.equals(out.script)) continue;
+			const amount = BigInt(out.value);
+			const claimValue = sweepOutputValue(
+				amount,
+				feeSatoshis,
+				destinationScript
+			);
+			if (claimValue === null) continue;
+			const claimTx = new bitcoin.Transaction();
+			claimTx.version = 2;
+			claimTx.addInput(
+				Buffer.from(spendingTxid, 'hex').reverse(),
+				i,
+				0xfffffffd
+			);
+			claimTx.addOutput(destinationScript, claimValue);
+			const sighash = claimTx.hashForWitnessV1(
+				0,
+				[sl.output],
+				[Number(amount)],
+				bitcoin.Transaction.SIGHASH_DEFAULT
+			);
+			const tweaked = tweakTaprootKeyPathPrivkey(revocationPrivkey, merkleRoot);
+			const witness = [signTaprootHtlcLeaf(sighash, tweaked)];
+			claimTx.setWitness(0, witness);
+			resolved.push({
+				trackedOutput: {
+					txid: spendingTxid,
+					outputIndex: i,
+					amount,
+					outputType: OutputType.TO_LOCAL,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight,
+					witnessScript: sl.output
+				},
+				spendTx: claimTx,
+				witness
+			});
+		}
+		return resolved;
+	}
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const delayedPubkey = derivePublicKey(
+		state.remoteBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const toSelfDelay = state.localConfig.toSelfDelay;
+	// BOLT 3 / CLN: second-level HTLC outputs are never lease-locked, so the
+	// peer's revoked second-level output is the plain to_local-format script.
+	const candidateScripts: Buffer[] = [
+		buildToLocalScript(revocationPubkey, delayedPubkey, toSelfDelay)
+	];
+
+	for (let i = 0; i < spendingTx.outs.length; i++) {
+		const out = spendingTx.outs[i];
+		let witnessScript: Buffer | undefined;
+		for (const script of candidateScripts) {
+			const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
+			if (p2wsh.output && p2wsh.output.equals(out.script)) {
+				witnessScript = script;
+				break;
+			}
+		}
+		if (!witnessScript) continue;
+		const amount = BigInt(out.value);
+		const claimValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		if (claimValue === null) continue;
+		// Revocation branch: no CSV/CLTV. Opt in to replacement so a stalled
+		// justice transaction can be rebuilt before the cheater's delay matures.
+		const claimTx = new bitcoin.Transaction();
+		claimTx.version = 2;
+		claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i, 0xfffffffd);
+		claimTx.addOutput(destinationScript, claimValue);
+		const sig = signPenaltyInput(
+			claimTx,
+			0,
+			witnessScript,
+			Number(amount),
+			revocationPrivkey
+		);
+		const witness = buildToLocalPenaltyWitness(sig, witnessScript);
+		claimTx.setWitness(0, witness);
+		resolved.push({
+			trackedOutput: {
+				txid: spendingTxid,
+				outputIndex: i,
+				amount,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight,
+				witnessScript
+			},
+			spendTx: claimTx,
+			witness
+		});
+	}
+
+	return resolved;
+}
+
+// ─────────────── Preimage Extraction ───────────────
+
+/**
+ * Extract a preimage from an HTLC spend witness on-chain.
+ * In an HTLC-success spend, the witness contains the preimage as the
+ * 4th element: [0, remoteSig, localSig, preimage, witnessScript]
+ *
+ * @returns The 32-byte preimage, or null if not found
+ */
+export function extractPreimageFromWitness(witness: Buffer[]): Buffer | null {
+	if (!witness || witness.length < 5) {
+		return null;
+	}
+
+	// HTLC-success witness format: [0, remoteSig, localSig, preimage, witnessScript]
+	// The preimage should be exactly 32 bytes
+	const candidate = witness[3];
+	if (candidate && candidate.length === 32) {
+		return candidate;
+	}
+
+	return null;
+}

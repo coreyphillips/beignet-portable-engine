@@ -1,0 +1,847 @@
+/**
+ * Guardian client (wire spec sections 2, 9, 10): endpoint selection over a
+ * capsule GuardianDescriptor, the HTTP verb mapping with per-verb protobuf
+ * envelopes, recoverable transport credentials, version gating against
+ * InfoResponse, and the quorum fan-out primitives the recovery flows build
+ * on.
+ *
+ * The transport is injectable: the default reaches http and https URLs
+ * through node's own modules, while onion-http endpoints need a Tor-capable
+ * transport (a SOCKS proxy or an embedded Tor) supplied by the caller. The
+ * client never weakens verification based on transport: receipts and
+ * certificates are checked against the guardian set, not the connection.
+ */
+
+import { request as httpRequest } from 'http';
+import { request as httpsRequest } from 'https';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import {
+	GUARDIAN_PROTOCOL_VERSION,
+	GuardianState,
+	receiptTranscriptHash,
+	rotationEvidenceProblem,
+	takeoverTranscriptHash,
+	verifyTranscript
+} from './guardian-wire';
+import {
+	IGuardianAcquireEpochRequest,
+	IGuardianAcquireEpochResponse,
+	IGuardianGetHeadResponse,
+	IGuardianGetStateResponse,
+	IGuardianInfoResponse,
+	IGuardianPutStateResponse,
+	IGuardianReceipt,
+	IGuardianRecord,
+	IGuardianRegisterNodeRequest,
+	IGuardianRegisterNodeResponse,
+	IGuardianSyncEpochResponse,
+	IGuardianSyncRecordResponse,
+	IGuardianTakeoverCertificate,
+	IGuardianRotateSetRequest,
+	IGuardianRotateSetResponse
+} from './guardian';
+import {
+	GUARDIAN_CONTENT_TYPE,
+	GUARDIAN_HTTP_BASE_PATH,
+	decodeAcquireEpochResponse,
+	decodeGetHeadResponse,
+	decodeGetStateResponse,
+	decodeInfoResponse,
+	decodePutStateResponse,
+	decodeRegisterNodeResponse,
+	decodeSyncEpochResponse,
+	decodeSyncRecordResponse,
+	encodeAcquireEpochRequest,
+	encodeGetHeadRequest,
+	encodeGetStateRequest,
+	encodePutStateRequest,
+	encodeRegisterNodeRequest,
+	encodeSyncEpochRequest,
+	encodeSyncRecordRequest,
+	encodeRotateSetRequest,
+	decodeRotateSetResponse
+} from './guardian-proto';
+import {
+	GuardianAuth,
+	GuardianDescriptor,
+	GuardianTransportType
+} from './capsule';
+
+export { GuardianAuth } from './capsule';
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+/** The HTTP layer failed (non-200); distinct from protocol-level statuses. */
+export class GuardianTransportError extends Error {
+	readonly httpStatus?: number;
+
+	constructor(message: string, httpStatus?: number) {
+		super(message);
+		this.name = 'GuardianTransportError';
+		this.httpStatus = httpStatus;
+	}
+}
+
+/** Minimal binary HTTP transport, injectable for Tor and for tests. */
+export type GuardianHttpTransport = (
+	url: string,
+	init: {
+		method: 'GET' | 'POST';
+		headers: Record<string, string>;
+		body?: Buffer;
+		timeoutMs: number;
+		maxResponseBytes: number;
+	}
+) => Promise<{ status: number; body: Buffer }>;
+
+/** Default transport over node http/https; refuses other schemes. */
+export function nodeGuardianTransport(): GuardianHttpTransport {
+	return (url, init): Promise<{ status: number; body: Buffer }> =>
+		new Promise((resolve, reject) => {
+			const parsed = new URL(url);
+			const requestFn =
+				parsed.protocol === 'https:'
+					? httpsRequest
+					: parsed.protocol === 'http:'
+					? httpRequest
+					: null;
+			if (!requestFn) {
+				reject(
+					new GuardianTransportError(
+						`unsupported URL scheme ${parsed.protocol}`
+					)
+				);
+				return;
+			}
+			const request = requestFn(
+				parsed,
+				{ method: init.method, headers: init.headers },
+				(response) => {
+					const chunks: Buffer[] = [];
+					let total = 0;
+					response.on('data', (chunk: Buffer) => {
+						total += chunk.length;
+						if (total > init.maxResponseBytes) {
+							request.destroy();
+							reject(
+								new GuardianTransportError('guardian response exceeds size cap')
+							);
+							return;
+						}
+						chunks.push(chunk);
+					});
+					response.on('end', () => {
+						resolve({
+							status: response.statusCode ?? 0,
+							body: Buffer.concat(chunks)
+						});
+					});
+					response.on('error', reject);
+				}
+			);
+			request.setTimeout(init.timeoutMs, () => {
+				request.destroy(
+					new GuardianTransportError('guardian request timed out')
+				);
+			});
+			request.on('error', (error) =>
+				reject(
+					error instanceof GuardianTransportError
+						? error
+						: new GuardianTransportError(String(error))
+				)
+			);
+			if (init.body) request.write(init.body);
+			request.end();
+		});
+}
+
+// ─────────────── endpoint selection (wire 2.4) ───────────────
+
+export interface IGuardianEndpointSelection {
+	url: string;
+	transportType: GuardianTransportType;
+}
+
+/** A Tor v3 onion service hostname: 56 base32 characters plus .onion. */
+const ONION_V3_HOSTNAME = /^[a-z2-7]{56}\.onion$/;
+
+/**
+ * Whether a hostname is a Tor v3 onion service. The one rule endpoint
+ * selection, the plaintext-credential guard and transport classification
+ * (assembly.ts guardianDescriptorFor) all share: a bare .onion suffix is not
+ * evidence of a Tor-encrypted destination.
+ */
+export function isOnionV3Hostname(hostname: string): boolean {
+	return ONION_V3_HOSTNAME.test(hostname);
+}
+
+/** Strictly loopback; container hostnames need explicit approval. */
+export function isLoopbackHostname(hostname: string): boolean {
+	return hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
+// ─────────────── bolt8 guardian addresses (wire 2.7, issue #699) ───────────────
+
+/** URL scheme of a guardian hosted by a beignet node, reached over BOLT 8. */
+export const GUARDIAN_BOLT8_SCHEME = 'bolt8:';
+
+/** Where a bolt8 guardian session dials: the node's ordinary peer address. */
+export interface IBolt8GuardianTarget {
+	/** 33-byte compressed Lightning node id. */
+	nodeId: Buffer;
+	host: string;
+	port: number;
+	/** The canonical form, `bolt8://<66-hex node id>@host:port`. */
+	url: string;
+}
+
+/**
+ * Parse `bolt8://<66-hex compressed node id>@<host>:<port>`, the guardian
+ * address of a beignet node hosting the reference guardian in-process. The
+ * userinfo position carries the NODE id (the key BOLT 8 authenticates the
+ * server by), never a credential; the transport credential rides in the
+ * descriptor's `auth`, as for every other transport. Throws with a precise
+ * message on anything malformed: a guardian silently dropped would change
+ * the quorum arithmetic.
+ */
+export function parseBolt8GuardianUrl(url: string): IBolt8GuardianTarget {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw new Error(`guardian URL "${url}" is not a valid URL`);
+	}
+	if (parsed.protocol !== GUARDIAN_BOLT8_SCHEME) {
+		throw new Error(`guardian URL "${url}" is not a bolt8 URL`);
+	}
+	if (!/^[0-9a-fA-F]{66}$/.test(parsed.username) || parsed.password !== '') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must carry a 66-hex compressed node id ` +
+				'before the @, and nothing else'
+		);
+	}
+	const nodeId = Buffer.from(parsed.username, 'hex');
+	if (!ecc.isPoint(nodeId)) {
+		throw new Error(
+			`bolt8 guardian node id ${parsed.username} is not a valid ` +
+				'compressed secp256k1 point'
+		);
+	}
+	// Non-special schemes keep the host's case; normalize it (DNS and onion
+	// names are case-insensitive) and strip IPv6 brackets so the target
+	// dials what net.connect expects.
+	const hostname = parsed.hostname.toLowerCase();
+	const host = hostname.replace(/^\[(.*)\]$/, '$1');
+	if (!host) {
+		throw new Error(`bolt8 guardian URL "${url}" has no host`);
+	}
+	if (parsed.port === '') {
+		throw new Error(`bolt8 guardian URL "${url}" has no port`);
+	}
+	const port = Number(parsed.port);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) {
+		throw new Error(`bolt8 guardian URL "${url}" has an invalid port`);
+	}
+	if (parsed.pathname !== '' && parsed.pathname !== '/') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must not carry a path; the guardian ` +
+				'verbs are addressed inside the session'
+		);
+	}
+	if (parsed.search !== '' || parsed.hash !== '') {
+		throw new Error(
+			`bolt8 guardian URL "${url}" must not carry a query or fragment`
+		);
+	}
+	return {
+		nodeId,
+		host,
+		port,
+		url: `bolt8://${parsed.username.toLowerCase()}@${hostname}:${port}`
+	};
+}
+
+export interface IGuardianEndpointOptions {
+	torEnabled: boolean;
+	/** Permits local-http to LOOPBACK hosts only. */
+	allowLocalHttp?: boolean;
+	/**
+	 * Approves specific NON-loopback local-http hostnames, for deployments
+	 * where an orchestrator genuinely guarantees network isolation (the
+	 * Umbrel container case). Providing this also enables loopback. A plain
+	 * boolean cannot express this safely: bearer and macaroon credentials
+	 * ride the Authorization header, so a stale or hostile descriptor
+	 * naming a clearnet http URL would otherwise receive them in plaintext.
+	 */
+	allowLocalHttpHost?: (hostname: string) => boolean;
+}
+
+/**
+ * Selection rule: Tor enabled means the first onion-http endpoint (falling
+ * back to https when the guardian advertises no onion one); otherwise the
+ * first https endpoint; then bolt8, which needs no approval because BOLT 8
+ * supplies transport encryption and server authentication on any network
+ * (an onion host still needs Tor); local-http only when explicitly
+ * configured, and then only to loopback or individually approved
+ * isolated-network hosts (wire 2.3: a general LAN or clearnet address never
+ * qualifies). A descriptor with no usable transport is an error surfaced to
+ * the operator, never a silent skip.
+ */
+export function selectGuardianEndpoint(
+	descriptor: GuardianDescriptor,
+	options: IGuardianEndpointOptions
+): IGuardianEndpointSelection {
+	const localEnabled =
+		options.allowLocalHttp === true || options.allowLocalHttpHost !== undefined;
+	const usable = (
+		type: GuardianTransportType
+	): IGuardianEndpointSelection | null => {
+		for (const transport of descriptor.transports) {
+			if (transport.type !== type) continue;
+			if (type === 'bolt8') {
+				let target: IBolt8GuardianTarget;
+				try {
+					target = parseBolt8GuardianUrl(transport.url);
+				} catch {
+					continue;
+				}
+				if (isOnionV3Hostname(target.host) && !options.torEnabled) continue;
+				return { url: target.url, transportType: type };
+			}
+			let parsed: URL;
+			try {
+				parsed = new URL(transport.url);
+			} catch {
+				continue;
+			}
+			if (type === 'https' && parsed.protocol !== 'https:') continue;
+			if (type === 'local-http') {
+				if (parsed.protocol !== 'http:') continue;
+				const approved =
+					isLoopbackHostname(parsed.hostname) ||
+					options.allowLocalHttpHost?.(parsed.hostname) === true;
+				if (!approved) continue;
+			}
+			if (
+				type === 'onion-http' &&
+				(parsed.protocol !== 'http:' ||
+					!ONION_V3_HOSTNAME.test(parsed.hostname))
+			) {
+				continue;
+			}
+			return { url: transport.url, transportType: type };
+		}
+		return null;
+	};
+	const order: GuardianTransportType[] = options.torEnabled
+		? ['onion-http', 'https', 'bolt8']
+		: ['https', 'bolt8'];
+	if (localEnabled) order.push('local-http');
+	for (const type of order) {
+		const selected = usable(type);
+		if (selected) return selected;
+	}
+	throw new GuardianTransportError(
+		`guardian ${descriptor.guardianId} advertises no usable transport ` +
+			`(torEnabled=${options.torEnabled}, localHttp=${localEnabled})`
+	);
+}
+
+// ─────────────── the client ───────────────
+
+export interface IGuardianClientOptions {
+	/** Base URL of the guardian, e.g. https://host or http://127.0.0.1:8080. */
+	url: string;
+	/** Every request of this client carries this set id. */
+	guardianSetId: Buffer;
+	/**
+	 * Transport credential (wire 9). bearer and macaroon ride the
+	 * Authorization header; tor-v3-client-auth lives at the Tor layer and is
+	 * consumed by the injected transport, not by HTTP headers.
+	 */
+	auth?: GuardianAuth;
+	transport?: GuardianHttpTransport;
+	timeoutMs?: number;
+	maxResponseBytes?: number;
+	/**
+	 * Permit a bearer or macaroon credential over plain http to a
+	 * NON-loopback, non-onion host. Off by default: that is a plaintext
+	 * credential on the wire, defensible only where an orchestrator
+	 * guarantees network isolation (the local-http container case).
+	 */
+	allowUnencryptedAuth?: boolean;
+}
+
+export class GuardianClient {
+	readonly url: string;
+	private readonly guardianSetId: Buffer;
+	private readonly transport: GuardianHttpTransport;
+	private readonly headers: Record<string, string>;
+	private readonly timeoutMs: number;
+	private readonly maxResponseBytes: number;
+	private versionGate: Promise<IGuardianInfoResponse> | null = null;
+
+	constructor(options: IGuardianClientOptions) {
+		this.url = options.url.replace(/\/+$/, '');
+		this.guardianSetId = Buffer.from(options.guardianSetId);
+		this.transport = options.transport ?? nodeGuardianTransport();
+		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.maxResponseBytes =
+			options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
+		this.headers = {};
+		if (options.auth?.type === 'bearer') {
+			this.headers.Authorization = `Bearer ${options.auth.token}`;
+		} else if (options.auth?.type === 'macaroon') {
+			this.headers.Authorization = `Macaroon ${options.auth.macaroon}`;
+		}
+		if (this.headers.Authorization && !options.allowUnencryptedAuth) {
+			const parsed = new URL(this.url);
+			// The onion exemption demands the same v3 hostname validation as
+			// endpoint selection: a bare .onion suffix is not evidence of a
+			// Tor-encrypted destination.
+			if (
+				parsed.protocol === 'http:' &&
+				!isLoopbackHostname(parsed.hostname) &&
+				!ONION_V3_HOSTNAME.test(parsed.hostname)
+			) {
+				throw new GuardianTransportError(
+					'refusing to send a bearer or macaroon credential over plaintext ' +
+						'HTTP to a non-local host; set allowUnencryptedAuth only for an ' +
+						'isolated container network'
+				);
+			}
+		}
+	}
+
+	/**
+	 * The advertised-range gate (wire 10), enforced rather than advisory:
+	 * every verb awaits one cached INFO exchange before sending anything, so
+	 * a guardian outside the supported protocol range is rejected without
+	 * ever receiving signed material. A failed probe clears the cache so a
+	 * transient outage does not wedge the client.
+	 */
+	private ensureCompatible(): Promise<IGuardianInfoResponse> {
+		if (!this.versionGate) {
+			this.versionGate = (async (): Promise<IGuardianInfoResponse> => {
+				const info = await this.info();
+				if (
+					info.minProtocolVersion > GUARDIAN_PROTOCOL_VERSION ||
+					info.maxProtocolVersion < GUARDIAN_PROTOCOL_VERSION
+				) {
+					throw new GuardianTransportError(
+						`guardian supports protocol ${info.minProtocolVersion}..` +
+							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`
+					);
+				}
+				return info;
+			})().catch((error) => {
+				this.versionGate = null;
+				throw error;
+			});
+		}
+		return this.versionGate;
+	}
+
+	private async exchange(verb: string | null, body?: Buffer): Promise<Buffer> {
+		const url =
+			verb === null
+				? `${this.url}${GUARDIAN_HTTP_BASE_PATH}/info`
+				: `${this.url}${GUARDIAN_HTTP_BASE_PATH}/${verb}`;
+		const response = await this.transport(url, {
+			method: verb === null ? 'GET' : 'POST',
+			headers:
+				verb === null
+					? { ...this.headers }
+					: { ...this.headers, 'Content-Type': GUARDIAN_CONTENT_TYPE },
+			body,
+			timeoutMs: this.timeoutMs,
+			maxResponseBytes: this.maxResponseBytes
+		});
+		if (response.status !== 200) {
+			throw new GuardianTransportError(
+				`guardian answered HTTP ${response.status}`,
+				response.status
+			);
+		}
+		return response.body;
+	}
+
+	async info(): Promise<IGuardianInfoResponse> {
+		return decodeInfoResponse(await this.exchange(null));
+	}
+
+	/** The public face of the gate; shares its cache with every verb. */
+	async checkVersion(): Promise<IGuardianInfoResponse> {
+		return this.ensureCompatible();
+	}
+
+	async register(
+		request: IGuardianRegisterNodeRequest
+	): Promise<IGuardianRegisterNodeResponse> {
+		await this.ensureCompatible();
+		return decodeRegisterNodeResponse(
+			await this.exchange('register_node', encodeRegisterNodeRequest(request))
+		);
+	}
+
+	async putState(record: IGuardianRecord): Promise<IGuardianPutStateResponse> {
+		await this.ensureCompatible();
+		return decodePutStateResponse(
+			await this.exchange('put_state', encodePutStateRequest({ record }))
+		);
+	}
+
+	async getHead(recoveryId: Buffer): Promise<IGuardianGetHeadResponse> {
+		await this.ensureCompatible();
+		return decodeGetHeadResponse(
+			await this.exchange(
+				'get_head',
+				encodeGetHeadRequest({
+					protocolVersion: GUARDIAN_PROTOCOL_VERSION,
+					guardianSetId: this.guardianSetId,
+					recoveryId
+				})
+			)
+		);
+	}
+
+	async getState(
+		recoveryId: Buffer,
+		fromSequence: bigint,
+		maxRecords = 0
+	): Promise<IGuardianGetStateResponse> {
+		await this.ensureCompatible();
+		return decodeGetStateResponse(
+			await this.exchange(
+				'get_state',
+				encodeGetStateRequest({
+					protocolVersion: GUARDIAN_PROTOCOL_VERSION,
+					guardianSetId: this.guardianSetId,
+					recoveryId,
+					fromSequence,
+					maxRecords
+				})
+			)
+		);
+	}
+
+	async acquireEpoch(
+		request: IGuardianAcquireEpochRequest
+	): Promise<IGuardianAcquireEpochResponse> {
+		await this.ensureCompatible();
+		return decodeAcquireEpochResponse(
+			await this.exchange('acquire_epoch', encodeAcquireEpochRequest(request))
+		);
+	}
+
+	async syncRecord(
+		record: IGuardianRecord
+	): Promise<IGuardianSyncRecordResponse> {
+		await this.ensureCompatible();
+		return decodeSyncRecordResponse(
+			await this.exchange('sync_record', encodeSyncRecordRequest({ record }))
+		);
+	}
+
+	/** Retire a namespace under this (outgoing) set in favour of a new one (wire 5.11). */
+	async rotateSet(
+		request: IGuardianRotateSetRequest
+	): Promise<IGuardianRotateSetResponse> {
+		await this.ensureCompatible();
+		return decodeRotateSetResponse(
+			await this.exchange('rotate_set', encodeRotateSetRequest(request))
+		);
+	}
+
+	async syncEpoch(
+		certificates: IGuardianTakeoverCertificate[]
+	): Promise<IGuardianSyncEpochResponse> {
+		await this.ensureCompatible();
+		return decodeSyncEpochResponse(
+			await this.exchange(
+				'sync_epoch',
+				encodeSyncEpochRequest({ certificates })
+			)
+		);
+	}
+}
+
+// ─────────────── client-side artifact verification ───────────────
+
+export interface IGuardianSetContext {
+	guardianSetId: Buffer;
+	/** The committed member keys (32-byte x-only each). */
+	members: Buffer[];
+}
+
+/** A receipt is valid evidence only under the committed set and a member key. */
+export function verifyGuardianReceipt(
+	receipt: IGuardianReceipt,
+	context: IGuardianSetContext
+): boolean {
+	try {
+		if (receipt.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) return false;
+		if (!receipt.guardianSetId.equals(context.guardianSetId)) return false;
+		if (!context.members.some((m) => m.equals(receipt.guardianId)))
+			return false;
+		return verifyTranscript(
+			receiptTranscriptHash(
+				receipt.guardianSetId,
+				receipt.guardianId,
+				receipt.state,
+				receipt.issuedAt
+			),
+			receipt.signature,
+			receipt.guardianId
+		);
+	} catch {
+		return false;
+	}
+}
+
+export function verifyGuardianCertificate(
+	cert: IGuardianTakeoverCertificate,
+	context: IGuardianSetContext
+): boolean {
+	try {
+		if (cert.protocolVersion !== GUARDIAN_PROTOCOL_VERSION) return false;
+		if (!cert.guardianSetId.equals(context.guardianSetId)) return false;
+		if (!context.members.some((m) => m.equals(cert.guardianId))) return false;
+		return verifyTranscript(
+			takeoverTranscriptHash(
+				cert.guardianSetId,
+				cert.guardianId,
+				cert.supersededState,
+				cert.newEpoch,
+				cert.newWriterPublicKey,
+				cert.issuedAt
+			),
+			cert.signature,
+			cert.guardianId
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The rotation a guardian attached to an answer, IF it is evidence
+ * (wire 5.11): root-signed over THIS set's prefix, bound to this
+ * recovery_id, naming a well-formed incoming set, and ABOVE the generation
+ * the caller already knows. Judged by rotationEvidenceProblem, the same
+ * rule the guardian applies to its own persisted marker, so the
+ * replication client and the restore driver can never disagree with each
+ * other or with the guardian about what a rotation is.
+ *
+ * The answer's status is deliberately NOT consulted: a retired namespace
+ * rides an OK head, a quarantined or tombstoned one an ERR_STORE_UNCERTAIN
+ * answer (wire 5.3), and one old guardian that still proves where the
+ * namespace went is the whole acceptance model of 5.9 step 5. The answer's
+ * own unsigned `generation`, when it carries one, raises the floor: a
+ * guardian that reports generation g beside a rotation at or below g
+ * contradicts itself, and neither half of that answer is evidence.
+ */
+export function verifyGuardianRotation(
+	response:
+		| { rotation?: IGuardianRotateSetRequest; generation?: bigint }
+		| undefined,
+	context: IGuardianSetContext,
+	recoveryId: Buffer,
+	knownGeneration: bigint
+): IGuardianRotateSetRequest | null {
+	const rotation = response?.rotation;
+	if (!rotation) return null;
+	const reported = response?.generation;
+	const floor =
+		typeof reported === 'bigint' && reported > knownGeneration
+			? reported
+			: knownGeneration;
+	const problem = rotationEvidenceProblem(rotation, {
+		guardianSetId: context.guardianSetId,
+		recoveryId,
+		generation: floor
+	});
+	return problem === null ? rotation : null;
+}
+
+// ─────────────── bound guardians ───────────────
+
+/**
+ * A client bound to the guardian identity it is supposed to be talking to.
+ *
+ * Quorum counting is only meaningful over DISTINCT guardians, and a URL is
+ * not an identity: two configured endpoints can point at the same guardian
+ * (a duplicated descriptor, a load balancer, a mistake), and unsigned
+ * negative answers like ERR_UNKNOWN_NODE carry no signature to dedupe by.
+ * Binding the expected id, and verifying it against INFO before any of it
+ * counts, is what makes "two guardians said so" mean two guardians.
+ */
+export interface IBoundGuardianClient {
+	client: GuardianClient;
+	/** 32-byte x-only key this endpoint must prove it holds. */
+	expectedGuardianId: Buffer;
+}
+
+export class GuardianBindingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'GuardianBindingError';
+	}
+}
+
+/**
+ * Configuration validity, checked without touching the network: identities
+ * must be distinct and must be members of the committed set. Both are
+ * always operator errors, so both throw.
+ */
+export function assertDistinctGuardianMembers(
+	bound: IBoundGuardianClient[],
+	context: IGuardianSetContext
+): void {
+	const seen = new Set<string>();
+	for (const entry of bound) {
+		const key = entry.expectedGuardianId.toString('hex');
+		if (seen.has(key)) {
+			throw new GuardianBindingError(
+				`guardian ${key} is configured more than once; distinct guardians are ` +
+					'what a quorum counts'
+			);
+		}
+		seen.add(key);
+		if (!context.members.some((m) => m.equals(entry.expectedGuardianId))) {
+			throw new GuardianBindingError(
+				`guardian ${key} is not a member of the committed set`
+			);
+		}
+	}
+}
+
+/**
+ * Prove each REACHABLE endpoint is the guardian it is bound to, using its
+ * own INFO. An endpoint that answers with a different identity, or that
+ * does not serve the configured set, is a configuration error and throws:
+ * counting it would let one guardian masquerade as two.
+ *
+ * Unreachability is NOT an error here, deliberately. Tolerating a down
+ * guardian is the whole point of a 2-of-3 set, and an endpoint that cannot
+ * answer INFO cannot answer anything else either, so it contributes
+ * nothing to any quorum regardless. The returned set names the identities
+ * that were positively verified, so unsigned negative answers can be
+ * counted only for guardians that proved who they are.
+ */
+export async function verifyGuardianBindings(
+	bound: IBoundGuardianClient[],
+	context: IGuardianSetContext
+): Promise<Set<string>> {
+	assertDistinctGuardianMembers(bound, context);
+	const verified = new Set<string>();
+	for (const entry of bound) {
+		const key = entry.expectedGuardianId.toString('hex');
+		let info;
+		try {
+			info = await entry.client.info();
+		} catch {
+			continue;
+		}
+		if (!info.guardianId.equals(entry.expectedGuardianId)) {
+			throw new GuardianBindingError(
+				`endpoint ${entry.client.url} announces ${info.guardianId.toString(
+					'hex'
+				)}, not the expected ${key}`
+			);
+		}
+		// A host that registers sets on demand lists a set only after
+		// REGISTER_NODE has run (wire 2.7), so its willingness stands in for
+		// the listing until then; a configured guardian must list the set.
+		if (
+			!info.guardianSetIds.some((id) => id.equals(context.guardianSetId)) &&
+			!info.acceptsRegistrations
+		) {
+			throw new GuardianBindingError(
+				`guardian ${key} does not serve the configured guardian set`
+			);
+		}
+		verified.add(key);
+	}
+	return verified;
+}
+
+// ─────────────── quorum fan-out primitives ───────────────
+
+export interface IGuardianFanOutResult<T> {
+	client: GuardianClient;
+	result?: T;
+	error?: Error;
+	/** Present when the fan-out ran over bound clients. */
+	guardianId?: Buffer;
+}
+
+/** Fan out over bound clients, carrying each guardian's identity through. */
+export async function boundFanOut<T>(
+	bound: IBoundGuardianClient[],
+	operation: (client: GuardianClient) => Promise<T>
+): Promise<Array<IGuardianFanOutResult<T>>> {
+	return Promise.all(
+		bound.map(async (entry) => {
+			try {
+				return {
+					client: entry.client,
+					guardianId: entry.expectedGuardianId,
+					result: await operation(entry.client)
+				};
+			} catch (error) {
+				return {
+					client: entry.client,
+					guardianId: entry.expectedGuardianId,
+					error: error instanceof Error ? error : new Error(String(error))
+				};
+			}
+		})
+	);
+}
+
+/**
+ * Run one operation against every guardian concurrently and settle all of
+ * them: partial failure is the normal case a 2-of-3 deployment exists for,
+ * so errors are collected, never thrown.
+ */
+export async function guardianFanOut<T>(
+	clients: GuardianClient[],
+	operation: (client: GuardianClient) => Promise<T>
+): Promise<Array<IGuardianFanOutResult<T>>> {
+	return Promise.all(
+		clients.map(async (client) => {
+			try {
+				return { client, result: await operation(client) };
+			} catch (error) {
+				return {
+					client,
+					error: error instanceof Error ? error : new Error(String(error))
+				};
+			}
+		})
+	);
+}
+
+/**
+ * Count DISTINCT verified receipt signers over an exact state: the barrier
+ * discipline (spec 5.3) counts a record durable once `required` distinct
+ * guardians have receipted a state at or past it.
+ */
+export function countReceiptQuorum(
+	results: Array<IGuardianFanOutResult<{ receipt?: IGuardianReceipt }>>,
+	context: IGuardianSetContext,
+	covers: (receiptState: GuardianState) => boolean
+): number {
+	const signers = new Set<string>();
+	for (const entry of results) {
+		const receipt = entry.result?.receipt;
+		if (!receipt) continue;
+		if (!verifyGuardianReceipt(receipt, context)) continue;
+		if (!covers(receipt.state)) continue;
+		signers.add(receipt.guardianId.toString('hex'));
+	}
+	return signers.size;
+}

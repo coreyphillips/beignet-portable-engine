@@ -1,0 +1,213 @@
+services:
+  bitcoind:
+    container_name: bitcoin
+    # 31.0: eclair 0.14.1 (needed for the post-#1289 channel_reestablish wire
+    # form, issue #305) asserts Bitcoin Core 31 or higher at startup.
+    image: btcpayserver/bitcoin:31.0
+    restart: unless-stopped
+    expose:
+      - '43782'
+      - '39388'
+    ports:
+      - '43782:43782'
+      - '39388:39388'
+    volumes:
+      - 'bitcoin_home:/home/bitcoin/.bitcoin'
+    environment:
+      BITCOIN_NETWORK: ${NBITCOIN_NETWORK:-regtest}
+      CREATE_WALLET: 'true'
+      BITCOIN_WALLETDIR: '/walletdata'
+      BITCOIN_EXTRA_ARGS: |
+        rpcport=43782
+        rpcbind=0.0.0.0:43782
+        rpcallowip=0.0.0.0/0
+        port=39388
+        whitelist=0.0.0.0/0
+        maxmempool=500
+        rpcauth=polaruser:5e5e98c21f5c814568f8b55d83b23c1c$$066b03f92df30b11de8e4b1b1cd5b1b4281aa25205bd57df9be82caf97a05526
+        txindex=1
+        fallbackfee=0.00001
+        zmqpubrawblock=tcp://0.0.0.0:28334
+        zmqpubrawtx=tcp://0.0.0.0:28335
+        zmqpubhashblock=tcp://0.0.0.0:28336
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-rpcport=43782", "-rpcuser=polaruser", "-rpcpassword=polarpass", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  bitcoinsetup:
+    image: btcpayserver/bitcoin:31.0
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: 'no'
+    volumes:
+      - 'bitcoin_home:/home/bitcoin/.bitcoin'
+    user: bitcoin
+    # generate one block so electrs stop complaining
+    entrypoint:
+      [
+        'bash',
+        '-c',
+        'sleep 1; while ! bitcoin-cli -rpcconnect=bitcoind -generate 1; do sleep 1; done',
+      ]
+
+  lnd:
+    container_name: lnd
+    image: lightninglabs/lnd:v0.20.0-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - '9735:9735'
+      - '8081:8080'
+      # LND altruist watchtower server (wtwire), for beignet tower-client
+      # interop tests.
+      - '9911:9911'
+    volumes:
+      - 'lnd_home:/root/.lnd'
+    command:
+      - '--noseedbackup'
+      - '--bitcoin.active'
+      - '--bitcoin.regtest'
+      - '--bitcoin.node=bitcoind'
+      - '--bitcoind.rpchost=bitcoind:43782'
+      - '--bitcoind.rpcuser=polaruser'
+      - '--bitcoind.rpcpass=polarpass'
+      - '--bitcoind.zmqpubrawblock=tcp://bitcoind:28334'
+      - '--bitcoind.zmqpubrawtx=tcp://bitcoind:28335'
+      - '--listen=0.0.0.0:9735'
+      - '--restlisten=0.0.0.0:8080'
+      - '--tlsextradomain=lnd'
+      - '--tlsextraip=0.0.0.0'
+      - '--debuglevel=info'
+      - '--protocol.wumbo-channels'
+      - '--protocol.zero-conf'
+      - '--protocol.option-scid-alias'
+      - '--maxpendingchannels=10'
+      - '--max-channel-fee-allocation=1.0'
+      - '--watchtower.active'
+      - '--watchtower.listen=0.0.0.0:9911'
+
+  cln:
+    container_name: cln
+    # v26.06.1 matches the live CLN that beignet splicing was validated
+    # against on mainnet; v24.11.1's channeld crashed right after sending
+    # splice_ack (CLN-side bug), blocking all splice interop tests.
+    image: elementsproject/lightningd:v26.06.1
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - '19846:19846'
+      # WebSocket peer listener (bind-addr=ws:), for beignet WS transport
+      # interop tests.
+      - '19847:19847'
+      - '3010:3010'
+    volumes:
+      - 'cln_home:/root/.lightning'
+    command:
+      - '--network=regtest'
+      - '--bitcoin-rpcconnect=bitcoind'
+      - '--bitcoin-rpcport=43782'
+      - '--bitcoin-rpcuser=polaruser'
+      - '--bitcoin-rpcpassword=polarpass'
+      - '--addr=0.0.0.0:19846'
+      # Accept BOLT 8 peers over WebSocket (RFC 6455) on 19847
+      - '--bind-addr=ws:0.0.0.0:19847'
+      - '--clnrest-port=3010'
+      - '--clnrest-host=0.0.0.0'
+      - '--large-channels'
+      - '--log-level=info'
+      # v26: offers are always on (--experimental-offers was removed);
+      # splicing and dual funding still use experimental flags.
+      # --experimental-dual-fund only changes CLN behavior for peers that also
+      # advertise option_dual_fund; the shared interop node (cln-helpers /
+      # createInteropNode) deliberately does NOT, so CLN's fundchannel stays v1
+      # for every tier except the dedicated v2 test. Do not add
+      # Feature.DUAL_FUND to createInteropNode without revisiting this.
+      - '--experimental-splicing'
+      - '--experimental-dual-fund'
+
+  eclair:
+    container_name: eclair
+    # Built locally from the official 0.14.1 release zip (see eclair/Dockerfile):
+    # 0.14.x implements the post-#1289 channel_reestablish next_funding form
+    # needed to resume a v2 open (issue #305), and no upstream 0.14.x image
+    # runs natively on arm64 (polarlightning stops at 0.13.1; the amd64
+    # acinq/eclair build SIGSEGVs under Rosetta). Requires the bitcoind 31.x
+    # image pinned above; a lower Core version makes eclair crash-loop under
+    # restart:unless-stopped and starve the CI runner.
+    build: ./eclair
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+      bitcoinsetup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - '9737:9737'
+      - '8082:8080'
+    environment:
+      JAVA_OPTS: >-
+        -Xmx512m
+        -Declair.allow-unsafe-startup=true
+        -Declair.chain=regtest
+        -Declair.server.port=9737
+        -Declair.server.binding-ip=0.0.0.0
+        -Declair.api.enabled=true
+        -Declair.api.port=8080
+        -Declair.api.password=eclairpassword
+        -Declair.api.binding-ip=0.0.0.0
+        -Declair.bitcoind.host=bitcoind
+        -Declair.bitcoind.rpcport=43782
+        -Declair.bitcoind.rpcuser=polaruser
+        -Declair.bitcoind.rpcpassword=polarpass
+        -Declair.bitcoind.wallet=default
+        -Declair.bitcoind.zmqblock=tcp://bitcoind:28334
+        -Declair.bitcoind.zmqtx=tcp://bitcoind:28335
+        -Declair.channel.min-public-funding-satoshis=20000
+        -Declair.channel.min-private-funding-satoshis=20000
+        -Declair.channel.max-restart-watch-delay=1s
+        -Declair.channel.max-block-processing-delay=1s
+        -Declair.features.option_dual_fund=optional
+        -Declair.printToConsole
+
+  electrs:
+    container_name: electrum
+    image: getumbrel/electrs:v0.10.10
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    expose:
+      - '60001'
+      - '28334'
+      - '28335'
+      - '28336'
+    ports:
+      - '60001:60001'
+      # - '28334:28334'
+      # - '28335:28335'
+      # - '28336:28336'
+    volumes:
+      - './electrs.toml:/data/electrs.toml'
+    environment:
+      - ELECTRS_NETWORK=regtest
+      - ELECTRS_ELECTRUM_RPC_ADDR=electrs:60001
+      - ELECTRS_DAEMON_RPC_ADDR=bitcoind:43782
+      - ELECTRS_DAEMON_P2P_ADDR=bitcoind:39388
+      - ELECTRS_LOG_FILTERS=INFO
+
+
+volumes:
+  bitcoin_home:
+  lnd_home:
+  cln_home:
+  eclair_home:
+
+networks: {}

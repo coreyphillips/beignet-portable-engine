@@ -1,0 +1,2191 @@
+# Beignet CLI & BeignetNode API
+
+A simplified interface for the beignet Bitcoin + Lightning library. Two ways to use it:
+
+1. **`BeignetNode` class** -- import into TypeScript/JS scripts
+2. **`beignet` CLI** -- run shell commands that talk to an HTTP daemon
+
+Both return plain JSON with hex string IDs and satoshi amounts (no Buffer, no bigint).
+
+---
+
+## Quick Start
+
+### CLI
+
+```bash
+# Initialize (generates mnemonic, writes ~/.beignet/config.json)
+npx ts-node src/cli/cli.ts init --network regtest
+
+# Start the daemon (stays in foreground, listens on 127.0.0.1:2112)
+npx ts-node src/cli/cli.ts start
+
+# In another terminal:
+npx ts-node src/cli/cli.ts info
+npx ts-node src/cli/cli.ts balance
+npx ts-node src/cli/cli.ts address
+npx ts-node src/cli/cli.ts invoice create 1000 "coffee"
+npx ts-node src/cli/cli.ts stop
+```
+
+After `npm run build`, you can also use the compiled version:
+
+```bash
+node dist/cli/cli.js start --network regtest
+# or if installed globally via npm link:
+beignet start --network regtest
+```
+
+### Programmatic (TypeScript)
+
+```typescript
+import { BeignetNode } from 'beignet/cli';
+
+const node = await BeignetNode.create({
+  network: 'regtest',
+  electrumHost: '127.0.0.1',
+  electrumPort: 60001,
+});
+
+console.log(node.getInfo());
+// { nodeId: "02ab...", network: "regtest", onchainBalanceSats: 0, ... }
+
+const addr = await node.getNewAddress();
+// "bcrt1q..."
+
+const invoice = node.createInvoice(1000, "test payment");
+// { bolt11: "lnbcrt10n1...", paymentHash: "ab12...", amountSats: 1000 }
+
+await node.destroy();
+```
+
+---
+
+## BeignetNode API
+
+### Factory
+
+```typescript
+const node = await BeignetNode.create({
+  mnemonic?: string,        // BIP39 mnemonic; generates new if omitted
+  network?: string,         // 'mainnet' | 'testnet' | 'signet' | 'regtest' (default: 'mainnet')
+  alias?: string,           // node alias
+  dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
+  electrumHost?: string,    // Electrum server host
+  electrumPort?: number,    // Electrum server port
+  electrumTls?: boolean,    // use TLS for Electrum
+  listenPort?: number,      // listen for inbound Lightning connections
+  preferAnchors?: boolean,  // anchor channels (default: true); set false for legacy static_remotekey
+  autoBootstrap?: boolean,  // auto-connect to DNS seed peers on start
+  autoReconnect?: boolean,  // auto-reconnect to peers on disconnect (default: true)
+  electrumServers?: Array<{ host: string; port: number; tls?: boolean }>,  // failover servers
+  backupPath?: string,      // enable automated backups to this path
+  backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
+  storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
+  dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC); see Spending Limits
+  connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
+  onError?: (error) => void, // error callback for node:error events
+  logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
+  logger?: ILogger,          // leveled diagnostic logger; entries passing logLevel are forwarded to it and it is injected into the underlying Wallet + LightningNode
+});
+```
+
+Internally wires together: `Wallet` + `LightningNode` + `SqliteStorage` + `WalletFundingProvider` + `ElectrumBackend`.
+
+### Methods
+
+All methods return plain objects. IDs are hex strings. Amounts are numbers in satoshis.
+
+#### Info
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getInfo()` | `NodeInfo` | Node ID, network, balances, peer/channel counts |
+| `getMnemonic()` | `string` | The BIP39 mnemonic |
+| `getBalance()` | `BalanceInfo` | `{ onchain, lightning, total, unsettledSats }` in sats |
+| `signMessage(message)` | `{ signature, pubkey }` | Sign with the node key (LND-compatible: `Lightning Signed Message:` prefix, double-SHA256, compact recoverable ECDSA, zbase32). Verifiable with `lncli verifymessage` |
+| `verifyMessage(message, signature)` | `{ valid, pubkey, knownNode }` | Recover the signer pubkey from an LND-style signature; `knownNode` says whether it is in our graph. Compare `pubkey` to the expected signer |
+
+#### On-chain
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getNewAddress()` | `Promise<string>` | Next unused bech32 receive address |
+| `sendOnchain(address, amountSats, satsPerVbyte?)` | `Promise<TxInfo>` | Build, sign, broadcast tx. Returns `{ txid, hex }`. Optional fee rate. |
+| `sendMaxOnchain(address, satsPerVbyte?)` | `Promise<TxInfo>` | Sweep the entire spendable balance to one address (amount = balance minus fee) |
+| `bumpFeeOnchain(txid, satsPerVbyte)` | `Promise<BoostResult>` | RBF-replace an unconfirmed wallet tx at a higher fee rate (BIP 125); NOT_BOOSTABLE when RBF is unavailable |
+| `boostOnchain(txid, satsPerVbyte?)` | `Promise<BoostResult>` | Fee-bump a tx: RBF when possible, else CPFP to a fresh wallet address |
+| `listBoostableTransactions()` | `BoostableTransactions` | Unconfirmed wallet txs eligible for RBF and/or CPFP |
+| `consolidateUtxos(satsPerVbyte?)` | `Promise<ConsolidateResult>` | Merge all UTXOs into one output at a fresh wallet address (send-max-to-self) |
+| `buildPsbt(outputs, satsPerVbyte?)` | `Promise<PsbtBuildInfo>` | Build an UNSIGNED PSBT for an external signer (hardware wallet); nothing is signed or broadcast |
+| `importSignedPsbt(psbtBase64)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT; returns `{ txid, txHex }` WITHOUT broadcasting |
+| `combinePsbts(psbts)` | `{ psbtBase64 }` | Combine partially signed copies of the same PSBT (multi-party signing) |
+| `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
+| `listUtxos()` | `UtxoInfo[]` | Wallet UTXOs; each entry carries a `frozen` flag |
+| `freezeUtxo(txid, index)` | `Promise<{ frozen }>` | Freeze a UTXO: excluded from ALL coin selection (send/send-max/consolidate/PSBT build) until unfrozen; still counted in the balance |
+| `unfreezeUtxo(txid, index)` | `Promise<{ unfrozen }>` | Make a frozen UTXO spendable again |
+| `setAddressLabel(address, label)` | `Promise<{ address, label }>` | Set a user label for an address (empty label clears it) |
+| `listAddressLabels()` | `Record<string, string>` | All user address labels keyed by address |
+| `exportDescriptors()` | `DescriptorsInfo` | BIP 380 output descriptors (with checksums) for all four address types. Public keys only; private keys are never exported |
+
+#### Peers
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `connectPeer(pubkey, host, port)` | `Promise<PeerInfo>` | Connect to Lightning peer. Times out after `connectTimeoutMs` (default 15s). |
+| `disconnectPeer(pubkey)` | `void` | Disconnect peer |
+| `listPeers()` | `PeerInfo[]` | List connected peers |
+
+#### DNS Bootstrap (BOLT 10)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `bootstrapPeers()` | `Promise<BootstrapPeerInfo[]>` | Discover peers via DNS seeds |
+| `connectToSeeds(maxPeers?)` | `Promise<string[]>` | Connect to discovered seed peers |
+
+#### Trusted Peers (Zero-Conf)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `addTrustedPeer(pubkey)` | `TrustedPeerInfo` | Trust a peer for zero-conf channels |
+| `removeTrustedPeer(pubkey)` | `TrustedPeerInfo` | Remove peer from trusted set |
+| `listTrustedPeers()` | `TrustedPeerInfo[]` | List all trusted peers |
+
+#### Channels
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `openChannel(pubkey, amountSats, pushSats?)` | `ChannelInfo` | Open channel, auto-funded from wallet |
+| `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
+| `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
+| `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout resolves to a wallet-scanned address first. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
+| `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
+| `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
+| `listChannels()` | `ChannelInfo[]` | List all channels |
+| `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
+| `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
+| `connectAndOpenChannel(pubkey, host, port, amountSats, opts?)` | `Promise<ChannelInfo>` | Connect to peer + open channel in one call. `opts: { pushSats? }` |
+| `ensureMinimumChannels(count, satsPerChannel, opts?)` | `Promise<ChannelInfo[]>` | Auto-open channels to meet minimum count. Connects to peers via gossip graph addresses before opening. `opts: { timeoutMs? }` |
+
+#### Invoices
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
+| `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
+| `listInvoices()` | `InvoiceInfo[]` | List all created invoices |
+| `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling. `minFinalCltvExpiry` is 1..2016 blocks and sets the BOLT 11 `c` tag |
+| `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |
+| `cancelHoldInvoice(paymentHash)` | `{ paymentHash, htlcsFailed }` | Fail parked HTLCs back (`incorrect_or_unknown_payment_details`) and close the invoice |
+| `listHoldInvoices()` | `HoldInvoiceInfo[]` | Hold invoices with state `OPEN\|ACCEPTED\|SETTLED\|CANCELLED` and parked totals |
+
+##### Hold invoices
+
+A hold (HODL) invoice decouples HTLC acceptance from settlement. The caller
+generates a preimage, keeps it, and hands `sha256(preimage)` to
+`createHoldInvoice`. When the payer pays, the HTLC is validated and **parked**:
+the payer sees the payment as in-flight (PENDING) while the recipient decides.
+`settleHoldInvoice(preimage)` completes it (the payer receives the preimage);
+`cancelHoldInvoice(paymentHash)` fails it back as if the invoice were unknown.
+Parked HTLCs are restart-safe (they re-park from storage) and are
+**auto-cancelled** by the CLTV sweeper 18 blocks before the HTLC expiry, so a
+forgotten hold can never force an on-chain timeout. Typical uses: escrow-style
+flows, just-in-time inventory checks, atomic swaps (the reverse swap provider
+below mints them; the submarine provider pays a peer's ordinary invoice).
+
+Hold progress fires events (`hold:accepted`, `hold:settled`, `hold:cancelled`),
+relayed over SSE and webhooks. `hold:accepted` fires for each new parked part,
+including partial MPP payments. Before funding a swap, compare
+`BigInt(heldAmountMsat)` with the full expected amount in millisatoshis.
+The `ACCEPTED` state alone does not mean the invoice is fully funded. The
+final hop enforces the invoice's `minFinalCltvExpiry` on every arriving HTLC,
+and each event and `GET /invoices/held` row reports the realised
+`earliestExpiry` and `cancelHeight` of the parked set, so a swap provider can
+verify the Lightning leg outlives its on-chain refund before funding.
+
+#### Payments
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). `maxFeeSats` caps routing fees. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws** — catches all errors and resolves with `status: 'FAILED'` instead. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
+| `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
+| `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
+| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until it settles or its claim expires (24h). |
+| `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
+| `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
+| `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
+| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s). |
+| `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
+
+#### BOLT 12 Offers
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
+| `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
+| `listOffers()` | `OfferInfo[]` | List local offers |
+| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). Drain mode and the spending limits apply to the returned invoice's amount |
+
+#### Channel Readiness
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getReadyChannels()` | `ChannelInfo[]` | List channels that are NORMAL and will accept a new HTLC |
+| `canSend(amountSats)` | `{ canSend, bestChannelId?, availableSats }` | Check if you can send this amount (accounts for channel reserves) |
+| `canReceive(amountSats)` | `{ canReceive, bestChannelId?, availableSats }` | Check if you can receive this amount (accounts for channel reserves) |
+
+#### Route Estimation & Probing
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `estimateRouteFee(bolt11, amountSats?)` | `RouteEstimate \| null` | Estimate fee without sending. Returns `{ feeSats, hops, cltvDelta }` or null |
+| `probeRoute(destination, amountSats)` | `{ success, feeSats?, hops? }` | Probe route viability to a destination node |
+| `estimatePayment(bolt11, amountSats?)` | `PaymentEstimate \| null` | Full payment intelligence: success probability, route quality, estimated fee and time, warnings |
+
+#### Graph Queries
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getGraphInfo()` | `GraphInfo` | Node/channel counts + last gossip sync time this session |
+| `getGraphNode(pubkey)` | `GraphNodeInfo \| null` | Node announcement info (alias, addresses, features) + its known channel SCIDs |
+| `getGraphChannel(scid)` | `GraphChannelInfo \| null` | Channel endpoints, capacity (from htlc_maximum_msat) and both directions' policies |
+| `describeGraph(limit?, offset?)` | `GraphDescribeResult` | Paged channel dump (limit defaults to 500, capped at 500) |
+| `queryRoute(destination, amountSats, maxFeeSats?)` | `RouteQueryResult` | Compute a route WITHOUT sending; hops feed `sendToRoute` |
+| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute` |
+
+#### Payment Proof
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getPaymentProof(paymentHash)` | `PaymentProof \| null` | Cryptographic proof of a completed payment (preimage, invoice, route info) |
+| `verifyPaymentProof(paymentHash)` | `PaymentProofVerification` | Verify proof cryptographically: `sha256(preimage) === paymentHash`. Returns `{ valid, proof?, error? }` |
+
+#### Payment Queue
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `enqueuePayment(bolt11, priority?, opts?)` | `QueuedPayment` | Add payment to priority queue (1-10, lower = higher priority). `opts: { amountSats?, maxFeeSats?, metadata? }` |
+| `listQueue()` | `QueuedPayment[]` | List all queue entries |
+| `cancelQueuedPayment(id)` | `boolean` | Cancel a queued payment by ID |
+
+#### Liquidity & Channel Intelligence
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getLiquiditySnapshot()` | `LiquiditySnapshot` | Liquidity analysis with actionable recommendations (OPEN_CHANNEL, CLOSE_CHANNEL, REBALANCE) |
+| `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
+| `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
+| `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats` |
+| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day) |
+
+Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
+
+#### Statistics
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getStats(windowMs?)` | `NodeStats` | Payment stats with optional time window. Includes `avgPaymentTimeSec` and `avgFeePct` when data available |
+
+#### Database Backup
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+
+Storage encryption: the SQLite database is encrypted at rest by default with a
+key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
+(channel state, preimages, payment secrets, invoices, payments, chain-monitor
+state) are AES-256-GCM encrypted, so backups made with `backup()` are encrypted
+too; restoring one requires the same mnemonic. Pre-encryption databases are
+migrated in place on first open. Set `storageEncryption: false` to opt out
+(plaintext storage).
+
+#### Static Channel Backup (SCB)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `exportStaticChannelBackup()` | `{ encoded, channelCount, path }` | Build, encrypt, and write the static channel backup |
+
+A static channel backup is a small, portable, versioned blob holding the
+minimum needed to recover funds for every open channel without the full
+database: per channel it records the channel id, peer node id and last-known
+addresses, funding outpoint (txid internal byte order + output index),
+capacity, per-channel key index, channel type, role, and taproot/anchor flags.
+The blob is JSON encrypted with AES-256-GCM under a key derived
+(HKDF-SHA256, info `beignet-scb-v1`) from the wallet's BIP39 seed, encoded as
+`beignet-scb-v1:` + base64 - it is useless without the mnemonic.
+
+The file is written atomically to `<dataDir>/channels.scb` and refreshed
+automatically whenever the channel set changes (channel open/splice calls,
+`channel:ready`, `channel:closed`, and channel resolution). Store a copy
+off-machine (e.g. via `beignet backup scb <destPath>` or `GET /backup/scb`).
+
+#### Automatic Peer Backup (BOLT 1 peer storage)
+
+| Method / Command | Returns | Description |
+|--------|---------|-------------|
+| `getPeerRetrievedBackup()` | `{ encoded, createdAt, fromPeer, channelCount, source } \| null` | Most useful valid SCB a peer returned this session, directly (`source: 'scb'`) or embedded in a Recovery Capsule (`source: 'capsule'`, re-encoded under the wallet seed); an empty backup never displaces one naming channels (daemon: `GET /backup/peer-retrieved`; CLI: `beignet backup peer-retrieved`) |
+
+With `peerStorageEnabled` (default true) the node advertises
+`option_provide_storage` and uses it in both directions:
+
+- **Our backup, held by peers.** Every SCB refresh is pushed as an opaque
+  `peer_storage` blob to each connected peer that advertises the feature, and
+  each such peer returns its held copy via `peer_storage_retrieval` on every
+  reconnect. Recovery-from-nothing: reinstall with the mnemonic, connect to
+  your old peers, read `GET /backup/peer-retrieved`, and feed its `encoded`
+  blob to `POST /restore/scb`. Nothing is restored automatically - recovery
+  stays explicit, and SCB recovery never broadcasts a stale commitment, so a
+  peer returning an old blob is harmless.
+- **Trust model.** Peers only ever see the seed-encrypted `beignet-scb-v1`
+  ciphertext; without the mnemonic it is useless to them. Blobs returned by
+  peers are untrusted input: anything that does not decrypt as our own SCB is
+  ignored, and among valid ones only the newest (`createdAt`) is kept.
+- **Storing for peers.** In return the node holds ONE blob (max 65531 bytes,
+  newest wins) per peer it has a non-closed channel with or trusts
+  (zero-conf trusted set), accepts at most one blob per peer per 60 seconds,
+  and sends it back on every reconnect. Blobs from strangers are dropped.
+  Stored blobs live in the `peer_storage_blobs` table, encrypted at rest like
+  the rest of the database.
+
+#### Restore
+
+| Method / Command | Returns | Description |
+|--------|---------|-------------|
+| `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
+| `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+| `restoreFromGuardians()` | `Promise<{ exact, framesApplied, guardiansRepaired, epoch }>` | Restore from guardian replicas and start the node on the restored state (daemon: `POST /recovery/restore` with `{ confirm: true }`; CLI: `beignet recovery restore`) |
+| `restoreFromCapsules({ unfenced? })` | `Promise<{ tier, channelCount, framesApplied, head, newestSeenHead, rejectedCandidates, restartRequired, unfenced?, recovering?, skipped? }>` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session (daemon: `POST /recovery/restore-capsule` with `{ confirm: true }`; CLI: `beignet recovery restore-capsule`). Tier 2 installs the exact state into a fresh database and holds the daemon until a restart; Tier 1 recovers the embedded SCB on the live node |
+
+Three very different restore modes:
+
+- **SCB restore = on-chain recovery only.** The backup holds no commitment
+  state, so the channels themselves cannot be resumed. Each entry is
+  reconstructed as a broadcast-banned channel (`ERRORED`, data-loss flagged -
+  the node will never publish its own stale commitment), the funding outpoint
+  is watched, and the peer is contacted so the normal reestablish exchange
+  proves our state stale. The honest peer then force-closes with ITS
+  commitment and the node sweeps only our `to_remote` balance to the wallet.
+  Funds arrive on-chain after the peer's force-close confirms; in-flight
+  HTLCs and anything beyond `to_remote` are not recoverable this way. The
+  blob decrypts only with the wallet mnemonic, and a backup taken on another
+  network is refused.
+
+- **DB restore = full state.** `beignet restore db <backupFile>` copies a
+  backup made with `backup()` over `<dataDir>/<network>.db`. The node must be
+  STOPPED: the command refuses while a daemon holds the wallet's
+  single-instance lock (and holds that lock itself during the copy). The file
+  must be a real SQLite database (16-byte header check), any existing
+  database is preserved at `<db>.pre-restore-<timestamp>` first, and stale
+  `-wal`/`-shm` sidecars are moved aside so they cannot corrupt the restored
+  file. The database is encrypted under the wallet seed, so the node must be
+  started with the same mnemonic that made the backup. WARNING: restoring a
+  stale database and going online can be unsafe (peers may prove the state
+  stale); prefer the most recent backup, and rely on SCB recovery when in
+  doubt.
+
+- **Guardian restore = resume the channels.** With the Recovery Protocol in a
+  guardian mode (below), the node's safety-critical state is replicated as an
+  encrypted journal to a 2-of-3 guardian set, and a restore reconstructs the
+  exact channel state and RESUMES the channels via `channel_reestablish`
+  instead of force-closing. See "Guardian recovery" next.
+
+#### Hosting a guardian (bolt8)
+
+Any beignet node that listens for peers can serve the reference guardian to
+other beignet nodes (docs/RECOVERY-GUARDIAN-WIRE.md 2.7, issue #699). Start
+it with `BEIGNET_GUARDIAN_SERVE=true`; the guardian is reached at the node's
+ordinary Lightning address, over a dedicated BOLT 8 session the writer opens
+under a fresh key, so the host never learns which Lightning node it guards.
+Its guardian id is derived from the node seed, so a node rebuilt from its seed
+keeps the same id. A wallet adds it by resolving the node's URI
+(`beignet recovery resolve-guardian <node id>@host:port`, or the daemon's
+`POST /recovery/resolve-guardian`) to an entry of the form
+`<guardianId>@bolt8://<node id>@host:port`, and pins that in
+`BEIGNET_RECOVERY_GUARDIANS` like any other guardian. A host keeps serving
+while its own writer lease is quarantined (the guardian-only lane), so nodes
+that guard each other can restart together. Quotas
+(`BEIGNET_GUARDIAN_MAX_BYTES`, `_MAX_SETS`) refuse new writes rather than
+delete, because pruning a namespace wedges a stranger's node for good.
+
+#### Rotating guardians
+
+A wallet's guardian set is no longer fixed for life (docs/RECOVERY-GUARDIAN-WIRE.md
+5.9, issue #701). `beignet recovery rotate-guardians <e> <e> <e>` (or
+`POST /recovery/rotate-guardians`) moves the wallet to a new set, one member or
+all three, without closing a channel: the daemon registers the namespace with
+the incoming set under its current lease at the next generation, backfills the
+retained journal until two of the incoming three hold the tip, switches in one
+transaction, and retires the outgoing set with `ROTATE_SET`. A restore device
+still configured with the outgoing set reads the rotation off any outgoing
+guardian and follows it to the live set by itself; `GET /recovery/status`
+reports the `generation`, `configuredSetStale` once the env lags the journal,
+and `rotation.followed` on a boot that followed one. A previous device still
+running on the outgoing set freezes the moment it sees the new generation, in
+a capsule or in a guardian's answer. A rotation interrupted by a crash resumes
+once the gate confirms; a retirement the outgoing set has not accepted yet is
+retried in the background.
+
+#### Guardian recovery (Recovery Protocol)
+
+The Recovery Protocol (docs/RECOVERY-PROTOCOL.md) is configured entirely
+through env/config, following the other `BEIGNET_*` settings:
+
+```bash
+BEIGNET_RECOVERY_MODE=quorum   # off | peer-storage | async-remote | quorum
+BEIGNET_RECOVERY_GUARDIANS=<64-hex-pubkey>@https://g1.example,<64-hex-pubkey>@https://g2.example,<64-hex-pubkey>@http://<v3>.onion
+BEIGNET_RECOVERY_PROFILE=crash-v1   # optional; crash-v1 is the only value
+BEIGNET_RECOVERY_REESTABLISH_HOLD_MS=600000   # peer-storage only; 0 disables
+BEIGNET_RECOVERY_AUTO_APPLY=false   # peer-storage only; apply the best capsule on an empty boot, no operator call
+BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS=15000   # wait this long after the first capsule for slower replicas
+BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; must fit inside the hold
+```
+
+- `off` (default): nothing changes.
+- `peer-storage`: the encrypted recovery journal is kept locally and a
+  Recovery Capsule (SCB + journal) is distributed over BOLT 1 peer storage.
+  No guardians involved, so no fencing between devices either. Restore:
+  boot the same mnemonic on a FRESH data dir in this mode (an empty node
+  pushes nothing, so the peers keep the capsule), connect to the peers the
+  node had channels with, check `capsules` on `GET /recovery/status`, then
+  `POST /recovery/restore-capsule` with `{ "confirm": true }`. Connecting
+  before you restore is safe: in this mode the node HOLDS a peer's
+  `channel_reestablish` for a channel the empty database has no record of
+  instead of answering it with the BOLT 1 unknown-channel error, which would
+  make the peer force-close the channel the restore is about to resume
+  (issue #462). `GET /recovery/status` lists each held peer under
+  `node.heldReestablish` with the `expiresAt` you have to beat; past that the
+  error goes out as before. The window is
+  `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` (default 600000; 0 answers
+  immediately) and it is granted once per peer and channel. When an
+  inline journal validates (Tier 2) the exact state is installed into a
+  fresh database, the daemon holds in the `restart-required` state (every
+  route but the recovery surface answers 503 `NODE_RESTART_REQUIRED`) and a
+  restart resumes the channels; the previous database is kept beside it as
+  `<network>.db.pre-capsule-restore-<timestamp>`, and API-key revocations,
+  webhooks and peer addresses follow into the restored one. The swap is
+  crash-safe: a marker (`<network>.capsule-restore.json`) lets the next boot
+  finish an interrupted swap. Otherwise (Tier 1) the embedded SCB is
+  recovered on the live node like `POST /restore/scb`.
+
+  A Tier 2 restore brings the channels back HOLDABLE, not fully live. A
+  capsule is best-effort recency by construction and a compatible
+  `channel_reestablish` proves compatibility, not recency, so every restored
+  channel carries `restoreRecencyUnproven` on `GET /recovery/status` for the
+  rest of its life. While it is set the daemon never force-closes that
+  channel on its own initiative (a peer error and the reestablish/errored
+  timeout backstops are all held, and the channel asks its peer to close
+  instead), and the channel takes no new HTLCs, since the on-chain HTLC
+  deadline backstops that would enforce them can never fire. Existing HTLCs
+  still settle and fail, and the balance is intact. A cooperative close is
+  refused by default in BOTH directions too: a mutual close pays out the
+  balances the restored row carries, and a stale capsule's allocation can
+  only be the peer-favourable one, since any payment received after the
+  checkpoint is missing from it. An ERRORED one reports
+  `status: "restore_recency_unproven"` rather than `force_closing`. The
+  exits are the peer closing, or the operator's labelled acknowledgement on
+  either close:
+  `beignet channel close <id> --accept-stale-state-risk`
+  (`POST /channel/close` with `acceptStaleStateRisk: true`) accepts the
+  stale-split risk and covers the whole negotiation, and
+  `beignet channel forceclose <id> --accept-stale-state-risk`
+  (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
+  that publishing a commitment the peer may already have revoked forfeits
+  the whole channel balance. Both are refused without the flag.
+- `async-remote`: the journal also replicates in the background to the
+  guardian set (exactly three `pubkey@url` entries; the pubkey is the
+  guardian's x-only identity key). Wire traffic never waits on guardians.
+- `quorum`: safety-critical wire messages (`revoke_and_ack`,
+  `update_fulfill_htlc`, ...) are additionally HELD until the journal frame
+  behind them is acknowledged by 2 of 3 guardians. This is the strongest
+  tier: a device destroyed at any moment restores on new hardware and
+  resumes its channels, and the epoch takeover fences the old device if it
+  ever comes back.
+
+Operational notes:
+
+- A malformed guardian entry, a wrong guardian count, or guardians configured
+  without a guardian mode REFUSE daemon startup: silently dropping a guardian
+  would change the quorum arithmetic. An unknown `BEIGNET_RECOVERY_MODE`
+  value falls back to `off` (the usual typo rule), but never silently: a
+  database already marked quorum then refuses to start unbarriered at the
+  library level, and configured guardians beside a typo'd mode refuse too.
+- In the guardian modes the node boots QUARANTINED: it makes no peer
+  connections until a guardian quorum confirms this device still owns the
+  writer lease (split-brain protection). If the guardians are unreachable at
+  boot, the daemon and its API come up, peer traffic waits, and confirmation
+  retries on a backoff; `GET /recovery/status` shows `gate: "quarantined"`.
+  A normal restart does NOT need the guardians reachable: the persisted
+  lease short-circuits the boot decision, only the confirmation waits.
+- Once confirmed, an idle node re-checks its lease with the guardians every
+  `BEIGNET_RECOVERY_LEASE_CHECK_MS` (default 300000; 0 disables) so a device
+  superseded while parked reports `fenced` within that window instead of at
+  its next commit or restart. An outage never changes the gate.
+- Restore-from-nothing: start the daemon with the same mnemonic, the same
+  guardian set, and a FRESH data dir. The boot detects the namespace on the
+  guardians and holds in a restore-pending state where only
+  `GET /recovery/status`, `POST /recovery/restore`, `GET /events`,
+  `GET /openapi.json` and `POST /stop` answer (everything else returns 503
+  `NODE_RESTORE_PENDING`; `/health` reads as not-ready, which is true).
+  `POST /recovery/restore` with `{ "confirm": true }` performs the guardian
+  takeover, streams `recovery:restore-progress` events over SSE/webhooks,
+  builds the node on the restored state, and returns the restore report.
+  The confirm flag is required because the takeover permanently fences any
+  still-running previous device. The restore is crash-safe and re-runnable.
+- Lost the guardian set too: every capsule a guardian-mode node pushes names
+  its guardians. Boot the fresh data dir in `peer-storage` mode (it pushes
+  nothing while empty), connect to the peers the node had channels with,
+  read `capsules.best.guardians` on `GET /recovery/status` (`guardianId` plus
+  transports; credentials are never reported there), rebuild
+  `BEIGNET_RECOVERY_GUARDIANS` as `<guardianId>@<url>` entries and restart in
+  the guardian mode: that boot holds restore-pending as above. When the
+  guardians require a transport credential, `beignet recovery
+  capsule-guardians` (`POST /recovery/capsule-guardians`, admin scope,
+  `{ "confirm": true }`) hands back the set WITH credentials as config-file
+  entries: put them under `recoveryGuardians` in the config file as objects
+  `{ "guardianId", "url", "auth" }` (the env form stays `pubkey@url`; a URL
+  must not carry userinfo, credentials go in `auth`). A running guardian-mode
+  node only reports a capsule's set, it never adopts one; a set that differs
+  from the configured one is logged as a warning.
+- `POST /recovery/restore-capsule` refuses a capsule that names guardians
+  by default (409 `CAPSULE_RESTORE_GUARDIAN_BACKED`): that state belongs to
+  a guardian-backed namespace and restores through the guardian set with
+  fencing, not from peer storage, and not by force-closing channels the
+  guardians could resume exactly. The emergency SCB-only path is
+  unchanged: `GET /backup/peer-retrieved` plus `POST /restore/scb`. A
+  quorum-durability journal is refused whether or not the capsule names
+  guardians (409 `CAPSULE_RESTORE_QUORUM_NAMESPACE`; capsules from before
+  locators existed carry none): it cannot boot without its quorum.
+- Guardian set gone for good: `{ "confirm": true, "unfenced": true }`
+  (`beignet recovery restore-capsule --unfenced`) is the labelled escape
+  hatch from spec 5.7. It restores the capsule anyway and CANNOT fence the
+  previous writer: if that device still runs, it keeps acting on the same
+  channels. The report carries the named guardians under `unfenced`, and
+  the restore progress stream says so. It is the only exception to the
+  default refusal, and it never applies to a quorum-durability journal:
+  such a chain refuses to boot without its quorum, so its only paths are
+  the guardians or the SCB route.
+- Zero-touch peer-storage restore (issue #690): with
+  `BEIGNET_RECOVERY_AUTO_APPLY=true` the daemon performs the capsule restore
+  itself on a boot whose database is empty. Every capsule a storage peer
+  returns is announced as `recovery:capsule-retrieved`; the first arrival
+  opens a settle window, and the best capsule is applied once every
+  connected storage peer has answered and
+  `BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS` (default 15 s) has passed, or at
+  `BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS` (default 2 minutes) at the
+  latest, which must fit inside the reestablish hold. A Tier 2 install then
+  rebuilds the node in-process on the restored database (no restart;
+  `recovery:restored` carries `resumed: true`), and channels the capsule's
+  journal did not carry are named in a `capsule:uncovered` progress event
+  and recovered through the peer (they close safely, the SCB degradation).
+  The flag automates an UNFENCED adoption: local durability cannot fence a
+  previous device that still runs, so an embedder asks the operator once
+  (at seed import) rather than defaulting it on. Refusals are the manual
+  route's, made once and reported under `autoApply.lastReason` on
+  `GET /recovery/status` (phases `idle`, `settling`, `applying`, `applied`,
+  `refused`); a database that already holds state is never a target.
+- Recovery events relayed over SSE and webhooks (always on):
+  `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`,
+  `recovery:reestablish-held`, `recovery:capsule-retrieved`,
+  `recovery:guardian_unreachable`, `recovery:restore-progress`,
+  `recovery:restored`.
+
+#### Health & Monitoring
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getHealth()` | `HealthInfo` | Node health: status, uptime, block height, electrum, peers, channels, graph |
+| `getChannelHealth(channelId)` | `ChannelHealth \| null` | Channel liquidity health: balance %, HTLC slot usage, warnings |
+| `getMainnetReadiness()` | `ReadinessReport` | Weighted readiness checklist (storage, chain backend, channels, fees, etc.) |
+| `getMetrics()` | `string` | Prometheus text exposition format metrics (channels, payments, balances, peers, uptime, etc.) |
+| `triggerBackup()` | `Promise<void>` | Trigger an on-demand backup (requires `backupPath` configured) |
+| `getActionLog(options?)` | `ActionLogEntry[]` | Query persistent action log. `options: { category?, since?, limit? }` |
+| `getNodeUri(externalHost?)` | `string \| null` | Node connection URI (`pubkey@host:port`). Returns null if not listening. |
+| `getNode()` | `LightningNode` | Access the underlying LightningNode for event wiring |
+
+#### Waiting
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `waitForReady(timeoutMs?)` | `Promise<void>` | Wait for node to be fully operational (peers reconnected, channels restored). Default 30s timeout. |
+| `waitForChannelReady(channelId, timeoutMs?)` | `Promise<void>` | Wait for channel to reach NORMAL state (default 60s timeout) |
+| `waitForPayment(paymentHash, timeoutMs?)` | `Promise<PaymentInfo>` | Wait for payment to settle (default 60s timeout) |
+
+#### Spending Limits
+
+> **SEMANTICS CHANGE: the daily spend limit is now a COMBINED Lightning +
+> on-chain budget.** It previously covered Lightning payments only. If you
+> rely on `dailySpendLimitSats`, external on-chain sends now consume the same
+> budget: `sendOnchain` (`POST /send`) and `sendMaxOnchain`
+> (`POST /send-max`) each count **amount + fee** against the daily limit and
+> are rejected with `SPENDING_LIMIT_EXCEEDED` once it is exhausted. For
+> send-max the check runs against the actual computed sweep total before
+> broadcast. An address-targeted `spliceOut` and `sendDirectFunding`
+> (`POST /direct-funding/send`) count the same way; direct funding is charged
+> its amount plus the fee ceiling it was given, because the exact fee is only
+> known once the receiver has built the transaction. Excluded by design (they
+> are not external spends): `consolidateUtxos` (self-pay), our own channel
+> opens/splices/funding, and
+> `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
+> counted (nothing is broadcast). Resets at midnight UTC.
+
+Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
+`sendPaymentAsync`, the queue and their routes) is checked and recorded at the
+amount that actually gets paid: the invoice's own amount whenever it carries
+one, and `amountSats` only for an amount-less invoice. A fractional msat amount
+rounds up. `validatePayment`, `estimatePayment` and `estimateRouteFee` preview
+the same amount. `payOffer` is checked and recorded the same way, against the
+amount of the BOLT 12 invoice the payee returns for the offer, which is what
+gets paid whatever `amountSats` asked for.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
+
+#### Drain Mode
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `setDraining(enabled)` | `void` | Enable/disable drain mode. When enabled, every payment entry point (`payInvoice()`, `sendPaymentAsync()`, `sendKeysend()`, `payOffer()`) throws `SERVICE_DRAINING`. `payOffer()` re-checks after the invoice request, so a drain that starts during it still stops the payment. |
+| `isDraining()` | `boolean` | Whether the node is currently draining |
+| `hasPendingPayments()` | `boolean` | Whether there are in-flight payments |
+
+#### Lifecycle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops (default 30s timeout) |
+| `destroy()` | `Promise<void>` | Immediate shutdown (stops wallet, storage, node) |
+
+### Events
+
+`BeignetNode` extends `EventEmitter`. All event data is JSON-safe (hex strings, numbers — no Buffer or bigint).
+
+```typescript
+node.on('payment:received', (info: PaymentInfo) => { ... });
+node.on('payment:sent', (info: PaymentInfo) => { ... });
+node.on('payment:failed', (info: PaymentInfo) => { ... });
+node.on('invoice:settled', ({ paymentHash, bolt11, amountSats }) => { ... }); // an invoice WE issued was paid (keysend fires only payment:received)
+node.on('hold:accepted', ({ paymentHash, state, heldAmountMsat, htlcCount }) => { ... }); // per-part running total: compare with the full expected msat before funding; also hold:settled and hold:cancelled (+ reason)
+node.on('channel:opening', ({ channelId, fundingTxid }) => { ... }); // funding negotiated + broadcast/watched
+node.on('channel:ready', ({ channelId }) => { ... });
+node.on('channel:pending-close', ({ channelId, initiator }) => { ... }); // coop close initiated ('local' | 'remote')
+node.on('channel:force-closing', ({ channelId, initiator }) => { ... }); // our force-close broadcast or peer unilateral detected
+node.on('channel:closed', ({ channelId }) => { ... });
+node.on('channel:resolved', ({ channelId }) => { ... }); // terminal: every on-chain output of the close irrevocably swept
+node.on('htlc:forwarded', ({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat }) => { ... }); // a forward settled (msat values as strings)
+node.on('swap:funded', ({ swapId, paymentHash, state, onchainSat, fundingHeight }) => { ... }); // reverse swap provider (issue #737); also swap:created, swap:held, swap:funding, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed
+node.on('swap:claim-confirmed', ({ swapId, direction, paymentHash, claimTxid }) => { ... }); // submarine swap provider (issue #743); also swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:payment-failed, swap:cancelled; every swap event carries direction
+node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we offered was fulfilled
+node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
+node.on('peer:connect', ({ pubkey }) => { ... });
+node.on('peer:disconnect', ({ pubkey }) => { ... });
+node.on('node:error', ({ code, message, timestamp }) => { ... });
+node.on('node:ready', () => { ... });           // node fully operational
+node.on('payment:retry', ({ paymentHash, attempt, maxRetries, nextRetryMs, error }) => { ... });
+node.on('backup:completed', ({ path, timestamp }) => { ... });
+node.on('backup:failed', ({ path, error, timestamp }) => { ... });
+node.on('electrum:failover', ({ from, to, timestamp }) => { ... }); // auto-reconnects to next server
+node.on('log', (entry: LogEntry) => { ... });  // structured logs
+```
+
+The `log` event fires based on the `logLevel` option. Set `logLevel: 'debug'` for verbose output, `'silent'` to suppress. Pass a `logger` (any `ILogger`, e.g. `createConsoleLogger(level)` from the main package) to also receive those entries as `logger.debug/info/warn/error(message, meta)` calls; the daemon uses this with `--log-level` / `BEIGNET_LOG_LEVEL` to print diagnostics to stderr (silent by default).
+
+### Return Types
+
+```typescript
+interface NodeInfo {
+  nodeId: string;           // 33-byte compressed pubkey, hex
+  alias?: string;
+  network: string;          // 'mainnet' | 'testnet' | 'signet' | 'regtest'
+  blockHeight: number;
+  onchainBalanceSats: number;
+  lightningBalanceSats: number;
+  channelCount: number;      // every known channel row, incl. CLOSED/FORCE_CLOSED
+  openChannelCount: number;  // channels not in a terminal state
+  peerCount: number;
+  listening: boolean;
+}
+
+interface BalanceInfo {
+  onchain: number;          // sats
+  lightning: number;        // sats
+  total: number;            // sats
+  unsettledSats?: number;   // sats locked in in-flight HTLCs
+}
+
+interface PeerInfo {
+  pubkey: string;
+  host: string;
+  port: number;
+  state: string;
+}
+
+interface ChannelInfo {
+  channelId: string;        // 32-byte hex
+  peerPubkey: string;       // 33-byte compressed pubkey hex
+  state: string;            // e.g. 'NORMAL', 'AWAITING_FUNDING_CONFIRMED'
+  localBalanceSats: number;
+  remoteBalanceSats: number;
+  capacitySats: number;
+  isAnchor: boolean;        // true if anchor channel (option_anchors_zero_fee_htlc_tx)
+  fundingTxid?: string;     // funding transaction ID hex
+  shortChannelId?: string;  // e.g. "800000x1x0"
+  feeratePerKw?: number;    // current commitment feerate
+  htlcCount?: number;       // number of active HTLCs
+  closeStatus?: {           // present for closing/closed channels
+    closer: 'local' | 'remote' | 'cooperative' | 'unknown';
+    reason?: string;        // 'user' or an automatic close code; absent for peer closes
+    closingTxid?: string;
+    broadcast: boolean;     // close tx reached the network (broadcast ok or spend observed)
+    confirmationHeight: number;  // 0 while unconfirmed
+    resolution: 'pending' | 'sweeping' | 'resolved';
+    fundsAvailableHeight?: number;  // to_local CSV maturity, our force close only
+  };
+}
+
+interface InvoiceInfo {
+  bolt11: string;           // full BOLT 11 invoice string
+  paymentHash: string;      // 32-byte hex
+  paymentSecret?: string;   // 32-byte hex — correlate incoming payments without re-decoding
+  amountSats?: number;
+  description?: string;     // invoice description
+  expiry?: number;          // expiry in seconds
+  createdAt?: number;       // unix seconds
+  status?: 'PENDING' | 'PAID' | 'EXPIRED';  // derived from payment state + expiry
+}
+
+interface DecodedInvoice {
+  network: string;          // 'bc', 'tb', 'bcrt'
+  amountSats?: number;
+  timestamp: number;
+  paymentHash: string;      // hex
+  paymentSecret?: string;   // hex
+  description?: string;
+  payeeNodeKey?: string;    // hex
+  expiry?: number;          // seconds
+  minFinalCltvExpiry?: number;
+  routingHints?: Array<Array<{
+    pubkey: string;
+    shortChannelId: string;
+    feeBaseMsat: number;
+    feeProportionalMillionths: number;
+    cltvExpiryDelta: number;
+  }>>;
+}
+
+interface PaymentInfo {
+  paymentHash: string;      // hex
+  preimage?: string;        // hex, present when settled
+  amountSats: number;
+  feeSats?: number;         // routing fee paid (from route)
+  status: 'PENDING' | 'COMPLETED' | 'FAILED';
+  direction: 'OUTGOING' | 'INCOMING';
+  failureCode?: number;     // BOLT 4 failure code
+  failureDescription?: string;  // human-readable
+  createdAt: number;        // unix ms
+  completedAt?: number;     // unix ms
+  metadata?: Record<string, string>;  // agent-defined key-value labels
+}
+
+interface RetryPaymentResult extends PaymentInfo {
+  attempts: number;         // total attempts made (1 = first try succeeded)
+}
+
+interface RetryPaymentOptions {
+  maxRetries?: number;      // default 3
+  backoffMs?: number;       // base delay in ms, default 2000 (2s, 4s, 8s, ...)
+  maxFeeSats?: number;      // routing fee cap
+  amountSats?: number;      // for amount-less invoices
+  metadata?: Record<string, string>;
+}
+
+interface PaymentFilter {
+  status?: 'PENDING' | 'COMPLETED' | 'FAILED';
+  direction?: 'OUTGOING' | 'INCOMING';
+  since?: number;           // unix ms — only payments after this time
+  limit?: number;           // max results
+  offset?: number;          // skip first N results
+  metadataKey?: string;     // filter by metadata key existence (or key=value with metadataValue)
+  metadataValue?: string;   // filter by metadata key=value match (requires metadataKey)
+}
+
+interface RouteEstimate {
+  feeSats: number;
+  hops: number;
+  cltvDelta: number;
+}
+
+interface NodeStats {
+  totalPaymentsSent: number;
+  totalPaymentsReceived: number;
+  totalPaymentsFailed: number;
+  totalSatsSent: number;
+  totalSatsReceived: number;
+  totalFeesPaid: number;
+  successRate: number;      // 0.0 to 1.0
+  uptimeMs: number;
+  windowMs?: number;        // present when time window specified
+  avgPaymentTimeSec?: number; // avg completed payment time
+  avgFeePct?: number;       // avg fee as % of payment amount
+}
+
+interface TxInfo {
+  txid: string;
+  hex: string;
+}
+
+interface OfferInfo {
+  offerId: string;          // 32-byte hex
+  description: string;
+  encoded?: string;         // bech32m "lno1..." string (present on creation)
+  amountSats?: number;      // amount in satoshis (converted from msat)
+  issuer?: string;
+  issuerId?: string;        // 33-byte hex
+  quantityMax?: number;
+  absoluteExpiry?: number;  // unix seconds
+}
+
+interface TrustedPeerInfo {
+  pubkey: string;           // 33-byte hex
+  trusted: boolean;
+}
+
+interface SpliceResult {
+  ok: boolean;              // true = the splice started, not that it completed
+  error?: string;           // set on a refusal
+  code?: SpliceRefusalCode; // CHANNEL_NOT_FOUND | SPLICING_NOT_NEGOTIATED |
+                            // INVALID_PARAMS | INSUFFICIENT_BALANCE |
+                            // FUNDING_PROVIDER_REQUIRED | SPLICE_BUSY |
+                            // SPLICE_REFUSED
+}
+
+interface BootstrapPeerInfo {
+  pubkey: string;           // 33-byte hex
+  host: string;
+  port: number;
+}
+
+interface Bolt12InvoiceInfo {
+  paymentHash: string;      // hex
+  amountSats: number;
+  description: string;
+  nodeId: string;           // hex
+  createdAt: number;        // unix seconds
+  relativeExpiry?: number;  // seconds
+}
+
+interface ChannelHealth {
+  channelId: string;        // 32-byte hex
+  state: string;            // e.g. 'NORMAL', 'AWAITING_REESTABLISH'
+  localBalancePct: number;  // 0-100, local balance as % of capacity
+  remoteBalancePct: number; // 0-100, remote balance as % of capacity
+  htlcCount: number;        // number of active HTLCs
+  maxHtlcs: number;         // max allowed HTLCs
+  capacitySats: number;     // total channel capacity
+  warnings: string[];       // 'LOW_OUTBOUND_LIQUIDITY', 'LOW_INBOUND_LIQUIDITY',
+                            // 'HTLC_SLOTS_NEARLY_FULL', 'AWAITING_REESTABLISH'
+}
+
+interface DailySpendInfo {
+  limitSats: number | null; // null if no limit configured
+  spentSats: number;        // sats spent today
+  remainingSats: number;    // sats remaining (Infinity if no limit)
+  resetsAt: number;         // unix ms — next midnight UTC
+}
+
+interface HealthInfo {
+  status: 'ready' | 'syncing' | 'degraded';
+  uptime: number;           // ms since start
+  blockHeight: number;
+  electrumConnected: boolean;
+  peerCount: number;
+  channelCount: number;
+  readyChannelCount: number;  // NORMAL channels that will accept a new HTLC
+  graphNodes: number;
+  graphChannels: number;
+}
+
+interface EventMessage {
+  type: string;             // e.g. 'payment:received', 'channel:ready'
+  data: Record<string, unknown>;
+}
+
+interface PaymentProof {
+  paymentHash: string;      // hex
+  preimage: string;         // hex
+  amountSats: number;
+  completedAt: number;      // unix ms
+  invoice?: string;         // original BOLT 11 invoice string
+  hopCount?: number;
+  feeSats?: number;
+}
+
+interface PaymentProofVerification {
+  valid: boolean;           // true if sha256(preimage) === paymentHash
+  proof?: PaymentProof;     // the proof data (if found)
+  error?: string;           // error message if verification failed
+}
+
+interface PaymentEstimate {
+  successProbabilityPct: number; // 0-100
+  estimatedTimeMs: number;
+  routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
+  warning?: string;
+  alternativeAvailable: boolean; // MPP route exists
+  estimatedFeeSats: number;
+  hopCount: number;
+}
+
+interface LiquiditySnapshot {
+  totalLocalBalanceSats: number;
+  totalRemoteBalanceSats: number;
+  totalCapacitySats: number;
+  channelCount: number;
+  activeChannelCount: number;
+  outboundLiquidityPct: number;  // 0-100
+  inboundLiquidityPct: number;   // 0-100
+  recommendations: LiquidityRecommendation[];
+}
+
+interface LiquidityRecommendation {
+  type: 'OPEN_CHANNEL' | 'CLOSE_CHANNEL' | 'REBALANCE_NEEDED';
+  priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
+  reason: string;
+  channelId?: string;       // present for channel-specific recommendations
+}
+
+interface ChannelSuggestion {
+  nodeId: string;           // 33-byte hex
+  alias?: string;
+  score: number;            // 0-100
+  channelCount: number;
+  totalCapacitySats: number;
+  reason: string;           // e.g. 'well-connected, high capacity'
+}
+
+interface FeeSnapshot {
+  currentSatPerVbyte: number;
+  trend: 'RISING' | 'FALLING' | 'STABLE';
+  percentile: number;       // 0-100
+  recommendation: 'OPEN_NOW' | 'WAIT' | 'NEUTRAL';
+  estimatedOpenChannelCostSats: number;
+  sampleCount: number;
+  minSatPerVbyte: number;
+  maxSatPerVbyte: number;
+  avgSatPerVbyte: number;
+}
+
+interface QueuedPayment {
+  id: string;
+  bolt11: string;
+  priority: number;         // 1 (highest) to 10 (lowest)
+  status: 'queued' | 'dispatching' | 'completed' | 'failed' | 'cancelled';
+  amountSats?: number;
+  maxFeeSats?: number;
+  metadata?: Record<string, string>;
+  error?: string;
+  createdAt: number;
+  completedAt?: number;
+}
+
+interface WebhookRegistration {
+  id: string;
+  url: string;
+  events: string[];         // e.g. ['payment:received', '*']
+  secret?: string;          // masked as '***' in list responses
+  createdAt: number;
+}
+
+interface ActionLogEntry {
+  category: string;         // 'payment' | 'channel' | 'htlc' | 'fee' | 'peer' | 'chain'
+  action: string;
+  timestamp: number;        // unix ms
+  data: Record<string, unknown>;
+}
+
+interface ReadinessReport {
+  score: number;            // 0-100 weighted pass rate
+  ready: boolean;           // true if no CRITICAL failures
+  checks: ReadinessCheck[];
+}
+
+interface ReadinessCheck {
+  name: string;             // e.g. 'STORAGE_CONFIGURED', 'CHAIN_BACKEND_CONNECTED'
+  status: 'PASS' | 'WARN' | 'FAIL';
+  severity: 'CRITICAL' | 'WARNING' | 'INFO';
+  message: string;
+}
+
+// BeignetNode extends EventEmitter and emits these typed events:
+interface BeignetNodeEvents {
+  'payment:received': (info: PaymentInfo) => void;
+  'payment:sent': (info: PaymentInfo) => void;
+  'payment:failed': (info: PaymentInfo) => void;
+  'invoice:settled': (data: { paymentHash: string; bolt11: string; amountSats: number }) => void;
+  'hold:accepted': (data: HoldInvoiceEvent) => void;
+  'hold:settled': (data: HoldInvoiceEvent) => void;
+  'hold:cancelled': (data: HoldInvoiceEvent & { reason: 'api' | 'expiry-scan' }) => void;
+  'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
+  'channel:ready': (data: { channelId: string }) => void;
+  'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
+  'channel:force-closing': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
+  'channel:closed': (data: { channelId: string }) => void;
+  'channel:resolved': (data: { channelId: string }) => void;
+  'splice:complete': (data: { channelId: string; fundingTxid?: string }) => void;
+  'splice:aborted': (data: { channelId: string; reason: string }) => void;
+  'splice:conflicted': (data: { channelId: string; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number }) => void;
+  'splice:reverted': (data: { channelId: string; spliceTxid: string; conflictTxid: string }) => void;
+  'htlc:forwarded': (data: { inChannelId: string; outChannelId: string; amountInMsat: string; amountOutMsat: string; feeMsat: string }) => void;
+  'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
+  'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
+  'peer:connect': (data: { pubkey: string }) => void;
+  'peer:disconnect': (data: { pubkey: string }) => void;
+  'node:error': (data: { code: string; message: string; timestamp: number }) => void;
+  'node:ready': () => void;
+  'payment:retry': (data: { paymentHash: string; attempt: number; maxRetries: number; nextRetryMs: number; error: string }) => void;
+  'backup:completed': (data: { path: string; timestamp: number }) => void;
+  'backup:failed': (data: { path: string; error: string; timestamp: number }) => void;
+  'electrum:failover': (data: { from: { host: string; port: number }; to: { host: string; port: number }; timestamp: number }) => void;
+  'log': (entry: LogEntry) => void;
+}
+
+type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
+
+interface LogEntry {
+  level: LogLevel;
+  message: string;
+  data?: Record<string, unknown>;
+  timestamp: number;
+}
+```
+
+### Channel States
+
+Channels progress through these states:
+
+| State | Can Send Payments? | Description |
+|-------|-------------------|-------------|
+| `AWAITING_FUNDING_CONFIRMED` | No | Funding tx broadcast, waiting for on-chain confirmations |
+| `AWAITING_CHANNEL_READY` | No | Funding confirmed, exchanging `channel_ready` messages |
+| `NORMAL` | **Yes** | Fully operational — HTLCs can be sent and received |
+| `AWAITING_REESTABLISH` | No | Reconnected after disconnect, re-syncing state |
+| `SHUTTING_DOWN` | No | Cooperative close initiated, no new HTLCs |
+| `NEGOTIATING_CLOSING` | No | Exchanging closing fee proposals |
+| `CLOSED` | No | Channel closed (cooperative or forced) |
+
+Only channels in `NORMAL` state can send/receive payments.
+
+### Error Handling
+
+All errors throw `BeignetError` with a `code`, `message`, and optional `failureCode` (BOLT 4):
+
+```typescript
+import { BeignetError, isRetryableError, isPermanentFailure } from 'beignet/cli';
+
+try {
+  await node.payInvoice(bolt11);
+} catch (err) {
+  if (err instanceof BeignetError) {
+    console.log(err.code);        // 'PAYMENT_FAILED', 'PAYMENT_TIMEOUT', etc.
+    console.log(err.message);     // 'Payment failed: unknown_next_peer'
+    console.log(err.failureCode); // BOLT 4 failure code (e.g. 0x400f)
+
+    if (isRetryableError(err)) {
+      // Transient failure — safe to retry (no route, timeout, temp failure)
+    }
+    if (isPermanentFailure(err)) {
+      // Permanent failure — give up (expired, invalid, PERM flag set)
+    }
+  }
+}
+```
+
+Error codes (`BeignetErrorCode` enum). The HTTP column is the status the daemon
+answers with: **4xx** when the request cannot be served as written, **409** when
+the node's own state conflicts with it, **502/504** when the trouble is upstream
+of us (the peer, the network), **503** when waiting genuinely changes the answer,
+and **500** only when the node itself failed. An agent can retry on 5xx and must
+not repeat a 4xx unchanged.
+
+| Code | Category | HTTP | Description |
+|------|----------|------|-------------|
+| `WALLET_CREATE_FAILED` | Wallet | 500 | On-chain wallet initialization failed |
+| `ADDRESS_FAILED` | Wallet | 500 | Could not derive new address |
+| `SEND_FAILED` | Wallet | 500 | On-chain send failed |
+| `REFRESH_FAILED` | Wallet | 500 | Wallet sync failed |
+| `NOT_BOOSTABLE` | Wallet | 409 | Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able) |
+| `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
+| `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
+| `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
+| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout |
+| `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
+| `NO_ROUTE` | Payments | 502 | No route found to destination |
+| `INVALID_INVOICE` | Payments | 400 | BOLT 11 string failed to parse |
+| `INVALID_OFFER` | Payments | 400 | BOLT 12 offer string failed to parse |
+| `INSUFFICIENT_BALANCE` | Payments | 409 | Not enough balance to send, or to fund the requested open |
+| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already pending |
+| `SPENDING_LIMIT_EXCEEDED` | Payments | 403 | Daily spending limit exceeded (permanent) |
+| `CHANNEL_NOT_FOUND` | Channels | 404 | Channel ID does not exist |
+| `CHANNEL_NOT_READY` | Channels | 409 | Channel is not in NORMAL state |
+| `OPEN_FAILED` | Channels | 409 | Channel open failed |
+| `CLOSE_FAILED` | Channels | 500 | Cooperative close failed |
+| `FORCE_CLOSE_FAILED` | Channels | 500 | Force close failed |
+| `ZERO_CONF_FAILED` | Channels | 500 | Zero-conf channel open failed |
+| `FUNDING_PROVIDER_REQUIRED` | Channels | 409 | The node has no funding provider able to serve this open or splice |
+| `FEE_ESTIMATE_NOT_READY` | Channels | 503 | The fee estimator has not delivered its first sample; retry shortly |
+| `SPLICING_NOT_NEGOTIATED` | Channels | 409 | `option_splice`/`option_quiesce` is missing on one side of the pair |
+| `SPLICE_REFUSED` | Channels | 409 | The channel exists but would not start the splice (state, peer, size) |
+| `SPLICE_BUSY` | Channels | 503 | The channel would splice but is held off by a state that ends on its own; retry the same request |
+| `PEER_NOT_CONNECTED` | Peers | 409 | Peer is not connected |
+| `HOLD_RESOLUTION_PENDING` | Invoices | 503 | `settleHoldInvoice`/`cancelHoldInvoice` left HTLCs parked for the hash: a channel refused them, or a settle or cancel is already under way. The hold is live; do not switch to the other action |
+| `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
+| `SWAP_NOT_CANCELLABLE` | Swaps | 409 | Reverse swap provider: the swap is past CREATED/HELD, so it resolves on chain by claim or refund and cannot be cancelled |
+| `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |
+| `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
+| `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
+| `NODE_DESTROYED` | Node | 409 | Operation on destroyed node |
+| `INVALID_PARAMS` | Node | 400 | Missing or invalid request parameters |
+| `NOT_FOUND` | Node | 404 | Resource not found |
+| `BODY_TOO_LARGE` | Node | 413 | Request body exceeds 1MB |
+| `MNEMONIC_REQUIRES_AUTH` | Node | 403 | apiToken or apiKeys required for mnemonic access |
+| `UNAUTHORIZED` | Node | 401 | Invalid or missing auth token / API key |
+| `FORBIDDEN` | Node | 403 | Valid API key without the scope a route requires |
+| `SERVICE_DRAINING` | Node | 409 | Node is draining, no new payments accepted |
+| `IDEMPOTENCY_CONFLICT` | HTTP | 409 | Same idempotency key used with different request body |
+| `RATE_LIMITED` | HTTP | 429 | Too many requests (token bucket rate limiter) |
+
+`SEND_FAILED`, `CLOSE_FAILED`, `FORCE_CLOSE_FAILED`, `ZERO_CONF_FAILED` and the
+`PSBT_*` codes keep the 500 default on purpose: each covers both caller-state
+problems and genuine node faults, so no single status is honest until they are
+split. The two close codes have had their caller-state half split off at the
+source: `POST /channel/close` and `POST /channel/forceclose` answer **400
+`INVALID_PARAMS`** for a malformed channel id and **404 `CHANNEL_NOT_FOUND`**
+for a channel the node does not hold, so a 500 from either now means a channel
+that exists and would not close.
+
+**Retryability is one decision, not two.** Every code answered with 502, 503 or
+504 is one `isRetryableError()` returns true for, and a test walks the status map
+to keep them from drifting apart. The status also reads the BOLT 4 failure code:
+a `PAYMENT_FAILED` carrying the PERM flag answers **409**, not `PAYMENT_FAILED`'s
+usual 502, because the payee refuses it every time. Failure bodies carry
+`failureCode` so a caller can make the same judgment itself.
+
+#### Typed Payment Errors (Lightning Layer)
+
+When `payInvoice()` fails, the underlying `LightningNode` throws a `LightningPaymentError` with a typed `code` property. The CLI layer catches these and maps them to `BeignetErrorCode`, but you can also import and check them directly:
+
+```typescript
+import { LightningPaymentError, LightningErrorCode } from 'beignet/cli';
+
+try {
+  await node.payInvoice(bolt11);
+} catch (err) {
+  if (err instanceof LightningPaymentError) {
+    switch (err.code) {
+      case LightningErrorCode.NO_ROUTE:         // No path to destination
+      case LightningErrorCode.DUPLICATE_PAYMENT: // Payment hash already in-flight
+      case LightningErrorCode.NO_CHANNEL_TO_HOP: // No channel to first hop peer
+      case LightningErrorCode.FEE_EXCEEDS_MAX:   // Route fee exceeds maxFeeMsat
+      case LightningErrorCode.MISSING_AMOUNT:     // Amount-less invoice with no amount
+      case LightningErrorCode.INVALID_INVOICE:    // Cannot determine payee
+      case LightningErrorCode.INVOICE_EXPIRED:    // Invoice has expired
+    }
+  }
+}
+```
+
+`LightningPaymentError` extends `Error`, so existing `catch` blocks continue to work. The `code` property enables programmatic error handling without string matching.
+
+#### Typed Channel-Open Refusals (Lightning Layer)
+
+A channel open the engine refuses on the caller's own arguments (a push toward a dual-fund peer, a `pushSats` above the funding amount, a non-positive fee rate, `max` without a pinned rate, a trusted open toward a peer that never negotiated `option_zeroconf`) throws an `InvalidChannelOpenError`. Every open entry point converts it to `INVALID_PARAMS`, so the daemon answers **HTTP 400 with the engine's message** instead of scrubbing it to a generic 500. Node faults stay untyped and still answer 500.
+
+```typescript
+import { BeignetError } from 'beignet/cli';
+
+try {
+  node.openChannel(peerPubkey, 100_000, 50_000);
+} catch (err) {
+  if (err instanceof BeignetError && err.code === 'INVALID_PARAMS') {
+    // The request cannot be served as written; err.message says why.
+  }
+}
+```
+
+`InvalidChannelOpenError` is what an embedder driving a raw `LightningNode` catches (it is exported from `beignet/cli` too); on `BeignetNode` and over HTTP the refusal always arrives as `INVALID_PARAMS`. A splice refused the same way throws the sibling `InvalidSpliceError`, which converts identically.
+
+#### Typed Channel-Funding State Refusals (Lightning Layer)
+
+A request the node cannot serve for its **own** state or configuration is a different thing: the request is well formed, this node cannot serve it as things stand. `INVALID_PARAMS` would be a lie, so these throw a `ChannelFundingUnavailableError` carrying a `code`, and each code answers with a status of its own.
+
+| `ChannelFundingUnavailableCode` | Reaches the caller as | HTTP |
+|---|---|---|
+| `FUNDING_PROVIDER_REQUIRED` | `FUNDING_PROVIDER_REQUIRED` | 409 |
+| `INSUFFICIENT_BALANCE` | `INSUFFICIENT_BALANCE` | 409 |
+| `FEE_ESTIMATE_NOT_READY` | `FEE_ESTIMATE_NOT_READY` | 503 |
+| `CHANNEL_NOT_FOUND` | `CHANNEL_NOT_FOUND` | 404 |
+
+```typescript
+import { BeignetError, isRetryableError } from 'beignet/cli';
+
+try {
+  node.openChannel(peerPubkey, 100_000, undefined, 5, true); // max open
+} catch (err) {
+  if (err instanceof BeignetError && isRetryableError(err)) {
+    // FEE_ESTIMATE_NOT_READY: the estimator's first sample lands in
+    // milliseconds, so a retry succeeds. Everything else needs a decision.
+  }
+}
+```
+
+Node faults are still deliberately untyped, so they keep scrubbing to a generic **500** with the detail in the daemon log only.
+
+#### Splice Refusals
+
+A splice starts asynchronously, so a refusal is **returned**, not thrown: `spliceIn`/`spliceOut` answer `{ ok: false, error, code }`. The daemon converts that code at the route boundary, so `POST /channel/splice-in` and `POST /channel/splice-out` answer a refused splice as a failure envelope, never a 200 carrying `ok: false` under `result`.
+
+| `SpliceRefusalCode` | Reaches the caller as | HTTP |
+|---|---|---|
+| `CHANNEL_NOT_FOUND` | `CHANNEL_NOT_FOUND` | 404 |
+| `INVALID_PARAMS` | `INVALID_PARAMS` | 400 |
+| `INSUFFICIENT_BALANCE` | `INSUFFICIENT_BALANCE` | 409 |
+| `FUNDING_PROVIDER_REQUIRED` | `FUNDING_PROVIDER_REQUIRED` | 409 |
+| `SPLICING_NOT_NEGOTIATED` | `SPLICING_NOT_NEGOTIATED` | 409 |
+| `SPLICE_BUSY` | `SPLICE_BUSY` | 503 |
+| `SPLICE_REFUSED` | `SPLICE_REFUSED` | 409 |
+
+A 2xx means the splice **started**. Its outcome arrives on the `splice:complete`, `splice:aborted`, `splice:reverted` and `node:error` events (a depth-locked splice whose external input was spent elsewhere is reverted to the old funding by agreement with the peer, issue #760; `splice:conflicted` and `node:error` code `SPLICE_INPUT_CONFLICT` precede it).
+
+`SPLICE_BUSY` is the one refusal to retry unchanged: the channel would splice but is held off by a state that ends on its own (a splice already in progress, a previous abort still awaiting the peer's echo, a quiescence session the peer owns, HTLCs still settling, the peer reconnecting). `isRetryableError` agrees; every other refusal code is permanent for the request as sent.
+
+---
+
+## CLI Commands
+
+The CLI is a thin HTTP client. `init` and `start` are handled locally; all other commands send requests to the daemon on `127.0.0.1:2112`.
+
+All output is JSON. Add `--pretty` for indented output.
+
+### Setup
+
+```bash
+beignet init [--network regtest] [--alias mynode]
+beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token mysecret] \
+  [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
+  [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
+  [--htlc-events] [--log-level info]
+beignet stop
+```
+
+Seed generation is CLI-only: `beignet init` creates the mnemonic (or you supply
+one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
+seed. `GET /mnemonic` only reveals the configured seed, and only when
+`apiToken` or `apiKeys` is set (admin scope).
+
+### API key management
+
+```bash
+beignet auth keys            # list named API keys (names, scopes, revoked/expired,
+                             # expiresAt/rotatedAt; never secrets)
+beignet auth revoke <name>   # disable a named key immediately (persisted;
+                             # survives restarts)
+beignet auth rotate <name>   # mint a new random secret for a named key;
+                             # printed ONCE, cannot be retrieved again
+```
+
+Any command accepts `--api-key <secret>` (alias of `--api-token`) or the
+`BEIGNET_API_KEY` env var to authenticate with a named key instead of the
+legacy token.
+
+### Info
+
+```bash
+beignet info
+# {"ok":true,"result":{"nodeId":"02ab...","network":"regtest","blockHeight":100,...}}
+
+beignet balance
+# {"ok":true,"result":{"onchain":50000,"lightning":10000,"total":60000}}
+
+beignet address
+# {"ok":true,"result":{"address":"bcrt1q..."}}
+
+beignet mnemonic
+# {"ok":true,"result":{"mnemonic":"abandon abandon ..."}}
+
+beignet health
+# {"ok":true,"result":{"status":"ready","uptime":3600000,...}}
+
+beignet readiness
+# {"ok":true,"result":{"score":85,"ready":true,"checks":[...]}}
+
+beignet metrics
+# beignet_channels_total{state="NORMAL"} 2
+# beignet_balance_sats{type="lightning"} 50000
+# ... (Prometheus text format, not JSON)
+
+beignet stats
+# {"ok":true,"result":{"totalPaymentsSent":10,...}}
+
+beignet stats 3600000
+# {"ok":true,"result":{"totalPaymentsSent":3,"windowMs":3600000,...}}
+
+beignet ready
+# {"ok":true,"result":{"ready":true}}
+
+beignet liquidity
+# {"ok":true,"result":{"totalLocalBalanceSats":500000,...,"recommendations":[...]}}
+
+beignet fees
+# {"ok":true,"result":{"currentSatPerVbyte":12,"trend":"FALLING","recommendation":"OPEN_NOW",...}}
+
+beignet spend-limit
+# Combined LN + on-chain budget with breakdown (spentSats == totalSats, kept for back-compat):
+# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
+
+beignet logs --category payment --limit 20
+# {"ok":true,"result":[{"category":"payment","action":"sent","timestamp":...,"data":{...}}]}
+
+beignet can-send 50000
+beignet can-receive 50000
+# {"ok":true,"result":{"canSend":true,...}}
+
+beignet node uri --host mynode.example.com
+# {"ok":true,"result":{"uri":"02ab...@mynode.example.com:9735"}}
+
+beignet node wait-ready --timeout 30000
+# Blocks until the node is operational
+```
+
+### On-chain
+
+```bash
+beignet send <address> <sats>
+# {"ok":true,"result":{"txid":"ab12...","hex":"0200..."}}
+
+beignet send-max <address> [satsPerVbyte]
+# Sweep the whole balance: {"ok":true,"result":{"txid":"cd34...","hex":"0200..."}}
+
+beignet tx bump-fee <txid> <satsPerVbyte>
+# RBF replacement: {"ok":true,"result":{"txid":"ef56...","boostType":"rbf","feeSats":420,"originalTxid":"ab12..."}}
+
+beignet tx boost <txid> [satsPerVbyte]
+# Auto RBF-else-CPFP: {"ok":true,"result":{"txid":"0178...","boostType":"cpfp",...}}
+
+beignet tx boostable
+# {"ok":true,"result":{"rbf":[...],"cpfp":[...]}}
+
+beignet consolidate [satsPerVbyte]
+# {"ok":true,"result":{"txid":"23ab...","utxosConsolidated":7,"address":"bc1q...","feeSats":310}}
+
+beignet psbt build <address> <sats> [satsPerVbyte]
+# Unsigned PSBT for a hardware wallet: {"ok":true,"result":{"psbtBase64":"cHNi...","feeSats":418,...}}
+
+beignet psbt import-signed <psbtBase64|file>
+# Validate + finalize (no broadcast): {"ok":true,"result":{"txid":"ab12...","txHex":"0200..."}}
+
+beignet psbt combine <psbt|file> <psbt|file>
+# {"ok":true,"result":{"psbtBase64":"cHNi..."}}
+beignet wallet refresh
+# {"ok":true,"result":{"refreshed":true}}
+
+beignet utxos
+# Each UTXO carries a frozen flag:
+# {"ok":true,"result":[{"txid":"ab12...","vout":0,"valueSats":50000,"frozen":false,...}]}
+
+beignet utxo freeze <txid> <index>
+# {"ok":true,"result":{"frozen":"ab12...:0"}}
+beignet utxo unfreeze <txid> <index>
+# {"ok":true,"result":{"unfrozen":"ab12...:0"}}
+beignet utxo frozen
+# List only frozen UTXOs
+
+beignet address label bc1q... "cold storage change"
+# {"ok":true,"result":{"address":"bc1q...","label":"cold storage change"}}
+beignet address labels
+# {"ok":true,"result":{"bc1q...":"cold storage change"}}
+
+beignet wallet descriptors
+# BIP 380 descriptors for all four address types (public keys only, with checksums):
+# {"ok":true,"result":{"fingerprint":"73c5da0a","descriptors":[{"addressType":"p2wpkh","external":"wpkh([73c5da0a/84h/0h/0h]xpub.../0/*)#...","internal":"wpkh(.../1/*)#..."},...]}}
+```
+
+On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
+can later be bumped with `tx bump-fee` (or `tx boost`, which falls back to
+CPFP when RBF is unavailable).
+
+**Daily spend limit (combined):** when the daemon is started with
+`--daily-spend-limit`, `send` and `send-max` count amount + fee against the
+SAME daily budget as Lightning payments and fail with
+`SPENDING_LIMIT_EXCEEDED` once it is exhausted. This limit was previously
+Lightning-only. `consolidate`, channel funding and `tx bump-fee`/`tx boost`
+are not counted. Frozen UTXOs are excluded from every send path (`send`,
+`send-max`, `consolidate`, `psbt build`) until unfrozen.
+
+**Multi-account and wallet birthday (library only):** `Wallet.create` accepts
+`account` (BIP32 account index, default 0; per-account storage isolation) and
+`birthdayHeight` (persisted creation-height metadata, exported with
+descriptors). The daemon always runs a single account-0 wallet and does not
+expose either option. `birthdayHeight` cannot speed up Electrum scans (the
+protocol has no height-filtered history), it is recorded for future backends
+and external tooling.
+
+The on-chain wallet's state (addresses, UTXOs, transactions) persists in the
+node's SQLite database (encrypted at rest when `storageEncryption` is on, the
+default), so restarts sync incrementally from Electrum instead of rebuilding
+the wallet from scratch.
+
+### Peers
+
+```bash
+beignet peer connect <pubkey> <host> <port>
+beignet peer disconnect <pubkey>
+beignet peer list
+```
+
+### DNS Bootstrap (BOLT 10)
+
+```bash
+beignet bootstrap discover
+# {"ok":true,"result":[{"pubkey":"02ab...","host":"1.2.3.4","port":9735},...]}
+
+beignet bootstrap connect 5
+# {"ok":true,"result":{"connected":["02ab...","03cd..."]}}
+```
+
+### Trusted Peers (Zero-Conf)
+
+```bash
+beignet trusted-peer add <pubkey>
+# {"ok":true,"result":{"pubkey":"02ab...","trusted":true}}
+
+beignet trusted-peer remove <pubkey>
+# {"ok":true,"result":{"pubkey":"02ab...","trusted":false}}
+
+beignet trusted-peer list
+# {"ok":true,"result":[{"pubkey":"02ab...","trusted":true}]}
+```
+
+### Channels
+
+```bash
+beignet channel open <pubkey> <sats> [pushSats]
+beignet channel open-zeroconf <pubkey> <sats> [pushSats]
+beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw] [--request-funds <sats>] [--blockheight <n>] [--max-lease-rates '<json>']
+# The lease flags buy inbound liquidity (option_will_fund) at or under the
+# given rate ceiling; --blockheight defaults to the node's current tip.
+beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
+beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
+beignet channel close <channelId> [--accept-stale-state-risk]
+beignet channel forceclose <channelId> [--accept-stale-state-risk]
+# Both closes pay out to a wallet-owned address the wallet scans (the current
+# unused address when the wallet can produce one; consecutive closes may get
+# the same address until it sees use), falling back to the startup sweep
+# address and then the funding-key address, so the closed balance is tracked
+# and spendable without a rescue sweep.
+# A channel restored from a Recovery Capsule refuses either close without the
+# flag. Cooperative: a mutual close pays out restored balances that cannot be
+# proven current. Force: if the peer holds a newer state the broadcast is
+# revoked and the whole channel balance goes to the justice path.
+beignet channel rebroadcast-close <channelId>
+beignet channel splice-in <channelId> <sats> <feeratePerkw>
+beignet channel splice-out <channelId> <sats> <feeratePerkw> [address]
+# [address] pays the spliced-out funds to an external address directly (one
+# transaction, no wallet hop); omitted, they go to the wallet
+beignet channel ensure-minimum 3 500000
+# Auto-open channels to at least 3 using graph suggestions, 500k sats each
+beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]
+beignet channel update-commitment-feerate <channelId> <feeratePerKw>
+# COMMITMENT feerate (BOLT 2 update_fee, opener only) - not the routing policy
+beignet channel policy <channelId>
+beignet channel list
+beignet channel ready
+# Only channels in NORMAL state
+beignet channel get <channelId>
+# channel get/list include the effective routing policy fields
+beignet channel health <channelId>
+beignet channel suggestions [count]
+beignet channel wait-ready <channelId> [--timeout 60000]
+```
+
+### Routing Fee Policy
+
+Per-channel control of the ROUTING policy advertised in `channel_update` (not
+the commitment feerate, which is `/channel/update-commitment-feerate`): base
+fee, proportional fee (ppm), CLTV delta, and HTLC min/max. Unset fields fall
+back to the node-wide defaults; overrides persist across restarts. Announced
+channels re-broadcast the updated `channel_update` immediately; unannounced
+channels send it directly to the peer.
+
+```bash
+beignet channel update-policy ab12... --base-fee-msat 500 --ppm 100
+# {"ok":true,"result":{"updated":1,"policies":[{"channelId":"ab12...","feeBaseMsat":500,"feeProportionalMillionths":100,"cltvExpiryDelta":40,"htlcMinimumMsat":"1000","htlcMaximumMsat":"500000000","source":"override"}]}}
+
+beignet channel update-policy all --cltv-delta 80
+# Applies to every channel; other fields keep their current values
+```
+
+### Forwarding History
+
+Ledger of settled forwards (HTLCs this node relayed where both legs
+fulfilled), with the fee earned per forward. Records persist in the node
+database (capped at 100k rows, oldest pruned first). Msat values are decimal
+strings. Failed forwards are not recorded.
+
+```bash
+beignet forwards --since 1751000000000 --limit 50
+# {"ok":true,"result":[{"id":7,"settledAt":1751234567890,"inChannelId":"ab12...","outChannelId":"cd34...","amountInMsat":"5005000","amountOutMsat":"5000000","feeMsat":"5000"}]}
+
+beignet forwards summary --since 1751000000000
+# {"ok":true,"result":{"count":42,"volumeOutMsat":"210000000","feesEarnedMsat":"210000"}}
+### Graph Queries
+
+lncli-style read access to the gossip network graph, plus manual routing:
+compute a route without paying, then (optionally) pay along exactly that route.
+SCIDs are formatted `<block>x<txIndex>x<output>` (16-char hex also accepted).
+
+```bash
+beignet graph info
+# {"ok":true,"result":{"nodeCount":18432,"channelCount":51200,"lastSyncAt":1767952800000}}
+
+beignet graph node 02abc...
+# {"ok":true,"result":{"pubkey":"02abc...","alias":"ACINQ","color":"ff9900","addresses":[...],"featuresHex":"8000...","lastUpdate":1767950000,"channelCount":3,"channels":["700000x1x0",...]}}
+
+beignet graph channel 700000x1x0
+# {"ok":true,"result":{"shortChannelId":"700000x1x0","node1Pubkey":"02ab..","node2Pubkey":"03cd..","capacitySats":1000000,"node1Policy":{"feeBaseMsat":1000,"feeProportionalMillionths":1,"cltvExpiryDelta":40,"htlcMinimumMsat":"1000","htlcMaximumMsat":"1000000000","disabled":false,"lastUpdate":1767950000},"node2Policy":{...}}}
+
+beignet graph describe --limit 100 --offset 200
+# Paged dump: {"ok":true,"result":{"totalChannels":51200,"limit":100,"offset":200,"channels":[...]}}
+
+beignet route query 02abc... 50000 --max-fee 100
+# Computes a route WITHOUT paying:
+# {"ok":true,"result":{"destination":"02abc...","amountSats":50000,"hops":[{"pubkey":"03cd..","shortChannelId":"700000x1x0","amountToForwardMsat":"50001000","outgoingCltvValue":80,"feeMsat":"1000","cltvExpiryDelta":40},...],"totalAmountMsat":"50001000","totalFeeMsat":"1000","totalCltvDelta":80,"finalCltvExpiry":40}}
+
+beignet route query 02abc... 50000 --pretty > route.json
+beignet payment send-to-route <paymentHash> route.json --payment-secret <hex>
+# Pays along exactly that route (accepts a file path or inline JSON;
+# both the full result object and a bare {"hops":[...]} work)
+
+beignet route estimate <bolt11> [sats]
+# {"ok":true,"result":{"feeSats":2,"hops":3,"cltvDelta":120}}
+
+beignet route probe 02abc... 50000
+# Probes route viability without paying
+```
+
+### Invoices & Payments
+
+```bash
+beignet invoice create [sats] [description]
+# {"ok":true,"result":{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000}}
+
+beignet invoice decode <bolt11>
+# {"ok":true,"result":{"network":"bcrt","amountSats":1000,"paymentHash":"ab12...",...}}
+
+beignet invoice validate <bolt11> [sats]
+# Pre-flight checks (decode, capacity, route): {"ok":true,"result":{"status":"OK","checks":[...]}}
+
+beignet invoice get <paymentHash>
+# Details of an invoice this node created
+
+beignet invoice pay <bolt11>
+# Blocks until payment settles or fails (60s timeout)
+# {"ok":true,"result":{"paymentHash":"ab12...","preimage":"cd34...","status":"COMPLETED",...}}
+
+beignet invoice pay-safe <bolt11> [--max-fee 100] [--amount 1000] [--timeout 60000]
+# Never errors: resolves with status FAILED instead
+
+beignet invoice pay-async <bolt11> [--max-fee 100] [--amount 1000]
+# Fire-and-forget: returns {paymentHash,status} immediately; poll 'payment get'
+
+beignet invoice pay-retry <bolt11> [--max-retries 5] [--backoff-ms 1000] [--max-fee 100]
+# Retries with exponential backoff on transient failures
+# {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED","attempts":2,...}}
+
+beignet keysend <pubkey> <sats> [--max-fee 100] [--timeout 60000]
+beignet keysend safe <pubkey> <sats>
+# Spontaneous payment, no invoice ('safe' resolves FAILED instead of erroring)
+
+beignet invoice list
+# {"ok":true,"result":[{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000,...}]}
+
+# Hold invoices: you keep the preimage; the payer's HTLC parks until you settle
+beignet invoice create-hold <sha256(preimage)> 1000 "escrow" --expiry 3600
+# {"ok":true,"result":{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000}}
+
+# Swap leg: the delta has to outlive the on-chain refund timeout and the margins
+# after it, or the payer gets its sats back over Lightning and still claims the
+# contract. A parked HTLC is cancelled 18 blocks before it expires, and the
+# refund still has to be resolved after that, so the reverse swap role asks for
+# refund 144 + resolution 24 + cancellation 18 + padding 8 = 194.
+beignet invoice create-hold <sha256(preimage)> 1000 "swap" --min-final-cltv 194
+
+beignet invoice held
+# {"ok":true,"result":[{"paymentHash":"ab12...","state":"ACCEPTED","heldAmountMsat":"1000000","htlcCount":1,...}]}
+
+beignet invoice settle-hold <preimage>       # fulfills the parked HTLC(s)
+beignet invoice cancel-hold <paymentHash>    # fails them back to the payer
+
+beignet payment list
+beignet payment get <paymentHash>
+beignet payment cancel <paymentHash>
+beignet payment wait <paymentHash> [--timeout 60000]
+beignet payment proof <paymentHash>
+beignet payment verify-proof <paymentHash>
+beignet payment estimate <bolt11> [sats]
+beignet payment metadata <paymentHash> '{"orderId":"1234"}'
+
+# Payment queue: ordered dispatch with priorities
+beignet queue add <bolt11> [--priority 5] [--amount 1000] [--max-fee 100]
+beignet queue list
+beignet queue cancel <id>
+```
+
+### Messages & Gossip
+
+```bash
+beignet message sign "proof of node ownership"
+# {"ok":true,"result":{"signature":"d7y...104 zbase32 chars...","pubkey":"02ab..."}}
+
+beignet message verify "proof of node ownership" <signature>
+# {"ok":true,"result":{"valid":true,"pubkey":"02ab...","knownNode":true}}
+
+beignet gossip sync            # sync graph from all connected peers
+beignet gossip sync-rapid      # Rapid Gossip Sync snapshot (mainnet)
+beignet channel diagnostics <channelId>
+beignet address validate bc1q...
+beignet recover-fallback-funds --fee-rate 5
+beignet backup trigger
+```
+
+### Guardian Recovery
+
+```bash
+beignet recovery status     # Recovery Protocol status: mode, guardian set,
+                            # startup gate, last durable sequence
+beignet recovery restore    # take this namespace over from the guardian
+                            # replicas and start the node on the restored
+                            # state (restore-pending daemons only; channels
+                            # RESUME instead of force-closing)
+beignet recovery restore-capsule  # peer-storage mode: restore from the
+                            # Recovery Capsules storage peers returned
+                            # (connect to the old channel peers first;
+                            # Tier 2 asks for a daemon restart)
+                            # --unfenced: guardian set gone; restores a
+                            # guardian-backed capsule WITHOUT fencing the
+                            # old writer (never for quorum journals)
+beignet recovery capsule-guardians  # the best retrieved capsule's guardian set
+beignet recovery resolve-guardian <node id>@host:port  # a beignet node as a guardian entry
+beignet recovery rotate-guardians <e> <e> <e>  # move to a new guardian set, channels running
+beignet guardian status             # the guardian this node serves to others
+                            # with credentials, as config entries
+```
+
+### BOLT 12 Offers
+
+```bash
+beignet offer create "Coffee" 1000
+# {"ok":true,"result":{"offerId":"ab12...","description":"Coffee","amountSats":1000,"encoded":"lno1..."}}
+
+beignet offer list
+# {"ok":true,"result":[{"offerId":"ab12...","description":"Coffee",...}]}
+
+beignet offer decode lno1...
+# {"ok":true,"result":{"offerId":"ab12...","description":"Coffee","amountSats":1000,...}}
+
+beignet offer pay lno1... 1000
+# Requests invoice from offer issuer, then pays it
+# {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED",...}}
+```
+
+### Webhooks (CLI)
+
+```bash
+beignet webhooks register https://myagent.com/callback payment:received,channel:ready --secret mysecret
+beignet webhooks register https://myagent.com/callback '*'
+# '*' subscribes to every event, including any added in future versions
+beignet webhooks list
+beignet webhooks unregister <id>
+```
+
+Every daemon endpoint has a CLI command except two that only make sense over
+HTTP: `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
+the CLI instead) and `GET /openapi.json` (machine-readable API discovery). The
+deprecated `POST /channel/update-fee` alias is covered by
+`channel update-commitment-feerate`.
+
+### JSON Envelope
+
+Every response follows this format:
+
+```json
+// Success
+{"ok": true, "result": { ... }}
+
+// Failure
+{"ok": false, "error": {"code": "PAYMENT_FAILED", "message": "No route found"}}
+```
+
+---
+
+## Configuration
+
+### Config File
+
+`~/.beignet/config.json`:
+
+```json
+{
+  "mnemonic": "abandon abandon ...",
+  "network": "regtest",
+  "alias": "mynode",
+  "dataDir": "/custom/path",
+  "electrumHost": "127.0.0.1",
+  "electrumPort": 60001,
+  "electrumTls": false,
+  "listenPort": 9735,
+  "daemonHost": "127.0.0.1",
+  "daemonPort": 2112,
+  "preferAnchors": true,
+  "apiToken": "mysecrettoken",
+  "apiKeys": [
+    { "name": "monitor", "key": "readonlysecret", "scopes": ["readonly"] },
+    { "name": "shop", "key": "invoicesecret", "scopes": ["invoice", "readonly"] },
+    { "name": "ops", "key": "adminsecret", "scopes": ["admin"] },
+    { "name": "contractor", "key": "temporarysecret", "scopes": ["readonly"],
+      "expiresAt": "2027-01-01T00:00:00Z" }
+  ],
+  "autoBootstrap": false,
+  "backupPath": "/var/backups/beignet/node.db",
+  "backupIntervalMs": 21600000,
+  "electrumServers": [
+    { "host": "electrum1.bluewallet.io", "port": 443, "tls": true },
+    { "host": "electrum2.bluewallet.io", "port": 443, "tls": true }
+  ],
+  "dailySpendLimitSats": 100000,
+  "connectTimeoutMs": 15000,
+  "tlsCert": "/etc/ssl/beignet/cert.pem",
+  "tlsKey": "/etc/ssl/beignet/key.pem",
+  "htlcEvents": false
+}
+```
+
+### Environment Variables
+
+Environment variables override the config file but are overridden by CLI flags.
+
+| Variable | Description |
+|----------|-------------|
+| `BEIGNET_MNEMONIC` | BIP39 mnemonic |
+| `BEIGNET_NETWORK` | `mainnet`, `testnet`, or `regtest` |
+| `BEIGNET_ALIAS` | Node alias |
+| `BEIGNET_DATA_DIR` | Data directory path |
+| `BEIGNET_ELECTRUM_HOST` | Electrum server hostname |
+| `BEIGNET_ELECTRUM_PORT` | Electrum server port |
+| `BEIGNET_ELECTRUM_TLS` | `true` or `false` |
+| `BEIGNET_LISTEN_PORT` | Lightning listen port |
+| `BEIGNET_DAEMON_HOST` | HTTP daemon bind address (default: `127.0.0.1`) |
+| `BEIGNET_DAEMON_PORT` | HTTP daemon port |
+| `BEIGNET_PREFER_ANCHORS` | `true` to prefer anchor channels |
+| `BEIGNET_API_TOKEN` | Legacy single API token (implicit admin scope) |
+| `BEIGNET_API_KEYS` | Named scoped API keys as a JSON array: `[{"name","key","scopes":["readonly"\|"invoice"\|"admin"]}]` |
+| `BEIGNET_API_KEY` | CLI-side only: bearer credential the CLI sends to the daemon (alias of `BEIGNET_API_TOKEN` for named-key secrets) |
+| `BEIGNET_AUTO_BOOTSTRAP` | `true` to auto-connect to DNS seed peers on start |
+| `BEIGNET_BACKUP_PATH` | Automated backup destination path |
+| `BEIGNET_BACKUP_INTERVAL_MS` | Backup interval in milliseconds (default: 21600000 = 6h) |
+| `BEIGNET_DAILY_SPEND_LIMIT_SATS` | Daily spending limit in satoshis (resets at midnight UTC) |
+| `BEIGNET_CONNECT_TIMEOUT_MS` | Timeout for `connectPeer()` in milliseconds (default: 15000) |
+| `BEIGNET_TLS_CERT` | Path to TLS certificate for HTTPS daemon |
+| `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
+| `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
+| `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
+| `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
+| `BEIGNET_RECOVERY_MODE` | Recovery Protocol mode: `off`, `peer-storage`, `async-remote`, `quorum` (default: off; unknown values fall back to off) |
+| `BEIGNET_RECOVERY_GUARDIANS` | Guardian set for async-remote/quorum, comma-separated `<64-hex-x-only-pubkey>@<url>` where the URL is `http(s)://...` for an HTTP guardian or `bolt8://<66-hex node id>@host:port` for a guardian hosted by a beignet node (crash-v1: exactly three; malformed entries refuse startup) |
+| `BEIGNET_RECOVERY_PROFILE` | Recovery fault-model profile; `crash-v1` is the only accepted value and the default |
+| `BEIGNET_RECOVERY_LEASE_CHECK_MS` | Guardian modes: idle writer lease re-check cadence in ms, an integer in 0..2147483647 (default: 300000; 0 disables; anything else refuses startup) |
+| `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS` | peer-storage mode: how long an unknown channel's `channel_reestablish` is held before the BOLT 1 error goes out, an integer in 0..2147483647 (default: 600000; 0 answers immediately; anything else refuses startup) |
+| `BEIGNET_GUARDIAN_SERVE` | `true` to serve the reference guardian to other beignet nodes over bolt8 sessions at this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7); needs `BEIGNET_LISTEN_PORT`. Independent of this node's own recovery mode, and kept serving while this node's own writer lease is quarantined |
+| `BEIGNET_GUARDIAN_TOKEN` | Bearer token every guardian session must present; unset runs open (BOLT 8 already encrypts and authenticates the host, so the token is an allow-list) |
+| `BEIGNET_GUARDIAN_MAX_BYTES` | Hard bound on the content one served guardian set may store (its encoded rows; SQLite's overhead comes on top): every write, epoch rows and rotations included, that would cross it is refused with `ERR_QUOTA_EXCEEDED` (default 268435456). Refuses, never deletes |
+| `BEIGNET_GUARDIAN_MAX_SETS` | Guardian sets this node will register (default 16) |
+| `BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES` | Advertised per-record ciphertext limit (default 4194304; protocol cap 16 MiB) |
+| `BEIGNET_RECOVERY_AUTO_APPLY` | peer-storage mode: on a boot whose database is empty, apply the best Recovery Capsule the storage peers return with no operator call and rebuild the node in-process on it (exact `true`/`false`; default off; refused outside peer-storage mode). Cannot fence a previous device that still runs |
+| `BEIGNET_RECOVERY_AUTO_APPLY_SETTLE_MS` | Auto-apply settle floor from the first capsule's arrival, so a slower replica still competes for the selection (default: 15000) |
+| `BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS` | Auto-apply ceiling from the first arrival; storage peers that never connect are not waited for past it (default: 120000; must be at least the settle floor and below `BEIGNET_RECOVERY_REESTABLISH_HOLD_MS`) |
+| `BEIGNET_FEE_BASE_MSAT` | Node-wide default routing base fee advertised in `channel_update`, an integer in 0..4294967295 msat (default: 1000; anything else refuses startup). Per-channel `channel update-policy` overrides win |
+| `BEIGNET_FEE_PPM` | Node-wide default proportional routing fee in millionths, an integer in 0..4294967295 (default: 1; anything else refuses startup). Per-channel overrides win |
+| `BEIGNET_CLTV_DELTA` | Node-wide default forwarding CLTV delta, an integer in 1..65535, `>= 18` recommended (default: 40; anything else refuses startup). Per-channel overrides win |
+| `BEIGNET_LEASE_RATES` | Liquidity ads (`option_will_fund`) seller policy: a JSON object `{"fundingWeightWitness":n,"leaseFeeBasis":n,"leaseFeeBaseSat":n,"channelFeeMaxBaseMsat":n,"channelFeeMaxProportionalThousandths":n}` (u16/u16/u32/u32/u16). Setting it sells inbound liquidity at these rates and advertises the feature bit; malformed or out-of-range values refuse startup; unset means never sell |
+| `BEIGNET_JIT_RECEIVE` | JIT channel receive, LSP role: hold HTLCs addressed to intercept SCIDs registered by wallet peers, fund a zero-conf channel with THIS node's coins, then forward (`true`/`false`, default off) |
+| `BEIGNET_JIT_FLAT_FEE_SAT` | Flat part of the opening fee the LSP role deducts from a JIT delivery, an integer in 0..4294967295 (default 0) |
+| `BEIGNET_JIT_FEE_PPM` | Proportional part of that fee in millionths of the delivered total, an integer in 0..1000000 (default 0) |
+| `BEIGNET_JIT_MAX_FLAT_FEE_SAT` | Wallet role: most an LSP may quote `POST /jit/invoice` as a flat fee before the intent is refused (default 10000) |
+| `BEIGNET_JIT_MAX_FEE_PPM` | Wallet role: most an LSP may quote as a proportional fee, in millionths (default 50000). Applies whether or not the LSP role is on |
+| `BEIGNET_JIT_MAX_CLIENT_FUNDING_SAT` | LSP role: most this node fronts for ONE client, open or splice (default 1000000; a partly numeric value refuses startup) |
+| `BEIGNET_JIT_MAX_CONCURRENT_FUNDINGS` | LSP role: fundings (opens plus splices) allowed in flight at once, an integer in 0..1000 (default 3). With the per-client cap this bounds what is committed at any instant |
+| `BEIGNET_JIT_MAX_TOTAL_FUNDING_SAT` | LSP role: lifetime budget of sats this node may ever front, counted across restarts (default unset, meaning no lifetime budget: exposure at any instant is bounded by the two caps above) |
+| `BEIGNET_SWAPS` | Reverse swap provider role (issue #737): a peer pays this node a hold invoice, this node funds a P2WSH contract the peer claims on chain, and the claim's preimage settles the hold (`true`/`false`, default off: the role locks THIS node's coins in contracts for peers) |
+| `BEIGNET_SWAP_FLAT_FEE_SAT` | Flat part of the swap fee, sats (default 0) |
+| `BEIGNET_SWAP_FEE_PPM` | Proportional part of the swap fee in millionths of the on-chain amount (default 0). The quoted funding miner fee is added to both |
+| `BEIGNET_SWAP_MIN_SAT` / `BEIGNET_SWAP_MAX_SAT` | Smallest and largest on-chain amount served (defaults 10000 / 1000000) |
+| `BEIGNET_SWAP_MAX_EXPOSURE_SAT` | Most principal this node will have at risk on chain across unresolved swaps at once (default 5000000) |
+| `BEIGNET_SWAP_MAX_CONCURRENT` | Unresolved swaps allowed at once, unpaid ones included (default 8) |
+| `BEIGNET_SWAP_REFUND_DELTA_BLOCKS` | Blocks from create to the contract's refund height (default 144). The hold invoice's final CLTV is derived from it so a paid hold always outlives the refund |
+| `BEIGNET_SWAP_FUNDING_CONFS` / `BEIGNET_SWAP_RESOLUTION_CONFS` | Depth the funding needs before it counts, and depth a claim or refund needs before it is the outcome (defaults 1 / 3). A claim settles the hold at any depth, the mempool included; a refund cancels it only at this depth. Both directions share these |
+| `BEIGNET_SWAP_SUBMARINE` | With `BEIGNET_SWAPS=true`, also serve the submarine direction (issue #743): a peer locks coins in a P2WSH contract whose preimage branch is this node's, this node pays the peer's own invoice once the funding has confirmed to `BEIGNET_SWAP_FUNDING_CONFS` and been re-verified unspent, with every HTLC bound to the refund height minus the claim margins, and claims the coins with the preimage. Exact `true`/`false`, default off: the node pays out Lightning funds against a contract it must then claim. The fee terms and exposure caps above apply to both directions |
+| `BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS` | Blocks between the last possible outgoing HTLC expiry and the peer's refund height, for a late preimage to be claimed and confirmed (default 24) |
+| `BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM` | Routing fee this node may spend on the payment, per million of the invoice (default 5000); charged into the swap fee floor on top of the flat, ppm and claim miner fee |
+| `BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS` | Blocks an unconfirmed claim waits before it is rebuilt at a higher fee (default 2); inside the claim safety window the claim is bumped every block, up to the whole output above dust |
+| `BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS` | Blocks from a submarine create to its refund height (default 288, bounds 144 to 432); an invoice whose final CLTV plus a 72 block route budget cannot fit under the refund height minus the margins is refused as `CLTV_UNFITTABLE` |
+| `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
+| `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
+
+### Priority Order
+
+CLI flags > environment variables > config file > defaults.
+
+### Default Electrum Servers
+
+| Network | Host | Port | TLS |
+|---------|------|------|-----|
+| mainnet | `fulcrum.bitkit.blocktank.to` | 8900 | yes |
+| testnet | `electrum.blockstream.info` | 60002 | yes |
+| regtest | `34.65.252.32` | 18483 | no |
+
+> The regtest default is a hosted Synonym regtest Electrum server. For local
+> development against your own regtest node, override it with
+> `BEIGNET_ELECTRUM_HOST`/`BEIGNET_ELECTRUM_PORT` or the `electrumHost`/
+> `electrumPort` options.
+
+---
+
+## HTTP API
+
+The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`.
+
+These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. The cache is in memory, so it does not survive a daemon restart.
+
+### Authentication
+
+Two kinds of credentials, usable together:
+
+- **Legacy single token** -- `apiToken` (via `--api-token`, `BEIGNET_API_TOKEN`, or config file). Backward compatible: it keeps working and carries an implicit `admin` scope.
+- **Named scoped keys** -- the `apiKeys` config array (or `BEIGNET_API_KEYS` env var as JSON): `[{ "name": "monitor", "key": "<secret>", "scopes": ["readonly"], "expiresAt": "2027-01-01T00:00:00Z" }, ...]`. A key may hold multiple scopes; `expiresAt` is optional.
+
+When any credential is configured, all endpoints require an `Authorization: Bearer <token-or-key-secret>` header. Exceptions (always accessible):
+
+- `GET /health`, `GET /ready` -- monitoring tools
+- `GET /openapi.json` -- API discovery
+- `GET /metrics` -- Prometheus scrapers
+
+If neither `apiToken` nor `apiKeys` is configured, all endpoints are open (backward-compatible). `GET /mnemonic` is only accessible when auth is configured (and only to `admin`).
+
+**Scopes:**
+
+| Scope | Grants |
+|-------|--------|
+| `readonly` | Every GET route (except `GET /mnemonic` and `GET /webhooks`) plus POSTs that are pure queries: estimate/validate/decode/verify and the wait endpoints. |
+| `invoice` | Receive-side routes: creating invoices/offers/hold invoices, settling/cancelling holds, `POST /address/new`, invoice/offer lookups and decoding, `GET /can-receive`, `POST /payment/wait`, and the `GET /events` SSE stream. |
+| `admin` | Everything, including paying/spending, channel and peer management, PSBTs, backups, webhooks management, `POST /stop`, and API key management. |
+
+Every route is explicitly classified in `src/cli/auth.ts` (`ROUTE_SCOPES`); a drift test fails the build if a new route ships without a classification, and unclassified routes fail closed (admin-only). Notable classifications: all webhook routes including `GET /webhooks` are admin-only (callback URLs can embed credentials; management is one unit); `POST /message/sign` is admin-only because it signs with the node identity key; `GET /events` (SSE) accepts `readonly` and `invoice`.
+
+Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSafeEqual`), for the legacy token too. Failures return **401** `UNAUTHORIZED` for a bad or missing key and **403** `FORBIDDEN` for a valid key without a required scope.
+
+**Expiry:** a named key may declare `expiresAt` (ISO 8601, e.g. `"2027-01-01T00:00:00Z"`). From that moment the key fails authentication exactly like an unknown key (401); the check happens on every request, so no restart is needed. An unparseable `expiresAt` is rejected at daemon startup (`INVALID_PARAMS`). `GET /auth/keys` reports `expiresAt` and a computed `expired` boolean per key.
+
+**Rotation:** `POST /auth/keys/rotate {"name": "..."}` (`beignet auth rotate <name>`, admin scope) mints a cryptographically random 32-byte hex secret for an existing named key. The old secret stops authenticating immediately; scopes and expiry are unchanged. The new secret appears ONCE in the response -- only its SHA-256 digest is stored, so it cannot be retrieved again; if it is lost, rotate again. Rotating a revoked key reinstates it under the new secret (the old, possibly compromised secret stays dead).
+
+**Persistence:** rotation and revocation are written to the node database (the encrypted `wallet_data` table -- digests only, never plaintext secrets) and are re-applied over the config-declared keys on every start. This fixes the earlier limitation where revocation was in-memory only and a daemon restart resurrected a revoked key. The config file remains the source of truth for the key *set*: overrides apply by name, an override whose name left the config is pruned, and editing a key's secret in the config discards any stored rotation/revocation for that name (an explicit config re-key wins). Removing a key from the config file remains the ultimate cleanup.
+
+**Legacy token caveats:** the single `apiToken` has no name, so it can be neither rotated nor expired nor revoked at runtime -- its behavior is unchanged. To retire it, change or remove it in the config and restart. Prefer named `apiKeys` for anything that needs lifecycle management.
+
+### Endpoints
+
+| Method | Path | Parameters | Description |
+|--------|------|------------|-------------|
+| GET | `/info` | -- | Node info |
+| GET | `/mnemonic` | -- | Show mnemonic (requires apiToken) |
+| GET | `/balance` | -- | Balances |
+| GET | `/health` | -- | Health status (auth-exempt) |
+| GET | `/openapi.json` | -- | OpenAPI 3.0 spec (auth-exempt) |
+| GET | `/stats` | `?window=<ms>` | Node statistics (optional time window in ms) |
+| GET | `/peers` | -- | List peers |
+| GET | `/channels` | -- | List channels |
+| GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
+| GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
+| GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
+| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |
+| GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
+| GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
+| GET | `/invoices` | -- | List created invoices |
+| GET | `/channel` | `?channelId=<hex>` | Get channel (query param or body) |
+| GET | `/channel/health` | `?channelId=<hex>` | Channel health assessment with liquidity warnings |
+| GET | `/payment` | `?paymentHash=<hex>` | Get payment (query param or body) |
+| GET | `/trusted-peers` | -- | List trusted peers |
+| GET | `/offers` | -- | List BOLT 12 offers |
+| GET | `/events` | -- | SSE event stream (auth-gated) |
+| POST | `/address/new` | -- | New address |
+| POST | `/wallet/refresh` | -- | Sync wallet |
+| POST | `/send` | `{ address, amountSats, satsPerVbyte? }` | Send on-chain (optional fee rate). Counts amount + fee against the combined daily spend limit |
+| POST | `/send-max` | `{ address, satsPerVbyte? }` | Sweep the whole on-chain balance to one address. The computed sweep total is checked against the combined daily spend limit before broadcast |
+| POST | `/tx/bump-fee` | `{ txid, satsPerVbyte }` | RBF an unconfirmed tx at a higher fee (NOT_BOOSTABLE if RBF unavailable) |
+| POST | `/tx/boost` | `{ txid, satsPerVbyte? }` | Fee-bump a tx: RBF when possible, else CPFP |
+| GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
+| POST | `/consolidate` | `{ satsPerVbyte? }` | Merge all UTXOs into one output at a fresh wallet address |
+| POST | `/psbt/build` | `{ outputs, satsPerVbyte? }` | Build an UNSIGNED PSBT for an external signer |
+| POST | `/psbt/import-signed` | `{ psbtBase64 }` | Validate + finalize a signed PSBT (no broadcast) |
+| POST | `/psbt/combine` | `{ psbts }` | Combine partially signed PSBT copies |
+| POST | `/utxo/freeze` | `{ txid, index }` | Freeze a UTXO: excluded from all coin selection until unfrozen |
+| POST | `/utxo/unfreeze` | `{ txid, index }` | Unfreeze a previously frozen UTXO |
+| POST | `/address/label` | `{ address, label }` | Set a user label for an address (empty label clears it) |
+| GET | `/address/labels` | -- | All user address labels keyed by address |
+| GET | `/wallet/descriptors` | -- | BIP 380 output descriptors (checksummed, public keys only) |
+| POST | `/peer/connect` | `{ pubkey, host, port }` | Connect peer |
+| POST | `/peer/disconnect` | `{ pubkey }` | Disconnect peer |
+| POST | `/peers/bootstrap` | -- | Discover peers via DNS |
+| POST | `/peers/connect-seeds` | `{ maxPeers? }` | Connect to seed peers |
+| POST | `/trusted-peer/add` | `{ pubkey }` | Trust peer for zero-conf |
+| POST | `/trusted-peer/remove` | `{ pubkey }` | Remove trusted peer |
+| POST | `/channel/open` | `{ pubkey, amountSats, pushSats? }` | Open channel |
+| POST | `/channel/open-zeroconf` | `{ pubkey, amountSats, pushSats? }` | Open zero-conf channel |
+| POST | `/channel/open-v2` | `{ pubkey, amountSats, fundingFeeratePerkw?, ... }` | Open dual-funded v2 channel |
+| POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
+| POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
+| POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
+| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
+| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
+| POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
+| POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
+| POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
+| POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
+| POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
+| GET | `/jit/status` | -- | The JIT receive role as it stands: `enabled`, the client ceilings, and (when on) `lsp` with the opening fee, the exposure caps, sats reserved and fronted, live intents, held HTLCs and fundings in flight. Readonly scope |
+| GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). Readonly scope |
+| GET | `/swaps/status` | -- | Swap provider (issues #737 and #743): `enabled`, and when on the fee terms, exposure caps, timing, reverse swaps per state and `exposedSat` at risk on chain; `submarine` reports the on-chain to Lightning direction the same way (`enabled: false` when it is off). Readonly scope |
+| GET | `/swaps` | `?id=<hex>` | The swap ledger (or one swap) in both directions (`direction` is `reverse` or `submarine`): state, contract terms, funding, payment, claim, refund and resolution facts; amounts as decimal strings, no private key. Readonly scope |
+| POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
+| POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, allowSplice?, allowUnpairedSplice?, unpairedSpliceDepth?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `trusted` lets an open go zero-conf; `allowSplice` lets a paired payer grow the existing channel with the liquidity peer instead of opening a second one; `allowUnpairedSplice` lets an anonymous payer do the same when its coin is confirmed, with a splice that locks at `unpairedSpliceDepth` confirmations (1..2016, default 3) rather than at broadcast, whatever the channel type (an anonymous payer with an unconfirmed coin still gets a new confirmed channel). While a splice with the liquidity peer is still confirming, every further offer is declined before the payer's witness leaves, so the payer falls back to a plain send. The three switches must be booleans (400 `INVALID_PARAMS` otherwise). `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
+| GET | `/direct-funding/config` | -- | Read the effective policy, `allowUnpairedSplice` and `unpairedSpliceDepth` included; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
+| POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
+| POST | `/direct-funding/prepare` | `{ request }` | Decode a request and start connecting to the node a send would talk to first, without waiting for the dial. Returns `{ requestId, receiverNodeId, amountSat, expiresAt, connection, peerNodeId? }`, where `connection` is `connected`, `connecting`, `awaiting_receiver` or `none`. Spends nothing and writes no payment record; a later `send` joins a dial still in progress. Admin scope |
+| POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat?, recoverReceipt? }` | Pay a request from one of our coins. Set `recoverReceipt` to ask the receiver to replay a receipt that never arrived (issue #767): it acts only on a post-witness payment with no receipt yet, re-sends the recorded offer with no second coin, signature or freeze, and returns the recorded outcome plus a `caveat` if the receiver cannot be reached. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens, and neither for a request that already has an attempt: a duplicate call spends nothing new, and refusing one would be read as "nothing happened") |
+| POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel). `minFinalCltvExpiry` is 1..2016 blocks; on a swap leg it has to clear the on-chain refund timeout plus the 18-block hold cancellation margin and the refund's own resolution time |
+| POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
+| POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
+| GET | `/invoices/held` | -- | List hold invoices with state + parked totals. Each row also carries `minFinalCltvExpiry` (the delta the invoice advertised and the final hop enforces on every arriving HTLC) and the realised expiry of the parked set: `earliestExpiry`, `cancelMarginBlocks` and `cancelHeight` (null before any part is committed). A swap provider checks `earliestExpiry` against its on-chain refund timeout before funding instead of trusting the advertised delta |
+| POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
+| POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
+| POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
+| POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
+| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. |
+| POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |
+| POST | `/payment/metadata` | `{ paymentHash, metadata }` | Attach key-value metadata to an existing payment |
+| POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
+| POST | `/route/probe` | `{ destination, amountSats }` | Probe route viability to a destination |
+| GET | `/graph/info` | -- | Network graph summary: node/channel counts, last sync time |
+| GET | `/graph/node` | `?pubkey=<hex>` | Node announcement info + its known channel SCIDs (404 if unknown) |
+| GET | `/graph/channel` | `?scid=<BxTxO or hex>` | Channel endpoints, capacity and both directions' policies (404 if unknown) |
+| GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
+| POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
+| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query` |
+| POST | `/backup` | `{ destPath }` | Create online database backup |
+| GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
+| POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
+| POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |
+| POST | `/message/verify` | `{ message, signature }` | Recover signer pubkey; `knownNode` = present in our graph |
+| POST | `/gossip/sync` | `{ pubkey? }` | Gossip sync from one peer or all connected peers |
+| POST | `/gossip/sync-rapid` | -- | Rapid Gossip Sync snapshot (mainnet only) |
+| GET | `/channel/diagnostics` | `?channelId=<hex>` | Routing-readiness diagnostics (SCID/announcement/peer issues) |
+| POST | `/address/validate` | `{ address }` | Validate a Bitcoin address for the active network |
+| POST | `/recover-fallback-funds` | `{ feeRatePerVbyte? }` | Sweep funding-key fallback UTXOs into the wallet |
+| POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
+| POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
+| POST | `/channel/update-policy` | `{ channelId?, all?, feeBaseMsat?, feeProportionalMillionths?, cltvExpiryDelta?, htlcMinimumMsat?, htlcMaximumMsat? }` | Set ROUTING fee policy per channel (or `all: true`); regenerates + re-broadcasts channel_update |
+| GET | `/channel/policy` | `?channelId=<hex>` | Effective routing policy (override or node defaults) with `source` field |
+| POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s) |
+| POST | `/channel/wait-ready` | `{ channelId, timeoutMs? }` | Wait for channel to reach NORMAL (default 60s) |
+| POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
+| POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
+| POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. |
+| GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
+| GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
+| GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |
+| POST | `/payment/estimate` | `{ bolt11, amountSats? }` | Payment intelligence: success probability, route quality, fees |
+| GET | `/liquidity` | -- | Liquidity analysis with recommendations |
+| GET | `/channel/suggestions` | `?count=<n>` | Graph-based channel open suggestions |
+| GET | `/fees` | -- | On-chain fee trend analysis |
+| GET | `/logs` | `?category=&since=&limit=` | Query persistent action log |
+| GET | `/readiness` | -- | Mainnet readiness checklist (12 checks) |
+| GET | `/metrics` | readonly | Prometheus text exposition format metrics (auth-gated: reports balances; `metricsPublic: true` serves it without auth) |
+| POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
+| DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
+| GET | `/webhooks` | -- | List registered webhooks |
+| POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment |
+| GET | `/queue` | -- | List payment queue |
+| POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
+| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
+| POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
+| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat) |
+| GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
+| POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
+| POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
+| GET | `/recovery/status` | -- | Recovery Protocol status: mode, guardian set, daemon state (`disabled`/`running`/`restore-required`/`restoring`/`restart-required`/`fenced`), the node view (startup gate, durability, last durable sequence, per-channel recovery status), and the Recovery Capsules storage peers returned this session (`capsules`, whose `best` names the guardian locators the capsule carries, credentials redacted), plus `autoApply` (the automatic capsule application: enabled, phase, settleUntil, lastReason). 404 on an older daemon = predates the feature; 200 with `disabled` = supported but off |
+| POST | `/recovery/restore` | `{ confirm: true }` | Restore from guardian replicas and start the node on the restored state (restore-pending daemons only; channels RESUME instead of force-closing; the takeover permanently fences the previous writer). Progress streams over SSE as `recovery:restore-progress` |
+| POST | `/recovery/restore-capsule` | `{ confirm: true, unfenced?: boolean }` | Peer-storage mode: restore from the Recovery Capsules storage peers returned this session. Tier 2 installs the exact state into a fresh database and holds the daemon until a restart (503 `NODE_RESTART_REQUIRED` elsewhere); Tier 1 recovers the embedded SCB on the live node. Progress streams over SSE as `recovery:restore-progress` |
+| GET | `/guardian/status` | -- | The guardian this node serves to others: `{ serving }` plus guardian id, token requirement, sessions, served sets (members, namespaces, bytes) and limits |
+| POST | `/recovery/rotate-guardians` | `{ guardians: [3 entries], confirm: true }` | Move this wallet to a new guardian set (one member or all three) with the channels running (wire 5.9): register with the incoming set under the current lease at the next generation, backfill, switch, retire the outgoing set. The env keeps naming the old set until updated; the journal's set is in force and the status route reports `configuredSetStale` |
+| POST | `/recovery/resolve-guardian` | `{ uri }` | A beignet node's `<node id>@host:port` to a guardian entry `<guardianId>@bolt8://<node id>@host:port`, by asking its guardian over a bolt8 session. Adopts nothing |
+| POST | `/recovery/capsule-guardians` | `{ confirm: true }` | The guardian set the best retrieved capsule names, INCLUDING transport credentials, as config-file entries for `recoveryGuardians`. The status route redacts credentials; this admin handoff is how a seed restore whose guardians need authentication gets them back. Nothing is adopted or persisted |
+| POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
+
+### Server-Sent Events (SSE)
+
+`GET /events` opens a persistent connection that streams events as they occur:
+
+```
+event: payment:received
+data: {"paymentHash":"ab12...","amountSats":1000,"status":"COMPLETED"}
+
+event: channel:ready
+data: {"channelId":"cd34..."}
+```
+
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, the hold-invoice lifecycle (`hold:accepted`, `hold:settled`, `hold:cancelled`), `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), the splice lifecycle `splice:complete`, `splice:aborted`, `splice:conflicted`, `splice:reverted` (issue #760: a depth-locked splice whose input was spent elsewhere is reverted to the old funding by agreement with the peer; payloads carry `channelId` plus `spliceTxid`/`conflictTxid` in display order where they exist), `peer:connect`, `peer:disconnect`, `node:ready`, and the Recovery Protocol events `recovery:durable`, `recovery:fenced`, `recovery:backfill-lost`, `recovery:reestablish-held`, `recovery:capsule-retrieved`, `recovery:guardian_unreachable`, `recovery:restore-progress`, `recovery:restored` (always on; low volume, and operator dashboards ride them). JIT receive progress on the LSP side (`jit:intent`, `jit:intent-superseded`, `jit:intercepted`, `jit:funding`, `jit:forwarded`, `jit:failed`; satoshi and millisatoshi figures as decimal strings) and direct-funding receiver progress (`direct-funding:offer:accepted` with `paired`, `direct-funding:offer:declined`, `direct-funding:offer:failed`, `direct-funding:offer:completed`) are relayed too (issue #669), so a dashboard follows a funding it fronts or receives without polling.
+
+- `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
+- `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+- The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount, minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks, cancelHeight}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount, count and expiry fields describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
+
+Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
+
+A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
+
+### Webhooks
+
+For agent frameworks that prefer callbacks over persistent connections, register webhook URLs:
+
+```bash
+# Register a webhook
+curl -X POST http://localhost:2112/webhooks/register \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://myagent.com/callback", "events": ["payment:received"], "secret": "mysecret"}'
+# {"ok":true,"result":{"id":"abc123...","url":"https://...","events":["payment:received"],...}}
+
+# List webhooks
+curl http://localhost:2112/webhooks
+# {"ok":true,"result":[...]}
+
+# Unregister
+curl -X DELETE http://localhost:2112/webhooks/unregister \
+  -H "Content-Type: application/json" \
+  -d '{"id": "abc123..."}'
+```
+
+Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks are persisted to SQLite and survive daemon restarts. Note: HMAC secrets are stored as hashes — re-register with a secret after restart if HMAC verification is needed.
+
+Registering with `"events": ["*"]` matches every relayed event, including the invoice, channel-lifecycle, and (when `--htlc-events` is enabled) HTLC events, plus any event types added in future versions. The event list matches the SSE list above.
+
+For each registration and payment hash, hold lifecycle deliveries run in order,
+including the one retry after a failed delivery. Other payment hashes can proceed
+independently. Retries retain the original payload and timestamp. Delivery is
+best effort: a request can be received more than once, and an event is dropped
+after both attempts fail. Handle duplicates without repeating funding and treat
+`SETTLED` and `CANCELLED` as terminal. After a disconnect or missed delivery,
+reconcile with `GET /invoices/held` before acting on an old acceptance event.
+
+### API Versioning
+
+All endpoints support an optional `/v1/` prefix for forward compatibility. The daemon strips the prefix automatically:
+
+```
+GET /v1/info       →  handled as  GET /info
+POST /v1/invoice/pay  →  handled as  POST /invoice/pay
+```
+
+All responses include `X-API-Version: 1` header. Non-prefixed routes continue to work unchanged.
+
+### CORS
+
+Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk.
+
+```typescript
+startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *
+startDaemon({ cors: 'https://myapp.com' });    // specific origin
+```
+
+Handles `OPTIONS` preflight requests automatically (`GET, POST, DELETE, OPTIONS`). The allowed request headers are `Content-Type`, `Authorization` and `X-Idempotency-Key`, so a browser client can send keyed `POST` requests (the `X-Idempotency-Key` header is documented under [HTTP API](#http-api)).
+
+---
+
+## File Layout
+
+```
+src/cli/
+  types.ts          -- JSON-serializable response types
+  errors.ts         -- BeignetError + BeignetErrorCode + BOLT failure descriptions
+  beignet-node.ts   -- Core wrapper class (most important file)
+  config.ts         -- Config file + PID file management
+  daemon.ts         -- HTTP daemon (http.createServer)
+  auth.ts           -- Scoped API keys: route->scope map, constant-time authenticator
+  openapi.ts        -- OpenAPI 3.0 spec generator (served at GET /openapi.json)
+  webhooks.ts       -- WebhookManager (register, dispatch, HMAC signing)
+  payment-queue.ts  -- PaymentQueue (priority, concurrency, capacity-aware)
+  http-rate-limiter.ts -- Token-bucket HTTP rate limiter
+  cli.ts            -- CLI entry point (#!/usr/bin/env node)
+  index.ts          -- Barrel exports
+  README.md         -- This file
+
+src/lightning/advisor/
+  liquidity-advisor.ts   -- Channel liquidity analysis and recommendations
+  fee-advisor.ts         -- On-chain fee trend tracking (144-sample circular buffer)
+  channel-suggestions.ts -- Graph-based channel open suggestions
+  index.ts               -- Barrel exports
+
+docs/
+  AI_AGENT_GUIDE.md -- Comprehensive deployment guide for AI agents
+
+tests/cli/
+  beignet-node.test.ts   -- Unit tests
+  webhooks.test.ts       -- Webhook tests
+  payment-queue.test.ts  -- Payment queue tests
+  payment-retry.test.ts  -- Payment retry with backoff tests
+  readiness.test.ts      -- Readiness checklist tests
+  metrics.test.ts        -- Prometheus metrics tests
+  electrum-failover.test.ts -- Electrum failover tests
+  auto-backup.test.ts    -- Automated backup tests
+  ensure-channels.test.ts -- Auto-open minimum channels tests
+  deployment-guide.test.ts -- Guide existence tests
+  competitive-improvements.test.ts -- Spending limits, idempotency, TLS, drain mode tests
+```
+
+---
+
+## Tests
+
+```bash
+# Run CLI unit tests (no infrastructure needed)
+npm run test:cli
+
+# Run daemon/Electrum integration tests (requires Electrum server)
+npm run test:integration
+
+# Run lightning unit tests
+npm run test:lightning
+
+# Run everything
+npm run test:all
+
+# Interop suites against the Docker nodes. LND_REST_PORT / LND_REST_HOST (and
+# LND_TAPROOT_REST_PORT / LND_TAPROOT_REST_HOST) move the endpoints; a suite
+# whose LND is unreachable skips with a line naming the port, and
+# INTEROP_REQUIRE_LND=1 / INTEROP_REQUIRE_LND_TAPROOT=1 fail instead of
+# skipping. See "Interop testing" in the top-level README.
+npm run test:interop
+```

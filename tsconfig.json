@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "target": "es2020",
+    "moduleResolution": "node",
+    "sourceMap": true,
+    "declarationDir": "./dist/types",
+    "outDir": "./dist",
+    "removeComments": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": false,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "strict": true,
+    "allowJs": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    "noUnusedLocals": true,
+    "typeRoots": ["./node_modules/@types", "./types"],
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "useUnknownInCatchVariables": false,
+    // Explicit so the compiler never picks the target default for us. "dom"
+    // is what src/wallet/index.ts (fetch) and src/lightning/l402/client.ts
+    // (globalThis.fetch) currently type against; dropping it needs a
+    // @types/node new enough to declare fetch itself.
+    "lib": ["es2020", "dom"]
+  },
+  // ts-node compiles per file through its LanguageService, which cost ~11 s of
+  // every mocha run and would be paid again by each parallel worker. Types are
+  // not lost: type-check.yml runs tsc:check and tsc:check:tests on the same
+  // events, and lint-check.yml runs type-aware eslint rules. Restore checking
+  // for a single run with TS_NODE_TYPE_CHECK=1.
+  "ts-node": {
+    "transpileOnly": true
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": ["./tests/", "node_modules", "./dist/"]
+}

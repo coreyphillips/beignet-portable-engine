@@ -1,0 +1,152 @@
+/**
+ * BOLT 2: Quiescence (STFU) state machine.
+ *
+ * State transitions:
+ *   NORMAL -> SENT_STFU (we initiate) -> QUIESCENT (peer responds with STFU)
+ *   NORMAL -> RECEIVED_STFU (peer initiates) -> QUIESCENT (we respond with STFU)
+ *   QUIESCENT -> NORMAL (exit quiescence)
+ *
+ * Rules:
+ *   - Cannot initiate quiescence with pending HTLCs
+ *   - Reject new update_add_htlc during quiescence
+ *   - Both sides must send STFU to enter QUIESCENT state
+ *   - Concurrent stfu (both sides set the initiator flag): BOLT 2 breaks the
+ *     tie arbitrarily in favor of the channel funder (the sender of
+ *     open_channel / open_channel2), who becomes the session initiator
+ */
+
+export enum QuiescenceState {
+	NORMAL = 'NORMAL',
+	SENT_STFU = 'SENT_STFU',
+	RECEIVED_STFU = 'RECEIVED_STFU',
+	QUIESCENT = 'QUIESCENT'
+}
+
+export class QuiescenceManager {
+	private state: QuiescenceState = QuiescenceState.NORMAL;
+	private _initiator = false;
+
+	getState(): QuiescenceState {
+		return this.state;
+	}
+
+	isQuiescent(): boolean {
+		return this.state === QuiescenceState.QUIESCENT;
+	}
+
+	isQuiescing(): boolean {
+		return this.state !== QuiescenceState.NORMAL;
+	}
+
+	/**
+	 * Has the PEER put an `stfu` on the wire?
+	 *
+	 * Only from its own `stfu` is the peer bound by BOLT 2's "MUST NOT send an
+	 * update message after `stfu`". While we have merely SENT one, the peer owes
+	 * nothing yet: its obligation starts at ITS receipt of ours, a moment we
+	 * cannot observe, and an update it had already dispatched crosses ours
+	 * legitimately. BOLT 2 requires that window to exist, since a peer holding
+	 * pending updates must drain them before it can "reply with `stfu` once it
+	 * can do so".
+	 *
+	 * So isQuiescing() (which is true in SENT_STFU too) can never be the
+	 * predicate for FAILING a channel, only for refusing an update. This is.
+	 */
+	peerHasSentStfu(): boolean {
+		return (
+			this.state === QuiescenceState.RECEIVED_STFU ||
+			this.state === QuiescenceState.QUIESCENT
+		);
+	}
+
+	isInitiator(): boolean {
+		return this._initiator;
+	}
+
+	/**
+	 * Initiate quiescence (send STFU).
+	 * Returns true if we should send STFU, false if not allowed.
+	 */
+	initiate(): boolean {
+		if (this.state !== QuiescenceState.NORMAL) {
+			return false;
+		}
+		this.state = QuiescenceState.SENT_STFU;
+		this._initiator = true;
+		return true;
+	}
+
+	/**
+	 * Handle receiving STFU from peer.
+	 * Returns true if we should respond with our own STFU.
+	 *
+	 * Breaking change (issue #372): both arguments are new and required.
+	 * Without them the concurrent-stfu case left BOTH peers believing they
+	 * were the session initiator, so there is no safe default; direct
+	 * callers must supply the peer message's initiator flag and their own
+	 * funder role.
+	 *
+	 * @param peerInitiator - the initiator flag carried by the peer's stfu
+	 * @param localIsOpener - whether we are the channel funder (opener)
+	 */
+	handlePeerStfu(
+		peerInitiator: boolean,
+		localIsOpener: boolean
+	): { shouldRespond: boolean; error?: string } {
+		switch (this.state) {
+			case QuiescenceState.NORMAL:
+				// Peer initiated -- we need to respond
+				this.state = QuiescenceState.RECEIVED_STFU;
+				this._initiator = false;
+				return { shouldRespond: true };
+			case QuiescenceState.SENT_STFU:
+				// Both sides sent STFU -- enter quiescent. If the peer also
+				// claims the initiator role (concurrent stfu, not a reply to
+				// ours), BOLT 2 breaks the tie: the channel funder is the
+				// session initiator.
+				this.state = QuiescenceState.QUIESCENT;
+				if (peerInitiator) {
+					this._initiator = localIsOpener;
+				}
+				return { shouldRespond: false };
+			case QuiescenceState.RECEIVED_STFU:
+			case QuiescenceState.QUIESCENT:
+				return {
+					shouldRespond: false,
+					error: 'Unexpected STFU in current state'
+				};
+			default:
+				return { shouldRespond: false, error: 'Unknown quiescence state' };
+		}
+	}
+
+	/**
+	 * Complete the quiescence handshake after we respond.
+	 * Called after we send our STFU response.
+	 */
+	completeHandshake(): void {
+		if (this.state === QuiescenceState.RECEIVED_STFU) {
+			this.state = QuiescenceState.QUIESCENT;
+		}
+	}
+
+	/**
+	 * Exit quiescence and return to normal operation.
+	 */
+	exitQuiescence(): boolean {
+		if (this.state !== QuiescenceState.QUIESCENT) {
+			return false;
+		}
+		this.state = QuiescenceState.NORMAL;
+		this._initiator = false;
+		return true;
+	}
+
+	/**
+	 * Reset to normal state (e.g., on disconnect).
+	 */
+	reset(): void {
+		this.state = QuiescenceState.NORMAL;
+		this._initiator = false;
+	}
+}

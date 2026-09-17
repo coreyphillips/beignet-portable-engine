@@ -1,0 +1,144 @@
+/**
+ * Liquidity ads (bLIP-0051) — lease fee accounting and will_fund authentication.
+ *
+ * A buyer requests inbound liquidity (request_funds in open_channel2); the
+ * seller commits to fund it for a fee, signing the lease terms (will_fund in
+ * accept_channel2). The buyer pays the lease fee out of its initial balance, and
+ * the seller's funds are time-locked until lease_expiry (enforced on-chain in a
+ * later milestone). This module is pure: fee math + signature auth only.
+ */
+
+import crypto from 'crypto';
+import { sign, verify } from '../crypto/ecdh';
+import { ILeaseRates } from '../gossip/types';
+
+/** Lease duration in blocks (bLIP-0051): ~4 weeks. */
+export const LEASE_DURATION_BLOCKS = 4032;
+
+/**
+ * Total lease fee (satoshis) the buyer pays the seller:
+ *   lease_fee_base_sat
+ *   + requested_sats * lease_fee_basis / 10_000
+ *   + funding_weight * funding_feerate_perkw / 1000
+ * The last term reimburses the seller's share of the on-chain funding cost.
+ */
+export function computeLeaseFeeSat(
+	rates: ILeaseRates,
+	requestedSats: bigint,
+	fundingFeeratePerkw: number
+): bigint {
+	const base = BigInt(rates.leaseFeeBaseSat);
+	const proportional = (requestedSats * BigInt(rates.leaseFeeBasis)) / 10_000n;
+	const weightFee =
+		(BigInt(rates.fundingWeightWitness) * BigInt(fundingFeeratePerkw)) / 1000n;
+	return base + proportional + weightFee;
+}
+
+/** Absolute block height the lease expires at. */
+export function computeLeaseExpiry(blockheight: number): number {
+	return blockheight + LEASE_DURATION_BLOCKS;
+}
+
+// On-chain lease enforcement uses CLN's encoding (bLIP-0051, validated live +
+// from CLN source): a PURE CSV. The lessor's to_local CSV number becomes
+// max(to_self_delay, lease_csv) and its anchored to_remote carries
+// `<lease_csv> OP_CHECKSEQUENCEVERIFY` instead of the standard 1, where
+// lease_csv = lease_expiry - the blockheight both sides agreed on at open
+// (advanced later only by opener-sent update_blockheight, wire type 137,
+// which beignet does not yet send). An earlier LND-Pool-style CLTV encoding
+// produced commitments CLN rejects.
+
+/**
+ * Remaining-lease CSV for commitment scripts. leaseCommitBlockheight is the
+ * blockheight agreed at open (request_funds.blockheight); legacy states that
+ * lost it fall back to the full lease duration (the value at open).
+ */
+export function leaseCsvBlocks(
+	leaseExpiry: number | undefined,
+	leaseCommitBlockheight: number | undefined
+): number | undefined {
+	if (leaseExpiry === undefined || leaseExpiry <= 0) return undefined;
+	if (leaseCommitBlockheight === undefined || leaseCommitBlockheight <= 0) {
+		return LEASE_DURATION_BLOCKS;
+	}
+	// An agreed blockheight at/past expiry means the lease has RUN OUT (CLN:
+	// lease_remaining = 0): the commitment scripts revert to their plain,
+	// un-leased form. Only reachable via committed update_blockheight rounds
+	// (at open the height is always expiry - LEASE_DURATION).
+	if (leaseCommitBlockheight >= leaseExpiry) {
+		return undefined;
+	}
+	return leaseExpiry - leaseCommitBlockheight;
+}
+
+/** BOLT/CLN option_will_fund signature tag prefix (16 ASCII bytes). */
+const WILL_FUND_TAG = Buffer.from('option_will_fund');
+
+/**
+ * The exact bytes a seller signs to commit to lease terms, matching CLN's
+ * lease_rates_get_commitment:
+ *   "option_will_fund" || funding_pubkey(33)
+ *   || lease_expiry(u32 BE) || channel_fee_max_base_msat(u32 BE)
+ *   || channel_fee_max_proportional_thousandths(u16 BE)
+ * where lease_expiry = blockheight + LEASE_DURATION_BLOCKS. Only the routing-fee
+ * caps are committed (not the whole rates record), and the negotiated
+ * channel_type is NOT part of the preimage.
+ */
+export function leaseWitnessData(
+	sellerFundingPubkey: Buffer,
+	blockheight: number,
+	rates: ILeaseRates
+): Buffer {
+	const tail = Buffer.alloc(10);
+	tail.writeUInt32BE(computeLeaseExpiry(blockheight), 0);
+	tail.writeUInt32BE(rates.channelFeeMaxBaseMsat, 4);
+	tail.writeUInt16BE(rates.channelFeeMaxProportionalThousandths, 8);
+	return Buffer.concat([WILL_FUND_TAG, sellerFundingPubkey, tail]);
+}
+
+function leaseSigHash(
+	sellerFundingPubkey: Buffer,
+	blockheight: number,
+	rates: ILeaseRates
+): Buffer {
+	return crypto
+		.createHash('sha256')
+		.update(leaseWitnessData(sellerFundingPubkey, blockheight, rates))
+		.digest();
+}
+
+/** Seller: sign a will_fund commitment with the node key that advertised the rates. */
+export function signWillFund(
+	sellerFundingPubkey: Buffer,
+	blockheight: number,
+	rates: ILeaseRates,
+	sellerNodePrivkey: Buffer
+): Buffer {
+	return sign(
+		leaseSigHash(sellerFundingPubkey, blockheight, rates),
+		sellerNodePrivkey
+	);
+}
+
+/**
+ * Buyer: verify a seller's will_fund signature against its node id. The rates
+ * MUST match what the seller advertised in node_announcement (verify that
+ * separately); this only proves the seller authenticated these exact terms.
+ */
+export function verifyWillFund(
+	signature: Buffer,
+	rates: ILeaseRates,
+	sellerNodeId: Buffer,
+	sellerFundingPubkey: Buffer,
+	blockheight: number
+): boolean {
+	try {
+		return verify(
+			leaseSigHash(sellerFundingPubkey, blockheight, rates),
+			sellerNodeId,
+			signature
+		);
+	} catch {
+		return false;
+	}
+}
