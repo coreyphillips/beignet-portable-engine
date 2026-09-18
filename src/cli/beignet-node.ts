@@ -2936,9 +2936,22 @@ export class BeignetNode extends EventEmitter {
 		}
 		// The two FFOR events with several arguments (issue #729): the epoch's
 		// committed state and a peer contradicting an ACTIVE epoch.
+		// LightningNode re-emits both of these as ONE object, while the
+		// channel manager emits them positionally. Taking them positionally
+		// here made channelId the whole object and record undefined, so
+		// fforEpochView threw on every state change, which aborted the drive
+		// that emitted it: an epoch never left NEGOTIATING, on either side.
 		this.node.on(
 			'ffor:state',
-			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+			({
+				channelId,
+				state,
+				record
+			}: {
+				channelId: Buffer;
+				state: number;
+				record: IFforEpochRecord;
+			}) => {
 				const hex = channelId.toString('hex');
 				this.emit('ffor:state', {
 					channelId: hex,
@@ -2949,7 +2962,13 @@ export class BeignetNode extends EventEmitter {
 		);
 		this.node.on(
 			'ffor:enforce',
-			(channelId: Buffer, record: IFforEpochRecord) => {
+			({
+				channelId,
+				record
+			}: {
+				channelId: Buffer;
+				record: IFforEpochRecord;
+			}) => {
 				const hex = channelId.toString('hex');
 				this.emit('ffor:enforce', {
 					channelId: hex,
@@ -6735,6 +6754,11 @@ export class BeignetNode extends EventEmitter {
 		const K = f.params.maxPayments;
 		const settledBit = (k: number): boolean =>
 			f.settledBitmap !== null && bitmapGet(f.settledBitmap, k);
+		// R: the invoice minted for each exposed slot, read back from the
+		// invoice store so a host that lost the string can share it again
+		// (issue #875). S never holds one.
+		const invoices =
+			f.role === 'R' ? this.node.fforSlotInvoices(channelIdHex) : [];
 		const slots = Array.from({ length: K }, (_, i) => {
 			const k = i + 1;
 			let state: string;
@@ -6754,11 +6778,13 @@ export class BeignetNode extends EventEmitter {
 			} else {
 				state = 'unissued';
 			}
+			const bolt11 = invoices[i] ?? null;
 			return {
 				k,
 				amountMsat: f.params.voucherAmountsMsat[i].toString(),
 				paymentHash: f.paymentHashes[i]?.toString('hex') ?? null,
-				state
+				state,
+				...(bolt11 ? { bolt11 } : {})
 			};
 		});
 		return {

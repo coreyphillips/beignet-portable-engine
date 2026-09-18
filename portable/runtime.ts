@@ -789,6 +789,16 @@ export async function createPortableRuntime(options: any) {
 				return n.listPayments();
 			case 'GET /invoices':
 				return n.listInvoices();
+			case 'GET /ffor/epochs':
+				return n.fforEpochs('R');
+			case 'GET /ffor/epoch':
+				return n.fforEpoch(q.get('channelId') ?? '');
+			case 'POST /ffor/epoch/start':
+				return n.fforStartEpoch(b);
+			case 'POST /ffor/invoice':
+				return durableInvoice(n.fforCreateInvoice(b));
+			case 'POST /ffor/recover':
+				return n.fforRecover({ channelId: b.channelId });
 			case 'GET /liquidity':
 				return n.getLiquiditySnapshot();
 			case 'GET /transactions':
