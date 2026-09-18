@@ -108,3 +108,7 @@ Normal fixed-amount Receive now prepares a durable reservation automatically. Us
 This requires a Beignet 0.21.8 or newer settlement peer. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
 
 See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evidence, commands, and deployment limits.
+
+## Continuous integration
+
+The portable fork builds and runs its own tests, checks public TypeScript declarations, checks JavaScript syntax, and audits dependencies. The upstream CLI and recovery suites remain in Beignet. `npm run test:relay:integration` additionally exercises the unpublished sibling `beignet-relay` checkout; the default tests use a local WebSocket server and need no sibling repositories.

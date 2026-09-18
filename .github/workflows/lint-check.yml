@@ -1,4 +1,4 @@
-name: lint-check
+name: syntax-check
 
 on:
   workflow_dispatch:
@@ -6,25 +6,20 @@ on:
   push:
     branches: [master]
 
+permissions:
+  contents: read
+
 jobs:
-  lint:
-    name: Run lint check
+  syntax:
+    name: Check portable JavaScript syntax
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out Git repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          fetch-depth: 1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 20
-          cache: 'npm'
-
-      - name: Install Node.js dependencies
-        run: npm ci
-
-      - name: Lint check
-        run: npm run lint:check
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Check scripts, adapters and tests
+        run: |
+          find portable portable-tests scripts -type f \( -name '*.cjs' -o -name '*.mjs' -o -name '*.js' \) -print0 | xargs -0 -n 1 node --check

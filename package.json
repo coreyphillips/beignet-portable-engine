@@ -13,7 +13,9 @@
     "test:regtest:channelize": "npm run build && node scripts/regtest-channelize.cjs",
     "test:smoke": "npm run build && node scripts/smoke-regtest.cjs",
     "test:regtest:ffor": "npm run build && node scripts/regtest-ffor.cjs",
-    "test:regtest:ffor:native": "node scripts/regtest-ffor-native.cjs"
+    "test:regtest:ffor:native": "node scripts/regtest-ffor-native.cjs",
+    "test:relay:integration": "npm run build && node --test scripts/relay-integration.test.cjs",
+    "check:types": "tsc --noEmit --strict --skipLibCheck false --target es2020 --moduleResolution node portable/types.d.ts portable/sqljs.d.ts"
   },
   "repository": {
     "type": "git",
@@ -88,7 +90,8 @@
   "devDependencies": {
     "@types/node": "22.18.0",
     "esbuild": "0.25.9",
-    "typescript": "5.9.2"
+    "typescript": "5.9.2",
+    "ws": "8.21.3"
   },
   "private": true,
   "module": "dist/portable.mjs"
