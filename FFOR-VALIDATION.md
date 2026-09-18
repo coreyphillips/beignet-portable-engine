@@ -1,39 +1,25 @@
-# FFOR compatibility and application readiness
+# Automatic offline receive validation
 
-Validated against upstream beignet 0.21.7 on 2026-09-18. This is a compatibility update and a reproducible audit, not an implementation of automatic offline receiving.
+Validated on September 18, 2026, against Beignet 0.21.7 plus the accompanying automatic-receive protocol changes.
 
-## What works
+The ordinary fixed-amount Receive flow now prepares and saves a reservation before returning an invoice. Startup and background reconciliation discover settled receipts without invalidating unpaid requests. No FFOR screen, manual recovery button, or user-managed reservation is required.
 
-The portable engine includes the 0.21.7 fixes while preserving its browser and native transport, storage, timer and batching adaptations. The native and browser clients share this engine and the wallet core.
+## Verified behavior
 
-`npm run test:regtest:ffor` uses disposable local regtest wallets and tests these boundaries:
+- Funded portable regtest: normal Receive, restart while unpaid, payment with the receiver stopped, automatic credit of 20,000 sats, one completed Activity entry, and persistence through another cold reopen.
+- A second invoice allocates a separate provider-funded channel while previously received funds remain usable, then automatically recovers another offline payment.
+- Isolated iOS 26.2 simulator: actual Hermes, Keychain, SQLCipher and native TCP. The app process was terminated after invoice creation. A separate payer completed the payment while it was stopped. Two cold launches verified automatic recovery and no duplicate receipt.
+- Production web worker: encrypted durable storage, worker shutdown before payment, automatic recovery on reopening, and a second restart without duplicate Activity. This exercises the production worker bundle in a browser-like realm, not browser UI compatibility.
+- Protocol regression: 187 FFOR and receipt-service checks pass. Dedicated coordinator tests cover unpaid retention, expiry grace, interrupted creation, epoch changes, and shutdown. Shared client tests verify use of the new receive route and refusal to silently downgrade when the provider does not support it.
 
-1. Normal wallet-core Receive creates an ordinary invoice and no FFOR reservation.
-2. An explicitly prepared FFOR reservation reaches ACTIVE, and its invoice reaches durable storage before it is returned.
-3. The receiver runtime stops and releases its storage. A separate payer completes a 20,000 sat payment while the receiver is stopped.
-4. Reopening the receiver does not itself recover the payment.
-5. Explicit recovery closes the reservation, credits exactly 20,000 sats, changes the invoice to PAID, and produces one completed Activity row.
-6. The credited balance, PAID invoice and single Activity row survive a second cold reopen.
-7. Recovering an unpaid reservation closes it. Paying its already issued invoice fails, even before its encoded expiry.
+`npm run test:regtest:ffor` runs the funded portable regression. `scripts/regtest-ffor-native.cjs` drives the separate Chicory `native-tests/OfflineReceive.tsx` entry with `FFOR_SIMULATOR_ID` pointing to an isolated simulator and bundle id `com.chicory.ffor-test`. These use disposable local regtest wallets and never a mainnet wallet.
 
-The script requires the local Bitcoin and Electrum regtest containers, the built upstream checkout selected by `BEIGNET_SOURCE_DIR`, and the sibling wallet-core and relay development checkouts. It mines test blocks and uses temporary wallet directories. It never uses a mainnet wallet.
+## Deployment requirements and limits
 
-## Why automatic receiving is not enabled
+The primary must run the accompanying Beignet service changes with `fforSettle.enabled` and, when new receive channels are needed, an explicit `fforReceiveFunding` budget. Stock 0.21.7 and older providers do not implement the new receipt queries or allocation requests. An unsupported provider fails preparation before an invoice is shared.
 
-The ordinary Receive flow in wallet-core chooses `/invoice/create` or `/jit/invoice`. Neither creates an offline reservation. Updating the engine does not change that choice.
+The receiver uses an empty inbound channel or obtains a separately funded channel. It never freezes a channel holding spendable local funds. Provider funding limits are cumulative across restarts, including failed allocations. They do not automatically reset; repeated receiving can need additional channels until an empty suitable channel can be reused.
 
-FFOR reserves fixed amounts on an existing funded channel. A JIT request that has no channel yet and an amountless request cannot simply be changed into a voucher invoice. The settlement peer must explicitly offer the service and accept the reservation's fee and budget terms.
+Invoices need an amount supported by the voucher book. Amountless and below-trim payments are not supported by this automatic path. Discovery depends on the settlement peer returning and does not replace independent witnesses or automatic enforcement against an unavailable or dishonest peer. No automatic force close is introduced.
 
-An ACTIVE reservation freezes ordinary channel updates, including outgoing HTLCs and splices. The current app uses its primary channel for both sending and automatic on-chain funding. Silently reserving that channel would affect both.
-
-Without a configured receipt witness, recovery learns the settlement result by closing the reservation. Closing stops admission of payments to every unpaid voucher. Calling recovery on every startup or foreground event would invalidate requests that users have already shared. Polling it while the receive screen is visible has the same problem.
-
-The integration needs receipt discovery and a channel/reservation lifecycle that preserves unpaid invoices while allowing normal wallet operations. Options to evaluate include the existing witness protocol plus a dedicated receive channel, or a reviewed protocol extension. No unsafe automatic close, force-close, or fallback to an ordinary invoice is introduced here.
-
-## Portable API additions
-
-The runtime now passes through receiver epoch listing, individual epoch reads, explicit setup, durable voucher invoice creation and cooperative recovery. Recovery does not forward a caller's `forceCloseIfUnreachable` flag. These are integration surfaces, not an automatic UI policy. No new FFOR screen or setting is exposed to the wallet user.
-
-## Release gate
-
-Do not claim that normal Receive survives powering off the phone or closing the browser yet. Before enabling it by default, test a paid and unpaid request across cold start and foreground resume, settlement-peer outages, expiry, multiple requests, concurrent sends, funding/splices, repeated recovery, and both native SQLCipher and browser OPFS persistence. A simulator or physical-device end-to-end FFOR test is still required; Node runtime tests do not replace it.
+See the Beignet `docs/AUTOMATIC-OFFLINE-RECEIVE.md` document for provider configuration, peer messages, and safety boundaries.

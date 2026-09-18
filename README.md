@@ -101,10 +101,10 @@ Old invoices do not contain their original unified Bitcoin address. There is no 
 
 Lightning-only metadata uses `address: null` (an omitted address is normalized to null), `uri` equal to the exact BOLT11 or `lightning:` followed by it, and backend-derived `bitcoinTracking: "lightning-only"`. The signed invoice, wallet ownership, network, hash, amount and expiry are still verified. No Bitcoin address lookup or attribution occurs. The nullable address is part of the immutable binding, so an existing Lightning-only request cannot later be rebound to a Bitcoin address. Both request forms survive restart in the same store.
 
-## Offline receiving status
+## Offline receiving
 
-The engine baseline is beignet 0.21.7. Its FFOR settlement and invoice-history
-fixes are included, but normal Receive still requires the wallet to stay open.
-See [the compatibility audit](FFOR-VALIDATION.md) for the verified stopped-wallet
-payment and the remaining lifecycle work before automatic offline receiving can
-be enabled without breaking unpaid requests or ordinary channel operations.
+Normal fixed-amount Receive now prepares a durable reservation automatically. Users can close the wallet after sharing the request. Reopening discovers settled receipts and updates the ordinary balance and Activity. Unpaid requests remain payable until expiry.
+
+This requires the accompanying upgraded Beignet settlement peer. Stock 0.21.7 does not implement receipt discovery or automatic receive-channel funding. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
+
+See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evidence, commands, and deployment limits.

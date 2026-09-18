@@ -42,6 +42,7 @@ async function runChannelize({
 	force = false,
 	now = Date.now(),
 	retryAt = 0,
+	excludeChannelIds = new Set(),
 	onDiagnostic
 }) {
 	if (!force && now < retryAt) return { last: null, retryAt };
@@ -50,7 +51,9 @@ async function runChannelize({
 		const target = rules.channelizeTarget({
 			onchainSats: balance.onchain,
 			utxos: node.listUtxos(),
-			channels: node.listChannels(),
+			channels: node
+				.listChannels()
+				.filter((c) => !excludeChannelIds.has(c.channelId)),
 			primaryPubkey: record.lfbw.primaryPubkey
 		});
 		if (target.action === 'wait') {

@@ -12,7 +12,8 @@
     "test:regtest": "npm run build && node scripts/regtest.cjs",
     "test:regtest:channelize": "npm run build && node scripts/regtest-channelize.cjs",
     "test:smoke": "npm run build && node scripts/smoke-regtest.cjs",
-    "test:regtest:ffor": "npm run build && node scripts/regtest-ffor.cjs"
+    "test:regtest:ffor": "npm run build && node scripts/regtest-ffor.cjs",
+    "test:regtest:ffor:native": "node scripts/regtest-ffor-native.cjs"
   },
   "repository": {
     "type": "git",

@@ -122,6 +122,7 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 		jitReceive: { enabled: true, flatFeeSat: 0, feePpm: 0 },
 		dfRelay: true,
 		fforSettle: { enabled: ffor },
+        fforReceiveFunding: {enabled: ffor, maxChannels: 10, maxChannelsPerPeer: 5, maxChannelSats: 500000, maxTotalSats: 2000000},
 		logger: { debug() {}, info() {}, warn() {}, error() {} }
 	});
 	await primary.refreshWallet();

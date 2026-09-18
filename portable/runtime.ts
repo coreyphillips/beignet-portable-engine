@@ -1,3 +1,4 @@
+import { OfflineReceive } from './offline-receive';
 import { BeignetNode } from '../src/cli/beignet-node';
 import { generateMnemonic, validateMnemonic } from 'bip39';
 import { Buffer } from 'buffer';
@@ -74,6 +75,8 @@ export async function createPortableRuntime(options: any) {
 		}));
 	};
 	let node: BeignetNode | undefined;
+	let offlineReceive: OfflineReceive | undefined;
+	let receiveTimer: any;
 	let closed = false,
 		busy = false;
 	let timer: any;
@@ -267,6 +270,7 @@ export async function createPortableRuntime(options: any) {
 		try {
 			const { last, retryAt } = await runChannelize({
 				node,
+				excludeChannelIds: offlineReceive?.reservedIds(),
 				record,
 				primary,
 				rules,
@@ -439,7 +443,16 @@ export async function createPortableRuntime(options: any) {
 					);
 				record.nodeId = node.getInfo().nodeId;
 				persist();
+				offlineReceive = new OfflineReceive(
+					node,
+					(jobs) => save(`/wallet/offline-receive-${record.id}.json`, jobs),
+					load(`/wallet/offline-receive-${record.id}.json`, [])
+				);
 				await setup();
+				receiveTimer = setInterval(() => {
+					if (!durabilityFailed) void offlineReceive?.sync().catch(() => {});
+				}, 2000);
+				void offlineReceive.sync().catch(() => {});
 				if (record.lfbw.setup === 'failed') retrySetupSoon();
 				lastSplice = null;
 				unpairedFunding = null;
@@ -520,6 +533,8 @@ export async function createPortableRuntime(options: any) {
 					});
 				return publicRecord();
 			} catch (error) {
+				if (receiveTimer) clearInterval(receiveTimer);
+				offlineReceive?.stop();
 				if (node) await node.destroy().catch(() => {});
 				node = undefined;
 				throw error;
@@ -545,6 +560,8 @@ export async function createPortableRuntime(options: any) {
 					sleep(STOP_DEADLINE_MS)
 				]);
 			clearInterval(timer);
+			clearInterval(receiveTimer);
+			offlineReceive?.stop();
 			for (const pending of pendingTimers) clearTimeout(pending);
 			pendingTimers.clear();
 			while (busy && Date.now() < deadline) await sleep(20);
@@ -615,6 +632,8 @@ export async function createPortableRuntime(options: any) {
 	/** Channels, each annotated with what is known about its funding on chain. */
 	const channelsWithFunding = (list: any[]) =>
 		list.map((channel) => {
+			if (offlineReceive?.reservedIds().has(channel.channelId))
+				channel = { ...channel, htlcUsable: false };
 			if (typeof channel?.fundingTxid !== 'string') return channel;
 			const index = channel.fundingOutputIndex ?? 0;
 			refreshFunding(channel.fundingTxid, index);
@@ -766,11 +785,18 @@ export async function createPortableRuntime(options: any) {
 		const n = requireNode();
 		if (route === 'POST /receive/requests')
 			return {
-				request: await receiveRequests().register(body?.request, {
-					getInvoice: (hash) => n.getInvoice(hash),
-					ownsAddress: (_address, scriptHash) =>
-						!!n.getWallet().getAddressFromScriptHash(scriptHash)
-				})
+				request: await receiveRequests().register(
+					{
+						...body?.request,
+						offlineReceive:
+							offlineReceive?.ownsInvoice(body?.request?.paymentHash) === true
+					},
+					{
+						getInvoice: (hash) => n.getInvoice(hash),
+						ownsAddress: (_address, scriptHash) =>
+							!!n.getWallet().getAddressFromScriptHash(scriptHash)
+					}
+				)
 			};
 		const b = body ?? {};
 		const q = url.searchParams;
@@ -789,6 +815,15 @@ export async function createPortableRuntime(options: any) {
 				return n.listPayments();
 			case 'GET /invoices':
 				return n.listInvoices();
+			case 'GET /receive/quote':
+				return offlineReceive!.quote(
+					record.lfbw.primaryPubkey,
+					Number(q.get('amountSats'))
+				);
+			case 'POST /receive/invoice':
+				return durableInvoice(
+					await offlineReceive!.create(b, record.lfbw.primaryPubkey)
+				);
 			case 'GET /ffor/epochs':
 				return n.fforEpochs('R');
 			case 'GET /ffor/epoch':
@@ -1080,6 +1115,7 @@ export async function createPortableRuntime(options: any) {
 				electrumPresets: [],
 				torAvailable: false,
 				jitQuoteAvailable: true,
+				offlineReceiveAvailable: true,
 				recoveryAvailable: true,
 				engineVersion: ENGINE_VERSION,
 				embedded: true
