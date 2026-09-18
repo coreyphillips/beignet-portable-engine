@@ -13080,6 +13080,7 @@ export class Channel {
 	 * and the adds cannot happen inside one synchronous drive.
 	 */
 	canOfferHtlcSet(amounts: bigint[]): boolean {
+		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
 		if (amounts.length === 0) return true;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
@@ -13119,7 +13120,8 @@ export class Channel {
 		return true;
 	}
 
-	acceptsNewHtlcs(lookThroughReestablish = false): boolean {
+	acceptsNewHtlcs(lookThroughReestablish = false, reservationHint = false): boolean {
+		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
 		if (this._state.restoreRecencyUnproven === true) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);
@@ -14709,6 +14711,32 @@ export class Channel {
 		return Buffer.concat(parts);
 	}
 
+	/**
+	 * The ANNOUNCEMENT_READY the exchange produced, rebuilt from both sides'
+	 * stored signatures. Null until both sides have signed.
+	 */
+	rebuildAnnouncement(
+		localNodeId: Buffer,
+		remoteNodeId: Buffer
+	): ChannelAction | null {
+		const nodeSig = this._state.localAnnouncementNodeSig;
+		const bitcoinSig = this._state.localAnnouncementBitcoinSig;
+		if (
+			!this._state.announceChannel ||
+			!this._state.shortChannelId ||
+			!nodeSig ||
+			!bitcoinSig
+		) {
+			return null;
+		}
+		return this.buildFullAnnouncement(
+			localNodeId,
+			remoteNodeId,
+			nodeSig,
+			bitcoinSig
+		);
+	}
+
 	private buildFullAnnouncement(
 		localNodeId: Buffer,
 		remoteNodeId: Buffer,
@@ -14973,6 +15001,12 @@ export class Channel {
 		if (aliasAnnounceErr) {
 			return refuse(`open_channel2 refused: ${aliasAnnounceErr}`);
 		}
+		// BOLT 2: channel_flags bit 0 = announce_channel, exactly as the v1
+		// acceptor reads it. Left unset, the acceptor kept the field's
+		// default (false) while the opener announced: the opener sent its
+		// announcement_signatures at depth, the acceptor never answered, and
+		// a beignet-to-beignet dual-funded channel was never in any graph.
+		this._state.announceChannel = (msg.channelFlags & 0x01) !== 0;
 
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = msg.commitmentFeeratePerkw;
@@ -21188,6 +21222,7 @@ export class Channel {
 			settledBitmap: null,
 			knownPreimages: Array.from({ length: K }, () => null),
 			exposedSlots: Array.from({ length: K }, () => false),
+			issuerProvisioned: false,
 			witnesses: [],
 			closeProcessed: false,
 			voucherRoundFailed: false,
@@ -22864,6 +22899,9 @@ export class Channel {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R') return 'no epoch of ours';
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.issuerProvisioned) {
+			return `the issuer sells this book: voucher ${k} gets no invoice from R`;
+		}
 		if (f.exposedSlots[k - 1]) return `voucher ${k} is already exposed`;
 		if (f.params.hashChain) {
 			for (let j = 1; j < k; j++) {
@@ -22959,6 +22997,29 @@ export class Channel {
 			];
 		}
 		this._state.ffor!.exposedSlots[k - 1] = true;
+		return [{ type: ChannelActionType.PERSIST_STATE }];
+	}
+
+	/**
+	 * R: record, before the manifest leaves, that an issuer sells this book
+	 * (section 9.7.2). Refused once any slot is exposed: the issuer picks the
+	 * lowest unissued slot of an amount and would sell that one again.
+	 */
+	fforMarkIssuerProvisioned(): ChannelAction[] {
+		const f = this._state.ffor;
+		const refuse = (message: string): ChannelAction[] => [
+			{ type: ChannelActionType.ERROR, message, cleanup: 'none' }
+		];
+		if (!f || f.role !== 'R') return refuse('FFOR: no epoch of ours');
+		const exposed = f.exposedSlots.indexOf(true);
+		if (exposed >= 0) {
+			return refuse(
+				`FFOR: voucher ${
+					exposed + 1
+				} is already exposed: the issuer would sell it again`
+			);
+		}
+		f.issuerProvisioned = true;
 		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 

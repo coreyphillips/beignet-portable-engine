@@ -2,8 +2,6 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { once } = require('node:events');
-const { pathToFileURL } = require('node:url');
-const path = require('node:path');
 const { createRelaySocketFactory } = require('../dist/portable.cjs');
 
 const token = 'test-relay-credential-not-for-public-errors-1234';
@@ -80,23 +78,30 @@ test('explicit shutdown, normal close and relay failures do not duplicate error 
 	assert.equal(events[1], 'close');
 });
 
-test('actual attached relay TCP refusal reaches the production portable socket promptly', async t => {
+test('WebSocket transport delivers TCP refusal to the portable socket promptly', async t => {
 	const http = require('node:http');
-	const { attachRelay } = await import(pathToFileURL(path.join(__dirname, '../../beignet-relay/relay.js')).href);
-	const { WebSocket } = require('../../beignet-relay/node_modules/ws');
+	const { WebSocket, WebSocketServer } = require('ws');
 	const reserved = net.createServer();
 	reserved.listen(0, '127.0.0.1');
 	await once(reserved, 'listening');
 	const port = reserved.address().port;
 	await new Promise(resolve => reserved.close(resolve));
 	const server = http.createServer();
-	const relay = attachRelay(server, {
-		electrum, peer: { host: '127.0.0.1', port }
-	}, { authorizeUpgrade: (_request, credential) => credential === token });
+	// Exercise the portable side against the relay wire protocol. The full
+	// sibling relay integration remains in scripts/relay-integration.test.cjs.
+	const relay = new WebSocketServer({ server });
+	relay.on('connection', ws => {
+		const upstream = net.connect({ host: '127.0.0.1', port });
+		upstream.on('error', error => {
+			assert.equal(error.code, 'ECONNREFUSED');
+			ws.close(1011, 'BEIGNET_UPSTREAM_REFUSED');
+		});
+		ws.on('close', () => upstream.destroy());
+	});
 	server.listen(0, '127.0.0.1');
 	await once(server, 'listening');
 	t.after(async () => {
-		await relay.close();
+		await new Promise(resolve => relay.close(resolve));
 		await new Promise(resolve => server.close(resolve));
 	});
 	const origin = `ws://127.0.0.1:${server.address().port}`;

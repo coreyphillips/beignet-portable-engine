@@ -5,6 +5,7 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
@@ -43,6 +44,7 @@ import {
 	IFforEpochRecord
 } from '../lightning/ffor/types';
 import { bitmapGet } from '../lightning/ffor/messages';
+import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
 import { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
@@ -532,6 +534,7 @@ export interface BeignetNodeOptions {
 	};
 	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
 	fforIssuer?: boolean;
+	fforReceiveFunding?: FforReceiveFunding;
 	/** Bearer token every guardian session must present; absent runs open. */
 	guardianToken?: string;
 	/** Disk one served set may occupy before writes are refused (256 MiB). */
@@ -1403,6 +1406,11 @@ function isHeldRestore(ch: { restoreRecencyUnproven?: boolean }): boolean {
 }
 
 export class BeignetNode extends EventEmitter {
+	private fforReceiveService?: FforReceiveService;
+	getFforReceiveService(): FforReceiveService {
+		if (!this.fforReceiveService) throw new Error("Wallet is not running");
+		return this.fforReceiveService;
+	}
 	// ─── Typed event overloads ───
 	on<K extends keyof BeignetNodeEvents>(
 		event: K,
@@ -2454,6 +2462,8 @@ export class BeignetNode extends EventEmitter {
 			recovery: this.recoveryNodeConfig
 		});
 
+		this.fforReceiveService = new FforReceiveService(this, opts.fforSettle, opts.fforReceiveFunding);
+
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
 		// down at startup), keep retrying and redirect sweeps to the wallet as
 		// soon as one is available — so force-close recovery doesn't get stuck on
@@ -2904,8 +2914,13 @@ export class BeignetNode extends EventEmitter {
 			'ffor:witness-provisioned',
 			'ffor:witness-recorded',
 			'ffor:witness-released',
+			'ffor:witness-refused',
+			'ffor:witness-closed',
+			'ffor:witness-expired',
+			'ffor:witness-audit',
 			'ffor:issuer-provisioned',
 			'ffor:issuer-issued',
+			'ffor:issuer-retired',
 			// Swap provider engines (issues #737 and #743). LightningNode
 			// re-emits both engines' events; without this relay the daemon's
 			// SSE and webhook lists promise them and never deliver one.
@@ -2936,9 +2951,22 @@ export class BeignetNode extends EventEmitter {
 		}
 		// The two FFOR events with several arguments (issue #729): the epoch's
 		// committed state and a peer contradicting an ACTIVE epoch.
+		// LightningNode re-emits both of these as ONE object, while the
+		// channel manager emits them positionally. Taking them positionally
+		// here made channelId the whole object and record undefined, so
+		// fforEpochView threw on every state change, which aborted the drive
+		// that emitted it: an epoch never left NEGOTIATING, on either side.
 		this.node.on(
 			'ffor:state',
-			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+			({
+				channelId,
+				state,
+				record
+			}: {
+				channelId: Buffer;
+				state: number;
+				record: IFforEpochRecord;
+			}) => {
 				const hex = channelId.toString('hex');
 				this.emit('ffor:state', {
 					channelId: hex,
@@ -2949,7 +2977,13 @@ export class BeignetNode extends EventEmitter {
 		);
 		this.node.on(
 			'ffor:enforce',
-			(channelId: Buffer, record: IFforEpochRecord) => {
+			({
+				channelId,
+				record
+			}: {
+				channelId: Buffer;
+				record: IFforEpochRecord;
+			}) => {
 				const hex = channelId.toString('hex');
 				this.emit('ffor:enforce', {
 					channelId: hex,
@@ -6735,6 +6769,11 @@ export class BeignetNode extends EventEmitter {
 		const K = f.params.maxPayments;
 		const settledBit = (k: number): boolean =>
 			f.settledBitmap !== null && bitmapGet(f.settledBitmap, k);
+		// R: the invoice minted for each exposed slot, read back from the
+		// invoice store so a host that lost the string can share it again
+		// (issue #875). S never holds one.
+		const invoices =
+			f.role === 'R' ? this.node.fforSlotInvoices(channelIdHex) : [];
 		const slots = Array.from({ length: K }, (_, i) => {
 			const k = i + 1;
 			let state: string;
@@ -6754,11 +6793,13 @@ export class BeignetNode extends EventEmitter {
 			} else {
 				state = 'unissued';
 			}
+			const bolt11 = invoices[i] ?? null;
 			return {
 				k,
 				amountMsat: f.params.voucherAmountsMsat[i].toString(),
 				paymentHash: f.paymentHashes[i]?.toString('hex') ?? null,
-				state
+				state,
+				...(bolt11 ? { bolt11 } : {})
 			};
 		});
 		return {
@@ -6887,6 +6928,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforCreateInvoice(body: {
+		expirySecs?: number;
 		channelId?: string;
 		k?: number;
 		description?: string;
@@ -6899,7 +6941,8 @@ export class BeignetNode extends EventEmitter {
 			const inv = this.node.createFforVoucherInvoice(
 				idBuf.toString('hex'),
 				body.k,
-				body.description ?? 'FFOR voucher'
+				body.description ?? 'FFOR voucher',
+				body.expirySecs
 			);
 			const f = this.node.getFforEpoch(idBuf.toString('hex'));
 			return {
@@ -7123,6 +7166,76 @@ export class BeignetNode extends EventEmitter {
 				records: w.records
 			})),
 			epoch: this.fforEpoch(idBuf.toString('hex'))
+		};
+	}
+
+	async fforCloseWitnesses(
+		channelId: string
+	): Promise<Record<string, unknown>[]> {
+		const idBuf = this.fforChannelId(channelId);
+		const f = this.node.getFforEpoch(idBuf.toString('hex'));
+		if (!f || f.role !== 'R') {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'no FFOR epoch of ours on this channel'
+			);
+		}
+		// Section 9.6.6 sends this at ff_close_ack. A witness closed earlier
+		// stops recording the book's later payments and its issuer stops
+		// issuing, so an ACTIVE epoch would lose its receipts. A channel
+		// closed on-chain takes no more payments and will never get the ack.
+		const channelState = this.node.getChannel(idBuf)?.state;
+		const closedOnChain =
+			channelState === ChannelState.FORCE_CLOSED ||
+			channelState === ChannelState.CLOSED;
+		if (f.settledBitmap === null && !closedOnChain) {
+			throw new BeignetError(
+				'FFOR_REFUSED',
+				'no ff_close_ack yet: close the epoch first'
+			);
+		}
+		const closed = await this.node.closeFforWitnesses(idBuf.toString('hex'));
+		return closed.map((w) => ({
+			witnessNodeId: w.witnessNodeId.toString('hex'),
+			ok: w.ok,
+			held: w.held
+		}));
+	}
+
+	async fforIssuedSlots(
+		channelId: string | undefined,
+		issuerNodeId: string | undefined
+	): Promise<Record<string, unknown>> {
+		const idBuf = this.fforChannelId(channelId);
+		if (
+			typeof issuerNodeId !== 'string' ||
+			!/^0[23][0-9a-fA-F]{64}$/.test(issuerNodeId)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'issuerNodeId must be a compressed node id'
+			);
+		}
+		let status: IFforIssuerStatusResp;
+		try {
+			status = await this.node.fetchFforIssuerStatus(
+				idBuf.toString('hex'),
+				issuerNodeId.toLowerCase()
+			);
+		} catch (err) {
+			throw new BeignetError('FFOR_REFUSED', (err as Error).message);
+		}
+		return {
+			ok: status.ok,
+			numSlots: status.numSlots,
+			issued: status.issued.toString('hex'),
+			slots: status.slots.map((s) => ({
+				k: s.k,
+				payerId: s.payerId.toString('hex'),
+				metadataHash: s.metadataHash.toString('hex'),
+				issuedUnixTime: Number(s.issuedUnixTime)
+			})),
+			error: status.error ?? null
 		};
 	}
 
@@ -12019,6 +12132,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Lifecycle ───────────────
 
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
+		this.fforReceiveService?.stop();
 		if (this.destroyed) return;
 		this.destroyed = true;
 		if (this.backupTimer) {
@@ -12060,6 +12174,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async destroy(): Promise<void> {
+		this.fforReceiveService?.stop();
 		this._bolt8Transport?.close();
 		this._bolt8Transport = null;
 		if (this._retireTimer) {

@@ -2,8 +2,8 @@
   "name": "@beignet/portable-engine",
   "version": "0.1.0",
   "description": "Portable Beignet Bitcoin and Lightning engine for browser workers and React Native",
-  "upstreamVersion": "0.21.2",
-  "upstreamCommit": "3e4d16bb3b4ed0d61f8306d8c20963475fa4ddf0",
+  "upstreamVersion": "0.21.8",
+  "upstreamCommit": "e5529047c0f2adcea32f9865a28dee66d907fd57",
   "main": "dist/portable.cjs",
   "scripts": {
     "build": "node scripts/build-portable.cjs",
@@ -11,7 +11,11 @@
     "test": "npm run build && node --test portable-tests/*.test.cjs",
     "test:regtest": "npm run build && node scripts/regtest.cjs",
     "test:regtest:channelize": "npm run build && node scripts/regtest-channelize.cjs",
-    "test:smoke": "npm run build && node scripts/smoke-regtest.cjs"
+    "test:smoke": "npm run build && node scripts/smoke-regtest.cjs",
+    "test:regtest:ffor": "npm run build && node scripts/regtest-ffor.cjs",
+    "test:regtest:ffor:native": "node scripts/regtest-ffor-native.cjs",
+    "test:relay:integration": "npm run build && node --test scripts/relay-integration.test.cjs",
+    "check:types": "tsc --noEmit --strict --skipLibCheck false --target es2020 --moduleResolution node portable/types.d.ts portable/sqljs.d.ts"
   },
   "repository": {
     "type": "git",
@@ -86,7 +90,8 @@
   "devDependencies": {
     "@types/node": "22.18.0",
     "esbuild": "0.25.9",
-    "typescript": "5.9.2"
+    "typescript": "5.9.2",
+    "ws": "8.21.3"
   },
   "private": true,
   "module": "dist/portable.mjs"

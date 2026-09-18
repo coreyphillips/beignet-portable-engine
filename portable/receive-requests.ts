@@ -68,6 +68,7 @@ function normalize(input: any, network: string) {
 	const request = {id:input.id, uri:input.uri, address, bolt11:input.bolt11,
 		paymentHash:input.paymentHash, amountSats:amount, description:input.description,
 		feeSats:input.feeSats, expiresAt:input.expiresAt, warnings:[...input.warnings], demo:false,
+        ...(input.offlineReceive === true ? { offlineReceive: true } : {}),
 		createdAt:parsed.timestamp * 1000, network};
 	return {request, scriptHash};
 }

@@ -965,6 +965,23 @@ export class LightningNode extends EventEmitter {
 	// refuses instead of resolving the same set a second time and reporting a
 	// second terminal state for it.
 	private resolvingHeldHtlcs: Set<string> = new Set();
+	// Settles and cancels the channel accepted for only part of a parked set,
+	// keyed by payment hash. The parts still in heldHtlcs owe this outcome
+	// and no other: failing back the rest of a set whose preimage is out
+	// loses the receiver funds, and settling the rest of a set already failed
+	// back reveals the preimage for a partial payment. `resolved` holds the
+	// parts already accepted, so the terminal event describes the whole set.
+	private heldResolutions: Map<
+		string,
+		(
+			| { outcome: 'settle' }
+			| {
+					outcome: 'cancel';
+					failureCode: number;
+					reason: HoldCancelReason;
+			  }
+		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
+	> = new Map();
 	private holdInvoiceEventQueue: Array<{
 		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
 		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
@@ -1763,7 +1780,9 @@ export class LightningNode extends EventEmitter {
 			buildPrivatePaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] => {
 				if (this.hasPublishedPublicChannel()) return [];
 				return this.buildBlindedPaymentPaths(false, 2, pathId);
-			}
+			},
+			connectFirstHop: (nodeId: Buffer, timeoutMs: number): Promise<void> =>
+				this.connectForRequest(nodeId.toString('hex'), timeoutMs)
 		});
 		this.wireOfferManagerEvents();
 
@@ -2829,6 +2848,12 @@ export class LightningNode extends EventEmitter {
 						amountMsat: string;
 						cltvExpiry: number;
 					}>;
+					resolution?: {
+						outcome: 'settle' | 'cancel';
+						failureCode?: number;
+						reason?: HoldCancelReason;
+						resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+					};
 				}>;
 				for (const entry of parsed) {
 					this.heldHtlcs.set(
@@ -2839,6 +2864,24 @@ export class LightningNode extends EventEmitter {
 							amountMsat: BigInt(h.amountMsat),
 							cltvExpiry: h.cltvExpiry
 						}))
+					);
+					const r = entry.resolution;
+					if (!r) continue;
+					const resolved = r.resolved.map((h) => ({
+						amountMsat: BigInt(h.amountMsat),
+						cltvExpiry: h.cltvExpiry
+					}));
+					this.heldResolutions.set(
+						entry.hashHex,
+						r.outcome === 'settle'
+							? { outcome: 'settle', resolved }
+							: {
+									outcome: 'cancel',
+									failureCode:
+										r.failureCode ?? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+									reason: r.reason ?? 'api',
+									resolved
+							  }
 					);
 				}
 			} catch {
@@ -3084,6 +3127,18 @@ export class LightningNode extends EventEmitter {
 
 		// Prune stale gossip immediately on restore (BOLT 7: >2 weeks = stale)
 		this.pruneStaleGossipWithStorage();
+
+		// Rebuild every usable public channel from its stored signatures, even
+		// when the graph row survived. The announcement handler also restores
+		// our broadcast cache and refresh timer, so its public policy remains
+		// available while the counterparty is offline.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (channelId && scid && channel.isHtlcUsable(true)) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
 
 		// JIT receive: bring back the live intents (so invoices already out
 		// there stay payable) and queue every pre-restart held HTLC to be
@@ -3864,6 +3919,7 @@ export class LightningNode extends EventEmitter {
 			// what is parked for it.
 			this.asyncPaymentManager.onChannelUsable(channelId.toString('hex'));
 			this.retryOwedHeldForwardFailures(channelId.toString('hex'));
+			this.retryHeldResolutions(channelId);
 			const peer = this.channelManager.getPeerForChannel(channelId);
 			if (peer) this.asyncPaymentManager.sendNotice(peer);
 		});
@@ -3985,6 +4041,7 @@ export class LightningNode extends EventEmitter {
 		);
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
+			this._ownChannelGossip.delete(channelId.toString('hex'));
 			this.persistChannel(channelId);
 			// A cooperative close records its signed tx just before the manager
 			// emits broadcast:tx; register the txid so the watcher's
@@ -4558,6 +4615,9 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'ffor:state',
 			(channelId: Buffer, state: number, record: IFforEpochRecord) => {
+				if (state === FforState.CLOSED && record.role === 'R') {
+					this.fforSettleVoucherInvoices(channelId, record);
+				}
 				this.emit('ffor:state', { channelId, state, record });
 			}
 		);
@@ -4565,6 +4625,22 @@ export class LightningNode extends EventEmitter {
 			'ffor:enforce',
 			(channelId: Buffer, record: IFforEpochRecord) => {
 				this.emit('ffor:enforce', { channelId, record });
+			}
+		);
+		this.channelManager.on(
+			'htlc:claimed-onchain',
+			(
+				channelId: Buffer,
+				paymentHash: Buffer,
+				preimage: Buffer,
+				claimTxid: string
+			) => {
+				this.fforSettleClaimedVoucher(
+					channelId,
+					paymentHash,
+					preimage,
+					claimTxid
+				);
 			}
 		);
 
@@ -4803,6 +4879,22 @@ export class LightningNode extends EventEmitter {
 						updateValid = false;
 					}
 					this.graph.applyChannelUpdate(updateMsg, { verified: updateValid });
+					// Persist the verified row: FFOR settlement reads it after a
+					// restart (fforTrySettleDelegated), and otherwise only a later
+					// peer update for this channel would save it.
+					const row = announcementValid
+						? this.graph.getChannel(annMsg.shortChannelId)
+						: undefined;
+					if (row?.announcementVerified === true) {
+						this.safeStorage(
+							() =>
+								this.storage!.saveGossipChannel(
+									annMsg.shortChannelId.toString('hex'),
+									row
+								),
+							'saveGossipChannel'
+						);
+					}
 				} catch {
 					// Ignore decode errors for self-generated announcements
 				}
@@ -7869,8 +7961,12 @@ export class LightningNode extends EventEmitter {
 	 * Connect to a peer by node id alone, resolving its address from the
 	 * gossip graph, then DNS bootstrap. Throws an error describing every
 	 * address tried (and every Tor address skipped) when nothing connects.
+	 * `options` applies to every dial.
 	 */
-	private async connectPeerById(pubkey: string): Promise<void> {
+	private async connectPeerById(
+		pubkey: string,
+		options: IPeerDialOptions = {}
+	): Promise<void> {
 		const attempts: string[] = [];
 		// ONE cancellation token for the whole node-id operation: a dial
 		// rejects typed on its own, but disconnectPeer() can also land in
@@ -7906,7 +8002,13 @@ export class LightningNode extends EventEmitter {
 		for (const { host, port } of candidates) {
 			assertNotCancelled();
 			try {
-				await this.peerManager!.connectPeer(pubkey, host, port);
+				await this.peerManager!.connectPeer(
+					pubkey,
+					host,
+					port,
+					undefined,
+					options
+				);
 				return;
 			} catch (err) {
 				// An explicit disconnectPeer() cancelled the whole node-id
@@ -7950,7 +8052,13 @@ export class LightningNode extends EventEmitter {
 				// before the FIRST dns dial too.
 				assertNotCancelled();
 				try {
-					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
+					await this.peerManager!.connectPeer(
+						pubkey,
+						peer.host,
+						peer.port,
+						undefined,
+						options
+					);
 					return;
 				} catch (err) {
 					// See the graph loop: cancellation stops the operation.
@@ -7967,6 +8075,43 @@ export class LightningNode extends EventEmitter {
 		throw new Error(
 			`Unable to resolve a connection to ${pubkey}: ${attempts.join('; ')}`
 		);
+	}
+
+	/**
+	 * Connect to a node a request goes to directly but that need not be a
+	 * channel peer (an FFOR witness or issuer, an offer's introduction node),
+	 * dialing by node id when it is not a ready peer. Rejects with the dial's
+	 * failure, or once `timeoutMs` passes; a dial still running then is left
+	 * to finish on its own. Without a peer transport, or while the recovery
+	 * gate holds peer traffic, it dials nothing and the send decides.
+	 */
+	private async connectForRequest(
+		pubkey: string,
+		timeoutMs: number
+	): Promise<void> {
+		const pm = this.peerManager;
+		if (!pm || pubkey === this.getNodeId()) return;
+		if (pm.getPeer(pubkey)?.getState() === 'ready') return;
+		if (!this.recoveryPermitsPeerTraffic()) return;
+		// Nothing follows the request up, so the dial must not leave the node
+		// redialing a stranger for good once it fails or its connection closes.
+		const dial = this.connectPeerById(pubkey, { reconnect: false });
+		dial.catch(() => undefined);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				dial,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(`dial to ${pubkey} timed out`)),
+						timeoutMs
+					);
+					timer.unref?.();
+				})
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	disconnectPeer(pubkey: string): void {
@@ -11167,17 +11312,7 @@ export class LightningNode extends EventEmitter {
 		const hex = channelId.toString('hex');
 		const gossip = this._ownChannelGossip.get(hex);
 		if (gossip) {
-			// Strictly increasing timestamp: peers dedupe an unchanged one, so a
-			// same-second policy change would never propagate.
-			let timestamp = Math.floor(Date.now() / 1000);
-			try {
-				timestamp = Math.max(
-					timestamp,
-					decodeChannelUpdateMessage(gossip.update).timestamp + 1
-				);
-			} catch {
-				// Unreadable cached update; fall through with the wall-clock time.
-			}
+			const timestamp = Math.floor(Date.now() / 1000);
 			const refreshed = this.refreshChannelUpdate(
 				gossip.update,
 				timestamp,
@@ -11188,13 +11323,7 @@ export class LightningNode extends EventEmitter {
 				announcement: gossip.announcement,
 				update: refreshed
 			});
-			try {
-				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed), {
-					verified: true
-				});
-			} catch {
-				// Own-update decode failure only affects our local graph view.
-			}
+			this.storeOwnChannelUpdate(refreshed);
 			this.broadcastOwnGossip();
 			return;
 		}
@@ -13616,7 +13745,18 @@ export class LightningNode extends EventEmitter {
 	): Buffer | null {
 		try {
 			const msg = decodeChannelUpdateMessage(cachedUpdate);
-			msg.timestamp = timestamp;
+			// Policy changes can advance the cached timestamp within one second.
+			// A refresh must not roll it back or be deduplicated by peers.
+			const row = this.graph.getChannel(msg.shortChannelId);
+			const direction = msg.channelFlags & 1;
+			const prior = direction === 0 ? row?.update1 : row?.update2;
+			const priorVerified =
+				direction === 0 ? row?.update1Verified : row?.update2Verified;
+			msg.timestamp = Math.max(
+				timestamp,
+				msg.timestamp + 1,
+				priorVerified === true && prior ? prior.timestamp + 1 : 0
+			);
 			// Reflect the current forwarding policy in the BOLT 7 disable bit
 			// (0x02), preserving the direction bit and any others. A node that
 			// declines to forward must not keep advertising its direction as
@@ -13649,6 +13789,27 @@ export class LightningNode extends EventEmitter {
 			return payload;
 		} catch {
 			return null;
+		}
+	}
+
+	/** Keep our graph and disk as fresh as the signed update we advertise. */
+	private storeOwnChannelUpdate(payload: Buffer): void {
+		try {
+			const update = decodeChannelUpdateMessage(payload);
+			this.graph.applyChannelUpdate(update, { verified: true });
+			const row = this.graph.getChannel(update.shortChannelId);
+			if (row?.announcementVerified === true) {
+				this.safeStorage(
+					() =>
+						this.storage!.saveGossipChannel(
+							update.shortChannelId.toString('hex'),
+							row
+						),
+					'saveGossipChannel'
+				);
+			}
+		} catch {
+			// A malformed cached update cannot refresh the local graph.
 		}
 	}
 
@@ -13708,6 +13869,10 @@ export class LightningNode extends EventEmitter {
 			// Likewise refresh each channel_update so the CHANNELS aren't pruned as
 			// stale either. Same policy, fresh timestamp — pure gossip, no force-close risk.
 			for (const [channelIdHex, gossip] of this._ownChannelGossip) {
+				const channel = this.channelManager.getChannel(
+					Buffer.from(channelIdHex, 'hex')
+				);
+				if (!channel?.isHtlcUsable(true)) continue;
 				const refreshedUpdate = this.refreshChannelUpdate(
 					gossip.update,
 					now,
@@ -13718,6 +13883,7 @@ export class LightningNode extends EventEmitter {
 						announcement: gossip.announcement,
 						update: refreshedUpdate
 					});
+					this.storeOwnChannelUpdate(refreshedUpdate);
 				}
 			}
 			this.broadcastOwnGossip();
@@ -13754,12 +13920,12 @@ export class LightningNode extends EventEmitter {
 	 * circular rebalance -- uses to land the final hop on this channel), or null
 	 * when the channel is unusable or lacks an SCID/alias.
 	 */
-	private buildRoutingHintForChannel(channel: Channel): IRoutingHintHop | null {
+	private buildRoutingHintForChannel(channel: Channel, reservationHint = false): IRoutingHintHop | null {
 		const state = channel.getFullState();
 		// Look through a reconnect (SCID and peer info stay valid for hints),
 		// and admit a usable mid-splice channel: it receives fine, still under
 		// its pre-splice scid until the lock.
-		if (!channel.acceptsNewHtlcs(true)) return null;
+		if (!channel.acceptsNewHtlcs(true, reservationHint)) return null;
 
 		const channelId = channel.getChannelId();
 		if (!channelId) return null;
@@ -16477,14 +16643,58 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 
-			// Section 7.6 checks 1 and 2 on the payee amount d_k.
+			// Section 7.6 checks 1 and 2 on the payee amount d_k. S's own policy
+			// counts only once the channel_announcement for the payload's
+			// short_channel_id is in our graph with every signature valid, the
+			// one case where a payer can have priced the hop from gossip instead
+			// of the book. With several S-R channels that need not be the epoch
+			// channel. The signature-exchange flags are no proof, since any bytes
+			// from the peer set them. The peer can also move a stored SCID onto
+			// another announced channel, and our funding key can repeat across
+			// channels. So the signed node ids must be us and R, and the SCID
+			// must resolve to a public channel of ours to R whose two funding
+			// keys the announcement carries, each beside its own node id.
+			const outScid = hopPayload.shortChannelId;
+			// A deferred row (learned lazily, or restored without settled
+			// flags) is verified here: nothing else on this path would.
+			const ann = outScid
+				? this.graph.getVerifiedChannelAnnouncement(outScid)
+				: undefined;
+			const signedNodes = ann
+				? [ann.nodeId1, ann.nodeId2].map((id) => id.toString('hex'))
+				: [];
+			const signedKeys = ann ? [ann.bitcoinKey1, ann.bitcoinKey2] : [];
+			const ours = signedNodes.indexOf(this.nodeId);
+			const rPeer = this.channelManager.getPeerForChannel(slot.channelId);
+			const outgoing =
+				outScid &&
+				ann &&
+				rPeer &&
+				signedNodes.includes(this.nodeId) &&
+				signedNodes.includes(rPeer)
+					? this.channelManager.getChannelsByPeer(rPeer).find((ch) => {
+							const st = ch.getFullState();
+							return (
+								st.announceChannel &&
+								st.shortChannelId?.equals(outScid) === true &&
+								signedKeys[ours].equals(st.localBasepoints.fundingPubkey) &&
+								st.remoteBasepoints?.fundingPubkey.equals(
+									signedKeys[1 - ours]
+								) === true
+							);
+					  })
+					: undefined;
+			const outgoingId = outgoing?.getChannelId();
 			const amountCheck = checkDelegatedAmounts({
 				payeeAmountMsat: entry.amountMsat,
 				amountMsat,
 				amtToForwardMsat: hopPayload.amountToForwardMsat ?? null,
 				hopKind: blinded ? 'blinded' : 'plaintext',
 				feeBaseMsat: record.params.feeBaseMsat,
-				feeProportionalMillionths: record.params.feeProportionalMillionths
+				feeProportionalMillionths: record.params.feeProportionalMillionths,
+				advertisedFee: outgoingId
+					? this.getForwardingPolicyForChannel(outgoingId)
+					: undefined
 			});
 			if (amountCheck) {
 				if (amountCheck.check === 2) {
@@ -16976,7 +17186,9 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * R: tell every acknowledged witness the epoch closed (section 9.6.6),
-	 * with the settled bitmap. Advisory for the witness's bookkeeping.
+	 * with the settled bitmap. Advisory for the witness's bookkeeping. The
+	 * requests go out together, so silent witnesses cost one `timeoutMs`
+	 * between them rather than one each.
 	 */
 	async closeFforWitnesses(
 		channelIdHex: string,
@@ -16990,37 +17202,39 @@ export class LightningNode extends EventEmitter {
 		}
 		const K = record.params.maxPayments;
 		const settled = record.settledBitmap ?? Buffer.alloc(Math.ceil(K / 8));
-		const out: { witnessNodeId: Buffer; ok: boolean; held: number }[] = [];
-		for (const w of record.witnesses) {
-			if (w.ackedAt === null) continue;
-			const requestId = FforWitnessService.freshRequestId();
-			try {
-				const body = await this.sendFforWitnessRequest(
-					w.witnessNodeId.toString('hex'),
-					FF_WITNESS_CLOSE_TYPE,
-					encodeWitnessClose(
-						requestId,
-						w.mailboxId,
-						record.hAct,
-						K,
-						settled,
-						crypto.randomBytes(32),
-						w.fetchPrivkey
-					),
-					requestId,
-					timeoutMs
-				);
-				const ack = decodeWitnessCloseAck(body);
-				out.push({
-					witnessNodeId: w.witnessNodeId,
-					ok: ack.ok,
-					held: ack.numRecordsHeld
-				});
-			} catch {
-				out.push({ witnessNodeId: w.witnessNodeId, ok: false, held: 0 });
-			}
-		}
-		return out;
+		const hAct = record.hAct;
+		return Promise.all(
+			record.witnesses
+				.filter((w) => w.ackedAt !== null)
+				.map(async (w) => {
+					const requestId = FforWitnessService.freshRequestId();
+					try {
+						const body = await this.sendFforWitnessRequest(
+							w.witnessNodeId.toString('hex'),
+							FF_WITNESS_CLOSE_TYPE,
+							encodeWitnessClose(
+								requestId,
+								w.mailboxId,
+								hAct,
+								K,
+								settled,
+								crypto.randomBytes(32),
+								w.fetchPrivkey
+							),
+							requestId,
+							timeoutMs
+						);
+						const ack = decodeWitnessCloseAck(body);
+						return {
+							witnessNodeId: w.witnessNodeId,
+							ok: ack.ok,
+							held: ack.numRecordsHeld
+						};
+					} catch {
+						return { witnessNodeId: w.witnessNodeId, ok: false, held: 0 };
+					}
+				})
+		);
 	}
 
 	/**
@@ -17033,8 +17247,10 @@ export class LightningNode extends EventEmitter {
 	createFforVoucherInvoice(
 		channelIdHex: string,
 		k: number,
-		description = 'FFOR voucher'
+		description = 'FFOR voucher',
+		expirySecs?: number
 	): ICreateInvoiceResult {
+		if (expirySecs !== undefined && (!Number.isSafeInteger(expirySecs) || expirySecs < 60 || expirySecs > 86400)) throw new Error('expirySecs must be between 60 and 86400');
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
 		const record = channel?.getFforEpoch() ?? null;
@@ -17078,13 +17294,14 @@ export class LightningNode extends EventEmitter {
 				`tip ${this.currentBlockHeight} is at or past settlement_deadline ${record.params.settlementDeadline}`
 			);
 		}
-		const hint = this.buildRoutingHintForChannel(channel);
+		const hint = this.buildRoutingHintForChannel(channel, true);
 		if (!hint) {
 			throw new Error('no usable SCID or alias for the route hint to S');
 		}
 		// Section 9.5.4: strictly ascending levels on a chained book, and one
-		// invoice per slot on any book. Durable BEFORE the invoice exists, so a
-		// restart cannot hand out a lower level after a higher one.
+		// invoice per slot on any book; none once an issuer sells the book.
+		// Durable BEFORE the invoice exists, so a restart cannot hand out a
+		// lower level after a higher one.
 		const exposureRefusal = channel.fforExposureRefusal(k);
 		if (exposureRefusal) throw new Error(`FFOR: ${exposureRefusal}`);
 		const marked = this.channelManager.fforMarkExposed(channelId, k);
@@ -17106,7 +17323,7 @@ export class LightningNode extends EventEmitter {
 		return this.createInvoice({
 			amountMsat: d,
 			description,
-			expiry,
+			expiry: Math.min(expiry, expirySecs ?? expiry),
 			paymentHash: record.paymentHashes[k - 1],
 			fforVoucher: true,
 			extraRoutingHints: [
@@ -17118,6 +17335,114 @@ export class LightningNode extends EventEmitter {
 					}
 				]
 			]
+		});
+	}
+
+	/**
+	 * R, once the epoch closed: complete the incoming payment record of every
+	 * voucher whose preimage the drain fulfilled with, and announce it. A
+	 * voucher invoice is an ordinary invoice with an external hash, so it has
+	 * a PENDING incoming payment from the mint; the receiver never handles
+	 * the payer's HTLC (S settled it upstream), so nothing on the onion path
+	 * ever completed it, and the invoice list said PENDING for a voucher the
+	 * channel balance already carried (issue #876). The credit is the drain
+	 * round's fulfil, which is what CLOSED follows, so this is where the
+	 * receive is announced: payment:received and invoice:settled, the same
+	 * two a wallet's notifications listen for.
+	 */
+	private fforSettleVoucherInvoices(
+		channelId: Buffer,
+		record: IFforEpochRecord
+	): void {
+		record.paymentHashes.forEach((hash, i) => {
+			const preimage = record.knownPreimages[i];
+			if (!hash || !preimage) return;
+			this.fforCompleteVoucherPayment(channelId, record, i, preimage);
+		});
+	}
+
+	/**
+	 * R: a voucher HTLC our claim took on-chain (issue #886). An enforced
+	 * epoch stays ACTIVE, so no CLOSED ever runs fforSettleVoucherInvoices
+	 * for it: the confirmed HTLC-success claim is the credit.
+	 */
+	private fforSettleClaimedVoucher(
+		channelId: Buffer,
+		paymentHash: Buffer,
+		preimage: Buffer,
+		claimTxid: string
+	): void {
+		const record = this.channelManager.getFforEpoch(channelId);
+		if (!record || record.role !== 'R') return;
+		const i = record.paymentHashes.findIndex((h) => h.equals(paymentHash));
+		if (i < 0) return;
+		this.fforCompleteVoucherPayment(channelId, record, i, preimage, claimTxid);
+	}
+
+	/**
+	 * Complete voucher slot `i`'s incoming payment and announce it, once.
+	 * `claimTxid` is the on-chain claim that credited it, noted on the
+	 * payment's metadata.
+	 */
+	private fforCompleteVoucherPayment(
+		channelId: Buffer,
+		record: IFforEpochRecord,
+		i: number,
+		preimage: Buffer,
+		claimTxid?: string
+	): void {
+		const hash = record.paymentHashes[i];
+		const hashHex = hash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.INCOMING ||
+			payment.status === PaymentStatus.COMPLETED
+		) {
+			return;
+		}
+		payment.status = PaymentStatus.COMPLETED;
+		payment.preimage = Buffer.from(preimage);
+		payment.completedAt = Date.now();
+		payment.amountMsat = record.params.voucherAmountsMsat[i];
+		// The voucher HTLC on our side, so a restart redispatch knows the
+		// completed hash was settled by exactly it.
+		if (record.sHtlcIdBase !== null) {
+			payment.settledHtlcs = [
+				`${channelId.toString('hex')}:${record.sHtlcIdBase + BigInt(i)}`
+			];
+		}
+		if (claimTxid) {
+			payment.metadata = { ...payment.metadata, claimTxid };
+		}
+		this.safeStorage(() => this.persistPayment(hash), 'persistPayment');
+		this.emit('payment:received', payment);
+		this.emitInvoiceSettled(hash, payment);
+		this.emitStructuredLog('payment', 'received', {
+			paymentHash: hashHex,
+			fforVoucher: 'true',
+			slot: String(i + 1),
+			...(claimTxid ? { claimTxid } : {})
+		});
+	}
+
+	/**
+	 * R: the invoice string exposed for each slot of an epoch, by slot (null
+	 * for a slot no invoice was minted for). createFforVoucherInvoice hands
+	 * an invoice out once and refuses the slot afterwards, and the epoch
+	 * record only says the slot is exposed; the invoice itself is in the
+	 * invoice store under the slot's payment hash, which is what a host that
+	 * lost the string (a reload, a second browser, a restart) reads it back
+	 * from (issue #875).
+	 */
+	fforSlotInvoices(channelIdHex: string): (string | null)[] {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		const record =
+			this.channelManager.getChannel(channelId)?.getFforEpoch() ?? null;
+		if (!record || record.role !== 'R') return [];
+		return record.paymentHashes.map((hash, i) => {
+			if (!record.exposedSlots[i] || !hash) return null;
+			return this.invoices.get(hash.toString('hex'))?.bolt11 ?? null;
 		});
 	}
 
@@ -17799,9 +18124,12 @@ export class LightningNode extends EventEmitter {
 			const parkedMsat = parked.reduce((sum, h) => sum + h.amountMsat, 0n);
 			if (
 				!alreadyParked &&
-				finalInvoice?.amountMsat &&
-				finalInvoice.amountMsat > 0n &&
-				parkedMsat >= finalInvoice.amountMsat
+				// A set with a settle or cancel partway through was acted on
+				// already, whatever its parked remainder still adds up to.
+				(this.heldResolutions.has(hashHex) ||
+					(finalInvoice?.amountMsat &&
+						finalInvoice.amountMsat > 0n &&
+						parkedMsat >= finalInvoice.amountMsat))
 			) {
 				this.emitStructuredLog('htlc', 'held_set_complete', {
 					paymentHash: hashHex,
@@ -18002,8 +18330,10 @@ export class LightningNode extends EventEmitter {
 	 * generated at createInvoice; an external preimage (validated against the
 	 * hash) is required for hold invoices created with an external payment hash.
 	 * Returns false when nothing is parked for the hash, when another
-	 * settle/cancel is already dispatching for it, or when the channel refused
-	 * every parked part.
+	 * settle/cancel is already dispatching for it, when a cancel already
+	 * failed part of the set back, or when the channel refused any parked
+	 * part. Refused parts stay parked and the settle is retried on reestablish
+	 * and on every block; true only once every part was fulfilled.
 	 * Throws if the preimage cannot be persisted, before revealing it.
 	 */
 	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
@@ -18014,6 +18344,7 @@ export class LightningNode extends EventEmitter {
 		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
 		// resolution.
 		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
+		if (this.heldResolutions.get(hashHex)?.outcome === 'cancel') return false;
 
 		const pre = preimage ?? this.preimages.get(hashHex);
 		if (!pre) {
@@ -18042,14 +18373,22 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.recordPreimage(paymentHash, pre);
 
 		this.resolvingHeldHtlcs.add(hashHex);
-		let fulfilled = 0;
+		const prior = this.heldResolutions.get(hashHex);
+		const refused: typeof held = [];
 		try {
+			// Bound before the first fulfil leaves: a block handled on this stack,
+			// or a restart after it, must not fail back a part still to come.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'settle',
+				resolved: prior?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				if (!this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre).ok) {
+					refused.push(h);
 					continue;
 				}
-				fulfilled++;
 				// Only once the fulfil is on its way: a refused part stays parked
 				// for a retry, and a cancel of that part still needs the secret to
 				// build a failure message the payer can decrypt.
@@ -18063,17 +18402,21 @@ export class LightningNode extends EventEmitter {
 		// than closing the invoice SETTLED over HTLCs the payer still holds. The
 		// preimage stays recorded: the monitors need it to claim on-chain if the
 		// channel closes before a retry lands.
-		if (fulfilled === 0) {
+		if (refused.length === held.length) {
+			if (!prior) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_settle_refused', {
 				paymentHash: hashHex,
 				htlcCount: held.length
 			});
 			return false;
 		}
-
-		this.heldHtlcs.delete(hashHex);
-		this.heldInvoiceHashes.delete(hashHex);
-		this.persistHeldHtlcs();
+		const settledSet = this.advanceHeldResolution(hashHex, held, refused, {
+			outcome: 'settle'
+		});
+		if (!settledSet) return false;
 
 		const payment = this.payments.get(hashHex);
 		if (payment) {
@@ -18097,12 +18440,82 @@ export class LightningNode extends EventEmitter {
 		const event: IHoldInvoiceStateEvent = {
 			paymentHash,
 			state: 'SETTLED',
-			heldAmountMsat: held.reduce((sum, h) => sum + h.amountMsat, 0n),
-			htlcCount: held.length,
-			...this.heldSetExpiry(hashHex, held)
+			heldAmountMsat: settledSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			htlcCount: settledSet.length,
+			...this.heldSetExpiry(hashHex, settledSet)
 		};
 		this.emitHoldInvoiceEvent('hold:settled', event);
 		return true;
+	}
+
+	/**
+	 * Record a settle or cancel dispatch that the channel accepted for at
+	 * least one part. With every part accepted the set leaves the parked map
+	 * and the whole resolved set is returned for the terminal event. Otherwise
+	 * only the refused parts stay parked, bound to this outcome for
+	 * retryHeldResolutions, and null is returned.
+	 */
+	private advanceHeldResolution(
+		hashHex: string,
+		held: Array<{
+			channelId: Buffer;
+			htlcId: bigint;
+			amountMsat: bigint;
+			cltvExpiry: number;
+		}>,
+		refused: typeof held,
+		chosen:
+			| { outcome: 'settle' }
+			| { outcome: 'cancel'; failureCode: number; reason: HoldCancelReason }
+	): Array<{ amountMsat: bigint; cltvExpiry: number }> | null {
+		const resolved = [
+			...(this.heldResolutions.get(hashHex)?.resolved ?? []),
+			...held
+				.filter((h) => !refused.includes(h))
+				.map((h) => ({ amountMsat: h.amountMsat, cltvExpiry: h.cltvExpiry }))
+		];
+		if (refused.length === 0) {
+			this.heldHtlcs.delete(hashHex);
+			this.heldResolutions.delete(hashHex);
+			this.heldInvoiceHashes.delete(hashHex);
+			this.persistHeldHtlcs();
+			return resolved;
+		}
+		this.heldHtlcs.set(hashHex, refused);
+		this.heldResolutions.set(hashHex, { ...chosen, resolved });
+		this.persistHeldHtlcs();
+		this.emitStructuredLog('htlc', `held_${chosen.outcome}_partial`, {
+			paymentHash: hashHex,
+			resolvedCount: resolved.length,
+			refusedCount: refused.length
+		});
+		return null;
+	}
+
+	/**
+	 * Re-drive the settles and cancels a channel accepted for only part of a
+	 * parked set, limited to sets with a part on `channelId` when given.
+	 */
+	private retryHeldResolutions(channelId?: Buffer): void {
+		for (const [hashHex, resolution] of [...this.heldResolutions]) {
+			const held = this.heldHtlcs.get(hashHex) ?? [];
+			if (channelId && !held.some((h) => h.channelId.equals(channelId))) {
+				continue;
+			}
+			const paymentHash = Buffer.from(hashHex, 'hex');
+			// Contained: on reestablish a throw would skip the commitment that
+			// carries this retry's own fulfil or fail.
+			try {
+				if (resolution.outcome === 'cancel') this.cancelHeldHtlc(paymentHash);
+				else this.settleHeldHtlc(paymentHash);
+			} catch (error) {
+				this.emitStructuredLog('htlc', 'held_resolution_retry_failed', {
+					paymentHash: hashHex,
+					outcome: resolution.outcome,
+					error: error instanceof Error ? error.message : String(error)
+				});
+			}
+		}
 	}
 
 	/**
@@ -18127,8 +18540,11 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Cancel a hold invoice: fail every parked HTLC back to the payer.
 	 * Returns false when nothing is parked for the hash, when another
-	 * settle/cancel is already dispatching for it, or when the channel refused
-	 * every parked part.
+	 * settle/cancel is already dispatching for it, when a settle already
+	 * fulfilled part of the set, or when the channel refused any parked part.
+	 * Refused parts stay parked and the cancel is retried, with its original
+	 * failure code and reason, on reestablish and on every block; true only
+	 * once every part was failed back.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
@@ -18142,10 +18558,24 @@ export class LightningNode extends EventEmitter {
 		// resolvingHeldHtlcs): the caller is a reentrant one, not a second
 		// resolution.
 		if (this.resolvingHeldHtlcs.has(hashHex)) return false;
+		const chosen = this.heldResolutions.get(hashHex);
+		if (chosen?.outcome === 'settle') return false;
+		if (chosen) {
+			failureCode = chosen.failureCode;
+			cancelReason = chosen.reason;
+		}
 
 		this.resolvingHeldHtlcs.add(hashHex);
-		let failed = 0;
+		const refused: typeof held = [];
 		try {
+			// Bound before the first fail leaves, as in settleHeldHtlc.
+			this.heldResolutions.set(hashHex, {
+				outcome: 'cancel',
+				failureCode,
+				reason: cancelReason,
+				resolved: chosen?.resolved ?? []
+			});
+			this.persistHeldHtlcs();
 			for (const h of held) {
 				const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 				const ss = this.receivedHtlcSharedSecrets.get(key);
@@ -18162,9 +18592,9 @@ export class LightningNode extends EventEmitter {
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				if (!this.channelManager.failHtlc(h.channelId, h.htlcId, reason).ok) {
+					refused.push(h);
 					continue;
 				}
-				failed++;
 				// The shared secret goes only once the failure is on its way: a
 				// refused part stays parked and is retried, and a retry that lost
 				// the secret can only send a zeroed packet the payer cannot decrypt.
@@ -18177,7 +18607,11 @@ export class LightningNode extends EventEmitter {
 		// fail, for one). Report the refusal and leave the set parked rather than
 		// closing the invoice CANCELLED over HTLCs the payer still holds; the
 		// expiry sweeper retries this same call on every block.
-		if (failed === 0) {
+		if (refused.length === held.length) {
+			if (!chosen) {
+				this.heldResolutions.delete(hashHex);
+				this.persistHeldHtlcs();
+			}
 			this.emitStructuredLog('htlc', 'held_cancel_refused', {
 				paymentHash: hashHex,
 				reason: cancelReason,
@@ -18185,16 +18619,19 @@ export class LightningNode extends EventEmitter {
 			});
 			return false;
 		}
+		const failedSet = this.advanceHeldResolution(hashHex, held, refused, {
+			outcome: 'cancel',
+			failureCode,
+			reason: cancelReason
+		});
+		if (!failedSet) return false;
 
-		this.heldHtlcs.delete(hashHex);
-		this.heldInvoiceHashes.delete(hashHex);
-		this.persistHeldHtlcs();
 		this.markHoldInvoiceCancelled(
 			hashHex,
 			cancelReason,
-			held.length,
-			held.reduce((sum, h) => sum + h.amountMsat, 0n),
-			held
+			failedSet.length,
+			failedSet.reduce((sum, h) => sum + h.amountMsat, 0n),
+			failedSet
 		);
 		this.emitStructuredLog('htlc', 'held_cancelled', {
 			paymentHash: hashHex,
@@ -18275,11 +18712,12 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
 		if (held && held.length > 0) {
-			const count = held.length;
+			const count =
+				held.length + (this.heldResolutions.get(hashHex)?.resolved.length ?? 0);
 			// cancelHeldHtlc also marks the invoice cancelled. A refusal (a settle
-			// already dispatching for this hash, or a channel that failed nothing
-			// back) leaves the invoice open, so it must not be reported as a
-			// cancellation.
+			// already dispatching or partly done for this hash, or a channel that
+			// refused a part) leaves the invoice open, so it must not be reported
+			// as a cancellation.
 			if (!this.cancelHeldHtlc(paymentHash)) return null;
 			return { htlcsFailed: count };
 		}
@@ -18353,7 +18791,11 @@ export class LightningNode extends EventEmitter {
 	 */
 	private scanExpiringHeldHtlcs(height: number): void {
 		if (height <= 0) return;
+		// A set with an outcome already chosen retries that outcome instead:
+		// the expiry cancel would fail back parts whose preimage is out.
+		this.retryHeldResolutions();
 		for (const [hashHex, held] of this.heldHtlcs) {
+			if (this.heldResolutions.has(hashHex)) continue;
 			const soon = held.some(
 				(h) =>
 					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
@@ -18379,8 +18821,15 @@ export class LightningNode extends EventEmitter {
 				amountMsat: string;
 				cltvExpiry: number;
 			}>;
+			resolution?: {
+				outcome: 'settle' | 'cancel';
+				failureCode?: number;
+				reason?: HoldCancelReason;
+				resolved: Array<{ amountMsat: string; cltvExpiry: number }>;
+			};
 		}> = [];
 		for (const [hashHex, held] of this.heldHtlcs) {
+			const r = this.heldResolutions.get(hashHex);
 			serial.push({
 				hashHex,
 				htlcs: held.map((h) => ({
@@ -18388,7 +18837,16 @@ export class LightningNode extends EventEmitter {
 					htlcId: h.htlcId.toString(),
 					amountMsat: h.amountMsat.toString(),
 					cltvExpiry: h.cltvExpiry
-				}))
+				})),
+				...(r && {
+					resolution: {
+						...r,
+						resolved: r.resolved.map((h) => ({
+							amountMsat: h.amountMsat.toString(),
+							cltvExpiry: h.cltvExpiry
+						}))
+					}
+				})
 			});
 		}
 		this.safeStorage(
@@ -24567,11 +25025,17 @@ export class LightningNode extends EventEmitter {
 				// A parked hold-invoice HTLC whose preimage was never revealed must
 				// be failed off-chain by the held-HTLC sweeper (same margin), not
 				// force-closed to claim: claiming would settle a payment the
-				// operator has not released.
+				// operator has not released. A set with a settle partway through
+				// has released it, so its remaining parts take the claim.
+				const resolution =
+					paymentHashHex !== undefined
+						? this.heldResolutions.get(paymentHashHex)
+						: undefined;
 				const parkedHold =
 					htlc.state !== HtlcState.FULFILLED &&
 					paymentHashHex !== undefined &&
-					this.heldInvoiceHashes.has(paymentHashHex);
+					this.heldInvoiceHashes.has(paymentHashHex) &&
+					resolution?.outcome !== 'settle';
 				const haveClaim =
 					!parkedHold &&
 					(htlc.state === HtlcState.FULFILLED ||
@@ -24700,6 +25164,18 @@ export class LightningNode extends EventEmitter {
 						break; // channel is closing; stop scanning it
 					}
 
+					// A part owed a recorded cancel is failed by retryHeldResolutions,
+					// which keeps the shared secret until the channel accepts the fail.
+					if (
+						resolution?.outcome === 'cancel' &&
+						this.heldHtlcs
+							.get(paymentHashHex!)
+							?.some(
+								(h) => h.channelId.equals(channelId) && h.htlcId === htlc.id
+							)
+					) {
+						continue;
+					}
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const blindedRole = this.blindedRoleFor(channelId, htlc.id);
 					if (blindedRole) {
@@ -25307,20 +25783,36 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
-	/** Send a witness-lane request and await the response with its request id. */
-	private sendFforWitnessRequest(
+	/**
+	 * Send a witness-lane request and await the response with its request id.
+	 * A witness or issuer need not be a channel peer, so one that is not
+	 * connected is dialed first; `timeoutMs` bounds the dial and the answer
+	 * together.
+	 */
+	private async sendFforWitnessRequest(
 		pubkey: string,
 		type: number,
 		payload: Buffer,
 		requestId: Buffer,
 		timeoutMs = 30_000
 	): Promise<Buffer> {
+		const deadline = Date.now() + timeoutMs;
+		let unanswered = `witness ${pubkey} did not answer type ${type}`;
+		try {
+			await this.connectForRequest(pubkey, timeoutMs);
+		} catch (err) {
+			// Still sent: the event transport may carry it. The dial's failure
+			// is what explains the silence if nothing does.
+			unanswered += ` (${err instanceof Error ? err.message : String(err)})`;
+		}
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) throw new Error(unanswered);
 		const id = requestId.toString('hex');
 		return new Promise<Buffer>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.fforWitnessRequests.delete(id);
-				reject(new Error(`witness ${pubkey} did not answer type ${type}`));
-			}, timeoutMs);
+				reject(new Error(unanswered));
+			}, remainingMs);
 			timer.unref?.();
 			this.fforWitnessRequests.set(id, { resolve, reject, timer });
 			this.emitOutbound(pubkey, type, payload);
@@ -25404,7 +25896,7 @@ export class LightningNode extends EventEmitter {
 		if (!witness) {
 			throw new Error('the issuer must first be provisioned as a witness');
 		}
-		const hint = this.buildRoutingHintForChannel(channel);
+		const hint = this.buildRoutingHintForChannel(channel, true);
 		if (!hint) throw new Error('no usable SCID or alias for the S hop');
 		const hops: IFforIssuerHop[] = [
 			...opts.witnessHops,
@@ -25441,6 +25933,13 @@ export class LightningNode extends EventEmitter {
 				this.nodePrivkey
 			)
 		});
+		// Durable before the manifest leaves, and never cleared: after a lost
+		// ack, or a refusal from an issuer that already holds a manifest for
+		// this mailbox, the issuer may still be selling the book.
+		const marked = this.channelManager.fforMarkIssuerProvisioned(channelId);
+		if (!marked.ok) {
+			throw new Error(marked.error ?? 'FFOR: issuer not recorded');
+		}
 		const requestId = FforWitnessService.freshRequestId();
 		const body = await this.sendFforWitnessRequest(
 			issuerNodeIdHex,
@@ -27136,6 +27635,23 @@ export class LightningNode extends EventEmitter {
 	 */
 	private pruneStaleGossipWithStorage(): void {
 		const now = Math.floor(Date.now() / 1000);
+
+		// A process suspended beyond the gossip age limit can run its prune
+		// before its refresh timer. Recover our live public proof first, so
+		// the timer ordering cannot temporarily revoke its fee policy.
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			const scid = channel.getShortChannelId();
+			if (!channelId || !scid || !channel.isHtlcUsable(true)) continue;
+			const row = this.graph.getChannel(scid);
+			const latest = Math.max(
+				row?.update1?.timestamp ?? 0,
+				row?.update2?.timestamp ?? 0
+			);
+			if (latest < now - DEFAULT_PRUNE_MAX_AGE) {
+				this.channelManager.reannounceChannel(channelId);
+			}
+		}
 
 		// Collect stale SCIDs before pruning from graph
 		const staleScids: string[] = [];

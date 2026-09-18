@@ -95,7 +95,7 @@ function makeVolume(dir) {
  * factory settings, and `device(name)` which creates a portable runtime and
  * embedded client on its own volume. `close()` tears everything down.
  */
-async function createHarness({ prefix = 'beignet-portable-' } = {}) {
+async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}) {
 	if (JSON.parse(btc('getblockchaininfo')).chain !== 'regtest')
 		throw new Error('the bitcoin container is not on regtest');
 	const { BeignetNode } = require(path.join(
@@ -121,6 +121,8 @@ async function createHarness({ prefix = 'beignet-portable-' } = {}) {
 		forwardingEnabled: true,
 		jitReceive: { enabled: true, flatFeeSat: 0, feePpm: 0 },
 		dfRelay: true,
+		fforSettle: { enabled: ffor },
+        fforReceiveFunding: {enabled: ffor, maxChannels: 10, maxChannelsPerPeer: 5, maxChannelSats: 500000, maxTotalSats: 2000000},
 		logger: { debug() {}, info() {}, warn() {}, error() {} }
 	});
 	await primary.refreshWallet();

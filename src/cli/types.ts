@@ -801,6 +801,7 @@ export interface BeignetConfig {
 	/** FFOR BOLT 12 issuer (spec section 9.7); needs the witness. Env:
 	 *  BEIGNET_FFOR_ISSUER (exact true/false). */
 	fforIssuer?: boolean;
+	fforReceiveFunding?: import("./ffor-receive").FforReceiveFunding;
 	/** Serve the reference guardian to other nodes over bolt8 sessions at
 	 *  this node's Lightning address (docs/RECOVERY-GUARDIAN-WIRE.md 2.7,
 	 *  issue #699). Needs listenPort. Independent of this node's own
@@ -1457,8 +1458,13 @@ export interface BeignetNodeEvents {
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;
 	'ffor:witness-released': (data: Record<string, unknown>) => void;
+	'ffor:witness-refused': (data: Record<string, unknown>) => void;
+	'ffor:witness-closed': (data: Record<string, unknown>) => void;
+	'ffor:witness-expired': (data: Record<string, unknown>) => void;
+	'ffor:witness-audit': (data: Record<string, unknown>) => void;
 	'ffor:issuer-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:issuer-issued': (data: Record<string, unknown>) => void;
+	'ffor:issuer-retired': (data: Record<string, unknown>) => void;
 	// Reverse swap provider (issue #737): swapId, paymentHash (hex), state,
 	// onchainSat and invoiceMsat (decimal strings), refundHeight, plus the
 	// transition's own facts (funding txid, claim txid, refund txid, reason).

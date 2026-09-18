@@ -2,7 +2,7 @@
 
 This local fork runs the real Beignet Bitcoin and Lightning engine inside a browser worker or React Native Hermes. Keys, signatures, BOLT 8 transport encryption, channel state and payment state stay in the device runtime. The optional sibling `beignet-relay` forwards encrypted Lightning bytes and Electrum JSON; it is not a wallet daemon and never receives a seed or signing key.
 
-Source baseline: upstream Beignet `0.21.2`, commit `3e4d16bb3b4ed0d61f8306d8c20963475fa4ddf0` (the `gitHead` npm records for the 0.21.2 release, and master's tip). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.21.2-portable` rather than a hand-maintained string. The original source repository was not modified. Its documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
+Source baseline: upstream Beignet `0.21.8`, commit `e552904` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.21.8-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
 
 ## Build and validation
 
@@ -100,3 +100,15 @@ Old invoices do not contain their original unified Bitcoin address. There is no 
 `npm run test:smoke` also checks two concurrent unpaid requests through the real engine, signed invoice registration, shared-client consumption, canonical replay, and registry/address reservation persistence across a complete engine restart. It creates no payments or channels.
 
 Lightning-only metadata uses `address: null` (an omitted address is normalized to null), `uri` equal to the exact BOLT11 or `lightning:` followed by it, and backend-derived `bitcoinTracking: "lightning-only"`. The signed invoice, wallet ownership, network, hash, amount and expiry are still verified. No Bitcoin address lookup or attribution occurs. The nullable address is part of the immutable binding, so an existing Lightning-only request cannot later be rebound to a Bitcoin address. Both request forms survive restart in the same store.
+
+## Offline receiving
+
+Normal fixed-amount Receive now prepares a durable reservation automatically. Users can close the wallet after sharing the request. Reopening discovers settled receipts and updates the ordinary balance and Activity. Unpaid requests remain payable until expiry.
+
+This requires a Beignet 0.21.8 or newer settlement peer. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
+
+See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evidence, commands, and deployment limits.
+
+## Continuous integration
+
+The portable fork builds and runs its own tests, checks public TypeScript declarations, checks JavaScript syntax, and audits dependencies. The upstream CLI and recovery suites remain in Beignet. `npm run test:relay:integration` additionally exercises the unpublished sibling `beignet-relay` checkout; the default tests use a local WebSocket server and need no sibling repositories.
