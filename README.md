@@ -2,7 +2,7 @@
 
 This local fork runs the real Beignet Bitcoin and Lightning engine inside a browser worker or React Native Hermes. Keys, signatures, BOLT 8 transport encryption, channel state and payment state stay in the device runtime. The optional sibling `beignet-relay` forwards encrypted Lightning bytes and Electrum JSON; it is not a wallet daemon and never receives a seed or signing key.
 
-Source baseline: upstream Beignet `0.21.7`, commit `63115a0` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.21.7-portable` rather than a hand-maintained string. The original source repository was not modified. Its documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
+Source baseline: upstream Beignet `0.21.8`, commit `e552904` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.21.8-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
 
 ## Build and validation
 
@@ -105,6 +105,6 @@ Lightning-only metadata uses `address: null` (an omitted address is normalized t
 
 Normal fixed-amount Receive now prepares a durable reservation automatically. Users can close the wallet after sharing the request. Reopening discovers settled receipts and updates the ordinary balance and Activity. Unpaid requests remain payable until expiry.
 
-This requires the accompanying upgraded Beignet settlement peer. Stock 0.21.7 does not implement receipt discovery or automatic receive-channel funding. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
+This requires a Beignet 0.21.8 or newer settlement peer. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
 
 See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evidence, commands, and deployment limits.

@@ -484,7 +484,8 @@ wallet receive while offline through a settlement peer that holds a pre-signed
 voucher book. The daemon exposes the receiver's lifecycle under `/ffor/*`
 (`/ffor/epoch/start`, `/ffor/invoice`, `/ffor/epoch/close`, `/ffor/preimage`,
 `/ffor/witness/provision`, `/ffor/issuer/offer`, `/ffor/issuer/provision`,
-`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`) and three roles a
+`/ffor/recover`, `/ffor/enforce`, `/ffor/epochs`, `/ffor/epoch`,
+`/ffor/witness/close`, `/ffor/issuer/issued`) and three roles a
 node can run for others, each an explicit opt-in switched on with an exact
 `true`:
 
@@ -497,23 +498,35 @@ node can run for others, each an explicit opt-in switched on with an exact
 The SSE stream carries `ffor:state`, `ffor:settled`, `ffor:delegated-failed`,
 `ffor:enforce` and the witness and issuer events.
 
-### Reverse swaps (Lightning to on-chain)
+### Swaps (Lightning to on-chain, and on-chain to Lightning)
 
-A beignet node can serve reverse swaps to any Lightning peer (issue #737): the
-peer pays a hold invoice, this node funds a P2WSH contract the peer claims on
-chain with its preimage, and the claim settles the hold. The role is an
-explicit opt-in switched on with an exact `true`, because it locks this node's
-own coins in contracts for peers:
+A beignet node can serve swaps to any Lightning peer in both directions.
+Reverse (issue #737): the peer pays a hold invoice, this node funds a P2WSH
+contract the peer claims on chain with its preimage, and the claim settles
+the hold. Submarine (issue #743): the peer locks coins in a P2WSH contract,
+this node pays the peer's own invoice under an absolute HTLC expiry ceiling,
+and the preimage that payment reveals claims the coins. Each direction is an
+explicit opt-in switched on with an exact `true`, because it puts this node's
+own funds at risk for peers:
 
 | Env | Role |
 |---|---|
 | `BEIGNET_SWAPS` | Serve reverse swaps. `BEIGNET_SWAP_FLAT_FEE_SAT` and `BEIGNET_SWAP_FEE_PPM` price them; `BEIGNET_SWAP_MIN_SAT`, `BEIGNET_SWAP_MAX_SAT`, `BEIGNET_SWAP_MAX_EXPOSURE_SAT` and `BEIGNET_SWAP_MAX_CONCURRENT` cap what is at risk; `BEIGNET_SWAP_REFUND_DELTA_BLOCKS`, `BEIGNET_SWAP_FUNDING_CONFS` and `BEIGNET_SWAP_RESOLUTION_CONFS` set the timing. `GET /swaps/status`, `GET /swaps`, `POST /swaps/cancel`. |
+| `BEIGNET_SWAP_SUBMARINE` | With `BEIGNET_SWAPS`, also serve submarine swaps (on-chain to Lightning): a peer locks coins in a contract, this node pays the peer's invoice under an absolute HTLC expiry ceiling and claims the coins with the preimage. `BEIGNET_SWAP_CLAIM_SAFETY_BLOCKS`, `BEIGNET_SWAP_PAYMENT_MAX_FEE_PPM`, `BEIGNET_SWAP_CLAIM_BUMP_INTERVAL_BLOCKS` and `BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS` set the direction's margins; the fee and exposure caps above apply to both. |
 
-The provider funds only against the complete committed MPP set of the hold
-invoice, settles the hold the moment a claim reveals the preimage (mempool
-included), and cancels the hold only after its own refund has confirmed to
-policy depth; never because the refund height passed. The SSE stream carries
-`swap:created` through `swap:settled`, `swap:refunded` and `swap:exposed`.
+The reverse provider funds only against the complete committed MPP set of
+the hold invoice, settles the hold the moment a claim reveals the preimage
+(mempool included), and cancels the hold only after its own refund has
+confirmed to policy depth; never because the refund height passed. The
+submarine provider pays only once the peer's funding has confirmed to policy
+depth and been re-verified unspent immediately before the dispatch, binds
+every HTLC of the payment to `refundHeight` minus its claim margins, judges
+the payment by the node's own HTLC view (never by a wall clock or a failed
+record while an HTLC is out), and persists its claim before broadcasting it.
+The SSE stream carries `swap:created` through `swap:settled`, `swap:refunded`
+and `swap:exposed` for the reverse direction and `swap:funding-seen`,
+`swap:paying`, `swap:preimage`, `swap:claim-broadcast`,
+`swap:claim-confirmed` and `swap:payment-failed` for the submarine one.
 
 ## Protocol layer (advanced)
 
@@ -616,7 +629,7 @@ LightningNode              High-level API (EventEmitter)
 | `recovery/` | Safety transition layer: atomic persistence, the durable outbound-message outbox, the opt-in hash-chained recovery journal, and the peer_storage Recovery Capsule |
 | `liquidity/` | JIT channel receive (LSP role): intercept SCIDs, held HTLCs, zero-conf open or splice, then forward; the opening fee is skimmed off the delivery for wallets that accept it, or charged to the sender through the invoice hint (hop mode) for wallets that cannot settle a short HTLC |
 | `direct-funding/` | Third-party direct funding: the signed payment request envelope, sealed frames, protocol messages, outstanding-request store, the transport registry with its direct-peer, onion and blind-relay lanes, the receiver engine that turns a payer's offered UTXO into channel funding, and the payer engine that verifies and signs it |
-| `swaps/` | Swaps: the P2WSH HTLC contract, claim/refund transactions, preimage extraction, admission policies, the durable swap ledger, the chain resolver, the wire protocol, and the reverse swap provider engine (Lightning to on-chain) |
+| `swaps/` | Swaps: the P2WSH HTLC contract, claim/refund transactions, preimage extraction, admission policies, the durable swap ledger, the chain resolver, the wire protocol, and the swap provider engines (reverse: Lightning to on-chain; submarine: on-chain to Lightning) |
 | `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |
@@ -698,6 +711,10 @@ Services in `docker/docker-compose.yml`:
 | cln | `elementsproject/lightningd:v26.06.1` | CLNRest 3010 |
 | eclair | 0.14.1, built locally from the release zip (`docker/eclair/Dockerfile`) | HTTP API 8082 |
 | electrs | `getumbrel/electrs:v0.10.10` | Electrum 60001 |
+
+The LND helpers read `LND_REST_HOST` / `LND_REST_PORT` (default `127.0.0.1:8081`) and `LND_P2P_HOST` / `LND_P2P_PORT` (default `127.0.0.1:9735`); the dedicated taproot container reads `LND_TAPROOT_REST_HOST` / `LND_TAPROOT_REST_PORT` (default `127.0.0.1:8082`) and `LND_TAPROOT_P2P_HOST` / `LND_TAPROOT_P2P_PORT` (default `127.0.0.1:9736`). Point them at whatever your `docker/docker-compose.override.yml` publishes, for example `LND_REST_PORT=8091 npm run test:interop`.
+
+An LND suite that has no usable counterparty skips itself and prints one line naming the suite, the endpoint it probed and the variables that move it (`[skip] lnd-jit-receive: LND REST not reachable at 127.0.0.1:8081 (set LND_REST_PORT / LND_REST_HOST)`, or `... LND reachable but macaroon read failed (docker exec lnd ...)`). A skip is invisible in a passing summary, so for a pre-release gate set `INTEROP_REQUIRE_LND=1` (and `INTEROP_REQUIRE_LND_TAPROOT=1` for the taproot suites): the same condition then fails the suite with that reason instead of skipping it.
 
 Covered per implementation: BOLT 8 handshake and BOLT 1 init/feature negotiation, disconnect/reconnect and ping/pong survival, channel open in both directions, bidirectional payments and payment_secret validation, MPP, SCID aliases, cooperative close, reestablish, gossip sync, inbound connections, anchor channels, anchor force-close with wallet-funded CPFP and HTLC-timeout fee-attach, and crash recovery. Beyond the shared matrix: taproot channel lifecycle vs LND (open, pay both directions, reestablish, coop and force close, penalty, SCB recovery), splice matrix and lease/liquidity-ads flows vs CLN, `simple_close` vs Eclair, blinded-path payments, and the watchtower client vs an LND tower.
 

@@ -1773,7 +1773,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/invoice': {
 				post: {
 					summary:
-						"R: the fixed-amount BOLT 11 invoice for slot k, payable while R is offline: amount exactly d_k, payment hash H_k, a route hint naming S with the epoch's fee terms. Only while ACTIVE, before the settlement deadline, once per slot, in ascending order on a chained book, and only after every provisioned witness has acknowledged",
+						"R: the fixed-amount BOLT 11 invoice for slot k, payable while R is offline: amount exactly d_k, payment hash H_k, a route hint naming S with the epoch's fee terms. Only while ACTIVE, before the settlement deadline, once per slot, in ascending order on a chained book, only after every provisioned witness has acknowledged, and never once an issuer has been provisioned on the epoch (the issuer sells the whole book)",
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1862,7 +1862,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/issuer/provision': {
 				post: {
 					summary:
-						"R: hand the issuer its manifest for an ACTIVE epoch it already witnesses: the offer, the payment-path template (the witness hops named here, then S with the epoch's fee terms, then R), issueUntil, and R's attestation. Returns the blinded node ids the issuer confirmed it controls",
+						"R: hand the issuer its manifest for an ACTIVE epoch it already witnesses: the offer, the payment-path template (the witness hops named here, then S with the epoch's fee terms, then R), issueUntil, and R's attestation. Returns the blinded node ids the issuer confirmed it controls. Refused once R has minted a voucher invoice on the epoch. Once a manifest has been sent, accepted or not, /ffor/invoice refuses every slot",
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1913,12 +1913,60 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'enabled and mailboxes' } }
 				}
 			},
+			'/ffor/witness/close': {
+				post: {
+					summary:
+						'R, once ff_close_ack is in or the channel is closed on-chain: send ff_witness_close (spec section 9.6.6) with the settled bitmap to every acknowledged witness. The witness stops recording and its issuer stops issuing; records stay fetchable until retention_until, and the reservation is held until then too. Advisory: a witness that does not answer reads ok false',
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': { description: 'Array of { witnessNodeId, ok, held }' },
+						'400': {
+							description:
+								'INVALID_PARAMS: channelId missing or malformed. FFOR_REFUSED: no ff_close_ack yet on a channel still open'
+						},
+						'404': { description: 'No channel, or no epoch of ours on it' }
+					}
+				}
+			},
 			'/ffor/issuer/status': {
 				get: {
 					summary:
 						'The BOLT 12 issuer this node runs (BEIGNET_FFOR_ISSUER): every manifest with its offer id, state, issued slots and issue_until',
 					tags: ['FFOR'],
 					responses: { '200': { description: 'enabled and manifests' } }
+				}
+			},
+			'/ffor/issuer/issued': {
+				get: {
+					summary:
+						"R: ask the issuer this node provisioned for the epoch which slots it issued, to whom and when (ff_issuer_status, spec section 9.7.7), so an issued-but-unpaid slot reads apart from a never-issued one. /ffor/issuer/status is this node's own issuer",
+					tags: ['FFOR'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						},
+						{
+							name: 'issuerNodeId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description:
+								'ok, numSlots, issued (the issued bitmap, hex), slots [{ k, payerId, metadataHash, issuedUnixTime }], error (the issuer refusal when ok is false)'
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: channelId or issuerNodeId missing or malformed. FFOR_REFUSED: no provision for that issuer, or it did not answer'
+						},
+						'404': { description: 'CHANNEL_NOT_FOUND' }
+					}
 				}
 			},
 			'/recovery/status': {
@@ -2590,7 +2638,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:issuer-provisioned, ffor:issuer-issued (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
 					tags: ['Node'],
 					responses: {
 						'200': {
