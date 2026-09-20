@@ -495,7 +495,60 @@ BEIGNET_RECOVERY_AUTO_APPLY_MAX_WAIT_MS=120000   # never wait longer than this; 
   `beignet channel forceclose <id> --accept-stale-state-risk`
   (`POST /channel/forceclose` with `acceptStaleStateRisk: true`) accepts
   that publishing a commitment the peer may already have revoked forfeits
-  the whole channel balance. Both are refused without the flag.
+  the whole channel balance. Both are refused without the flag. The FFOR
+  enforcement routes publish the same commitment and take the same flag:
+  `POST /ffor/enforce`, and `POST /ffor/recover` with
+  `forceCloseIfUnreachable: true`, are refused on such a channel without
+  `acceptStaleStateRisk: true` (issue #908).
+
+  The same hold has a second origin (issue #907): a peer whose
+  `channel_reestablish` claims this node is behind (a `next_revocation_number`
+  above anything this node released) without showing the per-commitment
+  secret that would prove it, all zeroes included. The channel fails with a
+  wire error, is ERRORED, and carries `reestablishRecencyUnproven` on
+  `GET /recovery/status` with `status: "reestablish_recency_unproven"`: no
+  automatic close, no new HTLCs, the peer asked to close on every reconnect.
+  A hostile peer can put a healthy channel here at no cost, so the exit is
+  the same labelled acknowledgement,
+  `beignet channel forceclose <id> --accept-stale-state-risk`, refused
+  without it with wording for this case.
+
+  A third origin is a LOCAL fault (issue #919): this node's own
+  `channel_reestablish` could not be built, because its shachain store holds
+  no per-commitment secret at the index its revocation counter names. BOLT 2
+  permits an all-zero `your_last_per_commitment_secret` only at
+  `next_revocation_number` 0, so there is no honest value to send above it and
+  nothing is sent: the peer gets a BOLT 1 error saying only that this node
+  cannot produce the message (naming the missing secret would tell a peer
+  where its own revoked commitments may go unpunished), and the operator gets
+  a `node:error` with code `REESTABLISH_SECRET_MISSING` naming the channel,
+  the revocation index and the exit, plus a `reestablish_secret_missing`
+  structured log. The channel carries `reestablishSecretMissing` on
+  `GET /recovery/status` with `status: "reestablish_secret_missing"` and the
+  same hold: no automatic close, no new HTLCs, the peer asked to close on
+  every reconnect, and
+  `beignet channel forceclose <id> --accept-stale-state-risk` as the operator
+  exit, refused without the flag with wording for this case. The hold is
+  PERMANENT: a shachain store cannot regrow a secret it never wrote, so the
+  peer's close and the acknowledged force close are the only two exits.
+  `GET /channel/<id>/diagnostics` reports it as `HELD_SECRET_MISSING`.
+
+  Either hold disarms the on-chain HTLC deadline backstops, so each one
+  that declines to close announces it: a `node:error` with code
+  `HTLC_DEADLINE_HELD` (on the SSE stream and the `onError` callback),
+  carrying the channel, the HTLC id and payment hash, its `cltv_expiry`,
+  the current height, which hold it is and the acknowledged force close
+  that is the exit. Throttled per HTLC per backstop, roughly hourly, so a
+  hold standing for weeks does not flood the stream. A peer can put a
+  channel into the reestablish hold at no cost, and only an operator can
+  take it out before a CLTV deadline passes, so these are the events to
+  alert on.
+
+  The same acknowledgement is required on those FFOR routes for the
+  reestablish and secret-missing origins. The `ffor:enforce` event carries
+  `restoreRecencyUnproven: true`, `reestablishRecencyUnproven: true`,
+  `reestablishSecretMissing: true`, or several of them, matching the
+  channel's holds, so the embedder knows to ask.
 - `async-remote`: the journal also replicates in the background to the
   guardian set (exactly three `pubkey@url` entries; the pubkey is the
   guardian's x-only identity key). Wire traffic never waits on guardians.
@@ -1712,11 +1765,18 @@ beignet webhooks list
 beignet webhooks unregister <id>
 ```
 
-Every daemon endpoint has a CLI command except two that only make sense over
-HTTP: `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
+Most daemon endpoints have a CLI command. HTTP-only exceptions include `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
 the CLI instead) and `GET /openapi.json` (machine-readable API discovery). The
 deprecated `POST /channel/update-fee` alias is covered by
-`channel update-commitment-feerate`.
+`channel update-commitment-feerate`. The app-driven FFOR lifecycle uses
+`/ffor/*` and `/receive/*` directly over HTTP. `GET /receive/quote` answers with
+a `mode` and `POST /receive/invoice` with a matching `kind`: `bolt11` when a
+channel that already exists with that peer can carry the payment offline, and
+`direct-funding` otherwise, which returns a direct-funding `request` instead of
+an invoice. Automatic receiving never opens a channel to obtain inbound
+liquidity. See
+[automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
+the durable invoice preparation and reconciliation API.
 
 ### JSON Envelope
 

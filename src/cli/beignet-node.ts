@@ -5,6 +5,7 @@
  * and ElectrumBackend behind a single class with plain JSON return types.
  */
 
+import { OfflineReceive } from './offline-receive';
 import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -1369,6 +1370,9 @@ export function jitInvoiceError(err: unknown): unknown {
 	) {
 		return new BeignetError(BeignetErrorCode.JIT_REFUSED, message);
 	}
+	if (/^JIT receive needs a new channel from the LSP/.test(message)) {
+		return new BeignetError(BeignetErrorCode.NEW_CHANNELS_REFUSED, message);
+	}
 	if (/timed out waiting for the LSP/.test(message)) {
 		return new BeignetError(BeignetErrorCode.JIT_TIMEOUT, message);
 	}
@@ -1394,19 +1398,91 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
 }
 
 /**
- * A channel restored from a Recovery Capsule whose state no channel_reestablish
- * has proven current (issue #469). It stays NORMAL, keeps its balance and
- * closes cooperatively, and it settles the HTLCs it already has - but it takes
- * no new ones and is offered to no router, so no readiness or capacity surface
- * may count it. Read off the wire field rather than recomputed: these surfaces
- * hold serialized channel info, not Channel objects.
+ * A channel no readiness or capacity surface may count: restored from a
+ * Recovery Capsule with no channel_reestablish proving its state current
+ * (issue #469), failed because its peer claimed at channel_reestablish that
+ * it is behind without proof (issue #907), failed because this node could not
+ * produce the per-commitment secret its own channel_reestablish owes (issue
+ * #919), or shown by its peer to be one revocation behind, which the peer
+ * proved with the secret (issues #905 and #915). The first and the last stay
+ * NORMAL and keep their balance and settle the HTLCs they already have; all
+ * four take no new ones and are offered to no router, so counting any of them
+ * advertises a channel whose acceptsNewHtlcs refuses every add. Read off the wire fields rather than
+ * recomputed: these surfaces hold serialized channel info, not Channel
+ * objects.
  */
-function isHeldRestore(ch: { restoreRecencyUnproven?: boolean }): boolean {
-	return ch.restoreRecencyUnproven === true;
+function isHeldRestore(ch: {
+	restoreRecencyUnproven?: boolean;
+	reestablishRecencyUnproven?: boolean;
+	reestablishSecretMissing?: boolean;
+	restoreRevokedRisk?: boolean;
+}): boolean {
+	return (
+		ch.restoreRecencyUnproven === true ||
+		ch.reestablishRecencyUnproven === true ||
+		ch.reestablishSecretMissing === true ||
+		ch.restoreRevokedRisk === true
+	);
+}
+
+/**
+ * The refusal an operator force close of a capsule-restored channel gets
+ * without the labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for
+ * (issue #469). /channel/forceclose, /ffor/enforce and /ffor/recover with
+ * forceCloseIfUnreachable all publish the same commitment, so they all
+ * refuse with the same words and name the same flag (issue #908).
+ */
+const STALE_STATE_FORCE_CLOSE_REFUSAL =
+	'This channel was restored from a Recovery Capsule and its state ' +
+	'cannot be proven current, so the node will not broadcast its ' +
+	'commitment on its own initiative. If the peer holds a newer ' +
+	'state, force closing publishes a revoked commitment and the ' +
+	'whole channel balance is lost to the justice path. Waiting for ' +
+	'the peer to close is the safe outcome. Set ' +
+	'acceptStaleStateRisk: true to force close anyway.';
+
+const REESTABLISH_FORCE_CLOSE_REFUSAL =
+	'The peer claimed at channel_reestablish that this channel state is ' +
+	'behind and showed no proof. Its recency cannot be proven, so the node ' +
+	'will not broadcast its commitment on its own initiative. If the claim ' +
+	'is true, force closing publishes a revoked commitment and the whole ' +
+	'channel balance is lost to the justice path; if the peer is lying, ' +
+	'the close is safe. Waiting for the peer to close is the safe outcome. ' +
+	'Set acceptStaleStateRisk: true to force close anyway.';
+
+const SECRET_MISSING_FORCE_CLOSE_REFUSAL =
+	'This node could not produce the per-commitment secret its own ' +
+	'channel_reestablish owes this peer, so local storage is damaged or ' +
+	'incomplete and the recency of this channel cannot be proven. The node ' +
+	'will not broadcast its commitment on its own initiative. If the stored ' +
+	'state is the stale one, force closing publishes a revoked commitment ' +
+	'and the whole channel balance is lost to the justice path. Waiting for ' +
+	'the peer to close is the safe outcome. Set acceptStaleStateRisk: true ' +
+	'to force close anyway.';
+
+interface IRecencyHold {
+	restoreRecencyUnproven?: true;
+	reestablishRecencyUnproven?: true;
+	reestablishSecretMissing?: true;
 }
 
 export class BeignetNode extends EventEmitter {
 	private fforReceiveService?: FforReceiveService;
+	private offlineReceive?: OfflineReceive;
+	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
+	getOfflineReceive(): OfflineReceive {
+		if (!this.offlineReceive)
+			throw new BeignetError(
+				'RECEIVE_UNAVAILABLE',
+				'Automatic receiving is unavailable.'
+			);
+		return this.offlineReceive;
+	}
+	private stopOfflineReceive(): void {
+		this.offlineReceive?.stop();
+		if (this.offlineReceiveTimer) clearInterval(this.offlineReceiveTimer);
+		this.offlineReceiveTimer = undefined;
+	}
 	getFforReceiveService(): FforReceiveService {
 		if (!this.fforReceiveService) throw new Error("Wallet is not running");
 		return this.fforReceiveService;
@@ -1532,6 +1608,15 @@ export class BeignetNode extends EventEmitter {
 	 *  state: the only boot that is a restore target. Cleared once a node
 	 *  was rebuilt on restored state. */
 	private _bootTargetEmpty = false;
+	/**
+	 * When the emptiness above was latched (issue #906). The new-channel
+	 * fence holds an empty boot only while an armed auto-apply lane has yet
+	 * to decide, and that hold expires _autoApplyMaxWaitMs after THIS
+	 * moment: the lane's own ceiling timer starts at the first capsule
+	 * arrival, so a wallet no storage peer ever answers for needs a bound
+	 * that does not wait on one.
+	 */
+	private _bootTargetEmptyAt = 0;
 	/** The boot options, kept so the automatic path can rebuild the node
 	 *  in-process on the installed database (the guardian restore keeps the
 	 *  same options under _deferredOpts for its deferred construction). */
@@ -1983,15 +2068,21 @@ export class BeignetNode extends EventEmitter {
 				'recoveryAutoApply applies to peer-storage mode only'
 			);
 		}
-		// Automatic capsule application only ever targets the boot that
-		// opened an empty database (issue #690): decided once, here, so state
-		// this node creates later never turns a running node into a target.
-		if (this._recoveryAutoApply) {
-			try {
-				assertEmptyTarget(this.storage);
-				this._bootTargetEmpty = true;
-			} catch {
-				this._bootTargetEmpty = false;
+		// Whether this boot opened a database with no channel or payment
+		// state: decided once, here, on EVERY boot. Automatic capsule
+		// application only ever targets such a boot (issue #690), so state
+		// this node creates later never turns a running node into a target;
+		// and the new-channel fence (issue #906) needs the same fact on the
+		// boots auto-apply is not armed for, since a bare-seed boot without
+		// it is exactly the boot that fence exists for. One read pass that
+		// stops at the first populated table, latched as a boolean.
+		try {
+			assertEmptyTarget(this.storage);
+			this._bootTargetEmpty = true;
+			this._bootTargetEmptyAt = Date.now();
+		} catch {
+			this._bootTargetEmpty = false;
+			if (this._recoveryAutoApply) {
 				this.log(
 					'info',
 					'Recovery auto-apply is armed but this database already holds ' +
@@ -2237,6 +2328,9 @@ export class BeignetNode extends EventEmitter {
 			coinType,
 			network: lnNetwork,
 			storage: this.storage,
+			// Issue #906: fence fresh indices during active auto-apply or a
+			// rebuild, and while the node's block height is zero.
+			newChannelsRefused: (): string | null => this.newChannelRefusal(),
 			enableNetworking: true,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
@@ -2462,7 +2556,28 @@ export class BeignetNode extends EventEmitter {
 			recovery: this.recoveryNodeConfig
 		});
 
-		this.fforReceiveService = new FforReceiveService(this, opts.fforSettle, opts.fforReceiveFunding);
+		this.fforReceiveService = new FforReceiveService(
+			this,
+			opts.fforSettle,
+			opts.fforReceiveFunding
+		);
+		const receiveKey = 'automatic_receive_jobs_v1';
+		const receiveJobs = this.storage.loadWalletData(receiveKey);
+		this.offlineReceive = new OfflineReceive(
+			this,
+			(jobs) => {
+				this.storage.saveWalletData(receiveKey, JSON.stringify(jobs));
+			},
+			receiveJobs ? JSON.parse(receiveJobs) : []
+		);
+		this.offlineReceiveTimer = setInterval(() => {
+			void this.offlineReceive?.sync().catch((error) => {
+				this.log('warn', 'Automatic receive reconciliation failed', {
+					error: String(error)
+				});
+			});
+		}, 2000);
+		this.offlineReceiveTimer.unref?.();
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
 		// down at startup), keep retrying and redirect sweeps to the wallet as
@@ -2985,9 +3100,15 @@ export class BeignetNode extends EventEmitter {
 				record: IFforEpochRecord;
 			}) => {
 				const hex = channelId.toString('hex');
+				// A capsule-restored channel is the likeliest to land here,
+				// and POST /ffor/enforce refuses it without the
+				// acceptStaleStateRisk acknowledgement, so the event names
+				// the hold up front rather than leaving the embedder to
+				// discover it from the refusal (issue #908).
 				this.emit('ffor:enforce', {
 					channelId: hex,
-					epoch: this.fforEpochView(hex, record)
+					epoch: this.fforEpochView(hex, record),
+					...this.recencyHold(channelId)
 				});
 			}
 		);
@@ -4531,6 +4652,104 @@ export class BeignetNode extends EventEmitter {
 			settleUntil: a.settleUntil ?? null,
 			lastReason: a.lastReason ?? null
 		};
+	}
+
+	/**
+	 * Whether this boot's EMPTINESS still fences new channels (issue #906,
+	 * F1(a)). An empty database is the state a capsule is meant to fill, and
+	 * the capsule carries the key-index table that says where allocation has
+	 * to continue from, so handing out an index before that arrives can burn
+	 * one a previous device already used.
+	 *
+	 * The rule is deliberately narrow: emptiness fences ONLY while the
+	 * automatic capsule lane is armed and its outcome is still open. An
+	 * emptiness that nothing is waiting on is just a new wallet, and a new
+	 * wallet has to be able to open its first channel, so a daemon without
+	 * the lane is never fenced on emptiness alone. The window is bounded
+	 * three ways, none of which needs a capsule to exist:
+	 *  - the lane reaches a terminal phase (applied or refused);
+	 *  - the restore clears _bootTargetEmpty (the database is no longer the
+	 *    thing a capsule would fill);
+	 *  - the lane's own ceiling, recoveryAutoApplyMaxWaitMs, elapses since
+	 *    the boot latched the emptiness. The lane's ceiling timer only
+	 *    starts at the FIRST capsule arrival, so a wallet no peer ever
+	 *    answers for would otherwise sit fenced forever.
+	 * #909 D9's operator marker ("this wallet really is new") is not
+	 * implemented yet; when it lands it belongs here as a fourth lift.
+	 */
+	private emptyBootRestoreUndecided(): boolean {
+		if (!this._bootTargetEmpty) return false;
+		if (!this._recoveryAutoApply || this.recoveryMode !== 'peer-storage') {
+			return false;
+		}
+		const phase = this._autoApply.phase;
+		if (phase === 'applied' || phase === 'refused') return false;
+		return Date.now() - this._bootTargetEmptyAt < this._autoApplyMaxWaitMs;
+	}
+
+	/**
+	 * The fence on brand-new channels (issue #906), consulted by the channel
+	 * manager ahead of every fresh key derivation, inbound accepts included.
+	 * Each condition names itself; the reason is local (the peer is told
+	 * only that new channels are refused for now):
+	 *  - the capsule auto-apply lane is unresolved (settling, applying, or
+	 *    the in-process rebuild is running): the capsule may still install
+	 *    the key-index table this node has to continue from, so no index is
+	 *    handed out until that is decided;
+	 *  - this boot opened an EMPTY database and an armed auto-apply lane has
+	 *    not decided yet (see emptyBootRestoreUndecided, which bounds it);
+	 *  - the chain tip is unknown AND this is a birth boot, the one whose
+	 *    next index is floored at the tip times CHANNEL_INDEX_FLOOR_STRIDE:
+	 *    until a height is known that floor cannot be set, so the next
+	 *    channel would take index 1. A boot that already knows where
+	 *    allocation stands (a key-index table, a persisted floor) is NOT
+	 *    fenced for a missing tip, or a daemon with no chain backend could
+	 *    never open or accept a channel at all. The channel manager refuses
+	 *    that same window on its own, for embedders that supply no
+	 *    predicate; this clause states it on the daemon's side too.
+	 * An idle lane on a populated database does NOT refuse. The floor
+	 * provides bounded spacing: for unclamped heights H > H0, sequential
+	 * allocation from H0 * 128 leaves every consumed index below H * 128
+	 * while at most 128 * (H - H0) indices have been consumed. Rejected
+	 * opens hand their index back, so only accepted ones count against that
+	 * budget. Same-block restores and allocations beyond the budget can
+	 * still reuse keys. This fence does not stop another running device or
+	 * establish that recovery found all previous state.
+	 */
+	private newChannelRefusal(): string | null {
+		// Mid-construction (the node config carries this predicate, so it can
+		// be consulted before the field is assigned): nothing is known yet.
+		const node = this.node as LightningNode | undefined;
+		if (!node) {
+			return 'New channels are refused until this node has finished booting';
+		}
+		const phase = this._autoApply.phase;
+		if (phase === 'settling' || phase === 'applying' || this._resuming) {
+			const stage = this._resuming ? 'rebuilding' : phase;
+			return (
+				'New channels are refused while a Recovery Capsule restore is ' +
+				`unresolved (auto-apply ${stage}): the restored key-index table ` +
+				'decides the next channel key index'
+			);
+		}
+		if (this.emptyBootRestoreUndecided()) {
+			return (
+				'New channels are refused while this empty boot waits for a ' +
+				'Recovery Capsule (auto-apply is armed and has not decided): the ' +
+				'capsule carries the key-index table the next channel key index ' +
+				'continues from'
+			);
+		}
+		if (
+			node.getCurrentBlockHeight() === 0 &&
+			node.getChannelManager().channelIndexTipFloorArmed
+		) {
+			return (
+				'New channels are refused until the chain tip is known so ' +
+				'recovery can initialize channel keys'
+			);
+		}
+		return null;
 	}
 
 	/** True while a capsule restore rebuilds the node in-process. */
@@ -7149,12 +7368,43 @@ export class BeignetNode extends EventEmitter {
 	async fforRecover(body: {
 		channelId?: string;
 		forceCloseIfUnreachable?: boolean;
+		acceptStaleStateRisk?: boolean;
 	}): Promise<Record<string, unknown>> {
 		const idBuf = this.fforChannelId(body.channelId);
-		const r = await this.node.rescueFforEpoch(idBuf.toString('hex'), {
-			forceCloseIfUnreachable: body.forceCloseIfUnreachable === true,
-			destinationScript: this.fforDestinationScript()
-		});
+		// forceCloseIfUnreachable reaches the engine's force close directly,
+		// so a channel held for either recency reason needs the acknowledgement
+		// /channel/forceclose and /ffor/enforce demand (issue #908). Strict
+		// boolean, the same rule those routes use. Refused before the witness
+		// fetch: the operator asked for a close this node will not make
+		// unacknowledged, and the fetch is repeatable. Only once an epoch of
+		// ours exists, so a channel without one keeps its own refusal.
+		if (
+			body.forceCloseIfUnreachable === true &&
+			this.node.getFforEpoch(idBuf.toString('hex'))?.role === 'R'
+		) {
+			this.requireForceCloseAcknowledgement(
+				idBuf,
+				body.acceptStaleStateRisk === true
+			);
+		}
+		const r = await this.node
+			.rescueFforEpoch(idBuf.toString('hex'), {
+				forceCloseIfUnreachable: body.forceCloseIfUnreachable === true,
+				acceptStaleStateRisk: body.acceptStaleStateRisk === true,
+				destinationScript: this.fforDestinationScript()
+			})
+			.catch((err: unknown) => {
+				if (err instanceof InvalidRequestError) {
+					// The hold may have arrived during witness retrieval. Preserve
+					// the same origin-specific refusal as the preflight check.
+					this.requireForceCloseAcknowledgement(
+						idBuf,
+						body.acceptStaleStateRisk === true
+					);
+					throw new BeignetError('INVALID_PARAMS', err.message);
+				}
+				throw err;
+			});
 		return {
 			action: r.action,
 			preimagesKnown: r.preimagesKnown,
@@ -7239,7 +7489,15 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
-	fforEnforce(channelId: string): Record<string, unknown> {
+	fforEnforce(
+		channelId: string,
+		// The RECOVERY-PROTOCOL 5.6 acknowledgement forceCloseChannel asks
+		// for on a capsule-restored channel (issue #469). This route publishes
+		// the same commitment, so it takes the same flag and refuses without
+		// it the same way; before issue #908 the refusal named a field the
+		// route could not accept.
+		acceptStaleStateRisk = false
+	): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
 		if (!f || f.role !== 'R') {
@@ -7249,7 +7507,7 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		return {
-			...this.forceCloseChannel(idBuf.toString('hex')),
+			...this.forceCloseChannel(idBuf.toString('hex'), acceptStaleStateRisk),
 			preimagesKnown: f.knownPreimages.filter((p) => p !== null).length
 		};
 	}
@@ -7301,8 +7559,7 @@ export class BeignetNode extends EventEmitter {
 	forceCloseChannel(
 		channelId: string,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
-		// (issue #469). Required only for a channel restored from a Recovery
-		// Capsule, whose recency nothing can prove: this node refuses to
+		// (issues #469 and #907). Required for either recency hold: this node refuses to
 		// broadcast such a commitment on its own initiative because the peer
 		// may already hold a revocation for it, and an operator command is the
 		// documented exit. It should be a decision, not a default, so the
@@ -7337,22 +7594,28 @@ export class BeignetNode extends EventEmitter {
 		}
 		// Compare on the DECODED bytes, which is what the engine resolves.
 		const canonicalId = idBuf.toString('hex');
-		const held = this.node
+		const row = this.node
 			.getRecoveryStatus()
-			.channels.find((c) => c.channelId === canonicalId)
-			?.restoreRecencyUnproven;
-		if (held === true && acceptStaleStateRisk !== true) {
+			.channels.find((c) => c.channelId === canonicalId);
+		// Before the acknowledgement, and regardless of it (issues #905 and
+		// #915): the holds below describe a risk the operator may accept, but
+		// this row's peer has PROVEN it holds the revocation for the stored
+		// commitment, so the risk is a certainty and there is nothing left to
+		// accept. The engine refuses too; this names the reason under its own
+		// code so a client does not read it as a missing flag.
+		if (row?.restoreRevokedRisk === true) {
 			throw new BeignetError(
-				'INVALID_PARAMS',
-				'This channel was restored from a Recovery Capsule and its state ' +
-					'cannot be proven current, so the node will not broadcast its ' +
-					'commitment on its own initiative. If the peer holds a newer ' +
-					'state, force closing publishes a revoked commitment and the ' +
-					'whole channel balance is lost to the justice path. Waiting for ' +
-					'the peer to close is the safe outcome. Set ' +
-					'acceptStaleStateRisk: true to force close anyway.'
+				BeignetErrorCode.FORCE_CLOSE_REVOKED,
+				"This channel's peer has shown, in channel_reestablish, that it " +
+					'already holds the revocation for the stored commitment. Force ' +
+					'closing would publish a revoked commitment and the whole channel ' +
+					'balance would be lost to the justice path. There is no risk to ' +
+					'accept, so acceptStaleStateRisk does not apply: wait for the ' +
+					'peer to force close, or for its retransmission to bring this ' +
+					'channel level again.'
 			);
 		}
+		this.requireForceCloseAcknowledgement(idBuf, acceptStaleStateRisk);
 		// Sweep recovered funds into the wallet-owned address (tracked + spendable)
 		// when available; fall back to the LN funding address otherwise.
 		let destinationScript = this.sweepDestinationScript;
@@ -7364,6 +7627,61 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		return this.node.forceCloseChannel(idBuf, destinationScript!);
+	}
+
+	/**
+	 * Read both recency holds from the channel that the engine will close.
+	 * The force-close routes and enforcement event share this snapshot so
+	 * a reestablish hold gets the same acknowledgement as a capsule hold.
+	 */
+	private recencyHold(channelId: Buffer): IRecencyHold {
+		const state:
+			| {
+					restoreRecencyUnproven?: boolean;
+					reestablishRecencyUnproven?: boolean;
+					reestablishSecretMissing?: boolean;
+			  }
+			| undefined = this.node
+			.getChannelManager()
+			.getChannel(channelId)
+			?.getFullState();
+		return {
+			...(state?.restoreRecencyUnproven === true
+				? { restoreRecencyUnproven: true as const }
+				: {}),
+			...(state?.reestablishRecencyUnproven === true
+				? { reestablishRecencyUnproven: true as const }
+				: {}),
+			...(state?.reestablishSecretMissing === true
+				? { reestablishSecretMissing: true as const }
+				: {})
+		};
+	}
+
+	private requireForceCloseAcknowledgement(
+		channelId: Buffer,
+		acceptStaleStateRisk: boolean
+	): void {
+		if (acceptStaleStateRisk === true) return;
+		const hold = this.recencyHold(channelId);
+		// One refusal per origin, in the engine's own precedence
+		// (recencyHoldOrigin): the local fault first, because it is the only
+		// one of the three that says this node's storage is damaged and a row
+		// can carry it beside the capsule hold.
+		if (hold.reestablishSecretMissing) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				SECRET_MISSING_FORCE_CLOSE_REFUSAL
+			);
+		}
+		if (hold.restoreRecencyUnproven || hold.reestablishRecencyUnproven) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				hold.restoreRecencyUnproven
+					? STALE_STATE_FORCE_CLOSE_REFUSAL
+					: REESTABLISH_FORCE_CLOSE_REFUSAL
+			);
+		}
 	}
 
 	/**
@@ -7437,6 +7755,18 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'HELD_RESTORE: Channel was restored from a Recovery Capsule and its state has not been proven current, so it takes no new HTLCs. Routing hints will be skipped.'
 			);
+		if (state.reestablishRecencyUnproven === true)
+			issues.push(
+				'HELD_REESTABLISH: The peer claimed at channel_reestablish that this channel state is behind and showed no proof, so the channel is held and takes no new HTLCs. Routing hints will be skipped.'
+			);
+		if (state.reestablishSecretMissing === true)
+			issues.push(
+				'HELD_SECRET_MISSING: This node could not produce the per-commitment secret its own channel_reestablish owes this peer, so local storage is damaged or incomplete and the channel is held and takes no new HTLCs. Routing hints will be skipped. The store cannot recover the secret, so the exits are the peer closing or an acknowledged force close.'
+			);
+		if (state.restoreRevokedRisk === true)
+			issues.push(
+				'HELD_REVOKED: The peer proved at channel_reestablish that it already holds the revocation for this commitment, so the channel takes no new HTLCs and no force close of it is permitted, the acknowledged one included. Routing hints will be skipped. It clears when the peer retransmits and this channel levels.'
+			);
 		if (state.fundingUnaccounted === true)
 			issues.push(
 				'FUNDING_UNACCOUNTED: Neither mempool nor chain can account for the funding transaction, so the channel takes no new HTLCs. Routing hints will be skipped. Existing HTLCs still settle, and the quarantine lifts by itself if the funding reappears.'
@@ -7509,6 +7839,9 @@ export class BeignetNode extends EventEmitter {
 		pendingSpliceLocalBalanceMsat?: bigint;
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
+		reestablishRecencyUnproven?: boolean;
+		reestablishSecretMissing?: boolean;
+		restoreRevokedRisk?: boolean;
 		fundingUnaccounted?: boolean;
 		payThroughSplice?: boolean;
 		revertedSplices?: Array<{
@@ -7570,6 +7903,11 @@ export class BeignetNode extends EventEmitter {
 		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
 		if (ch.restoreRecencyUnproven)
 			info.restoreRecencyUnproven = ch.restoreRecencyUnproven;
+		if (ch.reestablishRecencyUnproven)
+			info.reestablishRecencyUnproven = ch.reestablishRecencyUnproven;
+		if (ch.reestablishSecretMissing)
+			info.reestablishSecretMissing = ch.reestablishSecretMissing;
+		if (ch.restoreRevokedRisk) info.restoreRevokedRisk = ch.restoreRevokedRisk;
 		if (ch.fundingUnaccounted) info.fundingUnaccounted = ch.fundingUnaccounted;
 		if (ch.payThroughSplice !== undefined)
 			info.payThroughSplice = ch.payThroughSplice;
@@ -12132,6 +12470,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Lifecycle ───────────────
 
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
+		this.stopOfflineReceive();
 		this.fforReceiveService?.stop();
 		if (this.destroyed) return;
 		this.destroyed = true;
@@ -12174,6 +12513,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async destroy(): Promise<void> {
+		this.stopOfflineReceive();
 		this.fforReceiveService?.stop();
 		this._bolt8Transport?.close();
 		this._bolt8Transport = null;

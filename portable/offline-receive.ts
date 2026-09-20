@@ -165,26 +165,25 @@ export class OfflineReceive {
 									.find((e) => e.channelId === c.channelId)
 							)
 					);
-				if (channel) job.channelId = channel.channelId;
-				else {
-					const allocation = await this.node
-						.getFforReceiveService()
-						.request(
-							peer,
-							{
-								op: 'allocate',
-								allocationId: job.allocationId,
-								amountSats: job.amountSats
-							},
-							75000
-						);
-					if (!/^[a-f0-9]{64}$/.test(allocation?.channelId))
-						fail(
-							'RECEIVE_UNAVAILABLE',
-							'Your receive channel could not be verified.'
-						);
-					job.channelId = allocation.channelId;
+				// An offline receive is only for a channel that ALREADY exists with
+				// the primary and whose inbound covers the amount. It never obtains
+				// that capacity by having the primary open a channel: this used to
+				// send `allocate`, which asked the primary to fund a brand-new
+				// channel ahead of any payment, fee-free, and needed zero-conf
+				// trust to be usable at once. With no channel the wallet's ordinary
+				// request already carries the answers: a JIT invoice (the primary
+				// funds on the first payment and takes its fee) and a direct
+				// funding envelope (an on-chain payer's coin becomes the channel).
+				// Mirrors upstream beignet #925.
+				if (!channel) {
+					job.done = true;
+					this.persist();
+					fail(
+						'RECEIVE_UNAVAILABLE',
+						'No channel can hold this offline receive yet. Create an ordinary payment request first; once the primary has funded a channel, offline requests can reuse it.'
+					);
 				}
+				job.channelId = channel.channelId;
 				this.persist();
 			}
 			const channelId = job.channelId!;

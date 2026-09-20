@@ -48,6 +48,20 @@ function fakeNode({ channels = [], spliceIn, openChannelV2, connectAndOpenChanne
 
 const home = { channelId: 'home', peerPubkey: PRIMARY, state: 'NORMAL', htlcUsable: true };
 
+test('a recovery hold prevents channelization even when a funding quote was already in flight', async () => {
+	let allowed = true;
+	const node = fakeNode();
+	node.quoteOnchain = async () => {
+		allowed = false;
+		return { maxSendSats: 58000, feeSats: 400 };
+	};
+	const result = await runChannelize({ node, record, primary, rules, mayMutate: () => allowed });
+	assert.equal(result.last, null);
+	assert.equal(node.calls.some(call => ['spliceIn', 'openChannelV2', 'connectAndOpenChannel'].includes(call[0])), false);
+	const held = await runChannelize({ node: {}, record, primary, rules, mayMutate: () => false });
+	assert.equal(held.last, null);
+});
+
 test('a dual-funded open the primary refuses falls back to the plain open', async () => {
 	const node = fakeNode({
 		openChannelV2: () => {

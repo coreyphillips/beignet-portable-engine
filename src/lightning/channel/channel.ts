@@ -106,6 +106,8 @@ import {
 	createOpenerState,
 	createAcceptorState,
 	mustNotBroadcastCommitment,
+	isRecencyUnproven,
+	recencyHoldOrigin,
 	RecoveryCloseReason,
 	ChannelCloseReason
 } from './channel-state';
@@ -1009,6 +1011,18 @@ export class Channel {
 	// channel is back in AWAITING_REESTABLISH and the status derives from
 	// that. Cleared again once fresh signed traffic proves the exchange over.
 	private _lastReestablishOutcome: 'replay' | 'clean' | null = null;
+	// The reestablish this node could NOT build, because the shachain store
+	// had no secret at the index our revocation counter names (issue #919).
+	// One shot: the manager takes it right after the dispatch and turns it
+	// into the node's REESTABLISH_SECRET_MISSING error and structured log.
+	// In-memory only - the durable half is reestablishSecretMissing on the
+	// row, which is what keeps the hold across a restart; this is only the
+	// announcement, and a restart has nothing new to announce (the row is
+	// ERRORED and never builds another reestablish).
+	private _reestablishSecretMissingNotice: {
+		revocationIndex: bigint;
+		secretIndex: bigint;
+	} | null = null;
 	// Watchtower: the remote commitment transactions we have signed, keyed by the
 	// per-commitment point they use, so that when the peer later reveals that
 	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
@@ -1599,6 +1613,10 @@ export class Channel {
 	 * normal operation only its PUBLIC part is shared (partialVerify is a public
 	 * op). The per-signature SIGNING nonce used when WE co-sign the peer's
 	 * commitment is a SEPARATE, fresh-random nonce — never derived here.
+	 * PRECONDITION: all of this assumes ONE per-commitment seed per channel,
+	 * which only a never-reused channel key index guarantees (issue #906):
+	 * two channels sharing a seed share every verification nonce, and their
+	 * force closes at one height sign two sighashes under one secnonce.
 	 */
 	private _deriveVerificationNonce(height: bigint): Uint8Array {
 		const heightBuf = Buffer.alloc(8);
@@ -3022,6 +3040,62 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
+		// A commitment the peer has PROVEN it can punish (issues #905 and
+		// #915) enforces nothing at all: this node will not broadcast it under
+		// any reason, so every on-chain route for a new HTLC is already shut.
+		// Answered first and separately from the recency holds below, because
+		// this one has no operator exit to point the caller at. Obligations
+		// that predate the proof still settle through the resumed exchange,
+		// and the refusal lifts when the peer's retransmission levels the row.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot add HTLC: the peer holds the revocation for this ' +
+						'commitment, so its on-chain HTLC backstops are disabled'
+				}
+			];
+		}
+
+		// A channel whose recency cannot be proven takes no NEW HTLCs, whether
+		// it was restored from a capsule (issue #469), its peer claimed at
+		// reestablish that it is behind without proof (issue #907), or this
+		// node could not produce the secret its own channel_reestablish owes
+		// (issue #919). Its HTLC
+		// deadline backstops can never fire, since every automatic close is
+		// refused for as long as the hold stands, and an HTLC whose only
+		// on-chain enforcement this node has disarmed is a bounded risk turning
+		// into an unbounded one: the peer can simply stall and we have nothing
+		// to escalate to. Existing HTLCs still settle and fail off chain, and
+		// the channel can still be closed with the operator's acknowledged
+		// close or by the peer. Answered ahead of the lifecycle check below:
+		// a reestablish-held row is ERRORED from the moment the flag is set,
+		// and the hold, with its exit, is the answer the caller can act on,
+		// not the bare state name.
+		if (isRecencyUnproven(this._state)) {
+			const origin = recencyHoldOrigin(this._state);
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						origin === 'secret-missing'
+							? 'Cannot add HTLC: this node could not produce the ' +
+							  'per-commitment secret its own channel_reestablish owes the ' +
+							  'peer, so its state cannot be proven current and its ' +
+							  'on-chain HTLC backstops are disabled'
+							: origin === 'restore'
+							? 'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
+							  'and its state cannot be proven current, so its on-chain HTLC ' +
+							  'backstops are disabled'
+							: 'Cannot add HTLC: the peer claimed at channel_reestablish that ' +
+							  'this channel state is behind and showed no proof, so its ' +
+							  'state cannot be proven current and its on-chain HTLC ' +
+							  'backstops are disabled'
+				}
+			];
+		}
+
 		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
 		// update traffic has resumed per the splicing extension, and every add
 		// is mirrored onto both fundings by the start_batch commitment round.
@@ -3033,26 +3107,6 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: `Cannot add HTLC: channel in ${this._state.state} state`
-				}
-			];
-		}
-
-		// A capsule-restored channel whose recency cannot be proven takes no NEW
-		// HTLCs (issue #469). Its HTLC deadline backstops can never fire, since
-		// every automatic close is refused for as long as the hold stands, and
-		// an HTLC whose only on-chain enforcement this node has disarmed is a
-		// bounded risk turning into an unbounded one: the peer can simply stall
-		// and we have nothing to escalate to. Existing HTLCs still settle and
-		// fail off chain, and the channel can still be closed with the
-		// operator's acknowledged cooperative close or by the peer.
-		if (this._state.restoreRecencyUnproven === true) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cannot add HTLC: channel was restored from a Recovery Capsule ' +
-						'and its state cannot be proven current, so its on-chain HTLC ' +
-						'backstops are disabled'
 				}
 			];
 		}
@@ -3443,10 +3497,12 @@ export class Channel {
 			state: HtlcState.PENDING,
 			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {}),
 			...(dustExposureFailback ? { dustExposureFailback: true } : {}),
-			// Provenance for the capsule-restore hold (issue #469): only an add
-			// admitted while the hold already stood is refused by the node; one
+			// Provenance for the recency holds (issues #469 and #907) and for a
+			// proven revocation (issues #905 and #915): only an add admitted
+			// while the restriction already stood is refused by the node; one
 			// already committed in the capsule predates it and still settles.
-			...(this._state.restoreRecencyUnproven === true
+			...(isRecencyUnproven(this._state) ||
+			this._state.restoreRevokedRisk === true
 				? { addedWhileRestoreUnproven: true }
 				: {}),
 			// Same provenance for the funding-missing quarantine (issue #593).
@@ -4786,6 +4842,21 @@ export class Channel {
 
 		this._state.localCommitmentNumber++;
 
+		// The levelling revoke clears the proven-revocation flag (issues #905
+		// and #915). The flag says the peer already holds the secret for
+		// commitment localCommitmentNumber, which is precisely the secret
+		// revealed one line above, so this revoke tells the peer nothing it
+		// did not already have, and afterwards the row's current commitment
+		// is localCommitmentNumber + 1, whose secret has never left this
+		// node. Broadcasting is safe again. The ONLY way past the flagged
+		// index is this revoke - the counter advances nowhere else - so
+		// clearing here cannot outrun the proof. Leaving it set would keep
+		// mustNotBroadcastCommitment true for the life of a channel that has
+		// levelled, disarming its HTLC deadline backstops and closing its
+		// unilateral exit forever, which is a fund-loss path of its own. The
+		// PERSIST_STATE this path already leads with carries the clear.
+		this._state.restoreRevokedRisk = undefined;
+
 		// BOLT 2 (revoke_and_ack): next_per_commitment_point is the point for the
 		// NEXT commitment transaction — the one after the commitment we just
 		// adopted. With commitment M using getPerCommitmentPoint(seed, M) (per
@@ -5623,21 +5694,32 @@ export class Channel {
 	 */
 	getRecoveryStatus(): ChannelRecoveryStatus {
 		const s = this._state;
-		if (s.dataLossDetected) return ChannelRecoveryStatus.LocalDataLoss;
+		if (s.dataLossDetected || s.restoreRevokedRisk)
+			return ChannelRecoveryStatus.LocalDataLoss;
 		if (s.stateUncertain) return ChannelRecoveryStatus.StateUncertain;
 		if (
 			s.state === ChannelState.FORCE_CLOSED ||
 			s.state === ChannelState.ERRORED
 		) {
-			// ...unless the capsule restore hold is on, in which case no
-			// automatic close will ever run and reporting ForceClosing would
-			// tell an operator a close is under way when the channel is
-			// waiting on the peer or on them (issue #469).
-			if (
-				s.state === ChannelState.ERRORED &&
-				s.restoreRecencyUnproven === true
-			) {
-				return ChannelRecoveryStatus.RestoreRecencyUnproven;
+			// ...unless a recency hold is on, in which case no automatic close
+			// will ever run and reporting ForceClosing would tell an operator
+			// a close is under way when the channel is waiting on the peer or
+			// on them (issues #469, #907 and #919). The three origins report in
+			// recencyHoldOrigin's order, so the status and every refusal text
+			// name the same one on a row carrying more than one flag.
+			if (s.state === ChannelState.ERRORED) {
+				switch (recencyHoldOrigin(s)) {
+					case 'secret-missing':
+						// A LOCAL fault: this node could not produce the secret
+						// its own channel_reestablish owes (issue #919).
+						return ChannelRecoveryStatus.ReestablishSecretMissing;
+					case 'restore':
+						return ChannelRecoveryStatus.RestoreRecencyUnproven;
+					case 'reestablish':
+						// The peer claimed we are behind and showed no proof
+						// (issue #907).
+						return ChannelRecoveryStatus.ReestablishRecencyUnproven;
+				}
 			}
 			// ERRORED without a stale flag is recovered by broadcasting our
 			// latest commitment (the BOLT 1 prescription for a received
@@ -5673,18 +5755,31 @@ export class Channel {
 		if (this._state.recoveryCloseReason) {
 			return this._state.recoveryCloseReason;
 		}
-		if (this._state.dataLossDetected) return 'local-data-loss';
+		if (this._state.dataLossDetected || this._state.restoreRevokedRisk)
+			return 'local-data-loss';
 		if (this._state.stateUncertain) return 'state-uncertain';
-		// A capsule-restored row the peer has not confirmed yet (issue #469).
-		// DERIVED and never stamped by _ensureRecoveryCloseDisposition, unlike
-		// the two above: deriving keeps the disposition answerable to the flag
-		// rather than to a field some transition remembered to set. It is what
-		// stops the automatic-close gate becoming a trapdoor: an
-		// ERRORED row never reaches Channel.handleReestablish at all, because
-		// ChannelManager answers a reestablish for one with a wire error, so
-		// without a peer-close request such a channel would wait forever with
-		// nothing driving it anywhere.
-		if (this._state.restoreRecencyUnproven) return 'restore-unproven';
+		// The three recency holds. DERIVED and never stamped by
+		// _ensureRecoveryCloseDisposition, unlike the two above: deriving keeps
+		// the disposition answerable to the flag rather than to a field some
+		// transition remembered to set. It is what stops the automatic-close
+		// gate becoming a trapdoor: an ERRORED row never reaches
+		// Channel.handleReestablish at all, because ChannelManager answers a
+		// reestablish for one with a wire error, so without a peer-close
+		// request such a channel would wait forever with nothing driving it
+		// anywhere. One precedence order (recencyHoldOrigin) for all of them,
+		// so the status, the disposition and the refusal texts agree on a row
+		// carrying more than one flag.
+		switch (recencyHoldOrigin(this._state)) {
+			// Our own store could not produce the secret (issue #919).
+			case 'secret-missing':
+				return 'reestablish-secret-missing';
+			// A capsule-restored row the peer has not confirmed (issue #469).
+			case 'restore':
+				return 'restore-unproven';
+			// The peer claimed we are behind without proof (issue #907).
+			case 'reestablish':
+				return 'reestablish-unproven';
+		}
 		return undefined;
 	}
 
@@ -5761,10 +5856,61 @@ export class Channel {
 	 * same stale split the initiation was warned about.
 	 */
 	isMutualCloseHeld(): boolean {
+		// The proven revocation holds the close outright (issues #905 and
+		// #915), with no acknowledgement to lift it. The row's balances are
+		// one round stale by proof, not by supposition: the peer has a
+		// revoke_and_ack this row never recorded, so it has a commitment this
+		// row never built, and a mutual close lets it propose the split of
+		// the older one and take our signature over it. Unlike the holds
+		// above, this one is temporary: the peer's retransmission levels the
+		// row, the levelling revoke clears the flag, and the close proceeds.
+		if (this._state.restoreRevokedRisk === true) return true;
 		return (
-			this._state.restoreRecencyUnproven === true &&
+			isRecencyUnproven(this._state) &&
 			this._state.staleCloseRiskAccepted !== true
 		);
+	}
+
+	/**
+	 * Why this row's balances cannot be proven current, for the held-close
+	 * refusals: the capsule restore (issue #469), the peer's unproven behind
+	 * claim at channel_reestablish (issue #907), or this node's own missing
+	 * per-commitment secret (issue #919). Named per origin so an operator
+	 * reading the refusal is told what actually happened, in the one
+	 * precedence order (recencyHoldOrigin) the status and the daemon's
+	 * force-close refusal also use.
+	 */
+	private _heldCloseOrigin(): string {
+		// The proven revocation first: it is the only one of the three that no
+		// acknowledgement lifts, so an operator reading the refusal must be
+		// told that, and told what does lift it (issues #905 and #915).
+		if (this._state.restoreRevokedRisk === true) {
+			return (
+				'the peer has shown at channel_reestablish that it already holds ' +
+				'the revocation for this commitment, so these balances are one ' +
+				'round stale and this channel is waiting for the retransmission ' +
+				'from that peer to bring it level'
+			);
+		}
+		switch (recencyHoldOrigin(this._state)) {
+			case 'secret-missing':
+				return (
+					'this node could not produce the per-commitment secret its own ' +
+					'channel_reestablish owes the peer, a local storage fault that ' +
+					'leaves this row unable to prove its balances current'
+				);
+			case 'restore':
+				return (
+					'this channel was restored from a Recovery Capsule and its ' +
+					'balances cannot be proven current'
+				);
+			default:
+				return (
+					'the peer claimed at channel_reestablish that this channel ' +
+					'state is behind and showed no proof, which leaves its balances ' +
+					'unproven'
+				);
+		}
 	}
 
 	/**
@@ -5776,8 +5922,7 @@ export class Channel {
 	 */
 	refuseHeldMutualClose(): ChannelAction[] {
 		return this._heldCooperativeCloseRefusal(
-			'Cannot resume cooperative close: this channel was restored from a ' +
-				'Recovery Capsule and its balances cannot be proven current; ' +
+			`Cannot resume cooperative close: ${this._heldCloseOrigin()}; ` +
 				'awaiting your force close instead'
 		);
 	}
@@ -5813,6 +5958,14 @@ export class Channel {
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
 				: reason === 'restore-unproven'
 				? 'restored channel state has not been confirmed by channel_reestablish (recovery); awaiting your force close'
+				: reason === 'reestablish-unproven'
+				? 'your channel_reestablish claimed our state is behind without the per-commitment secret proving it; awaiting your force close'
+				: // Issue #919, and deliberately as bare as the wire error that
+				// first announced it: a peer told which secret this node has
+				// lost has been told where its own revoked commitments may
+				// now go unpunished.
+				reason === 'reestablish-secret-missing'
+				? 'cannot produce channel_reestablish from local state; awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
 			// The persist leads, exactly as it does at the two sites that first
@@ -6203,17 +6356,21 @@ export class Channel {
 		chain?: IForceCloseChainFacts
 	): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
-		// (dataLossDetected) or unprovable (stateUncertain), our latest local
-		// commitment may be revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive:
-		// StateUncertain is permanent absent independently verified storage
-		// provenance, so the only exit is the peer force-closing with ITS
-		// commitment; we sweep our to_remote from that.
+		// (dataLossDetected), unprovable (stateUncertain), or with
+		// the peer having shown it holds the revocation (restoreRevokedRisk,
+		// issues #905 and #915), our latest local commitment may be revoked in the
+		// peer's view - broadcasting it hands our entire balance to the
+		// justice path. Recovery is passive: StateUncertain is permanent
+		// absent independently verified storage provenance, so the only exit
+		// is the peer force-closing with ITS commitment; we sweep our
+		// to_remote from that.
 		if (mustNotBroadcastCommitment(this._state)) {
 			return {
 				ok: false,
 				error: this._state.dataLossDetected
 					? 'Refusing to broadcast stale commitment after data loss'
+					: this._state.restoreRevokedRisk
+					? 'Refusing to broadcast: the peer already holds the revocation for this commitment'
 					: 'Refusing to broadcast: restored state is not proven current'
 			};
 		}
@@ -6761,15 +6918,32 @@ export class Channel {
 		// Exact true only: the acknowledgement is authorization, and a JS
 		// caller passing a truthy non-boolean ('false', 1) must not spend it.
 		const acknowledged = acceptStaleStateRisk === true;
+		// The proven revocation (issues #905 and #915) is checked ahead of the
+		// acknowledgement and regardless of it, exactly as the force close is:
+		// acceptStaleStateRisk accepts a RISK, and here the peer has shown the
+		// stale round is a fact. Nothing durable changes, so the row stays
+		// resumable and the close can be retried once the peer's
+		// retransmission has levelled it.
+		if (this._state.restoreRevokedRisk === true) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot close cooperatively: ${this._heldCloseOrigin()}`,
+					cleanup: 'none'
+				}
+			];
+		}
 		if (this.isMutualCloseHeld() && !acknowledged) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
 					message:
-						'Cannot close cooperatively: channel was restored from a ' +
-						'Recovery Capsule and its balances cannot be proven current, ' +
-						'so a mutual close may sign away funds received after the ' +
-						'capsule was written',
+						`Cannot close cooperatively: ${this._heldCloseOrigin()}, so a ` +
+						'mutual close may sign away ' +
+						(this._state.restoreRecencyUnproven === true &&
+						this._state.reestablishSecretMissing !== true
+							? 'funds received after the capsule was written'
+							: 'funds a newer state would credit us'),
 					cleanup: 'none'
 				}
 			];
@@ -6788,7 +6962,7 @@ export class Channel {
 		const actions = this._initiateShutdown(scriptPubkey);
 		if (
 			acknowledged &&
-			this._state.restoreRecencyUnproven === true &&
+			isRecencyUnproven(this._state) &&
 			!actions.some((a) => a.type === ChannelActionType.ERROR)
 		) {
 			// The acknowledgement covers the whole negotiation, not just this
@@ -6935,8 +7109,7 @@ export class Channel {
 		// authorized close into ERRORED at its first response.
 		if (this.isMutualCloseHeld()) {
 			return this._heldCooperativeCloseRefusal(
-				'Cannot close cooperatively: this channel was restored from a ' +
-					'Recovery Capsule and its balances cannot be proven current; ' +
+				`Cannot close cooperatively: ${this._heldCloseOrigin()}; ` +
 					'please force close instead'
 			);
 		}
@@ -8803,9 +8976,76 @@ export class Channel {
 		return this._failChannelWithWireError(reason, 'lifecycle');
 	}
 
+	/**
+	 * Our own `channel_reestablish` cannot be built: the shachain store has no
+	 * secret at the index `next_revocation_number - 1` names (issue #919).
+	 *
+	 * What the PEER sees, and why. The choice was between silence (send no
+	 * channel_reestablish and let the peer's own reestablish time out or be
+	 * answered later) and a BOLT 1 `error` now. Silence is the worse of the
+	 * two: BOLT 2 has both sides send channel_reestablish before any other
+	 * message for the channel, so a silent node leaves an honest peer waiting
+	 * on a message that will never come, with its own disposition left to
+	 * whatever timeout it happens to implement (LND waits, CLN eventually
+	 * fails the connection, and neither learns anything), while OUR HTLC
+	 * deadline backstops are disarmed by the hold below for as long as that
+	 * lasts. The error makes the peer's disposition deterministic and
+	 * immediate: BOLT 1 says a node receiving an `error` SHOULD fail the
+	 * channel, and a peer that force-closes with ITS OWN commitment is exactly
+	 * the outcome RECOVERY-PROTOCOL 5.6 asks for here, since we sweep our
+	 * to_remote from it at the peer's state rather than publishing a
+	 * commitment that may already be revoked. What the error does NOT say is
+	 * which secret is missing. A peer told that our shachain store has lost a
+	 * received secret has been told that the justice path for that index may
+	 * be gone, which is an invitation to publish a revoked commitment of its
+	 * own; the wire text therefore says only that this node cannot produce the
+	 * message and that the channel is failed, and the precise fault (the
+	 * index, the store) stays in the local error and the structured log, where
+	 * the operator needs it and no counterparty reads it.
+	 *
+	 * Locally the channel is HELD, not force-closed: the row may itself be the
+	 * rolled-back copy, so broadcasting our latest commitment on our own
+	 * initiative is the one thing this state must not do. The flag rides the
+	 * same predicate the capsule and peer-claim holds use (isRecencyUnproven),
+	 * so every hold site covers it, and the operator's labelled force close
+	 * stays open as the exit.
+	 */
+	private _failReestablishSecretMissing(
+		revocationIndex: bigint,
+		secretIndex: bigint
+	): ChannelAction[] {
+		this._state.reestablishSecretMissing = true;
+		// Read back by the manager after the dispatch, which turns it into the
+		// node's REESTABLISH_SECRET_MISSING error and its structured log. A
+		// one-shot in-memory latch rather than an action, because the fault is
+		// local and nothing about it belongs in the peer's batch.
+		this._reestablishSecretMissingNotice = { revocationIndex, secretIndex };
+		const channelId = (
+			this._state.channelId ?? this._state.temporaryChannelId
+		).toString('hex');
+		return this._failChannelWithWireError(
+			'cannot produce channel_reestablish from local state; this channel ' +
+				'is failed and awaiting your force close',
+			undefined,
+			`Cannot send channel_reestablish for channel ${channelId}: the ` +
+				`shachain store holds no per-commitment secret at revocation ` +
+				`index ${revocationIndex} (shachain index ${secretIndex}), which ` +
+				'this node has already received and acknowledged, so there is no ' +
+				'honest value for your_last_per_commitment_secret. Local storage ' +
+				'is damaged or incomplete and cannot recover it. The channel is ' +
+				'failed and held: no automatic close will broadcast its ' +
+				'commitment, it takes no new HTLCs, and the peer is asked to ' +
+				'close instead. The exits are the peer closing or an ' +
+				'acknowledged force close (POST /channel/forceclose with ' +
+				'acceptStaleStateRisk: true), which publishes a commitment the ' +
+				'peer may already hold a revocation for'
+		);
+	}
+
 	private _failChannelWithWireError(
 		message: string,
-		cleanup?: IErrorAction['cleanup']
+		cleanup?: IErrorAction['cleanup'],
+		localMessage?: string
 	): ChannelAction[] {
 		// A hostile or malformed message can fail a channel whose safety
 		// flags already forbid broadcasting (a restored uncertain channel
@@ -8827,7 +9067,11 @@ export class Channel {
 			...(wire ? [wire] : []),
 			{
 				type: ChannelActionType.ERROR,
-				message,
+				// The local error may say MORE than the wire one: a fault whose
+				// detail helps the operator can be one a counterparty should not
+				// be handed (issue #919). Defaults to the wire text, which is
+				// what every other caller wants.
+				message: localMessage ?? message,
 				...(cleanup ? { cleanup } : {})
 			} as IErrorAction
 		];
@@ -8846,12 +9090,33 @@ export class Channel {
 		// the connection with "bad future last_local_per_commit_secret: N vs
 		// N-1" and force-closes.
 		const revocationCount = this._remoteRevocationCount();
-		const lastSecret =
-			revocationCount > 0n
-				? this._state.shaChainStore.getSecret(
-						MAX_INDEX - (revocationCount - 1n)
-				  ) || Buffer.alloc(32)
-				: Buffer.alloc(32);
+		// At revocation 0 the peer has revoked nothing and BOLT 2 REQUIRES the
+		// 32 zero bytes, so that arm is correct and stays exactly as it is.
+		// Above 0 the field MUST be the last per_commitment_secret we received,
+		// and there is no other honest value: zeroes there read on the wire as
+		// a protocol violation (CLN fails the connection with "bad future
+		// last_local_per_commit_secret"; this implementation since issue #907
+		// fails the channel, on chain at or below its own localCommitmentNumber
+		// and under the recency hold above it), so the old
+		// `|| Buffer.alloc(32)` fallback turned a LOCAL storage fault into a
+		// wire violation the peer acted on, with nothing local saying why
+		// (issue #919). A missing secret at revocationCount - 1 means this
+		// store cannot reproduce a secret this row already received and
+		// acknowledged: a lost write, a partly restored row, or a counter that
+		// disagrees with the store. Nothing is sent; the fault is recorded and
+		// announced locally instead.
+		let lastSecret = Buffer.alloc(32);
+		if (revocationCount > 0n) {
+			const secretIndex = MAX_INDEX - (revocationCount - 1n);
+			const stored = this._state.shaChainStore.getSecret(secretIndex);
+			if (!stored) {
+				return this._failReestablishSecretMissing(
+					revocationCount - 1n,
+					secretIndex
+				);
+			}
+			lastSecret = stored;
+		}
 
 		const myCurrentPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
@@ -8948,6 +9213,20 @@ export class Channel {
 			)
 		);
 		return actions;
+	}
+
+	/**
+	 * Take the pending "our channel_reestablish could not be built" notice, if
+	 * the last createReestablish raised one (issue #919). One shot: the caller
+	 * announces it once, and a repeat call answers null.
+	 */
+	takeReestablishSecretMissingNotice(): {
+		revocationIndex: bigint;
+		secretIndex: bigint;
+	} | null {
+		const notice = this._reestablishSecretMissingNotice;
+		this._reestablishSecretMissingNotice = null;
+		return notice;
 	}
 
 	/**
@@ -9794,17 +10073,48 @@ export class Channel {
 		}
 
 		// ── Data loss protection: validate yourLastPerCommitmentSecret ──
+		// BOLT 2: at next_revocation_number 0 the secret MUST be all zeroes;
+		// above 0 it MUST be the last per_commitment_secret the peer received
+		// from us, so all zeroes there is as wrong as any other value. An
+		// exemption for zeroes let a peer holding a newer state choose the
+		// plain gap arms below over the fell-behind arm, the only arm that
+		// forbids our broadcast (issue #907).
 		if (msg.nextRevocationNumber > 0n) {
 			const expectedSecret = getPerCommitmentSecret(
 				this._state.localPerCommitmentSeed,
 				msg.nextRevocationNumber - 1n
 			);
-			if (
-				!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
-				!msg.yourLastPerCommitmentSecret.equals(expectedSecret)
-			) {
+			if (!msg.yourLastPerCommitmentSecret.equals(expectedSecret)) {
 				// BOLT 2: MUST fail the channel — the peer is lying about (or has
 				// corrupted) our revocation chain. Wire error like the DLP path.
+				//
+				// Whether the failure may broadcast OUR commitment on its own
+				// depends on the index the peer named. Released indices run
+				// 0..localCommitmentNumber-1, so above localCommitmentNumber the
+				// peer counts a revoke_and_ack this row never sent, without the
+				// secret that would prove it (the fell-behind arm below). A
+				// peer that holds our newer state but cannot, or will not, show
+				// that secret looks exactly like one inventing the gap, and in
+				// the first case our latest commitment is revoked in its view.
+				// The ordinary refusal alone leaves the node to fail the channel
+				// on chain (handleChannelErrored), which would hand such a peer
+				// the very broadcast the fell-behind arm denies it. So the row
+				// takes the recency HOLD first, the same one a capsule restore
+				// carries (isRecencyUnproven): no automatic close of ours, the
+				// errored close and every timeout and HTLC deadline backstop
+				// included, no new HTLCs, and the derived reestablish-unproven
+				// disposition asks the peer to close with ITS commitment on
+				// every reconnect, from which we sweep our to_remote. Not
+				// StateUncertain: the claim is unverified, not proven, and a
+				// hostile peer can make it for free against a healthy channel,
+				// so the operator's labelled force close (acceptStaleStateRisk
+				// on the daemon) stays open as the exit. At or below
+				// localCommitmentNumber the index is one we released, so a
+				// wrong value there is a plain violation with no claim on our
+				// state, and the channel fails the ordinary way.
+				if (msg.nextRevocationNumber > this._state.localCommitmentNumber) {
+					this._state.reestablishRecencyUnproven = true;
+				}
 				return this._failChannelWithWireError(
 					'Invalid per-commitment secret in channel_reestablish'
 				);
@@ -9814,7 +10124,8 @@ export class Channel {
 		// ── Data loss protection: WE fell behind (BOLT 2) ──
 		// The peer expects a commitment/revocation beyond anything our restored
 		// state ever produced AND its yourLastPerCommitmentSecret passed the
-		// validation above while being non-zero: that secret is only derivable
+		// validation above, which at a non-zero next_revocation_number admits
+		// only the real secret (never zeroes): that secret is only derivable
 		// from OUR seed at an index we have not reached, so the peer provably
 		// holds a newer channel state than we do (we lost data). We MUST NOT
 		// broadcast our commitment - it is revoked in the peer's view and would
@@ -9896,6 +10207,55 @@ export class Channel {
 			];
 		}
 
+		// A valid secret proves the current commitment was revoked, whatever
+		// the row's origin (issues #905 and #915). localCommitmentNumber
+		// advances when WE send revoke_and_ack, so next_revocation_number at
+		// exactly localCommitmentNumber + 1 means the peer received one more
+		// revoke_and_ack than this row recorded sending, and the commitment it
+		// revoked is commitment localCommitmentNumber: the one this row would
+		// broadcast. The DLP arm above needs a larger gap, and the revocation
+		// arm below treats exactly + 1 as a signature in flight. A signature
+		// in flight alone cannot give the peer our SECRET at this index.
+		//
+		// The proof is that secret, not the counter, which the peer simply
+		// reads off our own channel_reestablish. Issue #907's validator above
+		// has already pinned your_last_per_commitment_secret to
+		// getPerCommitmentSecret(seed, nextRevocationNumber - 1), that is our
+		// real secret at index localCommitmentNumber, and failed the channel
+		// otherwise, all-zero bytes included: the value reaching this line can
+		// only be the real secret, which none of the released secrets
+		// 0..localCommitmentNumber-1 derives and only a peer we revoked that
+		// commitment to can hold. The all-zero conjunct below is therefore
+		// redundant today and kept as a guard: it costs a comparison and
+		// keeps a forged flag off if that rule is ever loosened again, and a
+		// forged flag would close the operator's force-close exit for good.
+		// No capsule restore is required for any of this (issue #915).
+		//
+		// With the secret required, a commitment gap beside this value is the
+		// DLP arm's above, so the gap arms below never see a flagged row. The
+		// row still RESUMES, because the peer's retransmitted commitment_signed
+		// is what levels it, and the revoke_and_ack we send in answer reveals
+		// the secret the peer already holds and clears the flag
+		// (sendRevokeAndAck). Its own persist: the trailing persist fires only
+		// beside a SEND_MESSAGE, and this shape retransmits nothing, so
+		// without it a crash after reestablish would forget the flag and
+		// reopen the operator's force close.
+		if (
+			msg.nextRevocationNumber === this._state.localCommitmentNumber + 1n &&
+			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
+			this._state.restoreRevokedRisk !== true
+		) {
+			this._state.restoreRevokedRisk = true;
+			// Deliberately NOT recording dlpRemotePerCommitmentPoint the way
+			// the DLP arm above does. That arm stamps an ERRORED row that
+			// never advances again, while this one resumes and keeps tracking
+			// the peer's point in remoteCurrentPerCommitmentPoint; the chain
+			// monitor prefers the DLP point over the live one when it sweeps
+			// to_remote from the peer's commitment, so stamping it here would
+			// pin a point that goes stale with the next round.
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
+		}
+
 		// ── Commitment retransmission logic ──
 		// msg.nextCommitmentNumber is the next commitment the peer expects to RECEIVE from us.
 		// We've created up to remoteCommitmentNumber commitments for them.
@@ -9910,11 +10270,19 @@ export class Channel {
 		// msg.nextRevocationNumber is the next revocation the peer expects from us.
 		// We can only have revoked up to localCommitmentNumber commitments.
 		// A value of EXACTLY localCommitmentNumber + 1 is the sig-in-flight
-		// case, not a gap: the peer signed a commitment we never received (the
-		// connection died between its updates/signature and us). Its own
-		// retransmission (updates + commitment_signed, triggered by our
-		// next_commitment_number) brings us level, after which we revoke
-		// normally. Only a larger gap is irrecoverable.
+		// case as far as the COUNTER goes: the peer signed a commitment we
+		// never received (the connection died between its updates/signature
+		// and us), and its own retransmission (updates + commitment_signed,
+		// triggered by our next_commitment_number) brings us level, after
+		// which we revoke normally. That is why this arm lets exactly + 1
+		// resume. What a signature in flight cannot explain is the peer
+		// knowing our secret at that index, so a VALID secret there has
+		// already set the never-broadcast flag above (issues #905 and #915)
+		// and the row resumes held. Only a larger gap is irrecoverable, and
+		// it is a backstop: the secret validator admits only our real secret
+		// at that index, and the fell-behind arm above then claims every such
+		// gap first, so this arm is normally unreachable; it stays so a gap
+		// can never fall through to the retransmission logic.
 		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
 			return this._heldReestablishGapFailure(
@@ -13082,6 +13450,7 @@ export class Channel {
 	canOfferHtlcSet(amounts: bigint[]): boolean {
 		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
 		if (amounts.length === 0) return true;
+		if (this._state.restoreRevokedRisk === true) return false;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			!this.canUpdateHtlcsDuringSplice()
@@ -13122,7 +13491,8 @@ export class Channel {
 
 	acceptsNewHtlcs(lookThroughReestablish = false, reservationHint = false): boolean {
 		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
-		if (this._state.restoreRecencyUnproven === true) return false;
+		if (this._state.restoreRevokedRisk === true) return false;
+		if (isRecencyUnproven(this._state)) return false;
 		if (this._state.fundingUnaccounted === true) return false;
 		return this.isHtlcUsable(lookThroughReestablish);
 	}

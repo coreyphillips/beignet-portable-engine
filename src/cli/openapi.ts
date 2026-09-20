@@ -304,7 +304,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/invoice': {
 				post: {
 					summary:
-						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine',
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
 						lspPubkey: 'string',
@@ -697,7 +697,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/close': {
 				post: {
 					summary:
-						'Cooperatively close a channel. The payout goes to a wallet-scanned address: the current unused wallet address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address, else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
+						'Cooperatively close a channel. The payout goes to a wallet-scanned address: the current unused wallet address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address, else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -712,7 +712,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/forceclose': {
 				post: {
 					summary:
-						'Force close a channel (returns commitment txid). A channel restored from a Recovery Capsule needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway',
+						'Force close a channel (returns commitment txid). A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because its recency cannot be proven: the node refuses to broadcast such a commitment on its own initiative, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path. Waiting for the peer to close is the safe outcome; the flag is the labelled way to accept the risk anyway. Once any channel reports restoreRevokedRisk on /recovery/status (its peer has shown in channel_reestablish that it already holds the revocation for the stored commitment), the force close is refused with FORCE_CLOSE_REVOKED (409) whatever the flag says: there is no risk left to accept; wait for the peer to force close',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -1745,6 +1745,76 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/receive/status': {
+				get: {
+					summary: 'Durable automatic receive requests and reserved channels',
+					tags: ['FFOR'],
+					responses: {
+						'200': {
+							description:
+								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), and a direct-funding request reserves no channel"
+						}
+					}
+				}
+			},
+			'/receive/quote': {
+				get: {
+					summary:
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
+					tags: ['FFOR'],
+					parameters: [
+						{
+							name: 'peer',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						},
+						{
+							name: 'amountSats',
+							in: 'query',
+							required: true,
+							schema: { type: 'integer' }
+						}
+					],
+					responses: {
+						'200': {
+							description:
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode contacts no peer and adds minAmountSat, the configured direct-funding minimum (5000 by default)'
+						},
+						'400': {
+							description:
+								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
+						},
+						'409': {
+							description: 'RECEIVE_UNAVAILABLE: the peer is not connected'
+						}
+					}
+				}
+			},
+			'/receive/invoice': {
+				post: {
+					summary:
+						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
+					tags: ['FFOR'],
+					requestBody: bodyContent({
+						peer: 'string',
+						requestId: 'string',
+						amountSats: 'number',
+						description: 'string',
+						quote: 'object'
+					}),
+					responses: {
+						'200': {
+							description:
+								"kind='bolt11' with the saved invoice, paymentHash, amountSats, expiresAt and offlineReceive=true; or kind='direct-funding' with request (the base64url envelope a payer pays), paymentHash (the receipt hash), expiresAt, amountSats, peer and offlineReceive=false. A direct-funding request is idempotent on requestId while unexpired and is replaced under the same id once it expires"
+						},
+						'409': {
+							description:
+								'RECEIVE_UNAVAILABLE: the peer is not connected, or direct funding is configured for a different peer'
+						}
+					}
+				}
+			},
 			'/ffor/epoch/start': {
 				post: {
 					summary:
@@ -1880,16 +1950,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/recover': {
 				post: {
 					summary:
-						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done',
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
-						forceCloseIfUnreachable: 'boolean'
+						forceCloseIfUnreachable: 'boolean',
+						// Conditionally required, only with forceCloseIfUnreachable
+						// on either recency hold.
+						acceptStaleStateRisk: 'boolean?'
 					}),
 					responses: {
 						'200': {
 							description:
 								'action (closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record'
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: forceCloseIfUnreachable on a recency-held channel without acceptStaleStateRisk: true'
 						}
 					}
 				}
@@ -1897,11 +1974,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/enforce': {
 				post: {
 					summary:
-						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch',
+						'R: force-close the channel carrying every known preimage; each settled voucher claims through its setup-time HTLC-success signature. The remedy when S will not answer ff_close or contradicted the epoch. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for: its recency cannot be proven, and if the peer holds a newer state the broadcast is revoked and the whole channel balance goes to the justice path (issue #908)',
 					tags: ['FFOR'],
-					requestBody: bodyContent({ channelId: 'string' }),
+					requestBody: bodyContent({
+						channelId: 'string',
+						// Conditionally required, and only for a capsule-restored
+						// or reestablish-held channel, as /channel/forceclose declares it.
+						acceptStaleStateRisk: 'boolean?'
+					}),
 					responses: {
-						'200': { description: 'ok, commitmentTxid, preimagesKnown' }
+						'200': { description: 'ok, commitmentTxid, preimagesKnown' },
+						'400': {
+							description:
+								'INVALID_PARAMS: a recency-held channel without acceptStaleStateRisk: true'
+						}
 					}
 				}
 			},
@@ -1977,7 +2063,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle; a cooperative close is refused in both directions too, since a mutual close pays out restored balances that cannot be proven current. The exits are the peer closing, or the operator acknowledging the risk with acceptStaleStateRisk: true on /channel/close (covers the whole negotiation) or /channel/forceclose. autoApply reports the automatic capsule application (peer-storage mode, BEIGNET_RECOVERY_AUTO_APPLY): enabled, phase (idle, settling, applying, applied, refused), settleUntil while settling, and lastReason after a refusal, which is the same refusal the manual route would have made. node.barrierLatency (quorum mode) is what the durability barrier has cost so far: waits that parked a message and were released by a guardian receipt, waits refused, and the last, mean, median, 95th percentile and maximum wait in milliseconds over the most recent 256 released waits, so the cost of the barrier is a measurement on this node rather than a guess'
+								'Mode, profile, guardians, daemon state, node recovery status (null when off, restore-pending or restart-required), retrieved capsule candidates with the best head and the guardian locators that capsule names (credentials redacted; reported, never adopted over the configured set), and restore progress when one is pending or running. In peer-storage mode node.heldReestablish lists peers whose channel_reestablish for a channel this node has no record of is being held rather than answered: each entry carries the expiresAt by which a capsule must be applied, after which the peer is told the channel is unknown and force-closes. A channel restored from a capsule carries node.channels[].restoreRecencyUnproven for as long as it exists: a capsule is best-effort recency and a compatible channel_reestablish does not prove otherwise, so the daemon will never force-close that channel on its own initiative (a peer error and the timeout backstops are held, and the channel asks its peer to close instead). Such a channel also takes no new HTLCs, since its on-chain HTLC deadline backstops can never fire, though existing ones still settle; a cooperative close is refused in both directions too, since a mutual close pays out restored balances that cannot be proven current. The exits are the peer closing, or the operator acknowledging the risk with acceptStaleStateRisk: true on /channel/close (covers the whole negotiation) or /channel/forceclose. A channel whose peer claimed at channel_reestablish that its state is behind without showing the per-commitment secret that would prove it carries node.channels[].reestablishRecencyUnproven and reports status reestablish_recency_unproven: it is ERRORED under the same hold (no automatic close, no new HTLCs, the peer asked to close on every reconnect) with the same exits, the peer closing or /channel/forceclose with acceptStaleStateRisk: true. A channel whose own channel_reestablish could not be built, because the shachain store on this node holds no per-commitment secret at the index its revocation counter names, carries node.channels[].reestablishSecretMissing and reports status reestablish_secret_missing: a local storage fault, held exactly the same way with the same exits, and permanently, since the store cannot recover the secret. It is announced when it happens as node:error REESTABLISH_SECRET_MISSING. Any channel, including one never restored from a capsule, carries node.channels[].restoreRevokedRisk and reports local_data_loss once its peer has shown, in channel_reestablish, that it already holds the revocation for the stored commitment: the risk has become a certainty, so /channel/forceclose refuses it with FORCE_CLOSE_REVOKED regardless of acceptStaleStateRisk, and a cooperative close is refused too. These channels take no new HTLCs and are offered to no router; the flag clears by itself once the retransmission from that peer levels the row and this node revokes the flagged commitment. autoApply reports the automatic capsule application (peer-storage mode, BEIGNET_RECOVERY_AUTO_APPLY): enabled, phase (idle, settling, applying, applied, refused), settleUntil while settling, and lastReason after a refusal, which is the same refusal the manual route would have made. node.barrierLatency (quorum mode) is what the durability barrier has cost so far: waits that parked a message and were released by a guardian receipt, waits refused, and the last, mean, median, 95th percentile and maximum wait in milliseconds over the most recent 256 released waits, so the cost of the barrier is a measurement on this node rather than a guess'
 						}
 					}
 				}
@@ -2638,7 +2724,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce, ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3746,6 +3832,21 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'boolean',
 							description:
 								'The channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current, so it takes no new HTLCs and is offered to no router. Existing HTLCs still settle; a cooperative close is refused in both directions without the acceptStaleStateRisk acknowledgement on /channel/close. Present only while the hold stands'
+						},
+						reestablishRecencyUnproven: {
+							type: 'boolean',
+							description:
+								'The peer claimed at channel_reestablish that this channel state is behind and showed no proof (a next_revocation_number above what this node ever released with a wrong or all-zero your_last_per_commitment_secret), so the channel is ERRORED under the same hold as restoreRecencyUnproven: no automatic close, no new HTLCs, no router edge, and the peer is asked to close on every reconnect. The exits are the peer closing or /channel/forceclose with acceptStaleStateRisk: true. Present only while the hold stands'
+						},
+						reestablishSecretMissing: {
+							type: 'boolean',
+							description:
+								'This node could not produce the your_last_per_commitment_secret its OWN channel_reestablish owes the peer: the shachain store held no secret at the index its revocation counter names, and BOLT 2 permits all zeroes only at next_revocation_number 0, so nothing was sent. Local storage is damaged or incomplete. The channel is ERRORED under the same hold as restoreRecencyUnproven: no automatic close, no new HTLCs, no router edge, and the peer is asked to close on every reconnect. The exits are the peer closing or /channel/forceclose with acceptStaleStateRisk: true. Permanent, since the store cannot recover the secret'
+						},
+						restoreRevokedRisk: {
+							type: 'boolean',
+							description:
+								'The peer has shown, in channel_reestablish, that it already holds the revocation for this channel stored commitment (a next_revocation_number of exactly localCommitmentNumber + 1 beside the valid per-commitment secret at that index), so broadcasting it would hand the whole balance to the justice path. Every force close is refused with FORCE_CLOSE_REVOKED, the acknowledgement included, and so is a cooperative close; the channel takes no new HTLCs and is offered to no router. It is not permanent: the row resumes, and the flag clears once the peer retransmits its commitment_signed and this node revokes the flagged commitment. Present on restored and ordinary channels alike'
 						},
 						fundingUnaccounted: {
 							type: 'boolean',

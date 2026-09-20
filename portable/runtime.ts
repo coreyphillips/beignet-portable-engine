@@ -13,6 +13,7 @@ import {
 import { verifyElectrumNetwork } from './network';
 import * as rules from './lfbw.cjs';
 import { runChannelize } from './channelize.cjs';
+import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export const DEFAULT_PRIMARY =
 	'025501f56b72e7b999443b836ae1bff4c6fff514943d3f6677302a9189949bd99c@ulyeemszaigzrvpjcjcby4ehibrvsuqi5sq4dmmew2urk2nse5f7spid.onion:9102';
@@ -64,6 +65,8 @@ export async function createPortableRuntime(options: any) {
 	const registry = load('/wallet/registry.json', null);
 	let record: any = registry?.record ?? null;
 	let storedMnemonic: string | null = registry?.mnemonic ?? null;
+	const recoveryImport = readRecoveryImport(registry?.recoveryImport);
+	const importPending = () => recoveryImport.autoApply && !recoveryImport.complete;
 	let receiveStore: ReceiveRequestStore | undefined;
 	const receiveRequests = () => {
 		if (!record) failure('NO_WALLET', 'Create or restore a wallet first', 404);
@@ -112,7 +115,21 @@ export async function createPortableRuntime(options: any) {
 	let directFundingInFlight = 0;
 	configure(options);
 	const persist = () =>
-		save('/wallet/registry.json', { record, mnemonic: storedMnemonic });
+		save('/wallet/registry.json', { record, mnemonic: storedMnemonic, recoveryImport });
+	const recoveryHold = () => node ? recoveryRefusal(node, importPending()) : null;
+	const requireRecoveryReady = () => {
+		const held = recoveryHold();
+		if (held) failure(held.code, held.message, 503);
+	};
+	const nodeUnavailable = () => !!node && (
+		node.resuming || node.restorePending || node.restartRequired
+	);
+	const healthy = () => !!node && !nodeUnavailable() && node.getHealth().electrumConnected;
+	const completeRecoveryImport = () => {
+		if (!importPending()) return;
+		recoveryImport.complete = true;
+		persist();
+	};
 	const publicRecord = () =>
 		record
 			? clone({
@@ -125,10 +142,10 @@ export async function createPortableRuntime(options: any) {
 						lastOffer
 					},
 					status: node ? 'running' : 'stopped',
-					healthy: !!node && node.getHealth().electrumConnected,
+					healthy: healthy(),
 					runtime: {
 						status: node ? 'running' : 'stopped',
-						healthy: !!node && node.getHealth().electrumConnected,
+						healthy: healthy(),
 						lfbwLast: record.lfbwLast ?? null
 					}
 				})
@@ -146,6 +163,7 @@ export async function createPortableRuntime(options: any) {
 	/** Whether the primary is a connected peer right now. */
 	const primaryConnected = () =>
 		!!node &&
+		!nodeUnavailable() &&
 		node
 			.listPeers()
 			.some(
@@ -162,6 +180,7 @@ export async function createPortableRuntime(options: any) {
 	let redialing = false;
 	const redialPrimary = async (opts: { force?: boolean } = {}) => {
 		if (redialing || closed || !node || record?.lfbw?.setup !== 'ready') return;
+		if (recoveryHold()) return;
 		if (!opts.force && primaryConnected()) return;
 		redialing = true;
 		try {
@@ -197,6 +216,7 @@ export async function createPortableRuntime(options: any) {
 		const pending = setTimeout(() => {
 			pendingTimers.delete(pending);
 			if (closed || !node || !record || record.lfbw.setup !== 'failed') return;
+			if (recoveryHold()) return;
 			if (startPromise) return;
 			void setup().then(async () => {
 				if (closed) return;
@@ -217,22 +237,29 @@ export async function createPortableRuntime(options: any) {
 	};
 	const runSetup = async () => {
 		if (!node || !record) return;
+		const held = recoveryHold();
+		// The initial recovery connection retrieves storage only. Leave direct
+		// funding disabled until the existing channel state has been installed.
+		if (held && (held.code !== 'NODE_RESTORE_PENDING' || nodeUnavailable())) return;
 		record.lfbw.setup = 'pending';
 		persist();
 		try {
 			const p = primary();
-			if (record.lfbw.trusted) node.addTrustedPeer(p.pubkey);
-			else node.removeTrustedPeer(p.pubkey);
+			if (!held) {
+				if (record.lfbw.trusted) node.addTrustedPeer(p.pubkey);
+				else node.removeTrustedPeer(p.pubkey);
+			}
 			// The policy names the liquidity peer every offer is negotiated with
 			// and signs its address into every request. It goes on before the
 			// connection is attempted: a primary that is down at start used to
 			// leave the policy unset, every offer declined with "no liquidity
 			// peer", and every request minted with no way to reach this wallet,
 			// until the next restart.
-			node.configureDirectFunding(rules.directFundingConfig(record.lfbw, p));
+			if (!held) node.configureDirectFunding(rules.directFundingConfig(record.lfbw, p));
 			try {
 				await node.connectPeer(p.pubkey, p.host, p.port);
 			} catch (error) {
+				if (nodeUnavailable()) return;
 				if (
 					!node
 						.listPeers()
@@ -261,6 +288,7 @@ export async function createPortableRuntime(options: any) {
 			closed ||
 			durabilityFailed ||
 			!node ||
+			recoveryHold() ||
 			busy ||
 			directFundingInFlight > 0 ||
 			record.lfbw.setup !== 'ready'
@@ -276,6 +304,7 @@ export async function createPortableRuntime(options: any) {
 				rules,
 				force,
 				retryAt: channelizeRetryAt,
+				mayMutate: () => !closed && !durabilityFailed && !recoveryHold(),
 				onDiagnostic: options.onDiagnostic
 			});
 			if (closed) return null;
@@ -323,6 +352,7 @@ export async function createPortableRuntime(options: any) {
 					autoBootstrap: false,
 					autoGossipSync: true,
 					recoveryMode: 'peer-storage',
+					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
 					forwardingEnabled: false,
 					// Silent by default; a caller that wants the engine's own log
@@ -335,6 +365,22 @@ export async function createPortableRuntime(options: any) {
 					},
 					onError(error) {
 						if (error.code === 'PERSISTENCE_ERROR') durabilityFailed = true;
+					}
+				});
+				// Native restore flags are durable before the swap finishes. They
+				// cover a crash between installing channels and our completion event.
+				if (importPending() && hasInstalledRecovery(node)) completeRecoveryImport();
+				node.on('recovery:restored', () => {
+					try {
+						completeRecoveryImport();
+						// The native wrapper rebuilt its node and policy in process.
+						const pending = setTimeout(() => {
+							pendingTimers.delete(pending);
+							if (!closed && !durabilityFailed) void setup().catch(() => {});
+						}, 0);
+						pendingTimers.add(pending);
+					} catch {
+						// persist() already fenced this runtime on a storage failure.
 					}
 				});
 				// Engine errors and peer changes are the only way to see why a
@@ -406,6 +452,7 @@ export async function createPortableRuntime(options: any) {
 					const pending = setTimeout(() => {
 						pendingTimers.delete(pending);
 						if (closed || !node) return;
+						if (recoveryHold()) return;
 						if (homeChannelUsable()) {
 							reestablishRedials = 0;
 							return;
@@ -450,9 +497,9 @@ export async function createPortableRuntime(options: any) {
 				);
 				await setup();
 				receiveTimer = setInterval(() => {
-					if (!durabilityFailed) void offlineReceive?.sync().catch(() => {});
+					if (!closed && !durabilityFailed && !recoveryHold()) void offlineReceive?.sync().catch(() => {});
 				}, 2000);
-				void offlineReceive.sync().catch(() => {});
+				if (!recoveryHold()) void offlineReceive.sync().catch(() => {});
 				if (record.lfbw.setup === 'failed') retrySetupSoon();
 				lastSplice = null;
 				unpairedFunding = null;
@@ -509,6 +556,7 @@ export async function createPortableRuntime(options: any) {
 				// that was unreachable at start is picked up without a restart.
 				timer = setInterval(() => {
 					if (closed || !node) return;
+					if (recoveryHold()) return;
 					if (record.lfbw.setup === 'failed' && !startPromise) {
 						void setup().then(() => channelize());
 						return;
@@ -677,7 +725,7 @@ export async function createPortableRuntime(options: any) {
 		(channel.payThroughSplice !== undefined ||
 			channel.pendingSpliceLocalBalanceSats !== undefined);
 	const reconcileActivity = async () => {
-		if (!node || reconciling || durabilityFailed) return;
+		if (!node || reconciling || durabilityFailed || recoveryHold()) return;
 		reconciling = true;
 		try {
 			let changed = false;
@@ -783,6 +831,13 @@ export async function createPortableRuntime(options: any) {
 		if (route === 'GET /receive/requests')
 			return { requests: receiveRequests().list() };
 		const n = requireNode();
+		if (route === 'GET /recovery/status')
+			return {
+				...n.getRecoverySurfaceStatus(),
+				importPending: importPending(),
+				importComplete: recoveryImport.complete
+			};
+		if (method !== 'GET' || nodeUnavailable()) requireRecoveryReady();
 		if (route === 'POST /receive/requests')
 			return {
 				request: await receiveRequests().register(
@@ -854,8 +909,6 @@ export async function createPortableRuntime(options: any) {
 				return n.listUtxos();
 			case 'GET /fees/estimates':
 				return n.getFeeEstimates();
-			case 'GET /recovery/status':
-				return n.getRecoverySurfaceStatus();
 			case 'GET /direct-funding/payments':
 				return n.listDirectFundingPayments();
 			case 'GET /direct-funding/config':
@@ -1117,6 +1170,7 @@ export async function createPortableRuntime(options: any) {
 				jitQuoteAvailable: true,
 				offlineReceiveAvailable: true,
 				recoveryAvailable: true,
+				recoveryAutoApplyAvailable: true,
 				engineVersion: ENGINE_VERSION,
 				embedded: true
 			};
@@ -1126,6 +1180,7 @@ export async function createPortableRuntime(options: any) {
 			(path === '/api/wallets' || path === '/api/wallets/import') &&
 			method === 'POST'
 		) {
+			validateRecoveryImport(body);
 			if (record)
 				failure(
 					'WALLET_EXISTS',
@@ -1153,8 +1208,8 @@ export async function createPortableRuntime(options: any) {
 					'INVALID_ELECTRUM',
 					'Electrum requires a hostname, port and TLS setting'
 				);
-			const mnemonic = body.mnemonic ?? generateMnemonic();
-			if (!validateMnemonic(mnemonic))
+			const mnemonic = body.mnemonic === undefined ? generateMnemonic() : body.mnemonic;
+			if (typeof mnemonic !== 'string' || !validateMnemonic(mnemonic))
 				failure('INVALID_MNEMONIC', 'Recovery phrase is invalid');
 			const uri =
 				body.lfbw?.primaryUri ??
@@ -1175,6 +1230,8 @@ export async function createPortableRuntime(options: any) {
 				onchainOnly: false
 			};
 			storedMnemonic = mnemonic;
+			recoveryImport.autoApply = body.recoveryAutoApply === true;
+			recoveryImport.complete = false;
 			persist();
 			try {
 				await start();
@@ -1214,6 +1271,7 @@ export async function createPortableRuntime(options: any) {
 			}
 			if (action === '/start' && method === 'POST') return start();
 			if (action === '/stop' && method === 'POST') return stop();
+			if (method !== 'GET') requireRecoveryReady();
 			if (
 				(action === '/lfbw/retry' || action === '/lfbw/setup') &&
 				method === 'POST'

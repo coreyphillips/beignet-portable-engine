@@ -11,7 +11,8 @@ export async function createSqlJsDatabaseFactory(options: {
 		wasmBinary: options.wasmBinary
 	});
 	return (path: string) => {
-		let db = new SQL.Database(options.load(path) ?? undefined);
+		const ephemeral = path === ':memory:';
+		let db = new SQL.Database(ephemeral ? undefined : options.load(path) ?? undefined);
 		let depth = 0;
 		let closed = false;
 		let poisoned = false;
@@ -24,6 +25,7 @@ export async function createSqlJsDatabaseFactory(options: {
 				);
 		};
 		const durable = () => {
+			if (ephemeral) return;
 			try {
 				options.save(path, db.export());
 			} catch (error) {

@@ -623,6 +623,15 @@ export interface INodeConfig {
 	 * secrets are re-derived on every restart and every recovery.
 	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
+	/**
+	 * Fence on brand-new channels (issue #906), passed through to the
+	 * channel manager: while it answers a reason, every open, outbound or
+	 * inbound, is refused with it and no channel key index is consumed. The
+	 * daemon supplies it during active capsule auto-apply or a rebuild, and
+	 * while its block height is zero. Idle or refused auto-apply permits
+	 * opens at a nonzero height. Unset, opens are never fenced.
+	 */
+	newChannelsRefused?: () => string | null;
 	/** Per-peer rate limit config */
 	rateLimitConfig?: {
 		maxHtlcsPerSecond?: number;
@@ -1016,6 +1025,35 @@ export interface IChannelInfo {
 	 * NORMAL channel can report htlcUsable false.
 	 */
 	restoreRecencyUnproven?: boolean;
+	/**
+	 * The peer's channel_reestablish claimed this channel's state is behind
+	 * and showed no proof (issue #907): the channel is ERRORED under the same
+	 * hold as restoreRecencyUnproven. No automatic close will broadcast its
+	 * commitment, it takes no new HTLCs and is offered to no router or
+	 * planner, and the peer is asked to close on every reconnect. The exits
+	 * are the peer's close or the operator's acknowledged force close.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
+	 * This node could not produce the `your_last_per_commitment_secret` its
+	 * own channel_reestablish owes the peer (issue #919): a local storage
+	 * fault, and the same hold as the two flags above. The channel is ERRORED,
+	 * no automatic close will broadcast its commitment, it takes no new HTLCs
+	 * and is offered to no router or planner, and the peer is asked to close
+	 * on every reconnect. Permanent: the store cannot recover the secret.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
+	 * The peer has proven at channel_reestablish that it holds the revocation
+	 * for this channel's current commitment (issues #905 and #915), so no
+	 * broadcast of it is permitted, the operator's own force close included.
+	 * The channel takes no new HTLCs and is offered to no router, planner or
+	 * routing hint; existing HTLCs still settle. Present on restored and
+	 * ordinary channels alike, and only until the peer's retransmission
+	 * levels the row; it is, alongside the two holds above, a reason a NORMAL
+	 * channel can report htlcUsable false.
+	 */
+	restoreRevokedRisk?: boolean;
 	/**
 	 * Neither mempool nor chain can account for this channel's funding and this
 	 * node has no broadcast left to answer with, so the channel is quarantined:
