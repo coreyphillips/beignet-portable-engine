@@ -43,8 +43,10 @@ async function runChannelize({
 	now = Date.now(),
 	retryAt = 0,
 	excludeChannelIds = new Set(),
+	mayMutate = () => true,
 	onDiagnostic
 }) {
+	if (!mayMutate()) return { last: null, retryAt };
 	if (!force && now < retryAt) return { last: null, retryAt };
 	try {
 		const balance = node.getBalance();
@@ -60,6 +62,7 @@ async function runChannelize({
 			return { last: decided(now, target), retryAt };
 		}
 		const fees = await node.getFeeEstimates();
+		if (!mayMutate()) return { last: null, retryAt };
 		const feeNormal = fees.normal || 2;
 		let order;
 		if (target.action === 'splice-in') {
@@ -78,6 +81,7 @@ async function runChannelize({
 				channelFunding: true,
 				satsPerVbyte: feeNormal
 			});
+			if (!mayMutate()) return { last: null, retryAt };
 			order = rules.channelizeOrder(target, {
 				txQuote,
 				feeNormal,
@@ -102,6 +106,7 @@ async function runChannelize({
 				retryAt
 			};
 		}
+		if (!mayMutate()) return { last: null, retryAt };
 		if (order.action === 'splice-in') {
 			const b = order.body;
 			const r = node.spliceIn(b.channelId, b.amountSats, b.feeratePerkw);

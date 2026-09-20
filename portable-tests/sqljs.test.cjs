@@ -1,6 +1,15 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { createSqlJsDatabaseFactory } = require('../dist/sqljs.cjs');
+const path = require('node:path');
+const { buildSync } = require('esbuild');
+const compiled = buildSync({
+	entryPoints: [path.join(__dirname, '../portable/sqljs.ts')],
+	bundle: true, platform: 'browser', format: 'cjs', write: false,
+	external: ['sql.js']
+}).outputFiles[0].text;
+const compiledModule = { exports: {} };
+new Function('module', 'exports', 'require', compiled)(compiledModule, compiledModule.exports, require);
+const { createSqlJsDatabaseFactory } = compiledModule.exports;
 test('SQLite transactions persist across fresh engines and rollback exceptions', async () => {
 	let persisted = null,
 		writes = 0;
@@ -71,4 +80,23 @@ test('SQLite BLOB rows satisfy the engine Buffer contract', async () => {
 	assert.equal(PortableBuffer.isBuffer(row.ciphertext), true);
 	assert.deepEqual(Array.from(row.ciphertext), [1, 2, 3]);
 	db.close();
+});
+
+test('memory scratch databases are isolated and never read or persist the durable volume', async () => {
+	let reads = 0, writes = 0;
+	const factory = await createSqlJsDatabaseFactory({
+		load: () => { reads++; throw Error('scratch read durable volume'); },
+		save: () => { writes++; throw Error('scratch wrote durable volume'); }
+	});
+	const first = factory(':memory:');
+	first.exec('CREATE TABLE scratch (id INTEGER)');
+	first.transaction(() => first.prepare('INSERT INTO scratch VALUES (?)').run(1))();
+	const second = factory(':memory:');
+	assert.throws(() => second.prepare('SELECT * FROM scratch').all(), /no such table/);
+	second.exec('CREATE TABLE scratch (id INTEGER)');
+	assert.deepEqual(second.prepare('SELECT * FROM scratch').all(), []);
+	assert.equal(first.prepare('SELECT * FROM scratch').all().length, 1);
+	assert.equal(reads, 0);
+	assert.equal(writes, 0);
+	first.close(); second.close();
 });
