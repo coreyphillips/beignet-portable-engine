@@ -53,7 +53,7 @@ export interface NodeInfo {
 	websocketPort?: number;
 }
 
-export type PeerState = 'connected' | 'connecting' | 'disconnected';
+export type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected';
 
 export interface PeerInfo {
 	pubkey: string;
@@ -137,6 +137,31 @@ export interface ChannelInfo {
 	 * both directions without the acceptStaleStateRisk acknowledgement.
 	 */
 	restoreRecencyUnproven?: boolean;
+	/**
+	 * The peer claimed at channel_reestablish that this channel's state is
+	 * behind and showed no proof, so the channel is ERRORED under the same
+	 * hold: no automatic close, no new HTLCs, no router edge, and the peer is
+	 * asked to close. The operator's force close needs acceptStaleStateRisk.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
+	 * This node could not produce the per-commitment secret its own
+	 * channel_reestablish owes the peer (issue #919), so local storage is
+	 * damaged or incomplete: the channel is ERRORED under the same hold, no
+	 * automatic close, no new HTLCs, no router edge, and the peer is asked to
+	 * close. The operator's force close needs acceptStaleStateRisk, and the
+	 * hold is permanent, since the store cannot recover the secret.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
+	 * The peer has proven at channel_reestablish that it already holds the
+	 * revocation for this channel's stored commitment, so no force close of
+	 * it is permitted, the operator's acknowledged one included
+	 * (FORCE_CLOSE_REVOKED), and neither is a cooperative close. No new
+	 * HTLCs, no router edge, no routing hint. Clears when the peer's
+	 * retransmission levels the channel.
+	 */
+	restoreRevokedRisk?: boolean;
 	/**
 	 * Neither mempool nor chain can account for the funding, so the channel is
 	 * quarantined: no new HTLCs, no router edge, no routing hint. Reversible
@@ -1454,6 +1479,20 @@ export interface BeignetNodeEvents {
 	'ffor:enforce': (data: {
 		channelId: string;
 		epoch: Record<string, unknown>;
+		/**
+		 * The channel is a capsule restore whose recency nothing has proven,
+		 * so POST /ffor/enforce needs acceptStaleStateRisk: true (issue
+		 * #908). Absent otherwise.
+		 */
+		restoreRecencyUnproven?: true;
+		/** The peer claimed newer state without proof; the same acknowledgement is required. */
+		reestablishRecencyUnproven?: true;
+		/**
+		 * This node could not produce the per-commitment secret its own
+		 * channel_reestablish owes (issue #919); the same acknowledgement is
+		 * required.
+		 */
+		reestablishSecretMissing?: true;
 	}) => void;
 	'ffor:witness-provisioned': (data: Record<string, unknown>) => void;
 	'ffor:witness-recorded': (data: Record<string, unknown>) => void;

@@ -39,6 +39,31 @@ export enum ChannelRecoveryStatus {
 	 * close or the operator's acknowledged close (either kind) resolves it.
 	 */
 	RestoreRecencyUnproven = 'restore_recency_unproven',
+	/**
+	 * Failed because the peer's channel_reestablish claimed this node is
+	 * behind and showed no proof: a next_revocation_number above what this
+	 * row ever released with a your_last_per_commitment_secret that is not
+	 * the secret at that index, zeroes included (issue #907). The same hold
+	 * as RestoreRecencyUnproven, from a different origin: no AUTOMATIC close
+	 * will broadcast its commitment, it takes no new HTLCs, and the peer is
+	 * asked to close on every reconnect. The peer's close or the operator's
+	 * acknowledged force close (acceptStaleStateRisk) resolves it.
+	 */
+	ReestablishRecencyUnproven = 'reestablish_recency_unproven',
+	/**
+	 * Failed because this node could not produce the
+	 * `your_last_per_commitment_secret` its OWN `channel_reestablish` owes
+	 * the peer: the shachain store held no secret at the index the peer's
+	 * revocation counter names (issue #919). BOLT 2 permits all zeroes only
+	 * at `next_revocation_number` 0, so nothing honest can be sent there and
+	 * the message is not built at all. The same hold as the two above, from a
+	 * LOCAL fault rather than a peer claim: no AUTOMATIC close will broadcast
+	 * its commitment, it takes no new HTLCs, and the peer is asked to close.
+	 * The peer's close or the operator's acknowledged force close
+	 * (acceptStaleStateRisk) resolves it; the store cannot recover the
+	 * secret, so the hold is permanent.
+	 */
+	ReestablishSecretMissing = 'reestablish_secret_missing',
 	Active = 'active',
 	ForceClosing = 'force_closing'
 }

@@ -54,6 +54,25 @@ export interface IChannelSnapshot {
 	 * (or a caller predating the field), and close advice stands.
 	 */
 	restoreRecencyUnproven?: boolean;
+	/**
+	 * The peer claimed at channel_reestablish that this channel is behind and
+	 * showed no proof (issue #907): the same hold as restoreRecencyUnproven,
+	 * so the same rule, advice to force-close it is withheld.
+	 */
+	reestablishRecencyUnproven?: boolean;
+	/**
+	 * This node could not produce the per-commitment secret its own
+	 * channel_reestablish owes the peer (issue #919): the same hold again,
+	 * from a local storage fault.
+	 */
+	reestablishSecretMissing?: boolean;
+	/**
+	 * The peer proved at channel_reestablish that it holds the revocation for
+	 * this channel's current commitment (issues #905 and #915). Broadcasting
+	 * it is refused under every reason, the operator's included, so close
+	 * advice is withheld for the same reason as the two holds above.
+	 */
+	restoreRevokedRisk?: boolean;
 }
 
 export interface ILiquiditySnapshot {
@@ -179,10 +198,13 @@ export class LiquidityAdvisor {
 				ch.state === 'AWAITING_REESTABLISH' &&
 				ch.stuckBlocks !== undefined &&
 				ch.stuckBlocks > 100 &&
-				// A capsule-held channel is EXPECTED to sit here until its peer
+				// A held channel is EXPECTED to sit here until its peer
 				// connects, and a local force close is exactly what its hold
-				// forbids; the exit is the peer's own close (issue #469).
-				ch.restoreRecencyUnproven !== true
+				// forbids; the exit is the peer's own close (issues #469, #907).
+				ch.restoreRecencyUnproven !== true &&
+				ch.reestablishRecencyUnproven !== true &&
+				ch.reestablishSecretMissing !== true &&
+				ch.restoreRevokedRisk !== true
 			) {
 				recommendations.push({
 					type: RecommendationType.CLOSE_CHANNEL,

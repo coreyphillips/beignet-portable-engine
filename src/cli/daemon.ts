@@ -248,6 +248,10 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// Unknown channel / wrong state / nothing recorded to rebroadcast are all
 	// problems with the caller's request, not node faults: never a 5xx.
 	REBROADCAST_FAILED: 400,
+	// A channel whose peer has shown it holds the revocation for the stored
+	// commitment (issues #905 and #915): the node's state conflicts with
+	// the request and no parameter changes the answer, so 409, not 400.
+	FORCE_CLOSE_REVOKED: 409,
 	// Recovery Protocol surface (docs/RECOVERY-PROTOCOL.md section 8).
 	// 503s are genuinely retryable (a quorum that answers later changes the
 	// answer); 409s are state conflicts the caller must react to; the rest
@@ -295,6 +299,8 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// policy, answered with the reason so the user can act on it; a silent
 	// LSP is upstream trouble, retryable.
 	JIT_REFUSED: 400,
+	// Our own fence, not the LSP's policy: waiting genuinely changes it.
+	NEW_CHANNELS_REFUSED: 503,
 	SWAP_NOT_CANCELLABLE: 409,
 	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
@@ -328,6 +334,17 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// FFOR (issue #729): a refused epoch, invoice, credit or provisioning is
 	// the caller's request against the engine's rules, never a server fault.
 	FFOR_REFUSED: 400,
+	// Automatic receive refuses invalid input or a reservation whose state
+	// needs review. Preserve these messages for the invoice form.
+	AMOUNT_TOO_SMALL: 400,
+	INVALID_REVIEW: 400,
+	QUOTE_EXPIRED: 409,
+	FEE_CHANGED: 409,
+	RECEIVE_UNAVAILABLE: 409,
+	RECEIVE_PENDING: 409,
+	RECEIVE_BUSY: 409,
+	// A failed durable invoice write is a server fault, not a caller refusal.
+	DURABILITY_FAILED: 500,
 	INVOICE_EXPIRED: 410,
 	SPENDING_LIMIT_EXCEEDED: 403,
 	// Draining is an operator decision, not a wait: isPermanentFailure agrees,
@@ -2692,6 +2709,17 @@ async function bootDaemon(
 		// channel; a guardian restore RESUMES them from replicated state.
 		// FFOR offline receive (issue #729): the receiver's epoch lifecycle,
 		// and the settlement, witness and issuer roles this node runs.
+		'GET /receive/status': () => success(node.getOfflineReceive().status()),
+		'GET /receive/quote': async (_body, query) =>
+			success(
+				await node
+					.getOfflineReceive()
+					.quote(query.get('peer') || '', Number(query.get('amountSats')))
+			),
+		'POST /receive/invoice': async (body) => {
+			const b = body as { peer: string };
+			return success(await node.getOfflineReceive().create(body, b.peer));
+		},
 		'GET /ffor/epochs': () => success(node.fforEpochs()),
 		'GET /ffor/settlements': () => success(node.fforEpochs('S')),
 		'GET /ffor/epoch': (body, query) => {
@@ -2744,9 +2772,17 @@ async function bootDaemon(
 				await node.fforRecover(body as Parameters<typeof node.fforRecover>[0])
 			),
 		'POST /ffor/enforce': (body) => {
-			const { channelId } = body as { channelId?: string };
+			const { channelId, acceptStaleStateRisk } = body as {
+				channelId?: string;
+				acceptStaleStateRisk?: boolean;
+			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			return success(node.fforEnforce(channelId));
+			// Strict boolean, the rule /channel/forceclose uses: this route
+			// publishes the same commitment, so a capsule-restored channel
+			// needs the same acknowledgement (issue #908).
+			return success(
+				node.fforEnforce(channelId, acceptStaleStateRisk === true)
+			);
 		},
 		'POST /ffor/witness/close': async (body) => {
 			const { channelId } = body as { channelId?: string };

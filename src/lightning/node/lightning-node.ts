@@ -250,6 +250,7 @@ import {
 } from '../swaps';
 import {
 	INodeConfig,
+	InvalidRequestError,
 	IResourceConfig,
 	IPaymentInfo,
 	ICreateInvoiceOptions,
@@ -412,6 +413,8 @@ import {
 	ISpliceInFlight,
 	IV2InFlight,
 	mustNotBroadcastCommitment,
+	isRecencyUnproven,
+	recencyHoldOrigin,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
@@ -614,6 +617,26 @@ const SWAP_TICK_SWEEP_DEADLINE_MS = 30_000;
 const HELD_FORWARD_ROW_BYTES = 1024;
 /** Metadata key the receiver's async receive grants persist under. */
 const ASYNC_RECEIVE_GRANTS_KEY = 'async_receive_grants';
+/**
+ * Metadata key the chain-tip floor on the next channel key index persists
+ * under (issue #906). Absent on a database that was populated on every boot
+ * of its life; '0' on one born from a bare seed that has not learned a real
+ * chain tip yet (the birth window, re-armed by a restart); a positive value
+ * once the birth boot's first real tip floored the counter (at the tip times
+ * CHANNEL_INDEX_FLOOR_STRIDE), written once.
+ */
+const CHANNEL_KEY_INDEX_FLOOR_KEY = 'channel_key_index_floor';
+/**
+ * Metadata key the allocation high-water mark on the channel key index
+ * persists under (issue #917): the highest index deriveKeysForNewChannel
+ * has ever handed out on this database, written at the moment it is handed
+ * out rather than when the channel row lands. Absent on a database that
+ * never allocated one (and on every database written before this key
+ * existed, which simply keeps the pre-#917 behaviour). Monotone: a released
+ * index (see ChannelManager._releaseUnusedChannelIndex) never lowers it,
+ * because it records what MAY have been used, not what was.
+ */
+const CHANNEL_KEY_INDEX_ALLOCATED_KEY = 'channel_key_index_allocated';
 /** Default wait for an LSP's answer to a registration request. */
 const ASYNC_GRANT_REQUEST_TIMEOUT_MS = 30_000;
 /** Grants kept per LSP (newest first); older ones are dropped. */
@@ -880,6 +903,20 @@ export class LightningNode extends EventEmitter {
 	 */
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
+	/**
+	 * Issue #906: true from a birth boot (decided in restoreFromStorage)
+	 * until the chain-tip floor on the next channel key index has fired and
+	 * its value is in the durable row; the per-header check is a no-op after
+	 * that, and on every later boot.
+	 */
+	private channelIndexFloorPending = false;
+	/**
+	 * Issue #917: the highest channel key index this node has recorded as
+	 * handed out, seeded from CHANNEL_KEY_INDEX_ALLOCATED_KEY at boot and
+	 * raised by every derivation. Keeps the durable row monotone and saves
+	 * the write when an index that was handed back is handed out again.
+	 */
+	private channelIndexAllocationMark = 0;
 	/** FFOR D-R receipt witness (section 9.6), when this node serves as one. */
 	private fforWitness: FforWitnessService | null = null;
 	/** FFOR BOLT 12 issuer (section 9.7), co-hosted with the witness. */
@@ -1619,6 +1656,13 @@ export class LightningNode extends EventEmitter {
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			// Issue #917: every index the manager hands out is durable before
+			// anything derived from it can reach the wire. Throws when the
+			// write fails, which refuses that open rather than letting a
+			// crash hand the index out a second time.
+			onChannelIndexAllocated: (channelIndex: number): void =>
+				this.recordChannelIndexAllocation(channelIndex),
+			newChannelsRefused: config.newChannelsRefused,
 			signerFactory: config.signerFactory,
 			// Recovery 5.8: in quorum mode this holds a batch's remaining
 			// actions until the frame behind them is replicated. In every
@@ -2618,6 +2662,67 @@ export class LightningNode extends EventEmitter {
 		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
 			this.channelManager.nextChannelIndex = nextChannelIndex;
 		}
+		// Issue #917: the allocation high-water mark, beside the table's own.
+		// The table records an index when the CHANNEL ROW lands; this row
+		// records it when the index is handed out, which is the only record
+		// an open that reached the wire and then died leaves behind. Seeding
+		// from max(table, mark + 1) is what keeps the next boot above every
+		// index this database ever handed out, used or abandoned. Validated
+		// like the floor below: a row that is not a positive number is no
+		// record at all and leaves the counter to the other sources. The
+		// setter only ever raises, so nothing here can lower the counter.
+		const allocationRow = this.storage.loadMetadata(
+			CHANNEL_KEY_INDEX_ALLOCATED_KEY
+		);
+		const parsedMark =
+			allocationRow === null ? NaN : parseInt(allocationRow, 10);
+		this.channelIndexAllocationMark =
+			Number.isFinite(parsedMark) && parsedMark > 0 ? parsedMark : 0;
+		if (this.channelIndexAllocationMark > 0) {
+			this.channelManager.nextChannelIndex =
+				this.channelIndexAllocationMark + 1;
+		}
+		// Issue #906: with NO key-index row at all there is no high-water mark
+		// to seed from, and a counter left at 1 would hand the next channel,
+		// opened or accepted, the keys of whichever channel a previous device
+		// held at index 1. Such a birth boot floors the counter at the chain
+		// tip times CHANNEL_INDEX_FLOOR_STRIDE instead (128 indices per
+		// block, a bounded margin for the opens a device can answer between
+		// two blocks; a refused open hands its index back), ONCE: from the
+		// height persisted
+		// below when there is one, else from the first header, and the value
+		// it reaches goes to the floor row (persistChannelIndexFloor). Every
+		// later boot seeds the counter from max(table high-water mark, row)
+		// and no header moves it again. An empty table is told apart from
+		// one whose top index is 0 (both answer 1 above) by the existence
+		// query, with the enumerator and then the answer itself standing in
+		// for backends that lack it.
+		// An allocation mark (#917) does not suppress the floor and must
+		// not: the floor only ever RAISES the counter, so it cannot floor
+		// below the mark seeded above, and an empty table with no floor row
+		// still means this database has no record of what a previous DEVICE
+		// handed out, which is what the floor answers. The mark answers the
+		// narrower question of what THIS database handed out.
+		const keyIndexTableEmpty = this.storage.hasChannelKeyIndices
+			? !this.storage.hasChannelKeyIndices()
+			: this.storage.loadAllChannelKeyIndices
+			? this.storage.loadAllChannelKeyIndices().length === 0
+			: nextChannelIndex <= 1;
+		// The floor row (issue #906 review). The key-index table cannot stand
+		// in for it: the floor raises the counter without writing any row,
+		// and a partial restore on the birth boot (an SCB missing its
+		// highest-index entry) lands rows BELOW the floor, so the next boot
+		// would read a populated table and seed the counter from a high-water
+		// mark a previous device had already passed. A '0' is the birth
+		// marker: the floor has not fired yet, so this boot is still a birth
+		// boot whatever that restore landed in the table meanwhile.
+		const floorRow = this.storage.loadMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY);
+		const persistedFloor = floorRow === null ? NaN : parseInt(floorRow, 10);
+		const floorPersisted =
+			Number.isFinite(persistedFloor) && persistedFloor > 0;
+		if (floorPersisted) this.channelManager.nextChannelIndex = persistedFloor;
+		const birthBoot =
+			!floorPersisted && (keyIndexTableEmpty || persistedFloor === 0);
 
 		// Restore channels — look up per-channel key index for each
 		for (const {
@@ -2895,6 +3000,22 @@ export class LightningNode extends EventEmitter {
 			const height = parseInt(savedHeight, 10);
 			if (!isNaN(height) && height > 0) {
 				this.currentBlockHeight = height;
+			}
+		}
+		// Issue #906: a birth boot arms the chain-tip floor on the next channel
+		// index. It fires now from the persisted height when there is one
+		// (without checking its freshness), else from the first
+		// header; either way the value is written once it has fired. Until
+		// then the row holds the birth marker, so a restart before any header
+		// is a birth boot again.
+		if (birthBoot) {
+			this.channelIndexFloorPending = true;
+			this.channelManager.armChannelIndexTipFloor(this.currentBlockHeight);
+			if (!this.persistChannelIndexFloor() && floorRow === null) {
+				this.safeStorage(
+					() => this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, '0'),
+					'saveChannelKeyIndexFloor'
+				);
 			}
 		}
 
@@ -4520,6 +4641,49 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// This node could not build its OWN channel_reestablish: the shachain
+		// store had no secret at the index our revocation counter names, and
+		// BOLT 2 has no honest value to put there above revocation 0 (issue
+		// #919). The channel has already failed itself and taken the recency
+		// hold; what is raised here is the LOCAL fault, which the peer is
+		// deliberately not told the detail of, because a peer that knows which
+		// received secret we lost knows where its own revoked commitments may
+		// go unpunished. An operator sees it before the peer acts on the wire
+		// error, and the channel is named so the labelled force close can be
+		// aimed at it.
+		this.channelManager.on(
+			'reestablish:secret-missing',
+			(channelId: Buffer, revocationIndex: bigint, secretIndex: bigint) => {
+				const channelIdHex = channelId.toString('hex');
+				this.emitStructuredLog('channel', 'reestablish_secret_missing', {
+					channelId: channelIdHex,
+					revocationIndex: revocationIndex.toString(),
+					secretIndex: secretIndex.toString()
+				});
+				this.emit('node:error', {
+					code: 'REESTABLISH_SECRET_MISSING',
+					channelId,
+					message:
+						`channel ${channelIdHex} cannot send channel_reestablish: the ` +
+						`shachain store holds no per-commitment secret at revocation ` +
+						`index ${revocationIndex} (shachain index ${secretIndex}), a ` +
+						'secret this node already received and acknowledged, so there ' +
+						'is no honest value for your_last_per_commitment_secret and ' +
+						'all zeroes would be a protocol violation the peer fails the ' +
+						'channel on. Local storage is damaged or incomplete and ' +
+						'cannot recover it. The channel is failed and held: no ' +
+						'automatic close will broadcast its commitment, it takes no ' +
+						'new HTLCs, and the peer is asked to close instead. The exits ' +
+						'are the peer closing or an acknowledged force close, POST ' +
+						'/channel/forceclose with acceptStaleStateRisk: true (CLI: ' +
+						'channel forceclose --accept-stale-state-risk), which ' +
+						'publishes a commitment the peer may already hold a ' +
+						'revocation for',
+					timestamp: Date.now()
+				} as ILightningError);
+			}
+		);
+
 		// A quorum barrier is holding a batch's messages (Recovery 5.8). Purely
 		// informational: the channel is waiting, not broken, and the release
 		// happens on its own once the guardians answer.
@@ -5948,6 +6112,43 @@ export class LightningNode extends EventEmitter {
 			 * acknowledged close (cooperative or force) are the exits.
 			 */
 			restoreRecencyUnproven?: boolean;
+			/**
+			 * The peer's channel_reestablish claimed this channel's state is
+			 * behind and showed no proof (issue #907): its counters named a
+			 * revocation this node never released while its secret was not
+			 * the one at that index. The channel is ERRORED under the same
+			 * hold as restoreRecencyUnproven, from a different origin: the
+			 * automatic close paths are held, it takes no new HTLCs and it
+			 * asks the peer to close on every reconnect. A hostile peer can
+			 * put a healthy channel here at no cost, so the exits are the
+			 * peer's close or the operator's acknowledged force close
+			 * (acceptStaleStateRisk), never an automatic broadcast.
+			 */
+			reestablishRecencyUnproven?: boolean;
+			/**
+			 * This node could not produce the `your_last_per_commitment_secret`
+			 * its OWN channel_reestablish owes the peer (issue #919): the
+			 * shachain store held no secret at the index its revocation
+			 * counter names, and BOLT 2 permits all zeroes only at
+			 * next_revocation_number 0. The message was not sent; the channel
+			 * is ERRORED under the same hold as the two flags above, from a
+			 * LOCAL storage fault rather than a peer claim, and the store
+			 * cannot recover the secret, so the hold is permanent. The exits
+			 * are the peer's close or the operator's acknowledged force close.
+			 */
+			reestablishSecretMissing?: boolean;
+			/**
+			 * The channel's peer has PROVEN, in its channel_reestablish, that
+			 * it already holds the revocation for the channel's current
+			 * commitment (issues #905 and #915): next_revocation_number one
+			 * above what this row recorded revoking, beside the real secret
+			 * at that index. The holds above describe a risk; this is a
+			 * certainty, so every broadcast is refused, the operator's force
+			 * close included, acceptStaleStateRisk or not, and so is a
+			 * cooperative close. No capsule restore is required. It clears
+			 * itself when the peer's retransmission levels the row.
+			 */
+			restoreRevokedRisk?: boolean;
 		}>;
 		/**
 		 * Peers whose channel_reestablish is parked because it names a channel
@@ -5972,6 +6173,9 @@ export class LightningNode extends EventEmitter {
 			awaitingDurability: boolean;
 			fundingUnidentified?: boolean;
 			restoreRecencyUnproven?: boolean;
+			reestablishRecencyUnproven?: boolean;
+			reestablishSecretMissing?: boolean;
+			restoreRevokedRisk?: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -5989,6 +6193,15 @@ export class LightningNode extends EventEmitter {
 				...(fundingUnidentified ? { fundingUnidentified: true } : {}),
 				...(state.restoreRecencyUnproven
 					? { restoreRecencyUnproven: true }
+					: {}),
+				...(state.reestablishRecencyUnproven
+					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(state.reestablishSecretMissing
+					? { reestablishSecretMissing: true }
+					: {}),
+				...(state.restoreRevokedRisk === true
+					? { restoreRevokedRisk: true }
 					: {})
 			});
 		}
@@ -11424,6 +11637,13 @@ export class LightningNode extends EventEmitter {
 		feeRatePerVbyte: number,
 		reason: ChannelCloseReason
 	): ChannelResult {
+		// Every reason, the operator's included (issue #905): the peer has
+		// shown it holds the revocation for this commitment, so there is no
+		// risk left for an acknowledgement to accept, only the justice path.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			return { ok: false, actions: [], error: revoked };
+		}
 		if (
 			reason !== 'user' &&
 			this.skipAutoCloseRecoveryGated(channelId, reason)
@@ -11435,6 +11655,23 @@ export class LightningNode extends EventEmitter {
 			};
 		}
 		const channel = this.channelManager.getChannel(channelId);
+		// The recency hold (issues #469 and #907), enforced centrally for the
+		// same reason the recovery gate is: every automatic arm consults
+		// skipAutoCloseRestoreUnproven before announcing a close, and a path
+		// that forgets still cannot broadcast. The operator's own force close
+		// (reason 'user') stays admitted: it is the hold's labelled exit.
+		if (
+			reason !== 'user' &&
+			channel !== undefined &&
+			this.skipAutoCloseRestoreUnproven(channel.getFullState(), reason)
+		) {
+			return {
+				ok: false,
+				actions: [],
+				error:
+					'automatic force close refused: channel state cannot be proven current (recency hold)'
+			};
+		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
 		const result = this.channelManager.forceClose(
@@ -11481,10 +11718,46 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * The refusal every force close of a channel meets once
+	 * its peer has shown it holds the revocation for the channel's current
+	 * commitment (restoreRevokedRisk, issue #905), or null when it does not.
+	 * Unlike the recency hold, which the operator's own close may override
+	 * (5.6's labelled escape hatch), this one has no override: the hatch
+	 * exists for a risk, and a revocation in the peer's hands is not a risk
+	 * but a certain loss to the justice path. Stated here so the operator
+	 * path can name it (FORCE_CLOSE_REVOKED) and _forceCloseWithReason can
+	 * enforce it for every reason at once.
+	 */
+	private forceCloseRevokedRefusal(channelId: Buffer): string | null {
+		const state = this.channelManager.getChannel(channelId)?.getFullState();
+		if (state?.restoreRevokedRisk !== true) return null;
+		return (
+			"force close refused: this channel's peer has shown, in " +
+			'channel_reestablish, that it already holds the revocation for the ' +
+			'stored commitment; broadcasting it would hand the whole balance to ' +
+			'the justice path. There is no risk to accept: wait for the peer to ' +
+			'force close'
+		);
+	}
+
 	forceCloseChannel(
 		channelId: Buffer,
 		destinationScript: Buffer
 	): { ok: boolean; error?: string; commitmentTxid?: string } {
+		// Named ahead of the engine's own refusal (issue #905): the operator
+		// is told the exit is closed for a reason no acknowledgement reopens,
+		// under a code a client can tell from an ordinary failed close.
+		const revoked = this.forceCloseRevokedRefusal(channelId);
+		if (revoked !== null) {
+			this.emit('node:error', {
+				code: 'FORCE_CLOSE_REVOKED',
+				channelId,
+				message: revoked,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: revoked };
+		}
 		const result = this._forceCloseWithReason(
 			channelId,
 			destinationScript,
@@ -12839,10 +13112,18 @@ export class LightningNode extends EventEmitter {
 				// splice instead of zeroing the liquidity for the splice window.
 				htlcUsable: ch.htlcUsable,
 				// Keeps the advisor from recommending a force close of a channel
-				// whose local broadcast the restore hold forbids (issue #469).
+				// whose local broadcast the recency hold forbids (issues #469,
+				// #907).
 				...(ch.restoreRecencyUnproven === true
 					? { restoreRecencyUnproven: true }
-					: {})
+					: {}),
+				...(ch.reestablishRecencyUnproven === true
+					? { reestablishRecencyUnproven: true }
+					: {}),
+				...(ch.reestablishSecretMissing === true
+					? { reestablishSecretMissing: true }
+					: {}),
+				...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 			};
 		});
 		return this.liquidityAdvisor.analyze(snapshots);
@@ -12869,7 +13150,14 @@ export class LightningNode extends EventEmitter {
 			htlcUsable: ch.htlcUsable,
 			...(ch.restoreRecencyUnproven === true
 				? { restoreRecencyUnproven: true }
-				: {})
+				: {}),
+			...(ch.reestablishRecencyUnproven === true
+				? { reestablishRecencyUnproven: true }
+				: {}),
+			...(ch.reestablishSecretMissing === true
+				? { reestablishSecretMissing: true }
+				: {}),
+			...(ch.restoreRevokedRisk === true ? { restoreRevokedRisk: true } : {})
 		}));
 		const plans = planRebalances(snapshots, {
 			minImbalancePct:
@@ -13383,6 +13671,20 @@ export class LightningNode extends EventEmitter {
 		// from "funding unaccounted for" (issue #593).
 		if (state.restoreRecencyUnproven === true) {
 			info.restoreRecencyUnproven = true;
+		}
+		if (state.reestablishRecencyUnproven === true) {
+			info.reestablishRecencyUnproven = true;
+		}
+		// The same hold from a local fault (issue #919).
+		if (state.reestablishSecretMissing === true) {
+			info.reestablishSecretMissing = true;
+		}
+		// And the proven revocation (issues #905 and #915), which every
+		// readiness surface built on this info must exclude as well: the
+		// channel refuses every add, so advertising it as ready would route
+		// payments into a refusal and hand out routing hints no one can use.
+		if (state.restoreRevokedRisk === true) {
+			info.restoreRevokedRisk = true;
 		}
 		if (state.fundingUnaccounted === true) {
 			info.fundingUnaccounted = true;
@@ -16351,12 +16653,13 @@ export class LightningNode extends EventEmitter {
 		const finalHop = isFinalHop(processed.nextPacket);
 		let policyCode: number | null = null;
 		if (
-			channel.getFullState().restoreRecencyUnproven === true &&
+			(isRecencyUnproven(channel.getFullState()) ||
+				channel.getFullState().restoreRevokedRisk === true) &&
 			htlcEntry.addedWhileRestoreUnproven === true
 		) {
-			// A capsule-restored channel whose recency cannot be proven takes
-			// no NEW HTLCs (issue #469). Settling this would reveal a preimage
-			// against a peer we could never escalate against, because every
+			// A channel with unproven recency or a proven revocation takes
+			// no NEW HTLCs (issues #469 and #915). Settling this would reveal a
+			// preimage against a peer we could never escalate against, because every
 			// automatic close is refused while the hold stands, so the on-chain
 			// claim the deadline backstops exist to make can never happen;
 			// forwarding is the same bet with an extra leg.
@@ -17132,6 +17435,8 @@ export class LightningNode extends EventEmitter {
 		channelIdHex: string,
 		opts: {
 			forceCloseIfUnreachable?: boolean;
+			/** Required to force-close a channel with either recency hold. */
+			acceptStaleStateRisk?: boolean;
 			destinationScript?: Buffer;
 			timeoutMs?: number;
 		} = {}
@@ -17173,6 +17478,20 @@ export class LightningNode extends EventEmitter {
 			return { preimagesKnown, witnesses, action: 'nothing' };
 		}
 		if (opts.forceCloseIfUnreachable && opts.destinationScript) {
+			// A reestablish hold can arrive during the witness fetch above.
+			// Check the current state immediately before building a commitment,
+			// including direct library calls that have no daemon preflight.
+			const current = this.channelManager.getChannel(channelId);
+			if (
+				current &&
+				isRecencyUnproven(current.getFullState()) &&
+				opts.acceptStaleStateRisk !== true
+			) {
+				throw new InvalidRequestError(
+					'Force closing a channel with unproven recency requires ' +
+						'acceptStaleStateRisk: true'
+				);
+			}
 			const res = this.channelManager.forceClose(
 				channelId,
 				opts.destinationScript,
@@ -19998,6 +20317,28 @@ export class LightningNode extends EventEmitter {
 		const expiry = opts.expiry ?? JIT_RECEIVE_DEFAULT_EXPIRY_SECONDS;
 		const maxAmountMsat =
 			opts.amountMsat ?? opts.maxAmountMsat ?? JIT_RECEIVE_DEFAULT_MAX_MSAT;
+		// A JIT receive with no usable channel to the LSP is a promise that
+		// the LSP may open one to us: its engine serves the intercepted HTLC
+		// by opening a channel and forwarding onto it, and has no confirmed
+		// fallback. So an invoice minted while this node would REFUSE a
+		// brand-new channel (the issue #906 fence: a bare-seed boot before
+		// its first header, an unresolved capsule restore) is a promise it
+		// cannot keep, and the payer finds that out only when its payment
+		// fails back at the LSP. The fence lifts on its own, so this refuses
+		// here rather than minting, and says which condition holds.
+		//
+		// Asked of the SAME predicate the hint decision below uses: over an
+		// existing usable channel the payment needs no new channel at all and
+		// nothing here applies.
+		if (!this.liveChannelWith(opts.lspPubkeyHex)) {
+			const refusal = this.channelManager.newChannelRefusal();
+			if (refusal) {
+				throw new Error(
+					'JIT receive needs a new channel from the LSP, which this node ' +
+						`cannot accept right now: ${refusal}`
+				);
+			}
+		}
 		const grant = await this.requestJitReceive(opts.lspPubkeyHex, {
 			maxAmountMsat,
 			...(opts.amountMsat !== undefined
@@ -20012,14 +20353,18 @@ export class LightningNode extends EventEmitter {
 			...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
 			acceptsSkimmedFee: opts.feeMode !== 'hop'
 		});
-		// Over an existing usable channel with the LSP the invoice routes the
-		// way any private-channel invoice does (the channel's own hint is
-		// already built below): the intent still stands, and a payment that
-		// outgrows the channel is refused at the LSP's addHtlc and held while
-		// it splices the channel bigger (tryHoldForSplice). Carrying the
+		// Over an existing channel with the LSP the invoice routes the way
+		// any private-channel invoice does (the channel's own hint is already
+		// built below): the intent still stands, and a payment that outgrows
+		// the channel is refused at the LSP's addHtlc and held while it
+		// splices the channel bigger (tryHoldForSplice). Carrying the
 		// intercept hint alongside had payers pick it and the LSP open a
 		// SECOND channel to a wallet that already had one.
-		const existing = this.usableChannelWith(opts.lspPubkeyHex);
+		//
+		// A channel mid-splice counts: it is still the home channel, it still
+		// receives under its pre-splice scid, and an intercept hint minted
+		// while it splices is the same second channel by another door.
+		const existing = this.liveChannelWith(opts.lspPubkeyHex);
 		const result = this.createInvoice({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
@@ -24367,6 +24712,28 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * A channel with this peer that exists and will go on existing: NORMAL,
+	 * or NORMAL underneath a splice. The JIT receive decisions ask this, not
+	 * `usableChannelWith`: a wallet whose home channel is mid-splice needs no
+	 * second one, so its invoice must not carry the intercept hint and the
+	 * new-channel fence does not apply to it. A splice-in needs the channel
+	 * NORMAL, which is why the direct-funding receiver keeps the other.
+	 */
+	private liveChannelWith(peerHex: string): Buffer | null {
+		for (const channel of this.listChannels()) {
+			if (channel.peerPubkey !== peerHex) continue;
+			if (
+				channel.state !== ChannelState.NORMAL &&
+				channel.state !== ChannelState.SPLICING
+			) {
+				continue;
+			}
+			return channel.channelId;
+		}
+		return null;
+	}
+
+	/**
 	 * Is any channel with this peer mid-splice (issue #760)? SPLICING covers
 	 * the negotiation; a non-null `spliceInFlight` covers a signed splice that
 	 * is waiting on depth, during which the channel reads NORMAL again. The
@@ -24468,6 +24835,88 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Issue #906: make the chain-tip floor on the next channel key index
+	 * outlive the process. The floor raises the manager's counter without
+	 * writing any key-index row, so on its own it lasts one boot: a partial
+	 * restore on that boot (an SCB missing its highest-index entry) leaves
+	 * rows below the floor, and the next boot, seeing a populated table,
+	 * would seed the counter from those rows and hand the next channel an
+	 * index the previous device already used. Called at arm time and after
+	 * every header while the floor is pending; writes ONCE, the moment the
+	 * floor has fired, and is a no-op after that and on every later boot.
+	 * The value is the counter the floor raised (the tip times
+	 * CHANNEL_INDEX_FLOOR_STRIDE, or above it when something already stood
+	 * higher), and restoreFromStorage seeds every later boot's counter from
+	 * it beside the table's own high-water mark.
+	 * Returns true once the row holds the floor.
+	 */
+	private persistChannelIndexFloor(): boolean {
+		if (!this.storage) return false;
+		if (!this.channelIndexFloorPending) return true;
+		if (this.channelManager.channelIndexTipFloorArmed) return false;
+		const floor = this.channelManager.nextChannelIndex;
+		const written = this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(CHANNEL_KEY_INDEX_FLOOR_KEY, String(floor)),
+			'saveChannelKeyIndexFloor'
+		);
+		if (written) this.channelIndexFloorPending = false;
+		return written;
+	}
+
+	/**
+	 * Issue #917: record that the channel manager is handing out
+	 * `channelIndex`, BEFORE anything derived from it can leave this node.
+	 *
+	 * The key-index table only learns an index when the channel ROW
+	 * persists, which is well after accept_channel (or our own open_channel,
+	 * funding_created, funding_signed) put that index's basepoints in front
+	 * of the peer, and for an open the process does not survive it never
+	 * learns it at all. The next boot then re-handed the same index out, and
+	 * the next channel carried the funding key, the four basepoints and the
+	 * per-commitment seed of the one the peer had already seen: issue #906's
+	 * reuse with a crash as its cause rather than a restore. The chain-tip
+	 * floor does not cover it, because it fires once per database and a
+	 * crash does not make the database new.
+	 *
+	 * Monotone by construction: a lower index (one handed back by
+	 * _releaseUnusedChannelIndex and handed out again) writes nothing, so a
+	 * rejected inbound open leaves the mark at the value it consumed. The
+	 * cost is a one-index hole in the sequence across a restart, which is
+	 * nothing; the alternative, lowering the mark, is the reuse itself.
+	 *
+	 * THROWS when the row cannot be written. Returning normally is the
+	 * promise the manager acts on, so a failed write must refuse the open
+	 * instead: the throw lands with the counter untouched, an outbound
+	 * caller sees it and an inbound one is contained by handleMessage, and
+	 * no index is burned either way. A node with no storage keeps today's
+	 * behaviour, since it has no durable record of anything to contradict.
+	 *
+	 * @param channelIndex - The index about to be handed out
+	 */
+	private recordChannelIndexAllocation(channelIndex: number): void {
+		if (!this.storage) return;
+		if (!Number.isFinite(channelIndex) || channelIndex < 1) return;
+		if (channelIndex <= this.channelIndexAllocationMark) return;
+		const written = this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					CHANNEL_KEY_INDEX_ALLOCATED_KEY,
+					String(channelIndex)
+				),
+			'saveChannelKeyIndexAllocation'
+		);
+		if (!written) {
+			throw new Error(
+				`cannot record channel key index ${channelIndex} durably: a new ` +
+					`channel is refused rather than risk handing this index out ` +
+					`again after a restart`
+			);
+		}
+		this.channelIndexAllocationMark = channelIndex;
+	}
+
+	/**
 	 * Every per-block obligation the NODE owns, for one header.
 	 *
 	 * Split out of handleNewBlock because a node with a configured chain
@@ -24496,6 +24945,8 @@ export class LightningNode extends EventEmitter {
 				// best-effort
 			}
 		}
+		// Issue #906: a birth boot's first header fires the floor; write it.
+		this.persistChannelIndexFloor();
 		this.retryOwedHeldForwardFailures();
 		// Funding txs we are obligated to broadcast (BOLT 2) but which have
 		// not confirmed yet: retry, so a transient failure at watch:funding
@@ -24830,17 +25281,115 @@ export class LightningNode extends EventEmitter {
 	 * While it holds, the channel asks the peer to close instead
 	 * (Channel.buildRecoveryCloseActions, regenerated on every reconnect), and
 	 * forceCloseChannel stays ungated, which is 5.6's labelled escape hatch.
+	 *
+	 * The same hold has a second origin (issue #907, reestablishRecencyUnproven):
+	 * the peer's channel_reestablish claimed we are behind, naming a
+	 * revocation this row never released, and showed no proof. A peer that
+	 * holds our newer state but withholds the secret is indistinguishable
+	 * from one inventing the gap, so the row is held exactly as a restore
+	 * is, and the same labelled operator exit stays open. One predicate,
+	 * isRecencyUnproven, answers for both so they can never drift apart.
+	 *
+	 * One case closes the hatch as well, and is not this predicate's: a peer
+	 * that has PROVEN it holds the revocation for the row's current
+	 * commitment (restoreRevokedRisk, issues #905 and #915) leaves no risk
+	 * for an acknowledgement to accept, so forceCloseRevokedRefusal refuses
+	 * every reason, 'user' included.
 	 */
 	private skipAutoCloseRestoreUnproven(
 		state: IChannelState,
 		context: string
 	): boolean {
-		if (state.restoreRecencyUnproven !== true) return false;
+		if (!isRecencyUnproven(state)) return false;
 		this.emitStructuredLog('channel', 'close_skipped_restore_unproven', {
 			channelId: (state.channelId ?? state.temporaryChannelId).toString('hex'),
-			context
+			context,
+			hold: recencyHoldOrigin(state)
 		});
 		return true;
+	}
+
+	/**
+	 * Blocks between two HTLC_DEADLINE_HELD notices for the same HTLC and the
+	 * same backstop. The per-block scans would otherwise re-announce every
+	 * held HTLC on every block; roughly hourly is often enough for an operator
+	 * watching a CLTV deadline and quiet enough not to drown the event stream.
+	 */
+	private static readonly HELD_HTLC_DEADLINE_NOTICE_INTERVAL_BLOCKS = 6;
+
+	/**
+	 * Block height of the last HTLC_DEADLINE_HELD notice, keyed by
+	 * channel:htlcKey:backstop. Entries for HTLCs the scans no longer reach
+	 * are pruned on the next emit, so the map tracks live held HTLCs only.
+	 */
+	private readonly heldHtlcDeadlineNotices = new Map<string, number>();
+
+	/**
+	 * Announce an HTLC deadline the recency hold has disarmed (issue #907).
+	 *
+	 * The three HTLC deadline backstops skip a held row before they emit
+	 * their own node:error, so under issue #469 the only trace was the
+	 * close_skipped_restore_unproven structured log: acceptable while the
+	 * hold could only be entered by this node's own capsule restore, since
+	 * the operator who restored knows the row is held and the restore also
+	 * refuses new HTLCs. Under issue #907 a PEER can put a healthy channel
+	 * into the same hold at no cost, with HTLCs already on the row, and the
+	 * only exit is a human running the acknowledged force close BEFORE a
+	 * CLTV deadline passes. Silence there loses the HTLC's value with no
+	 * event ever raised, so the skip speaks on the same channel the
+	 * backstops use, with the height, the deadline and the labelled exit.
+	 *
+	 * Throttled per (channel, HTLC, backstop) rather than left to fire on
+	 * every block, since the scans run once per block for as long as the hold
+	 * stands.
+	 */
+	private emitHeldHtlcDeadline(
+		state: IChannelState,
+		channelId: Buffer,
+		htlcKey: string,
+		htlc: IHtlcEntry,
+		context: string,
+		blockHeight: number
+	): void {
+		const channelIdHex = channelId.toString('hex');
+		const noticeKey = `${channelIdHex}:${htlcKey}:${context}`;
+		const last = this.heldHtlcDeadlineNotices.get(noticeKey);
+		const interval = LightningNode.HELD_HTLC_DEADLINE_NOTICE_INTERVAL_BLOCKS;
+		// Absolute distance, so a reorg that lowers the height does not park
+		// the notice until the chain climbs back past it.
+		if (last !== undefined && Math.abs(blockHeight - last) < interval) return;
+		this.heldHtlcDeadlineNotices.set(noticeKey, blockHeight);
+		// A key the scans still reach is refreshed every `interval` blocks, so
+		// anything staler belongs to an HTLC that resolved or a channel that
+		// closed and can go.
+		for (const [key, height] of this.heldHtlcDeadlineNotices) {
+			if (Math.abs(blockHeight - height) > interval * 4) {
+				this.heldHtlcDeadlineNotices.delete(key);
+			}
+		}
+		const hold = recencyHoldOrigin(state) ?? 'reestablish';
+		const origin =
+			hold === 'restore'
+				? 'this channel was restored from a Recovery Capsule and no channel_reestablish has proven its state current'
+				: hold === 'secret-missing'
+				? 'this node could not produce the per-commitment secret its own channel_reestablish owes the peer'
+				: 'the peer claimed at channel_reestablish that this channel state is behind and showed no proof';
+		this.emit('node:error', {
+			code: 'HTLC_DEADLINE_HELD',
+			channelId,
+			message:
+				`channel ${channelIdHex} HTLC ${htlc.id} (payment hash ` +
+				`${htlc.paymentHash.toString('hex')}) expires at height ` +
+				`${htlc.cltvExpiry} and the chain is at ${blockHeight}, but the ` +
+				`${context} backstop is held: ${origin}, so this node will not ` +
+				`broadcast a commitment for it (${hold} ` +
+				`recency hold). The HTLC's value is lost if nothing resolves it ` +
+				`before the deadline. The labelled exit is an acknowledged force ` +
+				`close, POST /channel/forceclose with acceptStaleStateRisk: true ` +
+				`(CLI: channel forceclose --accept-stale-state-risk), which ` +
+				`publishes a commitment the peer may already hold a revocation for`,
+			timestamp: Date.now()
+		} as ILightningError);
 	}
 
 	/**
@@ -24859,7 +25408,9 @@ export class LightningNode extends EventEmitter {
 	 * that will not happen, or clear the tracker holding its retry.
 	 *
 	 * The operator's own force close (reason 'user') stays admitted: it is
-	 * 5.6's labelled escape hatch, and the only exit a fenced node has.
+	 * 5.6's labelled escape hatch, and the only exit a fenced node has. The
+	 * one refusal that covers 'user' as well is forceCloseRevokedRefusal
+	 * (issue #905), which names a certainty rather than a risk.
 	 */
 	private skipAutoCloseRecoveryGated(
 		channelId: Buffer,
@@ -25051,14 +25602,28 @@ export class LightningNode extends EventEmitter {
 					// balance. The same arithmetic covers a fenced or
 					// quarantined node (issue #588).
 					if (
-						this.skipAutoCloseRecoveryGated(
-							channelId,
-							'HTLC_CLAIM_FORCE_CLOSE'
-						) ||
-						this.skipAutoCloseRestoreUnproven(
+						this.skipAutoCloseRecoveryGated(channelId, 'HTLC_CLAIM_FORCE_CLOSE')
+					) {
+						continue;
+					}
+					// The recency hold gets its own arm so the skip can say so on
+					// the same event stream the close would have used (issue #907):
+					// a peer can park this row here with HTLCs already on it, and
+					// only an operator can take it out before the deadline.
+					if (
+						this.skipAutoCloseRestoreUnproven(state, 'HTLC_CLAIM_FORCE_CLOSE')
+					) {
+						this.emitHeldHtlcDeadline(
 							state,
-							'HTLC_CLAIM_FORCE_CLOSE'
-						) ||
+							channelId,
+							key,
+							htlc,
+							'HTLC_CLAIM_FORCE_CLOSE',
+							blockHeight
+						);
+						continue;
+					}
+					if (
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,
@@ -25136,11 +25701,29 @@ export class LightningNode extends EventEmitter {
 							this.skipAutoCloseRecoveryGated(
 								channelId,
 								'FORWARD_TIMEOUT_FORCE_CLOSE'
-							) ||
+							)
+						) {
+							continue;
+						}
+						// The recency hold announces the disarmed deadline (issue
+						// #907), as the claim arm above does.
+						if (
 							this.skipAutoCloseRestoreUnproven(
 								state,
 								'FORWARD_TIMEOUT_FORCE_CLOSE'
-							) ||
+							)
+						) {
+							this.emitHeldHtlcDeadline(
+								state,
+								channelId,
+								key,
+								htlc,
+								'FORWARD_TIMEOUT_FORCE_CLOSE',
+								blockHeight
+							);
+							continue;
+						}
+						if (
 							this.skipAutoCloseFundingNotOnChain(
 								channel,
 								state,
@@ -25299,11 +25882,29 @@ export class LightningNode extends EventEmitter {
 					this.skipAutoCloseRecoveryGated(
 						channelId,
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
-					) ||
+					)
+				) {
+					continue;
+				}
+				// The recency hold announces the disarmed deadline (issue #907),
+				// as the arms in scanExpiringHtlcs do.
+				if (
 					this.skipAutoCloseRestoreUnproven(
 						state,
 						'FORWARD_TIMEOUT_FORCE_CLOSE'
-					) ||
+					)
+				) {
+					this.emitHeldHtlcDeadline(
+						state,
+						channelId,
+						key,
+						htlc,
+						'FORWARD_TIMEOUT_FORCE_CLOSE',
+						blockHeight
+					);
+					continue;
+				}
+				if (
 					this.skipAutoCloseFundingNotOnChain(
 						channel,
 						state,
@@ -25516,6 +26117,7 @@ export class LightningNode extends EventEmitter {
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
+			newChannelsRefused?: INodeConfig['newChannelsRefused'];
 		}
 	): LightningNode {
 		const coinType = options?.coinType ?? LnCoinType.REGTEST;
@@ -25593,7 +26195,8 @@ export class LightningNode extends EventEmitter {
 			watchtowers: options?.watchtowers,
 			recovery: options?.recovery,
 			guardianHost: options?.guardianHost,
-			channelKeyDeriver
+			channelKeyDeriver,
+			newChannelsRefused: options?.newChannelsRefused
 		});
 	}
 
@@ -26630,11 +27233,28 @@ export class LightningNode extends EventEmitter {
 						this.skipAutoCloseRecoveryGated(
 							channelId,
 							'HTLC_EXPIRY_FORCE_CLOSE'
-						) ||
-						this.skipAutoCloseRestoreUnproven(
+						)
+					) {
+						continue;
+					}
+					// The recency hold announces the disarmed deadline (issue
+					// #907): this value is ours, and past the expiry the
+					// downstream claims it with the preimage while this node
+					// holds nothing.
+					if (
+						this.skipAutoCloseRestoreUnproven(state, 'HTLC_EXPIRY_FORCE_CLOSE')
+					) {
+						this.emitHeldHtlcDeadline(
 							state,
-							'HTLC_EXPIRY_FORCE_CLOSE'
-						) ||
+							channelId,
+							key,
+							htlc,
+							'HTLC_EXPIRY_FORCE_CLOSE',
+							blockHeight
+						);
+						continue;
+					}
+					if (
 						this.skipAutoCloseFundingNotOnChain(
 							channel,
 							state,
