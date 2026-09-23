@@ -103,9 +103,13 @@ Lightning-only metadata uses `address: null` (an omitted address is normalized t
 
 ## Offline receiving
 
-Normal fixed-amount Receive now prepares a durable reservation automatically. Users can close the wallet after sharing the request. Reopening discovers settled receipts and updates the ordinary balance and Activity. Unpaid requests remain payable until expiry.
+Receiving offline is an opt-in on the receive screen, never the default. A fixed-amount request prepares a durable reservation, and the wallet can close after sharing it. Reopening discovers settled receipts and updates the ordinary balance and Activity. Unpaid requests remain payable until expiry.
 
-This requires a Beignet 0.21.8 or newer settlement peer. The provider must enable settlement and explicitly budget any new receive channels. The app reports unsupported preparation without silently issuing an online-only invoice.
+An offline receive only uses a channel that already exists with the primary: usable, holding none of this wallet's balance, and with inbound of at least the amount plus 50,000 sats. It never asks the primary to open one. With no such channel, the ordinary request (a JIT invoice or a direct-funding envelope) is how the wallet receives.
+
+`GET /receive/offline` answers `{ maxSats }`: the largest amount one channel can hold offline right now, or 0 when none can hold the 354 sat minimum. The apps offer "Receive offline" only above 0. `GET /receive/quote` refuses with `RECEIVE_UNAVAILABLE` before contacting the primary when no channel can hold the amount.
+
+This requires a Beignet 0.21.8 or newer primary with settlement enabled. The app reports unsupported preparation without silently issuing an online-only invoice.
 
 See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evidence, commands, and deployment limits.
 
