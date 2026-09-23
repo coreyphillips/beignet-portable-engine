@@ -870,6 +870,10 @@ export async function createPortableRuntime(options: any) {
 				return n.listPayments();
 			case 'GET /invoices':
 				return n.listInvoices();
+			case 'GET /receive/offline':
+				return (
+					offlineReceive?.capacity(record.lfbw.primaryPubkey) ?? { maxSats: 0 }
+				);
 			case 'GET /receive/quote':
 				return offlineReceive!.quote(
 					record.lfbw.primaryPubkey,

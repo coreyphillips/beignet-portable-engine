@@ -19,6 +19,9 @@ const live = (e: any) => e && !['CLOSED', 'ABORTED'].includes(e.state);
 const fail = (code: string, message: string): never => {
 	throw Object.assign(new Error(message), { code, status: 409 });
 };
+const MINIMUM_SATS = Number(DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis);
+/** Inbound a receive channel keeps beyond the amount it holds offline. */
+const INBOUND_HEADROOM_SATS = 50000;
 export class OfflineReceive {
 	private jobs: Job[];
 	private creating = false;
@@ -61,11 +64,72 @@ export class OfflineReceive {
 			this.jobs.filter((j) => !j.done && j.channelId).map((j) => j.channelId!)
 		);
 	}
-	async quote(peer: string, amountSats: number): Promise<any> {
+	/**
+	 * Channels that can hold an offline receive of some amount: usable, with
+	 * the peer, unreserved, no live epoch, and holding none of this wallet's
+	 * money. Never park spendable money on a receive lane. A channel with
+	 * earned funds remains available to the normal send and channelize paths.
+	 */
+	private candidates(peer: string): any[] {
+		const reserved = this.reservedIds();
+		const epochs = this.node.fforEpochs('R');
+		return this.node
+			.listChannels()
+			.filter(
+				(c) =>
+					c.peerPubkey === peer &&
+					c.state === 'NORMAL' &&
+					c.htlcUsable &&
+					c.localBalanceSats === 0 &&
+					!reserved.has(c.channelId) &&
+					!live(epochs.find((e: any) => e.channelId === c.channelId))
+			);
+	}
+	private channelFor(peer: string, amountSats: number): any {
+		return this.candidates(peer).find(
+			(c) => c.remoteBalanceSats >= amountSats + INBOUND_HEADROOM_SATS
+		);
+	}
+	/**
+	 * The largest offline receive one channel can hold right now, or 0 when
+	 * none can hold the minimum. The wallet offers "Receive offline" only
+	 * above 0, so the refusals in quote and create only meet a race.
+	 */
+	capacity(peer: string): { maxSats: number } {
+		const most = this.candidates(peer).reduce(
+			(max, c) =>
+				Math.max(max, (Number(c.remoteBalanceSats) || 0) - INBOUND_HEADROOM_SATS),
+			0
+		);
+		return { maxSats: most >= MINIMUM_SATS ? most : 0 };
+	}
+	private unavailable(peer: string): never {
+		const { maxSats } = this.capacity(peer);
+		return fail(
+			'RECEIVE_UNAVAILABLE',
+			maxSats > 0
+				? `An offline receive can take up to ${maxSats} sats right now. Enter a smaller amount, or turn off Receive offline.`
+				: 'No channel can hold an offline receive right now. It needs a channel with your primary node that holds none of your balance. Turn off Receive offline to create an ordinary payment request.'
+		);
+	}
+	private checkAmount(amountSats: number) {
 		if (!Number.isSafeInteger(amountSats) || amountSats <= 0)
 			fail('AMOUNT_REQUIRED', 'Enter an amount for this payment request.');
-		const minimum = Number(DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis);
-		if (amountSats < minimum) fail('AMOUNT_TOO_SMALL', `Enter at least ${minimum} sats for this payment request.`);
+		if (amountSats < MINIMUM_SATS)
+			fail(
+				'AMOUNT_TOO_SMALL',
+				`Enter at least ${MINIMUM_SATS} sats for this payment request.`
+			);
+	}
+	async quote(peer: string, amountSats: number): Promise<any> {
+		this.checkAmount(amountSats);
+		// Refuse before the review rather than after it: without a channel that
+		// can hold the amount, create would only refuse later.
+		if (!this.channelFor(peer, amountSats)) this.unavailable(peer);
+		return this.terms(peer, amountSats);
+	}
+	private async terms(peer: string, amountSats: number): Promise<any> {
+		this.checkAmount(amountSats);
 		const terms = await this.node
 			.getFforReceiveService()
 			.request(peer, { op: 'quote' }, 15000);
@@ -128,7 +192,9 @@ export class OfflineReceive {
 				fail('QUOTE_EXPIRED', 'Review this payment request again.');
 			// Recheck terms before changing a channel. A peer cannot increase the
 			// authorized sender fee by returning a more expensive allocation reply.
-			const fresh = await this.quote(peer, body.amountSats);
+			// The channel is chosen below, so a retry whose own reservation holds
+			// the channel is not refused as if another request held it.
+			const fresh = await this.terms(peer, body.amountSats);
 			if (JSON.stringify(fresh.terms) !== JSON.stringify(body.quote.terms))
 				fail(
 					'FEE_CHANGED',
@@ -146,25 +212,7 @@ export class OfflineReceive {
 			}
 			await this.wait(() => this.node.getInfo().blockHeight > 0);
 			if (!job.channelId) {
-				const reserved = this.reservedIds();
-				// Never park spendable money on a receive lane. A channel with earned
-				// funds remains available to the normal send and channelize paths.
-				const channel = this.node
-					.listChannels()
-					.find(
-						(c) =>
-							c.peerPubkey === peer &&
-							c.state === 'NORMAL' &&
-							c.htlcUsable &&
-							c.localBalanceSats === 0 &&
-							c.remoteBalanceSats >= job!.amountSats + 50000 &&
-							!reserved.has(c.channelId) &&
-							!live(
-								this.node
-									.fforEpochs('R')
-									.find((e) => e.channelId === c.channelId)
-							)
-					);
+				const channel = this.channelFor(peer, job.amountSats);
 				// An offline receive is only for a channel that ALREADY exists with
 				// the primary and whose inbound covers the amount. It never obtains
 				// that capacity by having the primary open a channel: this used to
@@ -178,10 +226,7 @@ export class OfflineReceive {
 				if (!channel) {
 					job.done = true;
 					this.persist();
-					fail(
-						'RECEIVE_UNAVAILABLE',
-						'No channel can hold this offline receive yet. Create an ordinary payment request first; once the primary has funded a channel, offline requests can reuse it.'
-					);
+					this.unavailable(peer);
 				}
 				job.channelId = channel.channelId;
 				this.persist();

@@ -149,3 +149,90 @@ test('changed sender fees fail before a reservation or channel is created',async
  await assert.rejects(coordinator.create({requestId:'review',amountSats:20000,quote:{peer,amountSats:20000,terms:{feeBaseMsat:0,feePpm:0},expiresAt:2000}},peer),{code:'FEE_CHANGED'});
  assert.equal(saves,0);
 });
+
+function receiver(channels, { epochs = [], jobs = [], fees = { feeBaseMsat: 0, feePpm: 0 } } = {}) {
+	let requests = 0;
+	const node = {
+		listChannels: () => channels,
+		fforEpochs: () => epochs,
+		getFforReceiveService: () => ({
+			request: async () => {
+				requests++;
+				return { version: 1, ...fees };
+			}
+		})
+	};
+	const coordinator = new OfflineReceive(node, () => {}, jobs, () => 1000);
+	return {
+		coordinator,
+		get requests() {
+			return requests;
+		}
+	};
+}
+const empty = (remoteBalanceSats, extra = {}) => ({
+	channelId,
+	peerPubkey: peer,
+	state: 'NORMAL',
+	htlcUsable: true,
+	localBalanceSats: 0,
+	remoteBalanceSats,
+	...extra
+});
+const most = (channels, options) =>
+	receiver(channels, options).coordinator.capacity(peer).maxSats;
+
+test('capacity counts only an empty usable channel with the primary, less the headroom', () => {
+	assert.equal(most([]), 0);
+	assert.equal(most([empty(80000)]), 30000);
+	assert.equal(most([empty(80000), empty(120000, { channelId: '55'.repeat(32) })]), 70000);
+	assert.equal(most([empty(80000, { localBalanceSats: 1 })]), 0);
+	assert.equal(most([empty(80000, { peerPubkey: '03' + '33'.repeat(32) })]), 0);
+	assert.equal(most([empty(80000, { htlcUsable: false })]), 0);
+	assert.equal(most([empty(80000, { state: 'SPLICING' })]), 0);
+});
+test('capacity is 0 below the minimum offline amount', () => {
+	assert.equal(most([empty(50353)]), 0);
+	assert.equal(most([empty(50354)]), 354);
+});
+test('a reserved channel or one with a live epoch holds no further offline receive', () => {
+	const held = { id: 'held', peer, amountSats: 1000, allocationId: '44'.repeat(16), channelId };
+	assert.equal(most([empty(80000)], { jobs: [held] }), 0);
+	assert.equal(most([empty(80000)], { jobs: [{ ...held, done: true }] }), 30000);
+	assert.equal(most([empty(80000)], { epochs: [{ channelId, state: 'ACTIVE' }] }), 0);
+	assert.equal(most([empty(80000)], { epochs: [{ channelId, state: 'CLOSED' }] }), 30000);
+});
+test('quote refuses before asking the primary when no channel can hold the amount', async () => {
+	const none = receiver([empty(80000, { localBalanceSats: 5000 })]);
+	await assert.rejects(none.coordinator.quote(peer, 20000), {
+		code: 'RECEIVE_UNAVAILABLE',
+		message: /No channel can hold an offline receive right now/
+	});
+	assert.equal(none.requests, 0);
+	const small = receiver([empty(80000)]);
+	await assert.rejects(small.coordinator.quote(peer, 30001), {
+		code: 'RECEIVE_UNAVAILABLE',
+		message: /up to 30000 sats/
+	});
+	assert.equal(small.requests, 0);
+	const quote = await small.coordinator.quote(peer, 30000);
+	assert.equal(quote.available, true);
+	assert.equal(small.requests, 1);
+});
+test('a retried create is not refused over its own reservation', async () => {
+	const r = receiver([empty(80000)], {
+		jobs: [{ id: 'review', peer, amountSats: 20000, allocationId: '44'.repeat(16), channelId }],
+		fees: { feeBaseMsat: 1, feePpm: 0 }
+	});
+	await assert.rejects(
+		r.coordinator.create(
+			{
+				requestId: 'review',
+				amountSats: 20000,
+				quote: { peer, amountSats: 20000, terms: { feeBaseMsat: 0, feePpm: 0 }, expiresAt: 2000 }
+			},
+			peer
+		),
+		{ code: 'FEE_CHANGED' }
+	);
+});
