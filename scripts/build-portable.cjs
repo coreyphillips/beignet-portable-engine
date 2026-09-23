@@ -12,7 +12,6 @@ const aliases = {
 	tls: 'tls',
 	dns: 'unsupported',
 	http: 'unsupported',
-	https: 'unsupported',
 	os: 'unsupported',
 	zlib: 'zlib',
 	'better-sqlite3': 'sqlite'
@@ -21,6 +20,23 @@ for (const k in aliases)
 	aliases[k] = path.resolve('portable', aliases[k] + '.ts');
 aliases.path = require.resolve('path-browserify');
 aliases.stream = require.resolve('stream-browserify');
+// `https` resolves per importer: the Rapid Gossip Sync download gets a
+// fetch-backed get (portable/rgs-https.ts), and every other importer keeps
+// the explicit failure, so no other HTTPS client is quietly switched on.
+const RGS_IMPORTER = path.resolve('src/lightning/gossip/rapid-sync.ts');
+const httpsPerImporter = {
+	name: 'https-per-importer',
+	setup(build) {
+		build.onResolve({ filter: /^https$/ }, (args) => ({
+			path: path.resolve(
+				'portable',
+				path.resolve(args.importer) === RGS_IMPORTER
+					? 'rgs-https.ts'
+					: 'unsupported.ts'
+			)
+		}));
+	}
+};
 (async () => {
 	fs.mkdirSync('dist', { recursive: true });
 	for (const format of ['esm', 'cjs'])
@@ -33,6 +49,7 @@ aliases.stream = require.resolve('stream-browserify');
 				target: 'es2020',
 				outfile: `dist/portable.${format === 'esm' ? 'mjs' : 'cjs'}`,
 				alias: aliases,
+				plugins: [httpsPerImporter],
 				inject: ['portable/globals.ts'],
 				define: {
 					'process.env.NODE_ENV': '"production"',

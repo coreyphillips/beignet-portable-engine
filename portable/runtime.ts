@@ -896,6 +896,10 @@ export async function createPortableRuntime(options: any) {
 				return n.fforRecover({ channelId: b.channelId });
 			case 'GET /liquidity':
 				return n.getLiquiditySnapshot();
+			case 'GET /graph/info':
+				// The size of the network map routes are found on: the Rapid
+				// Gossip Sync snapshot plus what the primary gossips.
+				return n.getGraphInfo();
 			case 'GET /transactions':
 				return n.listOnchainTransactions();
 			case 'GET /receive/onchain':
