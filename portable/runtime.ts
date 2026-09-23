@@ -1,4 +1,5 @@
 import { OfflineReceive } from './offline-receive';
+import { explainNoRoute } from './no-route';
 import { BeignetNode } from '../src/cli/beignet-node';
 import { generateMnemonic, validateMnemonic } from 'bip39';
 import { Buffer } from 'buffer';
@@ -957,7 +958,38 @@ export async function createPortableRuntime(options: any) {
 				});
 			case 'POST /payment/estimate': {
 				const value = n.estimatePayment(b.bolt11, b.amountSats);
-				if (!value) failure('NO_ROUTE', 'Unable to estimate payment');
+				if (!value) {
+					// The router answers only null. Say which fact stopped it.
+					let decoded: any = null;
+					try {
+						decoded = n.decodeInvoice(b.bolt11);
+					} catch {
+						decoded = null;
+					}
+					const primary: string | null = record?.lfbw?.primaryPubkey ?? null;
+					const why = explainNoRoute({
+						amountSats:
+							decoded?.amountSats ??
+							(Number.isSafeInteger(b.amountSats) ? b.amountSats : null),
+						destination: decoded?.payeeNodeKey ?? null,
+						hasRoutingHints: !!decoded?.routingHints?.length,
+						primaryPubkey: primary,
+						primaryConnected: n
+							.listPeers()
+							.some(
+								(p: any) =>
+									p.pubkey === primary &&
+									(p.connected === true ||
+										p.state === 'ready' ||
+										p.state === 'connected')
+							),
+						channels: n.listChannels(),
+						sendableSats: Number(n.getLiquiditySnapshot().sendableSats) || 0,
+						graphChannelCount: (pubkey) =>
+							n.getGraphNode(pubkey)?.channelCount ?? null
+					});
+					failure(why.code, why.message);
+				}
 				return value;
 			}
 			case 'POST /invoice/pay-safe':
