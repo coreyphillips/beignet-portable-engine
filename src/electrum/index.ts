@@ -66,6 +66,15 @@ import {
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
 
 /**
+ * The constructor and connectToElectrum both accept one server or a list of
+ * them; every consumer wants the list.
+ */
+function toServerList(servers?: TServer | TServer[]): TServer[] {
+	if (!servers) return [];
+	return Array.isArray(servers) ? servers : [servers];
+}
+
+/**
  * A well formed script hash used only to ask a server whether it is still
  * answering. It addresses nothing; the balance in the reply is discarded. The
  * same value rn-electrum-client uses for its own post-connect probe.
@@ -669,13 +678,12 @@ export class Electrum {
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
-		let customPeers = servers
-			? Array.isArray(servers)
-				? servers
-				: [servers]
-			: [];
-		// @ts-ignore
-		customPeers = customPeers.length ? customPeers : this?.servers ?? [];
+		// The instance's own servers may be a single object too (#980), so the
+		// fallback is normalized the same way as the argument.
+		const givenPeers = toServerList(servers);
+		const customPeers = givenPeers.length
+			? givenPeers
+			: toServerList(this.servers);
 		const electrumNetwork = getElectrumNetwork(network);
 		if (
 			!disableRegtestCheck &&
@@ -707,6 +715,18 @@ export class Electrum {
 				}
 				lastError = String(startResponse.error);
 				continue;
+			}
+			// disconnect() may have landed during the dial. It released this
+			// instance's hold and withdrew it from the routers, and it does not
+			// wait for the attempt it interrupted, so recording the server now
+			// would put a stopped instance back into connectedServers, where
+			// isOurPeer would keep vouching for the peer on behalf of a wallet
+			// that has stopped, with nothing left to release the entry. The
+			// socket the dial built is taken back down and nothing is recorded:
+			// the candidate did connect, so it is not charged a failure either.
+			if (this._disconnected) {
+				await electrum.stop({ network: electrumNetwork });
+				return err(DISCONNECTED_ERROR);
 			}
 			this.recordServerSuccess(candidate, electrumNetwork);
 			connected = true;
@@ -770,7 +790,13 @@ export class Electrum {
 		// stopped. Take it back down, and announce nothing: disconnect()
 		// publishes nothing itself, and a connected event for a stopped wallet
 		// is a lie its consumers act on.
+		// The hold is released as well. The candidate loop records a server
+		// only after it saw the flag clear, so nothing should be held here
+		// today, but an await that lands between that record and this check
+		// would let disconnect() slip in after the record, and a hold that
+		// outlives disconnect() is released by nobody.
 		if (this._disconnected) {
+			this.holdConnectedServer(null, null);
 			await electrum.stop({ network: electrumNetwork });
 			return err(DISCONNECTED_ERROR);
 		}
@@ -2833,6 +2859,41 @@ export class Electrum {
 			);
 		}
 		this.connectedToElectrum = false;
+	}
+
+	/**
+	 * Stops an instance whose wallet was never handed to anyone, such as the
+	 * one a Wallet.create builds before it returns an error (issue #966).
+	 *
+	 * The constructor starts the connection poll, and the caller has no wallet
+	 * to stop, so without this the poll runs forever: it connects to the
+	 * configured servers, reports the connection through a wallet the caller
+	 * was told does not exist, and keeps the process alive.
+	 *
+	 * The full disconnect() only runs when this instance is connected or has a
+	 * connect in flight. It stops rn-electrum-client's client for the network,
+	 * and there is only one of those per network in the whole process, so for
+	 * an instance that never connected it would tear down the socket a sibling
+	 * wallet on the same network is using.
+	 * @returns {Promise<void>}
+	 */
+	public async abandon(): Promise<void> {
+		this.stopConnectionPolling();
+		// A poll tick already running checks this at entry and again before it
+		// reconnects, so it returns instead of putting the instance on the
+		// network. Only an explicit connectToElectrum clears it.
+		this._disconnected = true;
+		const connecting = this._connectInFlight;
+		if (!this.connectedToElectrum && !connecting) return;
+		if (connecting) {
+			// The attempt reads the flag above, so it never reports a
+			// connection. How it ended does not matter here, only that the
+			// teardown runs after it: an attempt that succeeds records its server
+			// as held by this instance, and one that finished after disconnect()
+			// would leave that record with nothing left to release it.
+			await connecting.catch(() => undefined);
+		}
+		await this.disconnect();
 	}
 
 	public startConnectionPolling(): void {

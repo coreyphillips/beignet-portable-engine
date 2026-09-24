@@ -82,7 +82,7 @@ const node = await BeignetNode.create({
   backupPath?: string,      // enable automated backups to this path
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
   storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
-  dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC); see Spending Limits
+  dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC; the day's ledger is persisted and survives a restart); see Spending Limits
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
@@ -209,15 +209,15 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). `maxFeeSats` caps routing fees. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
-| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws** — catches all errors and resolves with `status: 'FAILED'` instead. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
+| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
-| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until it settles or its claim expires (24h). |
+| `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
-| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s). |
+| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
 
 #### BOLT 12 Offers
@@ -227,7 +227,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). Drain mode and the spending limits apply to the returned invoice's amount |
+| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount |
 
 #### Channel Readiness
 
@@ -270,6 +270,10 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `enqueuePayment(bolt11, priority?, opts?)` | `QueuedPayment` | Add payment to priority queue (1-10, lower = higher priority). `opts: { amountSats?, maxFeeSats?, metadata? }` |
 | `listQueue()` | `QueuedPayment[]` | List all queue entries |
 | `cancelQueuedPayment(id)` | `boolean` | Cancel a queued payment by ID |
+| `resolveInterruptedPayment(bolt11)` | `Promise<InterruptedPaymentOutcome>` | How a payment the queue was dispatching ended (one a restart interrupted, or one still out at the queue's payment timeout), from the node's record (in memory, then on disk): `{ status: 'completed', paymentHash }` or `{ status: 'unpaid' }`, once every HTLC offered for it is resolved. The queue's resolver for such an entry |
+| `whenReadyToPay(run)` | `void` | Calls `run` once the node can pay: after a pending guardian restore, once the node is ready, and once some channel can carry an HTLC (or there is no channel); never after shutdown |
+
+Entries survive a restart. The queue dispatches the restored ones once some channel can carry an HTLC after the start (or no channel is left that could), and looks again on every `channel:usable`, without waiting for another enqueue. A payment enqueued before that dispatches on its own; the restored ones wait. An entry left `dispatching` by a restart is checked against the node's record for its invoice before anything sends it again: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead, and one you build yourself dispatches restored entries only once you call `start()`. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching`, its concurrency slot is released, and it is recorded from the node's outcome through the same check, `completed` when the payment settles and `failed` ("Payment was left pending by the dispatch and then failed without paying") once every HTLC resolved with nothing paid; it is not queued again in this process; a restart settles it like any interrupted entry, and one that paid nothing is then queued again. An entry the resolver could not answer (no node to ask yet) is asked about again on `start()` and on `resettle()`, which the daemon calls once a capsule resume has rebuilt the node; a `PaymentQueue` you build yourself calls `resettle()` itself. A `PaymentQueue` without a resolver records such a dispatch `failed` with its outcome unknown, for you to look up before paying that invoice again (issue #976). `amountSats` and `maxFeeSats` must be whole numbers of satoshis, zero or greater; `enqueuePayment` (and `POST /queue/add`) refuses anything else with `INVALID_PARAMS`. An entry whose amount is in its invoice rather than in `amountSats` waits for capacity for that amount just as one with `amountSats` does, instead of being dispatched unchecked into "no route" (issue #981); a `PaymentQueue` you build yourself gets this by passing `invoiceAmountSats`, a callback that returns the invoice's amount in whole satoshis, since the queue never decodes an invoice itself. The daemon and `BeignetNode` share one queue per process: the routes under `/queue` and `enqueuePayment`/`listQueue`/`cancelQueuedPayment` serve the same `PaymentQueue`, which persists through the node's current storage, so it keeps working after an in-process capsule restore replaces the database (issue #978).
 
 #### Liquidity & Channel Intelligence
 
@@ -695,9 +699,23 @@ the same amount. `payOffer` is checked and recorded the same way, against the
 amount of the BOLT 12 invoice the payee returns for the offer, which is what
 gets paid whatever `amountSats` asked for.
 
+The ledger is persisted (issue #977): a restart within the UTC day resumes
+the day's total, and the budget a payment still holds while its HTLC is out
+comes back with it. A Lightning payment is charged when it settles, once,
+whichever path sent it (`payInvoice`, `sendKeysend`, `payOffer`,
+`sendPaymentAsync`), including a settle that lands after `payInvoice` gave up
+waiting or after a restart. Before this the counters were per-process, so
+every restart started the day at zero. Failed payments are not charged, and
+a payment that fails with nothing left in flight gives its budget back at
+once. A payment cancelled while its HTLC is out keeps its budget held until
+that HTLC settles or fails back, or the 24h window ends: the HTLC cannot be
+retracted, and releasing the budget on the cancel would let it be spent
+twice. `getDailySpendInfo().pendingSats` is what in-flight payments hold,
+and `remainingSats` subtracts it, so it is what the next payment can pass.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
+| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
 
 #### Drain Mode
 
@@ -711,8 +729,8 @@ gets paid whatever `amountSats` asked for.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops (default 30s timeout) |
-| `destroy()` | `Promise<void>` | Immediate shutdown (stops wallet, storage, node) |
+| `gracefulShutdown(timeoutMs?)` | `Promise<void>` | Graceful shutdown: drains in-flight HTLCs, persists state, then stops the node, then the on-chain wallet, then closes the database, so the wallet's last writes land (default 30s timeout) |
+| `destroy()` | `Promise<void>` | Immediate shutdown (stops the node, then the on-chain wallet, then closes the database) |
 
 ### Events
 
@@ -946,8 +964,9 @@ interface ChannelHealth {
 
 interface DailySpendInfo {
   limitSats: number | null; // null if no limit configured
-  spentSats: number;        // sats spent today
-  remainingSats: number;    // sats remaining (Infinity if no limit)
+  spentSats: number;        // sats spent today (persisted; survives a restart within the UTC day)
+  remainingSats: number;    // sats the next payment can pass: limit minus spent minus pending (Infinity if no limit)
+  pendingSats: number;      // sats held by payments still in flight
   resetsAt: number;         // unix ms — next midnight UTC
 }
 
@@ -1085,6 +1104,7 @@ interface BeignetNodeEvents {
   'hold:cancelled': (data: HoldInvoiceEvent & { reason: 'api' | 'expiry-scan' }) => void;
   'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
   'channel:ready': (data: { channelId: string }) => void;
+  'channel:usable': (data: { channelId: string }) => void;  // can take a new HTLC again (lock, reconnect, splice lock or unwind, funding quarantine lifted); not relayed over SSE
   'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:force-closing': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:closed': (data: { channelId: string }) => void;
@@ -1175,13 +1195,13 @@ not repeat a 4xx unchanged.
 | `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
 | `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
 | `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
-| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout |
+| `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976) |
 | `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
 | `NO_ROUTE` | Payments | 502 | No route found to destination |
 | `INVALID_INVOICE` | Payments | 400 | BOLT 11 string failed to parse |
 | `INVALID_OFFER` | Payments | 400 | BOLT 12 offer string failed to parse |
 | `INSUFFICIENT_BALANCE` | Payments | 409 | Not enough balance to send, or to fund the requested open |
-| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already pending |
+| `DUPLICATE_PAYMENT` | Payments | 409 | Payment with this hash already completed, or still has an HTLC out; `payInvoiceSafe` returns the existing record instead |
 | `SPENDING_LIMIT_EXCEEDED` | Payments | 403 | Daily spending limit exceeded (permanent) |
 | `CHANNEL_NOT_FOUND` | Channels | 404 | Channel ID does not exist |
 | `CHANNEL_NOT_READY` | Channels | 409 | Channel is not in NORMAL state |
@@ -1230,7 +1250,7 @@ usual 502, because the payee refuses it every time. Failure bodies carry
 
 #### Typed Payment Errors (Lightning Layer)
 
-When `payInvoice()` fails, the underlying `LightningNode` throws a `LightningPaymentError` with a typed `code` property. The CLI layer catches these and maps them to `BeignetErrorCode`, but you can also import and check them directly:
+When a send is refused, the underlying `LightningNode` throws a `LightningPaymentError` with a typed `code` property. The CLI layer catches these and maps them to `BeignetErrorCode`, in `payInvoice()`, `sendPaymentAsync()`, `sendKeysend()` and `payOffer()` alike (issue #991), so every payment route answers a refusal with its own code and HTTP status. When driving the `LightningNode` directly you can import and check them yourself:
 
 ```typescript
 import { LightningPaymentError, LightningErrorCode } from 'beignet/cli';
@@ -1241,7 +1261,7 @@ try {
   if (err instanceof LightningPaymentError) {
     switch (err.code) {
       case LightningErrorCode.NO_ROUTE:         // No path to destination
-      case LightningErrorCode.DUPLICATE_PAYMENT: // Payment hash already in-flight
+      case LightningErrorCode.DUPLICATE_PAYMENT: // Payment hash already paid or in-flight
       case LightningErrorCode.NO_CHANNEL_TO_HOP: // No channel to first hop peer
       case LightningErrorCode.FEE_EXCEEDS_MAX:   // Route fee exceeds maxFeeMsat
       case LightningErrorCode.MISSING_AMOUNT:     // Amount-less invoice with no amount
@@ -1398,7 +1418,7 @@ beignet fees
 
 beignet spend-limit
 # Combined LN + on-chain budget with breakdown (spentSats == totalSats, kept for back-compat):
-# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
+# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"pendingSats":0,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
 
 beignet logs --category payment --limit 20
 # {"ok":true,"result":[{"category":"payment","action":"sent","timestamp":...,"data":{...}}]}
@@ -1475,7 +1495,9 @@ CPFP when RBF is unavailable).
 `--daily-spend-limit`, `send` and `send-max` count amount + fee against the
 SAME daily budget as Lightning payments and fail with
 `SPENDING_LIMIT_EXCEEDED` once it is exhausted. This limit was previously
-Lightning-only. `consolidate`, channel funding and `tx bump-fee`/`tx boost`
+Lightning-only. The ledger is persisted, so a daemon restart within the UTC
+day resumes the day's total rather than starting it at zero.
+`consolidate`, channel funding and `tx bump-fee`/`tx boost`
 are not counted. Frozen UTXOs are excluded from every send path (`send`,
 `send-max`, `consolidate`, `psbt build`) until unfrozen.
 
@@ -1865,10 +1887,12 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_AUTO_BOOTSTRAP` | `true` to auto-connect to DNS seed peers on start |
 | `BEIGNET_BACKUP_PATH` | Automated backup destination path |
 | `BEIGNET_BACKUP_INTERVAL_MS` | Backup interval in milliseconds (default: 21600000 = 6h) |
-| `BEIGNET_DAILY_SPEND_LIMIT_SATS` | Daily spending limit in satoshis (resets at midnight UTC) |
+| `BEIGNET_DAILY_SPEND_LIMIT_SATS` | Daily spending limit in satoshis (resets at midnight UTC; the day's ledger survives a restart) |
 | `BEIGNET_CONNECT_TIMEOUT_MS` | Timeout for `connectPeer()` in milliseconds (default: 15000) |
 | `BEIGNET_TLS_CERT` | Path to TLS certificate for HTTPS daemon |
 | `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
+| `BEIGNET_TOR_PROXY` | SOCKS5 proxy as `host:port` for outbound Lightning peer and watchtower connections (e.g. Tor at `127.0.0.1:9050`); `.onion` peers need one. Unset, `.onion` peers fall back to `127.0.0.1:9050` and everything else is dialed directly |
+| `BEIGNET_TOR_PROXY_ONION_ONLY` | `true` to use `BEIGNET_TOR_PROXY` for `.onion` hosts only and dial public clearnet hosts directly (hybrid mode, LND's `tor.skip-proxy-for-clearnet-targets`); exact `true`/`false`, anything else is ignored. Needs `BEIGNET_TOR_PROXY`, or startup is refused |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
 | `BEIGNET_EAGER_GOSSIP_VERIFY` | `true` to verify foreign gossip signatures at intake instead of lazily at serve time (default: lazy; exact `true`/`false`, anything else is ignored) |
 | `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
@@ -1912,6 +1936,27 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_SWAP_SUBMARINE_REFUND_DELTA_BLOCKS` | Blocks from a submarine create to its refund height (default 288, bounds 144 to 432); an invoice whose final CLTV plus a 72 block route budget cannot fit under the refund height minus the margins is refused as `CLTV_UNFITTABLE` |
 | `BEIGNET_DF_RELAY` | Relay direct-funding frames for OTHER nodes (`true`/`false`, default off). Paying and being paid needs nothing switched on; this is work done for strangers, metered but not free |
 | `BEIGNET_DF_MIN_AMOUNT` | Smallest direct-funding offer this node serves, a whole number of satoshis. Clamps up to the 5000 sat protocol floor; a partly numeric value refuses startup |
+
+### Tor proxy
+
+`BEIGNET_TOR_PROXY` (`--tor-proxy`, config key `torProxy`) sets the SOCKS5
+proxy for outbound peer and watchtower connections. On its own it proxies every
+public host, which hides the node's clearnet address from its peers at the cost
+of Tor's latency on every dial. `BEIGNET_TOR_PROXY_ONION_ONLY=true`
+(`--tor-proxy-onion-only`, config key `torProxyOnionOnly`) keeps the proxy for
+`.onion` hosts only, so a node can reach onion peers through a Tor that lives
+elsewhere (a separate container, say) while dialing clearnet peers directly.
+It needs `BEIGNET_TOR_PROXY`: set alone it has nothing to act on and startup is
+refused. Private and loopback hosts are dialed directly in every case, because
+Tor refuses them.
+
+| Destination | proxy alone | proxy plus onion-only |
+|---|---|---|
+| `.onion` | proxy | proxy |
+| private or loopback | direct | direct |
+| public clearnet | proxy | direct |
+
+Guardian sessions over bolt8 already dial only onion hosts through the proxy.
 
 ### Priority Order
 
@@ -2051,7 +2096,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
-| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. |
+| POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. A refusal carries the same code and status as `/invoice/pay`: 409 `DUPLICATE_PAYMENT` for a hash already paid or still in flight, 502 `NO_ROUTE`, 400 `INVALID_INVOICE`, and so on, never a bare 502 `PAYMENT_FAILED` (issue #991). |
 | POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |
 | POST | `/payment/metadata` | `{ paymentHash, metadata }` | Attach key-value metadata to an existing payment |
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
@@ -2100,7 +2145,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
-| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat) |
+| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat; `pendingSats` is what in-flight payments hold and `remainingSats` subtracts it). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
 | POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
 | POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |

@@ -448,6 +448,7 @@ async function handleStart(): Promise<void> {
 	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
 	const torProxyFlag = parseFlag('--tor-proxy');
 	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
+	if (hasFlag('--tor-proxy-onion-only')) cliFlags.torProxyOnionOnly = true;
 	const announceAddrFlag = parseFlag('--announce-addr');
 	if (announceAddrFlag)
 		cliFlags.announceAddresses = announceAddrFlag
@@ -496,17 +497,17 @@ async function handleStart(): Promise<void> {
 	try {
 		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
 
-		writePidFile(process.pid, daemonPort);
-		output({
-			ok: true,
-			result: { message: 'Node started', port: daemonPort, pid: process.pid }
-		});
-
 		// Clean shutdown on signals: the same teardown POST /stop runs, so an
 		// in-flight backup completes and SQLite closes before the process ends.
 		// The inner bound caps the node's HTLC drain; the outer one covers a
 		// hang the node's own timeout does not reach (SQLite close, wallet
 		// stop) so Ctrl-C always terminates.
+		// The handlers go in before the pid file and the `Node started` line
+		// announce readiness (issue #968). A supervisor or test that signals
+		// as soon as it sees the banner would otherwise hit the default action
+		// and kill the process with no drain, no wallet stop and the pid file
+		// left behind. removePidFile ignores a missing file, and a signal is
+		// only handled once this synchronous block has written the pid file.
 		const SHUTDOWN_NODE_TIMEOUT_MS = 10_000;
 		const SHUTDOWN_FORCE_EXIT_MS = 15_000;
 		let shuttingDown = false;
@@ -533,6 +534,12 @@ async function handleStart(): Promise<void> {
 		};
 		process.on('SIGINT', shutdown);
 		process.on('SIGTERM', shutdown);
+
+		writePidFile(process.pid, daemonPort);
+		output({
+			ok: true,
+			result: { message: 'Node started', port: daemonPort, pid: process.pid }
+		});
 
 		if (isDaemon) {
 			// Keep running
@@ -3050,6 +3057,9 @@ Start flags:
   --tls-key <path>                       TLS private key file (requires --tls-cert)
   --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
                                          connections (e.g. Tor at 127.0.0.1:9050)
+  --tor-proxy-onion-only                 Use --tor-proxy for .onion peers only and
+                                         dial public clearnet peers directly
+                                         (hybrid mode; needs --tor-proxy)
   --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
                                          (IPv4, [ipv6]:port, .onion v3, or hostname;
                                          port defaults to 9735)

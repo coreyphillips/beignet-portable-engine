@@ -1,3 +1,16 @@
+# Portable engine validation, 2026-09-24 addendum
+
+The fork now tracks upstream Beignet **0.22.0** (`7f53b7a`, the version bump commit the npm release was built from), resynced from 0.21.12 on 2026-09-24; this addendum supersedes the "now tracks" line of the one below, and `PATCHES.md` carries the method and what the release changes for this fork. A tarball of the 0.21.12 fork was written first (`beignet-engine-backup-0.21.12-2026-09-24.tar.gz` at the workspace root, `node_modules` and `dist` excluded). Upstream had changed seven of the nineteen patched files; 50 of the 51 hunks reapplied to pristine `7f53b7a` with no fuzz (26 by an offset only, the largest 288 lines in `beignet-node.ts`), and the one that did not was the destination-routing hunk in `peer-manager.ts`, ported by hand onto upstream's new `selectOutboundProxy` call (#963). The reapplied tree's sorted added and removed lines are identical to the recaptured patch's except in that hunk, and the fork-only `reconstructable-batch.ts` was restored. The esbuild input graph grows from 546 to 547 inputs, the new `src/cli/node-storage-view.ts`.
+
+Checks, all on 2026-09-24:
+
+- `npm test`: 82 of 82 unit tests pass.
+- `tsc --noEmit` with the repository's `tsconfig.json`, on `main` and on the resynced tree: 22 errors before and 22 after, the identical set by file and message.
+- `npm run check:types` passes, and the built `dist/portable.mjs` and `dist/portable.cjs` report `0.22.0-portable`.
+- `npm run test:regtest:channelize` exits 0 with all 18 checks passing against the Docker `bitcoin` and `electrum` containers and the local CLN: deposit spliced into the home channel, a second wallet paying this wallet's request by direct funding in one transaction, and a deposit that opens a channel. The direct-funding payer child logged `invalid tag (chacha20-poly1305, 65535 bytes, aad 0)` from its peer twice, disconnected and redialled the primary, and the step passed; `channelize` was not run on 0.21.12, so whether that is new is not known.
+
+Not run for this resync: `test:regtest`, `test:smoke`, the FFOR regtests, and the shared and browser suites.
+
 # Portable engine validation, 2026-09-23 addendum
 
 The fork now tracks upstream Beignet **0.21.12** (`79bfc46`, the version bump commit, taken before it was published to npm), resynced from 0.21.10 on 2026-09-23 with 0.21.11 taken in the same step; this addendum supersedes the "now tracks" line of the one below, and `PATCHES.md` carries the method and what the two releases change for this fork. A tarball of the 0.21.10 fork was written first (`beignet-engine-backup-0.21.10-2026-09-23.tar.gz` at the workspace root, `node_modules` and `dist` excluded). Upstream had changed three of the nineteen patched files; 50 of the 51 hunks reapplied to pristine `79bfc46` with no fuzz (21 by an offset only, the largest 64 lines in `lightning-node.ts`), and the one that did not was a formatting-only quote change in `src/cli/beignet-node.ts` whose line upstream replaced with a typed refusal (#920), so it was dropped. The reapplied tree's sorted added and removed lines are identical to the recaptured patch's less that reflow, and the fork-only `reconstructable-batch.ts` was restored. The esbuild input graph is unchanged at 544 inputs.
