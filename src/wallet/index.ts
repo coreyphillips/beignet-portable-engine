@@ -211,6 +211,12 @@ export class Wallet {
 	// outlasts two new blocks is final (issue #935). Memory only: a restart
 	// counts again from its own first miss, which only waits longer.
 	private readonly _noTxindexMisses: Map<string, number> = new Map();
+	// How often this session has set each transaction's exists flag to false,
+	// by txid. A refresh acts on its answer for a transaction only if no
+	// clearing came after its lookup went out: otherwise it neither rewrites
+	// the record, which would read it as back, nor watches it again. Never
+	// reset, so a count never repeats (issues #945 and #964).
+	private readonly _ghostClearings: Map<string, number> = new Map();
 	// The highest tip updateHeader has replaced. A failover to a server
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
@@ -490,11 +496,16 @@ export class Wallet {
 	}
 
 	static async create(params: IWallet): Promise<Result<Wallet>> {
+		// Outside the try, so the catch can reach a wallet the constructor built.
+		let wallet: Wallet | undefined;
 		try {
-			const wallet = new Wallet(params);
+			wallet = new Wallet(params);
 			if (wallet._disableMessagesOnCreate) wallet.disableMessages = true;
 			const res = await wallet.setWalletData();
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) {
+				await wallet._abandonFailedCreate();
+				return err(res.error.message);
+			}
 			void wallet.updateFeeEstimates(true);
 			// A host that owns the startup refresh (and must hold its ONE
 			// promise, e.g. BeignetNode.waitForInitialSync) opts out here so
@@ -502,7 +513,33 @@ export class Wallet {
 			if (!wallet._disableRefreshOnCreate) void wallet.refreshWallet({});
 			return ok(wallet);
 		} catch (e) {
+			if (wallet) await wallet._abandonFailedCreate();
 			return err(e);
+		}
+	}
+
+	/**
+	 * Silences and stops a wallet Wallet.create is about to report as failed
+	 * (issue #966). The constructor has already started the Electrum
+	 * connection poll, and the caller never receives this instance, so nothing
+	 * else could ever stop it: it would go on connecting, calling onMessage
+	 * for a wallet the caller was told does not exist, and keeping the process
+	 * alive.
+	 *
+	 * Never throws. A teardown that fails is logged, so the caller still gets
+	 * the error that failed the create rather than this one.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async _abandonFailedCreate(): Promise<void> {
+		this.disableMessages = true;
+		try {
+			await this.electrum.abandon();
+		} catch (e) {
+			this.logger.warn(
+				'Unable to stop the Electrum connection of a wallet that failed to create.',
+				e
+			);
 		}
 	}
 
@@ -3291,6 +3328,17 @@ export class Wallet {
 		//If the tx is reorg'd or bumped from the mempool and no longer exists, the transaction will be removed from the store and updated in the activity list.
 		await this.checkUnconfirmedTransactions();
 
+		// Every transaction's clearing count as this refresh's lookup goes out.
+		// A record's height and address come from its address history entry, so
+		// an answer is only as new as the history call below. A clearing that
+		// lands after this point, from a check beside this refresh, may rest on
+		// a newer answer than this one, so it stands on every branch below: the
+		// record is neither rewritten from this answer nor watched again, and
+		// the next refresh reads it again if the transaction really is back.
+		// This refresh's own check, and the forced refresh nested in its rescan,
+		// are done by now, so neither counts as newer (issues #945 and #964).
+		const clearingsAtLookup = new Map(this._ghostClearings);
+
 		const history = await this.electrum.getAddressHistory({
 			scanAllAddresses: scanAllAddresses || replaceStoredTransactions
 		});
@@ -3308,7 +3356,6 @@ export class Wallet {
 				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
-
 		const getTransactionsResponse = await this.electrum.getTransactions({
 			txHashes: filteredTxHashes
 		});
@@ -3322,17 +3369,44 @@ export class Wallet {
 		if (formatTransactionsResponse.isErr()) {
 			return err(formatTransactionsResponse.error.message);
 		}
-		const transactions = formatTransactionsResponse.value;
+		// The answers this refresh may still act on: every transaction no
+		// clearing has landed on since its lookup went out. Both the watch
+		// below and the record writes are taken from this one map, since
+		// updateGhostTransactions relies on a refresh that reads a record as
+		// back watching it in the same stretch. Nothing awaits between here and
+		// the merge into the transactions map, so no clearing can land in
+		// between (issue #964).
+		const fresh: IFormattedTransactions = {};
+		for (const [txid, transaction] of Object.entries(
+			formatTransactionsResponse.value
+		)) {
+			if (
+				(this._ghostClearings.get(txid) ?? 0) ===
+				(clearingsAtLookup.get(txid) ?? 0)
+			) {
+				fresh[txid] = transaction;
+			}
+		}
 
 		// Add unconfirmed transactions.
 		// No need to wait for this to finish.
 		void this.addUnconfirmedTransactions({
-			transactions
+			transactions: fresh
 		});
 
 		if (replaceStoredTransactions) {
-			// No need to check the existing txs since we're replacing them. Update with the returned formatTransactionsResponse.
-			this._data.transactions = transactions;
+			// No need to check the existing txs since we're replacing them. Update
+			// with the fresh answers. A transaction this refresh looked up but has
+			// no fresh answer for keeps the record it has, since the missing answer
+			// says nothing about it: a clearing landed on it meanwhile (issue
+			// #964), the server answered its entry with an error (issue #934), or
+			// its batch failed (issue #872).
+			const next: IFormattedTransactions = { ...fresh };
+			for (const { tx_hash } of filteredTxHashes) {
+				const kept = this._data.transactions[tx_hash];
+				if (!(tx_hash in next) && kept) next[tx_hash] = kept;
+			}
+			this._data.transactions = next;
 			await this.saveWalletData('transactions', this._data.transactions);
 			return ok(undefined);
 		}
@@ -3346,17 +3420,22 @@ export class Wallet {
 		const receivedTxs: TTransactionMessage[] = [];
 		const sentTxs: TTransactionMessage[] = [];
 
-		Object.keys(transactions).forEach((txid) => {
+		Object.keys(fresh).forEach((txid) => {
 			const stored = storedTransactions[txid];
 			const isNew = !stored;
-			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (isNew || stored.height !== transactions[txid].height) {
+			// The ghost path leaves a cleared record at height 0, and a transaction
+			// back in the mempool returns at height 0 too, so only its exists flag
+			// changed. The server has just served it, and the record was cleared
+			// before this lookup went out, so it is pending again (issue #945).
+			const returned = stored?.exists === false;
+			//If the tx is new, was cleared and is back, or now has a different block height
+			if (isNew || returned || stored.height !== fresh[txid].height) {
 				formattedTransactions[txid] = {
-					...transactions[txid],
+					...fresh[txid],
 					// Keep the previous timestamp if the tx is not new.
 					timestamp:
 						storedTransactions[txid]?.timestamp ??
-						transactions[txid]?.timestamp ??
+						fresh[txid]?.timestamp ??
 						Date.now()
 				};
 				// A confirmation is a transition: a transaction the wallet already
@@ -3380,10 +3459,10 @@ export class Wallet {
 
 			// if the tx is new, incoming but not from a transfer - show notification
 			if (isNew) {
-				if (transactions[txid].type === EPaymentType.received) {
-					receivedTxs.push({ transaction: transactions[txid] });
-				} else if (transactions[txid].type === EPaymentType.sent) {
-					sentTxs.push({ transaction: transactions[txid] });
+				if (fresh[txid].type === EPaymentType.received) {
+					receivedTxs.push({ transaction: fresh[txid] });
+				} else if (fresh[txid].type === EPaymentType.sent) {
+					sentTxs.push({ transaction: fresh[txid] });
 				}
 				notificationTxid = txid;
 			}
@@ -3473,7 +3552,7 @@ export class Wallet {
 	): Promise<Result<string>> {
 		try {
 			// What the check below looks up. An entry a refresh adds while it
-			// waits is in none of its results.
+			// waits is in none of its results, and both branches below keep it.
 			const observed = new Set(Object.keys(this.getUnconfirmedTransactions()));
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
@@ -3510,7 +3589,12 @@ export class Wallet {
 				});
 				if (updated.isErr()) return err(updated.error.message);
 			} else {
-				this._data.unconfirmedTransactions = unconfirmedTxs;
+				// As on the ghost path, an entry a refresh added while this check
+				// waited is kept (issue #944).
+				this._data.unconfirmedTransactions = this.keepAddedMeanwhile(
+					unconfirmedTxs,
+					observed
+				);
 				const saved = await this.saveWalletData(
 					'unconfirmedTransactions',
 					this._data.unconfirmedTransactions
@@ -3742,6 +3826,32 @@ export class Wallet {
 	}
 
 	/**
+	 * What a check leaves under observation: the map it built, plus every entry
+	 * a refresh added while it waited. Such an entry is not among what the
+	 * check looked up, so it is in none of its results, and a record found
+	 * already in a block is not fetched again: this entry is all that would
+	 * notice a later reorg of it (issue #944). An entry the check did look up
+	 * keeps the check's copy, so one it dropped stays dropped. Read after the
+	 * check's last await, so an entry added during any of them is kept.
+	 * @private
+	 * @param {IFormattedTransactions} unconfirmedTxs The check's own map.
+	 * @param {Set<string>} observed Every transaction that check looked up.
+	 * @returns {IFormattedTransactions}
+	 */
+	private keepAddedMeanwhile(
+		unconfirmedTxs: IFormattedTransactions,
+		observed: Set<string>
+	): IFormattedTransactions {
+		const next: IFormattedTransactions = { ...unconfirmedTxs };
+		for (const [txid, transaction] of Object.entries(
+			this.getUnconfirmedTransactions()
+		)) {
+			if (!observed.has(txid)) next[txid] = transaction;
+		}
+		return next;
+	}
+
+	/**
 	 * Removes transactions from the store and activity list.
 	 * @private
 	 * @async
@@ -3765,6 +3875,10 @@ export class Wallet {
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
+					this._ghostClearings.set(
+						txId,
+						(this._ghostClearings.get(txId) ?? 0) + 1
+					);
 					// A reorg'd out transaction no mempool took back is answered "no
 					// such transaction" rather than with no confirmations: by a server
 					// with a txindex always, and by electrs on a node without one for
@@ -3790,15 +3904,19 @@ export class Wallet {
 			// The check's own map rather than the old one less these ghosts: a
 			// transaction the same round found back in the mempool is observed at
 			// zero from now on, where its old copy would report the same reorg
-			// again on the next check. An entry a refresh added while the check
-			// waited is not in that map, and is kept: a record found already in
-			// a block is not fetched again, so this entry is all that would
-			// notice a later reorg of it.
-			const next: IFormattedTransactions = { ...unconfirmedTxs };
-			for (const [txid, transaction] of Object.entries(
-				this.data.unconfirmedTransactions
-			)) {
-				if (!observed.has(txid)) next[txid] = transaction;
+			// again on the next check.
+			const next = this.keepAddedMeanwhile(unconfirmedTxs, observed);
+			// A refresh whose lookup went out during the write above, after these
+			// clearings, may have been served one of these ghosts, read it as back
+			// and watched it again. Its record no longer reads cleared, and
+			// dropping its entry would leave it held and unwatched, so a later
+			// loss would never show. The next check judges it again instead
+			// (issue #945). A refresh whose lookup went out before these
+			// clearings leaves them be (issue #964).
+			for (const txId of txIds) {
+				const live = this.data.unconfirmedTransactions[txId];
+				const record = this.data.transactions[txId];
+				if (live && record && record.exists !== false) next[txId] = live;
 			}
 			this._data.unconfirmedTransactions = next;
 			// Their counted misses end here, with their observation, and not when
@@ -4032,6 +4150,11 @@ export class Wallet {
 
 	/**
 	 * Formats the provided transaction.
+	 *
+	 * A transaction is left out of the result, like an entry the server
+	 * answered with an error, when the previous output of any of its inputs
+	 * could not be looked up (issue #965). The caller keeps whatever record it
+	 * has for it and the next refresh tries again.
 	 * @async
 	 * @param {ITransaction<IUtxo>[]} transactions
 	 * @returns {Promise<Result<IFormattedTransactions>>}
@@ -4063,7 +4186,7 @@ export class Wallet {
 				});
 			}
 		});
-		const inputDataResponse = await this.getInputData({
+		const inputDataResponse = await this._getInputData({
 			inputs
 		});
 		if (inputDataResponse.isErr()) {
@@ -4072,7 +4195,7 @@ export class Wallet {
 			);
 		}
 		const addressTypeKeys = Object.values(EAddressType);
-		const inputData = inputDataResponse.value;
+		const { inputData, unresolved } = inputDataResponse.value;
 		const currentAddresses = currentWallet.addresses;
 		const currentChangeAddresses = currentWallet.changeAddresses;
 
@@ -4105,10 +4228,34 @@ export class Wallet {
 		);
 
 		const formattedTransactions: IFormattedTransactions = {};
+		const heldBack: string[] = [];
 		transactions.forEach(({ data, result }) => {
 			// An entry the server answered with an error carries no result
 			// (issue #934). Skip it and format the rest of the batch.
 			if (!result?.txid) {
+				return;
+			}
+
+			// Hold back a transaction with an input whose previous output could
+			// not be looked up. Formatted from a partial answer, the wallet's own
+			// send has no matched input value and reads as received, with its
+			// change as the value and a fee that is off by the missing input. It
+			// has to be any input, not only one spending a transaction the wallet
+			// knows: on a restore the history scan covers a window of addresses at
+			// a time (filterAddressesForGapLimit), so the wallet's own funding
+			// transaction may not be known yet. Left out here, the transaction is
+			// neither recorded nor announced and the next refresh tries again.
+			// The balance does not depend on it, since UTXOs are read separately
+			// (issue #965).
+			const unresolvedInput = result.vin.some(
+				(vin) =>
+					'txid' in vin &&
+					vin.txid !== undefined &&
+					vin.vout !== undefined &&
+					unresolved.has(`${vin.txid}${vin.vout}`)
+			);
+			if (unresolvedInput) {
+				heldBack.push(result.txid);
 				return;
 			}
 
@@ -4232,11 +4379,23 @@ export class Wallet {
 			};
 		});
 
+		if (heldBack.length) {
+			this.logger.warn(
+				'Holding back transactions whose inputs could not all be looked up, to retry on the next refresh:',
+				heldBack
+			);
+		}
+
 		return ok(formattedTransactions);
 	}
 
 	/**
 	 * Returns formatted input data from the inputs array.
+	 *
+	 * An input whose previous output could not be looked up, even on a retry,
+	 * is missing from the result. formatTransactions holds back a transaction
+	 * with such an input rather than format it from a partial answer (issue
+	 * #965).
 	 * @async
 	 * @param {{tx_hash: string, vout: number}[]} inputs
 	 * @returns {Promise<Result<InputData>>}
@@ -4246,6 +4405,33 @@ export class Wallet {
 	}: {
 		inputs: { tx_hash: string; vout: number }[];
 	}): Promise<Result<InputData>> {
+		const res = await this._getInputData({ inputs });
+		if (res.isErr()) return err(res.error);
+		return ok(res.value.inputData);
+	}
+
+	/**
+	 * Looks up the previous output of each input, and names the inputs it
+	 * could not resolve.
+	 *
+	 * An input is unresolved when no usable answer came back for it on the
+	 * first attempt or on a retry: the server answered it with an error, with
+	 * nothing, or with a transaction lacking that output. It is found by what
+	 * is missing rather than by the error branch, so each of these is retried
+	 * and reported. Inputs are keyed as formatTransactions looks them up,
+	 * `${tx_hash}${vout}`, taken from the request. An input the server calls
+	 * too large to send is neither retried nor unresolved, since that answer
+	 * does not change (issue #965).
+	 * @private
+	 * @async
+	 * @param {{tx_hash: string, vout: number}[]} inputs
+	 * @returns {Promise<Result<{ inputData: InputData; unresolved: Set<string> }>>}
+	 */
+	private async _getInputData({
+		inputs
+	}: {
+		inputs: { tx_hash: string; vout: number }[];
+	}): Promise<Result<{ inputData: InputData; unresolved: Set<string> }>> {
 		try {
 			// Defense-in-depth behind the updateTransactions guard: never ask
 			// the server for a prevout that does not exist (coinbase inputs
@@ -4254,7 +4440,30 @@ export class Wallet {
 				(i) => i.tx_hash !== undefined && i.vout !== undefined
 			);
 			const inputData: InputData = {};
-			const failedRequests: { tx_hash: string; vout: number }[] = [];
+			// The last error the server answered each input with.
+			const errors = new Map<string, { code?: number; message?: string }>();
+			// Inputs Electrum considers too large to send. No point in asking for
+			// them again, so they are logged and skipped.
+			const tooLarge = new Set<string>();
+
+			const read = (
+				answers: ITransaction<{ tx_hash: string; vout: number }>[]
+			): void => {
+				for (const { data, result, error } of answers) {
+					if (!data) continue;
+					const key = `${data.tx_hash}${data.vout}`;
+					const output = result?.vout?.[data.vout];
+					if (output?.scriptPubKey) {
+						inputData[key] = this._extractVoutData(output);
+					} else if (error) {
+						errors.set(key, error);
+						if (/response too large/i.test(error.message ?? '')) {
+							tooLarge.add(key);
+							this._logGetInputDataError(error, data);
+						}
+					}
+				}
+			};
 
 			const batchLimit = this.electrum.batchLimit;
 			for (let i = 0; i < inputs.length; i += batchLimit) {
@@ -4271,29 +4480,18 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						if (
-							error?.message &&
-							error.message.includes('response too large')
-						) {
-							// No point in re-running this tx_hash since Electrum considers the tx too large, just log the error.
-							this._logGetInputDataError(error, data);
-						} else {
-							failedRequests.push(data);
-						}
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
 
-			// Attempt to retrieve the data for any failed getTransactionsFromInputs request.
-			for (const input of failedRequests) {
+			// Every input still without a usable answer, each asked once more.
+			const missing = new Map<string, { tx_hash: string; vout: number }>();
+			for (const input of inputs) {
+				const key = `${input.tx_hash}${input.vout}`;
+				if (!(key in inputData) && !tooLarge.has(key)) {
+					missing.set(key, input);
+				}
+			}
+			for (const input of missing.values()) {
 				const getTransactionsResponse =
 					await this.electrum.getTransactionsFromInputs({
 						txHashes: [input]
@@ -4305,19 +4503,21 @@ export class Wallet {
 							getTransactionsResponse.error?.data
 					);
 				}
-				getTransactionsResponse.value.data.map(({ data, result, error }) => {
-					if (result && result?.vout) {
-						const { addresses, value, key } = this._extractVoutData(
-							result.vout[data.vout],
-							data
-						);
-						inputData[key] = { addresses, value };
-					} else if (error) {
-						this._logGetInputDataError(error, data);
-					}
-				});
+				read(getTransactionsResponse.value.data);
 			}
-			return ok(inputData);
+
+			const unresolved = new Set<string>();
+			for (const [key, input] of missing) {
+				if (key in inputData || tooLarge.has(key)) continue;
+				unresolved.add(key);
+				const error = errors.get(key);
+				if (error) {
+					this._logGetInputDataError(error, input);
+				} else {
+					this.logger.warn('No usable answer for input data of:', input);
+				}
+			}
+			return ok({ inputData, unresolved });
 		} catch (e) {
 			return err(e);
 		}
@@ -4327,21 +4527,19 @@ export class Wallet {
 	 * Extracts data from the provided vout.
 	 * @private
 	 * @param {IVout} vout
-	 * @param { tx_hash: string; vout: number } data
-	 * @returns { addresses: string[]; value: number; key: string }
+	 * @returns { addresses: string[]; value: number }
 	 */
-	private _extractVoutData(
-		vout: IVout,
-		data: { tx_hash: string; vout: number }
-	): { addresses: string[]; value: number; key: string } {
+	private _extractVoutData(vout: IVout): {
+		addresses: string[];
+		value: number;
+	} {
 		const addresses = vout.scriptPubKey.addresses
 			? vout.scriptPubKey.addresses
 			: vout.scriptPubKey.address
 			? [vout.scriptPubKey.address]
 			: [];
 		const value = vout.value;
-		const key = `${data.tx_hash}${vout.n}`;
-		return { addresses, value, key };
+		return { addresses, value };
 	}
 
 	/*
@@ -5482,12 +5680,16 @@ export class Wallet {
 	}
 
 	/**
-	 * Sets "exists" to false for a given on-chain transaction id.
+	 * Sets "exists" to false for a given on-chain transaction id. A refresh
+	 * whose lookup goes out after this and gets the transaction from the server
+	 * sets it back to true (issue #945). One whose lookup was already in flight
+	 * leaves it false and does not watch it again (issue #964).
 	 * @param {string} txid
 	 */
 	async addGhostTransaction({ txid }: { txid: string }): Promise<void> {
 		if (txid in this._data.transactions) {
 			this._data.transactions[txid].exists = false;
+			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 		}
 		await this.saveWalletData('transactions', this._data.transactions);
 	}

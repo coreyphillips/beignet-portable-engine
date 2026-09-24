@@ -34,6 +34,7 @@ import {
 	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
+import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
@@ -136,7 +137,10 @@ import {
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
-import { socks5SocketFactory } from '../lightning/transport/peer-manager';
+import {
+	Socks5ProxyScope,
+	socks5SocketFactory
+} from '../lightning/transport/peer-manager';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
 import {
@@ -159,7 +163,10 @@ import {
 	ChannelFundingUnavailableCode,
 	SpliceRefusalCode,
 	IHoldCancelledEvent,
-	IHoldInvoiceStateEvent
+	IHoldInvoiceStateEvent,
+	IStructuredLog,
+	PaymentDirection,
+	PaymentStatus
 } from '../lightning/node/types';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -168,6 +175,8 @@ import {
 	isAnchorChannel,
 	ChannelState
 } from '../lightning/channel/types';
+import { isRecencyUnproven } from '../lightning/channel/channel-state';
+import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
 import {
@@ -176,7 +185,11 @@ import {
 	describeFailureCode,
 	isRetryableError
 } from './errors';
-import { PaymentQueue } from './payment-queue';
+import {
+	IPaymentQueueStorage,
+	InterruptedPaymentOutcome,
+	PaymentQueue
+} from './payment-queue';
 import {
 	NodeInfo,
 	PeerInfo,
@@ -454,6 +467,15 @@ export interface BeignetNodeOptions {
 	 * an onion address. Needs a running Tor daemon/Tor Browser on that port.
 	 */
 	torProxy?: string;
+	/**
+	 * Use torProxy for `.onion` peers only and dial public clearnet peers
+	 * directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 * Without it every public peer rides the proxy. Private and loopback hosts
+	 * are dialed directly either way. Needs torProxy: startup is refused when
+	 * this is set without one, since it only chooses which hosts use the
+	 * configured proxy. Applies to peer dials and watchtower connections.
+	 */
+	torProxyOnionOnly?: boolean;
 	/**
 	 * Addresses to advertise in our node_announcement so remote peers can
 	 * discover and dial us, as "host[:port]" strings (port defaults to 9735).
@@ -775,6 +797,30 @@ export function parseScid(scid: string): Buffer {
 }
 
 /**
+ * The BeignetError code for each LightningErrorCode the engine throws out of a
+ * send, as payInvoice has always mapped them. Every public payment method
+ * routes an engine refusal through this table (issue #991), so a refusal
+ * carries the same code, and over HTTP the same status, whichever method or
+ * route it came in by.
+ */
+export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+	NO_ROUTE: 'NO_ROUTE',
+	DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
+	NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
+	FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
+	// The caller's own bound (#751): its code, not a generic failure, so a
+	// swap provider can tell "no route under the refund height" from "no
+	// route at all".
+	CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
+	MISSING_AMOUNT: 'INVALID_PARAMS',
+	INVALID_INVOICE: 'INVALID_PARAMS',
+	// A keysend refused for its own arguments (a destination that is not a
+	// 33-byte key, a zero amount): the caller's problem, as MISSING_AMOUNT is.
+	INVALID_KEYSEND: 'INVALID_PARAMS',
+	INVOICE_EXPIRED: 'INVOICE_EXPIRED'
+};
+
+/**
  * Decode a user-supplied BOLT 11 string. The parser throws plain Error, which
  * the daemon scrubs to a generic 500 and logs as an unhandled server fault;
  * a typed INVALID_INVOICE keeps the parser's message and answers 400.
@@ -988,7 +1034,10 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
 /**
- * One dispatched async payment attempt's claim on the daily budget.
+ * One dispatched Lightning payment attempt's claim on the daily budget,
+ * whichever path sent it: payInvoice, sendKeysend, payOffer and
+ * sendPaymentAsync all open one at admission, and the payment:sent handler
+ * in create() charges it when the payment settles (issue #977).
  *
  * A claim has two lifetimes. Its RESERVATION holds `sats` in
  * _pendingSpendSats so nothing else is admitted against capacity this attempt
@@ -1003,15 +1052,24 @@ export interface AsyncSpendClaim {
 	expiresAt: number;
 	/** Whether `sats` is still counted in _pendingSpendSats. */
 	reserved: boolean;
+	/**
+	 * Set on the claims a hash still holds once a settlement of that hash has
+	 * been charged to another of them. A boot reconciliation can only tell
+	 * that the hash settled, not how many times, so it charges nothing for a
+	 * hash whose claims all carry this; an in-process settlement report still
+	 * charges one claim per report (issue #977).
+	 */
+	settled?: boolean;
 }
 
 /**
  * How long a dispatched async payment keeps HOLDING daily budget. The hold has
  * to outlive the payment's own FAILED report: BOLT 2 has no way to retract an
- * update_add_htlc, so cancelPayment(), the engine's stuck-payment sweep and its
- * expired-invoice sweep all mark a payment failed while its HTLC is still live,
- * and the engine deliberately completes such a payment when the preimage turns
- * up. One full daily window is where the hold ends, because by then the budget
+ * update_add_htlc, so cancelPayment() marks a payment failed while its HTLC is
+ * still live (the payment timeouts and the expired-invoice sweep leave such a
+ * payment PENDING since #976), and the engine deliberately completes such a
+ * payment when the preimage turns up. One full daily window is where the hold
+ * ends, because by then the budget
  * the payment was admitted against has itself rolled over.
  *
  * This is emphatically not a claim that the HTLC is dead by then — routing
@@ -1033,6 +1091,32 @@ export const ASYNC_SPEND_CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
  * the one direction a spending limit must never fail in.
  */
 export const MAX_ASYNC_SPEND_CLAIMS = 4096;
+
+/**
+ * Metadata key of the persisted daily spend ledger (issue #977): the day's
+ * counters and every open claim, written after each mutation and read back
+ * at boot, so a restart within the UTC day neither forgets what the day
+ * already spent nor loses the claim a settlement still has to charge.
+ */
+export const DAILY_SPEND_STATE_KEY = 'daemon:daily-spend:v1';
+
+/** The row under DAILY_SPEND_STATE_KEY. */
+export interface PersistedDailySpendState {
+	/** Epoch ms of the next midnight UTC, when the counters go back to zero. */
+	resetTime: number;
+	totalSats: number;
+	lightningSats: number;
+	onchainSats: number;
+	/** paymentHash hex -> that hash's claims, oldest first. */
+	claims: Record<string, AsyncSpendClaim[]>;
+}
+
+/** Epoch ms of the next midnight UTC, when the daily counters reset. */
+const nextUtcMidnight = (): number => {
+	const next = new Date();
+	next.setUTCHours(24, 0, 0, 0);
+	return next.getTime();
+};
 
 /**
  * Direct-funding offers remembered as charged to the daily budget. Only a
@@ -1425,6 +1509,37 @@ function isHeldRestore(ch: {
 	);
 }
 
+/** States a channel never takes a new HTLC from again. */
+const CLOSING_CHANNEL_STATES: ReadonlySet<ChannelState> = new Set([
+	ChannelState.SHUTTING_DOWN,
+	ChannelState.NEGOTIATING_CLOSING,
+	ChannelState.CLOSED,
+	ChannelState.FORCE_CLOSED,
+	ChannelState.ERRORED
+]);
+
+/**
+ * Whether a channel can still come to take a new HTLC (issue #967): one that
+ * is closing, closed or failed cannot, looked through a pending reestablish,
+ * and neither can one under a recency hold, which ends only in a close.
+ */
+function canBecomeUsable(channel: Channel): boolean {
+	const st = channel.getFullState();
+	const effective =
+		st.state === ChannelState.AWAITING_REESTABLISH && st.preReestablishState
+			? st.preReestablishState
+			: st.state;
+	return !CLOSING_CHANNEL_STATES.has(effective) && !isRecencyUnproven(st);
+}
+
+/**
+ * Private trigger for the pay-readiness wait: a channel closed, failed or
+ * went away, so "no live channel left" may now hold (issue #967). A symbol,
+ * so it is no public event, and shutdown's removeAllListeners() takes its
+ * listeners with the rest.
+ */
+const CHANNELS_CHANGED = Symbol('channels-changed');
+
 /**
  * The refusal an operator force close of a capsule-restored channel gets
  * without the labelled acknowledgement RECOVERY-PROTOCOL 5.6 asks for
@@ -1522,6 +1637,12 @@ export class BeignetNode extends EventEmitter {
 	private wallet!: Wallet;
 	private node!: LightningNode;
 	private storage!: SqliteStorage;
+	/**
+	 * The fenced view of the database the current node was built on (issue
+	 * #958). Kept so shutdown can fence it even when the node's own teardown
+	 * throws before its close.
+	 */
+	private _nodeStorageView?: SqliteStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
@@ -1714,43 +1835,46 @@ export class BeignetNode extends EventEmitter {
 	private _websocketPort?: number;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
-	// _dailySpentSats is the combined LN + onchain total; the two source
-	// counters below only feed the GET /spend-limit breakdown.
+	// The daily ledger (issue #977). _dailySpentSats is the combined LN +
+	// onchain total; the two source counters below only feed the
+	// GET /spend-limit breakdown. Every field down to _asyncSpendClaims is
+	// persisted under DAILY_SPEND_STATE_KEY after each mutation and restored
+	// at boot, so a restart within the UTC day resumes the day where it was.
 	private _dailySpentSats = 0;
 	private _dailySpentLightningSats = 0;
 	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	/**
-	 * paymentHash hex -> the budget claim of every async attempt dispatched for
-	 * that hash, oldest first. A payment submitted through the fire-and-forget
-	 * path returns before it settles and so has no local listener to release
-	 * its reservation; the forwarding payment:sent handler installed in
-	 * create() charges one claim per settlement, which keeps the listener count
-	 * constant no matter how many async payments are in flight.
+	 * paymentHash hex -> the budget claim of every Lightning payment attempt
+	 * dispatched for that hash, oldest first, whichever path sent it. A
+	 * blocking call's own listener may be gone by the time the settlement
+	 * lands (a timeout with the HTLC still out, or a restart), so no path
+	 * charges its own settlement: the forwarding payment:sent handler
+	 * installed in create() charges one claim per settlement, from this
+	 * ledger, which is persisted (issue #977). That also keeps the listener
+	 * count constant no matter how many payments are in flight.
 	 *
 	 * A claim's sats stay counted in _pendingSpendSats until its reservation is
-	 * released, and a payment reporting FAILED does NOT release it: the HTLC
-	 * cannot be retracted and the engine completes the payment if the preimage
-	 * turns up, so freeing the budget there let a caller cancel a live payment
-	 * to win its daily allowance back and spend it twice. A reservation ends
-	 * only when a settlement charges it, when the engine reported dispatching
-	 * nothing, or when it expires (ASYNC_SPEND_CLAIM_TTL_MS). The record itself
-	 * outlives the reservation so that a settlement arriving afterwards is
-	 * still charged, to the day it arrives on.
+	 * released, and a payment reporting FAILED does NOT release it while an
+	 * HTLC is still out: the HTLC cannot be retracted and the engine completes
+	 * the payment if the preimage turns up, so freeing the budget there let a
+	 * caller cancel a live payment to win its daily allowance back and spend
+	 * it twice. A reservation ends when a settlement charges it (the hash's
+	 * other claims release with it, since the engine reports one settlement
+	 * per hash and refuses a re-send of a paid hash), when a failure report
+	 * arrives with nothing in flight for the hash any more (the payment:failed
+	 * handler in create(), so the release does not depend on a listener that
+	 * a timeout or a restart may have removed), or when it expires
+	 * (ASYNC_SPEND_CLAIM_TTL_MS). The record itself outlives the reservation
+	 * so that a settlement arriving afterwards is still charged, to the day
+	 * it arrives on.
 	 *
 	 * One claim per ATTEMPT, not per hash: a resubmission dispatched while an
 	 * earlier attempt's HTLC may still be out there is a second live claim, and
 	 * either of them can be the one that settles.
 	 */
 	private readonly _asyncSpendClaims = new Map<string, AsyncSpendClaim[]>();
-	/**
-	 * paymentHash hex -> how many blocking sends (payInvoice) currently own that
-	 * hash's spend accounting. Their own listener records the settlement, so the
-	 * forwarding handler in create() must not charge an async claim for the same
-	 * event. Held only for as long as the listener is installed.
-	 */
-	private readonly _blockingPaymentHashes = new Map<string, number>();
 	private _maxPaymentSats?: number;
 	/**
 	 * Paid L402 credentials, so a gated API is paid for once rather than per
@@ -1968,6 +2092,15 @@ export class BeignetNode extends EventEmitter {
 			if (refusal !== null) {
 				throw new BeignetError('INVALID_PARAMS', `jitReceive: ${refusal}`);
 			}
+		}
+		// Refused before the lock, storage or Electrum are touched (issue
+		// #963): the switch only narrows which hosts use the proxy, so with no
+		// proxy configured it is a misconfiguration and not a no-op.
+		if (opts.torProxyOnionOnly && !opts.torProxy) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'torProxyOnionOnly needs torProxy: it only chooses which hosts use the configured proxy'
+			);
 		}
 		const networkName = this.networkName;
 
@@ -2287,11 +2420,17 @@ export class BeignetNode extends EventEmitter {
 			if (!proxyHost || !Number.isFinite(port)) {
 				throw new BeignetError(
 					'INVALID_PARAMS',
-					`Invalid torProxy "${opts.torProxy}" — expected "host:port"`
+					`Invalid torProxy "${opts.torProxy}": expected "host:port"`
 				);
 			}
 			socks5Proxy = { host: proxyHost, port };
 		}
+		// Hybrid mode (issue #963): the proxy serves .onion peers only and
+		// public clearnet peers are dialed directly. Private and loopback
+		// hosts are direct under either scope.
+		const socks5ProxyScope: Socks5ProxyScope = opts.torProxyOnionOnly
+			? 'onion'
+			: 'all';
 
 		// Parse addresses to advertise in our node_announcement (BOLT 7).
 		let announcedAddresses: INodeAddress[] | undefined;
@@ -2328,10 +2467,16 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 
+		// A fenced view, not the database itself: the node's destroy() closes
+		// it, and the database stays open for the wallet, which stops after
+		// the node and still writes (issue #958). Every path that builds a
+		// node comes through here, so each gets a fresh view of the database
+		// it runs on.
+		this._nodeStorageView = nodeStorageView(this.storage);
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
-			storage: this.storage,
+			storage: this._nodeStorageView,
 			// Issue #906: fence fresh indices during active auto-apply or a
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null => this.newChannelRefusal(),
@@ -2528,6 +2673,7 @@ export class BeignetNode extends EventEmitter {
 			logger: this.logger,
 			sweepDestinationScript,
 			socks5Proxy,
+			socks5ProxyScope,
 			...(opts.guardianServe
 				? {
 						guardianHost: {
@@ -2632,7 +2778,11 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:sent', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
-			// Before the forward, so a subscriber reading the daily spend from
+			// The one place a Lightning settlement is charged to the daily
+			// budget (issue #977): every pay path opened a claim at admission,
+			// and this handler is registered before any of their listeners, so
+			// the spend is counted before a blocking caller resolves, and
+			// before the forward, so a subscriber reading the daily spend from
 			// this event sees the settled payment already counted.
 			this._chargeAsyncSpendClaim(pi.paymentHash);
 			this.log('info', 'Payment sent', {
@@ -2644,11 +2794,16 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
-			// Deliberately no spend accounting here. A failure report is not the
-			// end of an async payment's claim on the daily budget: the HTLC it
-			// dispatched cannot be withdrawn and can still be fulfilled, so the
-			// claim runs until a settlement charges it or it expires. See
-			// _asyncSpendClaims.
+			// The one place a failure report touches the daily budget (issue
+			// #977). A failure is not the end of a claim while an HTLC is
+			// still out: it cannot be withdrawn and can still be fulfilled, so
+			// the claim runs on. Once nothing is in flight for the hash (the
+			// engine gave up after its last HTLC failed back, or refused before
+			// dispatching) nothing can settle under it any more, and every
+			// reservation under the hash goes; the records stay. Here rather
+			// than in the pay paths' own listeners: those are gone after a
+			// timeout with the HTLC out, and sendPaymentAsync never had one.
+			this._releaseAsyncSpendClaimsUnlessInFlight(info.paymentHash);
 			// A bare failure code cannot be acted on: the same code means very
 			// different things depending on WHICH hop returned it. Log the erring hop
 			// and the channel it was asked to forward over, so a route failure can be
@@ -2674,6 +2829,80 @@ export class BeignetNode extends EventEmitter {
 			this.refreshStaticChannelBackup();
 			this.emit('channel:ready', { channelId });
 		});
+		// A channel that can take a new HTLC again (issue #967): it reached
+		// NORMAL on channel_ready, or finished reestablishing on a reconnect.
+		// node:ready fires once the peers' init handshakes are done, before
+		// any reestablish, so the payment queues wait for this instead.
+		const usableNode = this.node;
+		// Out of the channel manager's dispatch turn: a payment the event
+		// releases must not be sent from inside the message handler that is
+		// still finishing the reestablish or the splice lock.
+		const deferEmit = (emit: () => void): void => {
+			setImmediate(() => {
+				if (this.destroyed || this._resuming || this.node !== usableNode) {
+					return;
+				}
+				try {
+					emit();
+				} catch (err: unknown) {
+					try {
+						this.log('warn', 'A payment-readiness listener failed', {
+							error: err instanceof Error ? err.message : String(err)
+						});
+					} catch {
+						// A throwing log listener must not crash the process
+						// from a timer callback either.
+					}
+				}
+			});
+		};
+		const announceUsable = (channelId: Buffer): void =>
+			deferEmit(() => {
+				const channel = usableNode.getChannelManager().getChannel(channelId);
+				if (!channel?.acceptsNewHtlcs()) return;
+				this.emit('channel:usable', { channelId: channelId.toString('hex') });
+			});
+		this.node.on('channel:ready', (data: { channelId: Buffer }) =>
+			announceUsable(data.channelId)
+		);
+		this.node
+			.getChannelManager()
+			.on('channel:reestablished', (channelId: Buffer) =>
+				announceUsable(channelId)
+			);
+		// A splice that locks, or one that unwinds, can leave the channel
+		// usable where the reestablish could not (still SPLICING then, or a
+		// taproot channel parked until splice_locked). One channel grown by
+		// splice is the whole of a typical wallet.
+		for (const event of [
+			'splice:complete',
+			'splice:aborted',
+			'splice:reverted'
+		]) {
+			this.node.on(event, (data: { channelId: Buffer }) =>
+				announceUsable(data.channelId)
+			);
+		}
+		// The funding quarantine lifting says so only in its structured log.
+		this.node.on('log', (entry: IStructuredLog) => {
+			if (entry?.action !== 'funding_missing_quarantine_lifted') return;
+			const idHex = entry.data?.channelId;
+			if (typeof idHex === 'string') announceUsable(Buffer.from(idHex, 'hex'));
+		});
+		// A channel that closed, failed or went away may have been the last
+		// live one; the pay-readiness wait then stops waiting.
+		const channelsChanged = (): void =>
+			deferEmit(() => this.emit(CHANNELS_CHANGED));
+		for (const event of [
+			'channel:pending-close',
+			'channel:force-closing',
+			'channel:closed',
+			'channel:voided',
+			'channel:aborted'
+		]) {
+			this.node.on(event, channelsChanged);
+		}
+		this.node.getChannelManager().on('channel:errored', channelsChanged);
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
@@ -3218,7 +3447,9 @@ export class BeignetNode extends EventEmitter {
 			opts.dailySpendLimitSats > 0
 		) {
 			this._dailySpendLimitSats = opts.dailySpendLimitSats;
-			this._resetDailySpendIfNeeded();
+			// After the node is built (step 6): the ledger's claims are
+			// reconciled against what it knows of their payments.
+			this._loadSpendState();
 		}
 		if (opts.maxPaymentSats !== undefined && opts.maxPaymentSats > 0) {
 			this._maxPaymentSats = opts.maxPaymentSats;
@@ -4334,8 +4565,8 @@ export class BeignetNode extends EventEmitter {
 			}
 			if (resume) this._resuming = true;
 			else this._restartRequired = true;
-			// Tear the running node down (its destroy closes the database), then
-			// swap the files through the same path a crashed swap resumes on.
+			// Tear the running node down and close the database, then swap the
+			// files through the same path a crashed swap resumes on.
 			this.teardownNodeForRestart();
 			try {
 				this.finishStagedCapsuleRestore(dbPath);
@@ -4436,6 +4667,20 @@ export class BeignetNode extends EventEmitter {
 			}
 			this._resuming = false;
 			this._bootTargetEmpty = false;
+			// The queue's wait to start was bound to the node just torn down;
+			// the rebuilt node gets its own. start() runs once, so a queue
+			// already started only looks at its held entries again (issue
+			// #978).
+			if (this.paymentQueue) {
+				this.whenReadyToPay(() => {
+					this.paymentQueue?.start();
+					// An entry whose outcome the torn-down node could not
+					// answer is asked about again on the rebuilt one (issue
+					// #976).
+					this.paymentQueue?.resettle();
+					this.paymentQueue?.poke();
+				});
+			}
 			// The candidates served their purpose; a fresh boot would hold
 			// none, and the peers re-send on their next connect anyway.
 			this._peerRetrievedCapsules.clear();
@@ -4780,8 +5025,19 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		// The queue itself stays, and is not stopped: stop() is for good, and
+		// after the resume it serves the rebuilt node over the installed
+		// database through its live storage view (issue #978).
 		this.paymentQueue?.removeAllListeners();
 		this.node.destroy();
+		// The node's destroy() closes only its view of the database (issue
+		// #958); the swap needs the file itself closed, as it was when the
+		// node closed the database directly.
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort, as the node's own close was
+		}
 		void (this.wallet as Wallet | undefined)?.stop().catch(() => {
 			/* best effort */
 		});
@@ -4795,10 +5051,13 @@ export class BeignetNode extends EventEmitter {
 	 * Daemon-local state that lives in the database beside the channel
 	 * state, and must follow the operator into the restored one: persisted
 	 * API-key rotations and revocations (a dropped override resurrects a
-	 * revoked secret), registered webhooks, and the peer addresses just
-	 * used to retrieve the capsules (so the restored node dials its channel
-	 * peers on its own). The auth override is mandatory; the rest is best
-	 * effort and logged.
+	 * revoked secret), registered webhooks, the payment queue's rows (the
+	 * queue outlives an in-process resume and updates them later, issue
+	 * #978), and the peer addresses just used to retrieve the capsules (so
+	 * the restored node dials its channel peers on its own), and the daily
+	 * spend ledger (a resume must not hand the day's allowance back, issue
+	 * #977). The auth override is mandatory; the rest is best effort and
+	 * logged.
 	 */
 	private carryDaemonState(from: SqliteStorage, to: SqliteStorage): void {
 		const overrides = from.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
@@ -4821,6 +5080,25 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 		try {
+			for (const row of from.loadAllQueueEntries()) {
+				// saveQueueEntry writes the columns an enqueue sets; the
+				// outcome columns follow as the queue records them.
+				to.saveQueueEntry(row);
+				if (row.error !== undefined || row.completedAt !== undefined) {
+					to.updateQueueEntryStatus(
+						row.id,
+						row.status,
+						row.error,
+						row.completedAt
+					);
+				}
+			}
+		} catch (err) {
+			this.log('warn', 'Could not carry the payment queue into the restore', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		try {
 			for (const peer of from.loadAllPeerAddresses()) {
 				to.savePeerAddress(peer.pubkey, peer.host, peer.port);
 			}
@@ -4828,6 +5106,16 @@ export class BeignetNode extends EventEmitter {
 			this.log('warn', 'Could not carry peer addresses into the restore', {
 				error: err instanceof Error ? err.message : String(err)
 			});
+		}
+		try {
+			const spend = from.loadMetadata(DAILY_SPEND_STATE_KEY);
+			if (spend !== null) to.saveMetadata(DAILY_SPEND_STATE_KEY, spend);
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not carry the daily spend ledger into the restore',
+				{ error: err instanceof Error ? err.message : String(err) }
+			);
 		}
 	}
 
@@ -8836,16 +9124,20 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Spending Limits ───────────────
 
-	private _resetDailySpendIfNeeded(): void {
-		const now = Date.now();
-		if (now >= this._dailySpendResetTime) {
-			// Reset at next midnight UTC
-			const tomorrow = new Date();
-			tomorrow.setUTCHours(24, 0, 0, 0);
-			this._dailySpendResetTime = tomorrow.getTime();
+	/**
+	 * Zeroes the counters once the day has ended. The reset is written on its
+	 * own unless the caller writes the ledger right after it (persist false,
+	 * from _recordSpend and _loadSpendState), so a rollover inside a mutation
+	 * is one write with the mutation rather than a zeroed row followed by the
+	 * real one.
+	 */
+	private _resetDailySpendIfNeeded(persist = true): void {
+		if (Date.now() >= this._dailySpendResetTime) {
+			this._dailySpendResetTime = nextUtcMidnight();
 			this._dailySpentSats = 0;
 			this._dailySpentLightningSats = 0;
 			this._dailySpentOnchainSats = 0;
+			if (persist) this._persistSpendState();
 		}
 	}
 
@@ -8886,23 +9178,25 @@ export class BeignetNode extends EventEmitter {
 		// it to the expired day's total means the next _resetDailySpendIfNeeded
 		// (whichever of a check or a read happens to run first) erases it. That
 		// made a read-only getDailySpendInfo decide whether the spend counted.
-		this._resetDailySpendIfNeeded();
+		this._resetDailySpendIfNeeded(false);
 		this._dailySpentSats += amountSats;
 		if (source === 'onchain') {
 			this._dailySpentOnchainSats += amountSats;
 		} else {
 			this._dailySpentLightningSats += amountSats;
 		}
+		this._persistSpendState();
 	}
 
 	/**
-	 * Reserves the budget one async attempt can still spend, and returns the
-	 * claim so its caller can drop that exact attempt again. Appended rather
-	 * than replacing what the hash already holds: see _asyncSpendClaims.
+	 * Reserves the budget one attempt can still spend, and returns the claim
+	 * so its caller can drop that exact attempt again. Appended rather than
+	 * replacing what the hash already holds: see _asyncSpendClaims. Every
+	 * Lightning pay path opens one at admission (issue #977).
 	 *
 	 * Nothing is claimed when no daily limit is configured. _pendingSpendSats
 	 * is then read by nobody and _recordSpend does nothing, so a claim could
-	 * only grow the ledger — and eventually refuse submissions — on behalf of
+	 * only grow the ledger, and eventually refuse submissions, on behalf of
 	 * accounting that does not exist.
 	 */
 	private _openAsyncSpendClaim(
@@ -8933,7 +9227,33 @@ export class BeignetNode extends EventEmitter {
 		if (claims) claims.push(claim);
 		else this._asyncSpendClaims.set(paymentHashHex, [claim]);
 		this._pendingSpendSats += amountSats;
+		this._persistSpendState();
 		return claim;
+	}
+
+	/**
+	 * Moves one claim from the provisional key sendKeysend opened it under to
+	 * the hash the engine chose for it. The engine picks a keysend's preimage,
+	 * so its hash is unknown until the send returns, while the reservation has
+	 * to hold from admission onwards; a provisional key is never a payment
+	 * hash, so no settlement can charge the claim before the move, and a boot
+	 * drops any such key it finds persisted.
+	 */
+	private _rekeyAsyncSpendClaim(
+		fromKey: string,
+		toKey: string,
+		claim: AsyncSpendClaim
+	): void {
+		const from = this._asyncSpendClaims.get(fromKey);
+		if (from) {
+			const index = from.indexOf(claim);
+			if (index !== -1) from.splice(index, 1);
+			if (from.length === 0) this._asyncSpendClaims.delete(fromKey);
+		}
+		const to = this._asyncSpendClaims.get(toKey);
+		if (to) to.push(claim);
+		else this._asyncSpendClaims.set(toKey, [claim]);
+		this._persistSpendState();
 	}
 
 	/**
@@ -8953,65 +9273,102 @@ export class BeignetNode extends EventEmitter {
 		if (index === -1) return;
 		claims.splice(index, 1);
 		if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
-		this._releaseAsyncSpendClaim(claim);
+		this._releaseClaimReservation(claim);
+		this._persistSpendState();
 	}
 
 	/**
 	 * Gives one claim's reservation back while keeping its record. For a claim
 	 * whose window has passed, and for one the engine reported dispatching
-	 * nothing for: neither should go on pinning daily budget, and neither is
-	 * proof that no HTLC behind it will ever settle.
+	 * nothing for, or gave up on with nothing out: none should go on pinning
+	 * daily budget, and none is proof that no HTLC behind it will ever
+	 * settle.
 	 */
 	private _releaseAsyncSpendClaim(claim: AsyncSpendClaim): void {
-		if (!claim.reserved) return;
+		if (this._releaseClaimReservation(claim)) this._persistSpendState();
+	}
+
+	/** _releaseAsyncSpendClaim without the write; true when it released. */
+	private _releaseClaimReservation(claim: AsyncSpendClaim): boolean {
+		if (!claim.reserved) return false;
 		claim.reserved = false;
 		this._pendingSpendSats -= claim.sats;
+		return true;
 	}
 
 	/**
-	 * Charges one async attempt against the daily budget when a payment
-	 * settles. Exactly one claim per settlement: a hash can carry several live
-	 * attempts, each able to settle on its own, and a repeat terminal event for
-	 * a hash with nothing left to charge is a no-op.
-	 *
-	 * A no-op too while a blocking caller owns the hash, since payInvoice's own
-	 * listener records that settlement itself.
+	 * What a payment:failed report does to the hash's claims. Every
+	 * reservation under the hash goes when nothing is in flight for it any
+	 * more (the engine gave up after its last HTLC failed back, or refused
+	 * before dispatching): a failed HTLC counts as in flight only until its
+	 * removal is irrevocable, and the engine gives up only after that (issue
+	 * #989), so the give-up report itself sees none. The records stay, for a
+	 * settlement that still arrives and for the boot reconciliation. With an
+	 * HTLC still in flight (a cancelPayment on a live HTLC) every claim stays
+	 * whole: the HTLC cannot be retracted, and its settle charges a claim.
+	 * Nothing is asked of the engine for a hash that holds no reservation.
 	 */
-	private _chargeAsyncSpendClaim(paymentHashHex: string): void {
-		if (this._blockingPaymentHashes.has(paymentHashHex)) return;
+	private _releaseAsyncSpendClaimsUnlessInFlight(paymentHash: Buffer): void {
+		const claims = this._asyncSpendClaims.get(paymentHash.toString('hex'));
+		if (!claims || !claims.some((claim) => claim.reserved)) return;
+		if (this.node.hasHtlcInFlight(paymentHash)) return;
+		let released = false;
+		for (const claim of claims) {
+			released = this._releaseClaimReservation(claim) || released;
+		}
+		if (released) this._persistSpendState();
+	}
+
+	/**
+	 * Charges one attempt against the daily budget when a payment settles.
+	 * Exactly one claim per settlement report, and a repeat terminal event
+	 * for a hash with nothing left to charge is a no-op. The engine reports
+	 * one settlement per hash and refuses a re-send of a paid hash (#975), so
+	 * nothing can ever charge the hash's other claims: their reservations go
+	 * in the same write, and they stay as records marked settled so that the
+	 * boot reconciliation (see _loadSpendState) does not charge the hash
+	 * again.
+	 *
+	 * With `claim`, that claim and no other: a keysend settled inside the
+	 * send charges the claim it opened, and this is a no-op when the handler
+	 * in create() already charged it. Otherwise the oldest claim still
+	 * holding budget, so a settlement frees a reservation wherever there is
+	 * one to free, failing that the oldest record: a settlement whose
+	 * reservation lapsed first still spent the money, and the day it lands on
+	 * is the day that has to carry it. A claim not yet marked settled is
+	 * preferred at each step, so a boot charge lands on the attempt it
+	 * belongs to.
+	 */
+	private _chargeAsyncSpendClaim(
+		paymentHashHex: string,
+		claim?: AsyncSpendClaim
+	): void {
 		this._expireAsyncSpendClaims();
 		const claims = this._asyncSpendClaims.get(paymentHashHex);
 		if (!claims || claims.length === 0) return;
-		// The oldest claim still holding budget, so a settlement frees a
-		// reservation wherever there is one to free. Failing that the oldest
-		// record: a settlement whose reservation lapsed first still spent the
-		// money, and the day it lands on is the day that has to carry it.
-		const reserved = claims.findIndex((entry) => entry.reserved);
-		const [claim] = claims.splice(reserved === -1 ? 0 : reserved, 1);
+		let index: number;
+		if (claim) {
+			index = claims.indexOf(claim);
+			if (index === -1) return;
+		} else {
+			const rank = (entry: AsyncSpendClaim): number =>
+				(entry.reserved ? 0 : 2) + (entry.settled ? 1 : 0);
+			index = 0;
+			for (let i = 1; i < claims.length; i++) {
+				if (rank(claims[i]) < rank(claims[index])) index = i;
+			}
+		}
+		const [charged] = claims.splice(index, 1);
+		for (const rest of claims) {
+			rest.settled = true;
+			this._releaseClaimReservation(rest);
+		}
 		if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
 		// Released before the spend is recorded, so a concurrent
-		// _checkSpendLimit never sees the same sats counted twice.
-		this._releaseAsyncSpendClaim(claim);
-		this._recordSpend(claim.sats);
-	}
-
-	/**
-	 * Marks a hash whose spend accounting a blocking send owns, for as long as
-	 * that send's own listener is installed. Counted, so the first of two
-	 * overlapping calls to finish does not unmark the hash under the second.
-	 */
-	private _acquireBlockingPayment(paymentHashHex: string): void {
-		this._blockingPaymentHashes.set(
-			paymentHashHex,
-			(this._blockingPaymentHashes.get(paymentHashHex) ?? 0) + 1
-		);
-	}
-
-	private _releaseBlockingPayment(paymentHashHex: string): void {
-		const held = this._blockingPaymentHashes.get(paymentHashHex);
-		if (held === undefined) return;
-		if (held > 1) this._blockingPaymentHashes.set(paymentHashHex, held - 1);
-		else this._blockingPaymentHashes.delete(paymentHashHex);
+		// _checkSpendLimit never sees the same sats counted twice. The record
+		// is the one write for all of it.
+		this._releaseClaimReservation(charged);
+		this._recordSpend(charged.sats);
 	}
 
 	/**
@@ -9019,15 +9376,17 @@ export class BeignetNode extends EventEmitter {
 	 * wherever the ledger is read or written, so the accounting needs no timer
 	 * of its own. The records stay: see _releaseAsyncSpendClaim.
 	 */
-	private _expireAsyncSpendClaims(): void {
+	private _expireAsyncSpendClaims(persist = true): void {
 		const now = Date.now();
+		let released = false;
 		for (const claims of this._asyncSpendClaims.values()) {
 			for (const claim of claims) {
 				if (claim.reserved && claim.expiresAt <= now) {
-					this._releaseAsyncSpendClaim(claim);
+					released = this._releaseClaimReservation(claim) || released;
 				}
 			}
 		}
+		if (released && persist) this._persistSpendState();
 	}
 
 	private _countAsyncSpendClaims(): number {
@@ -9050,6 +9409,7 @@ export class BeignetNode extends EventEmitter {
 	private _pruneAsyncSpendClaims(target: number): number {
 		let count = this._countAsyncSpendClaims();
 		if (count <= target) return count;
+		const before = count;
 		// Map iteration is insertion-ordered, so this walks the hashes oldest
 		// first, and each hash's own claims oldest first within it.
 		for (const [paymentHashHex, claims] of this._asyncSpendClaims) {
@@ -9064,7 +9424,236 @@ export class BeignetNode extends EventEmitter {
 			if (claims.length === 0) this._asyncSpendClaims.delete(paymentHashHex);
 			if (count <= target) break;
 		}
+		if (count < before) this._persistSpendState();
 		return count;
+	}
+
+	/**
+	 * Writes the ledger (the day's counters and every open claim) under
+	 * DAILY_SPEND_STATE_KEY, after every mutation, so a restart within the
+	 * UTC day resumes the day's total and the claims still waiting on a
+	 * settlement (issue #977). Nothing is written when no limit is
+	 * configured: the ledger is then read by nobody. A write that fails is
+	 * logged and does not fail the payment that caused it; the next mutation
+	 * writes the whole ledger again.
+	 */
+	private _persistSpendState(): void {
+		if (this._dailySpendLimitSats === undefined) return;
+		// A daemon that has not opened its database has nowhere to write.
+		const storage = this.storage as SqliteStorage | undefined;
+		if (!storage) return;
+		const claims: PersistedDailySpendState['claims'] = {};
+		for (const [paymentHashHex, list] of this._asyncSpendClaims) {
+			if (list.length > 0) claims[paymentHashHex] = list;
+		}
+		const state: PersistedDailySpendState = {
+			resetTime: this._dailySpendResetTime,
+			totalSats: this._dailySpentSats,
+			lightningSats: this._dailySpentLightningSats,
+			onchainSats: this._dailySpentOnchainSats,
+			claims
+		};
+		try {
+			storage.saveMetadata(DAILY_SPEND_STATE_KEY, JSON.stringify(state));
+		} catch (err) {
+			this.log('warn', 'Could not persist the daily spend ledger', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/**
+	 * Restores the ledger persisted under DAILY_SPEND_STATE_KEY, at boot and
+	 * again when initNode runs for a resumed or restored database (issue
+	 * #977). What the process held in memory is dropped first: the row is
+	 * the ledger from here on.
+	 *
+	 * The day's counters are adopted when the stored day has not ended (now
+	 * is before its resetTime) and that resetTime is no later than the next
+	 * midnight UTC from now (a row written under a clock set into the future
+	 * would otherwise keep the counters from ever resetting once the clock
+	 * is corrected); any other row starts the day at zero, as the midnight
+	 * reset would have. Each stored claim is then reconciled with what the
+	 * node knows of its hash, since the settlement it waits on may have
+	 * landed, or become impossible, while the process was down:
+	 * - the payment settled (its OUTGOING record is COMPLETED, in memory or
+	 *   in the durable row, or a preimage is known): the hash's claims come
+	 *   back without their reservations, since nothing can settle under them
+	 *   any more, and one claim not yet marked settled is charged now, as the
+	 *   payment:sent handler would have, the rest being marked settled so
+	 *   that no later boot charges the same settlement again;
+	 * - the record is FAILED or gone and no HTLC is in flight for the hash:
+	 *   nothing can settle under the claim any more, so it is dropped and
+	 *   its reservation is not restored;
+	 * - otherwise (the record is PENDING, or an HTLC is still out) the claim
+	 *   is restored as stored, reservation and expiry included, so the settle
+	 *   charges it and the expiry sweep or the give-up report releases it.
+	 * Every claim is back in the ledger before anything is charged, so no
+	 * write during the restore is a partial ledger. A row that cannot be read
+	 * or parsed is logged and starts the day at zero with no claims; a claim
+	 * that fails the shape check is dropped.
+	 */
+	private _loadSpendState(): void {
+		for (const claims of this._asyncSpendClaims.values()) {
+			for (const claim of claims) this._releaseClaimReservation(claim);
+		}
+		this._asyncSpendClaims.clear();
+		this._dailySpendResetTime = 0;
+		this._dailySpentSats = 0;
+		this._dailySpentLightningSats = 0;
+		this._dailySpentOnchainSats = 0;
+
+		let stored: Partial<PersistedDailySpendState> | undefined;
+		try {
+			const raw = this.storage.loadMetadata(DAILY_SPEND_STATE_KEY);
+			if (raw) stored = JSON.parse(raw) as Partial<PersistedDailySpendState>;
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not read the persisted daily spend ledger; the day starts at zero',
+				{ error: err instanceof Error ? err.message : String(err) }
+			);
+		}
+		const nonNegative = (value: unknown): value is number =>
+			typeof value === 'number' && Number.isFinite(value) && value >= 0;
+		if (
+			stored &&
+			nonNegative(stored.resetTime) &&
+			Date.now() < stored.resetTime &&
+			stored.resetTime <= nextUtcMidnight() &&
+			nonNegative(stored.totalSats) &&
+			nonNegative(stored.lightningSats) &&
+			nonNegative(stored.onchainSats)
+		) {
+			this._dailySpendResetTime = stored.resetTime;
+			this._dailySpentSats = stored.totalSats;
+			this._dailySpentLightningSats = stored.lightningSats;
+			this._dailySpentOnchainSats = stored.onchainSats;
+		} else {
+			// Written with the rest of the restore below.
+			this._resetDailySpendIfNeeded(false);
+		}
+
+		const isClaim = (value: unknown): value is AsyncSpendClaim => {
+			const entry = value as Partial<AsyncSpendClaim> | null;
+			return (
+				typeof entry === 'object' &&
+				entry !== null &&
+				nonNegative(entry.sats) &&
+				typeof entry.expiresAt === 'number' &&
+				Number.isFinite(entry.expiresAt) &&
+				typeof entry.reserved === 'boolean' &&
+				(entry.settled === undefined || typeof entry.settled === 'boolean')
+			);
+		};
+		let restored = 0;
+		let charged = 0;
+		let dropped = 0;
+		const toCharge: string[] = [];
+		const rows =
+			stored?.claims && typeof stored.claims === 'object'
+				? Object.entries(stored.claims)
+				: [];
+		for (const [paymentHashHex, list] of rows) {
+			const total = Array.isArray(list) ? list.length : 0;
+			const claims = Array.isArray(list) ? list.filter(isClaim) : [];
+			dropped += total - claims.length;
+			if (claims.length === 0) continue;
+			if (!/^[0-9a-f]{64}$/.test(paymentHashHex)) {
+				dropped += claims.length;
+				continue;
+			}
+			const paymentHash = Buffer.from(paymentHashHex, 'hex');
+			const outcome = this._spendClaimOutcomeAtBoot(
+				paymentHash,
+				paymentHashHex
+			);
+			if (outcome === 'gone') {
+				dropped += claims.length;
+				continue;
+			}
+			// Copied field by field: only the claim's own fields come back
+			// from disk. A settled hash's claims come back unreserved.
+			const kept = claims.map(
+				(entry): AsyncSpendClaim => ({
+					sats: entry.sats,
+					expiresAt: entry.expiresAt,
+					reserved: entry.reserved && outcome !== 'settled',
+					...(entry.settled ? { settled: true } : {})
+				})
+			);
+			this._asyncSpendClaims.set(paymentHashHex, kept);
+			for (const entry of kept) {
+				if (entry.reserved) this._pendingSpendSats += entry.sats;
+			}
+			restored += kept.length;
+			if (outcome === 'settled' && kept.some((entry) => !entry.settled)) {
+				toCharge.push(paymentHashHex);
+			}
+		}
+		// Only once every claim is back, so each charge writes the whole
+		// ledger.
+		for (const paymentHashHex of toCharge) {
+			this._chargeAsyncSpendClaim(paymentHashHex);
+			charged++;
+		}
+		this._expireAsyncSpendClaims(false);
+		this._persistSpendState();
+		if (stored) {
+			this.log('info', 'Daily spend ledger restored', {
+				spentSats: this._dailySpentSats,
+				resetsAt: this._dailySpendResetTime,
+				claimsRestored: restored,
+				settledWhileDown: charged,
+				claimsDropped: dropped
+			});
+		}
+	}
+
+	/**
+	 * What the node knows of a stored claim's payment at boot: 'settled' when
+	 * the HTLC view or the durable row reports the hash paid, judged the way
+	 * the engine judges a duplicate (#975); 'live' while the record is
+	 * PENDING or an HTLC is still out for it; 'gone' otherwise. A durable row
+	 * that cannot be read is logged and reads as live: a reservation kept too
+	 * long is the safe side of that error.
+	 */
+	private _spendClaimOutcomeAtBoot(
+		paymentHash: Buffer,
+		paymentHashHex: string
+	): 'settled' | 'live' | 'gone' {
+		const view = this.node.getOutgoingHtlcs(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return 'settled';
+		}
+		try {
+			const durable = this.storage.loadPayment(paymentHashHex);
+			if (
+				durable?.direction === PaymentDirection.OUTGOING &&
+				(durable.status === PaymentStatus.COMPLETED ||
+					durable.preimage !== undefined ||
+					this.storage.loadPreimage(paymentHashHex) !== null)
+			) {
+				return 'settled';
+			}
+		} catch (err) {
+			this.log(
+				'warn',
+				'Could not read a payment record for the daily spend ledger; keeping its claim',
+				{
+					paymentHash: paymentHashHex,
+					error: err instanceof Error ? err.message : String(err)
+				}
+			);
+			return 'live';
+		}
+		if (
+			view.status === PaymentStatus.PENDING ||
+			this.node.hasHtlcInFlight(paymentHash)
+		) {
+			return 'live';
+		}
+		return 'gone';
 	}
 
 	/**
@@ -9092,19 +9681,31 @@ export class BeignetNode extends EventEmitter {
 		limitSats: number | null;
 		spentSats: number;
 		remainingSats: number;
+		pendingSats: number;
 		resetsAt: number;
 		totalSats: number;
 		lightningSats: number;
 		onchainSats: number;
 	} {
 		this._resetDailySpendIfNeeded();
+		// The same sweep _checkSpendLimit runs, so the reservation reported is
+		// the one the next admission is judged against.
+		this._expireAsyncSpendClaims();
 		const limit = this._dailySpendLimitSats ?? null;
+		const pendingSats = this._pendingSpendSats;
 		return {
 			// Back-compat fields (spentSats == totalSats):
 			limitSats: limit,
 			spentSats: this._dailySpentSats,
+			// What the next admission can still pass: the day's total and the
+			// budget in-flight payments still hold both count against it.
 			remainingSats:
-				limit !== null ? Math.max(0, limit - this._dailySpentSats) : Infinity,
+				limit !== null
+					? Math.max(0, limit - this._dailySpentSats - pendingSats)
+					: Infinity,
+			// Held by payments still in flight (issue #977): a claim opened at
+			// admission that no settlement, failure or expiry has released.
+			pendingSats,
 			resetsAt: this._dailySpendResetTime,
 			// Breakdown: the limit is a single combined LN + onchain budget.
 			totalSats: this._dailySpentSats,
@@ -9396,6 +9997,78 @@ export class BeignetNode extends EventEmitter {
 		return height + cltvLimit;
 	}
 
+	/**
+	 * The PAYMENT_TIMEOUT a blocking payment rejects with once its wait is
+	 * over, after failing the record only when nothing is out for it (issue
+	 * #976). BOLT 2 has no way to retract an update_add_htlc: an HTLC still
+	 * offered can settle after the clock, so such a record stays PENDING
+	 * until it resolves rather than reading FAILED in between, and the
+	 * message says so, because a caller that reads a timeout as a failure
+	 * and pays again is refused (#975) but must not be told it failed. No
+	 * further route is tried for it: the engine freezes its retries, so a
+	 * later update_fail_htlc ends it (FAILED, payment:failed) rather than
+	 * dispatching a retry outside this call's admission and accounting; an
+	 * HTLC whose on-chain timeout resolves ends it the same way. A ghost
+	 * record, with no HTLC out, is failed as before, and the caller's claim
+	 * on the daily budget follows the record (issue #977): a failed ghost
+	 * dispatched nothing that could settle under it, so its reservation
+	 * goes (the record stays, as for a failure the engine reports by
+	 * return); with an HTLC still out the claim stays whole, for the
+	 * payment:sent handler in create() to charge when the HTLC settles, or
+	 * the expiry sweep to release.
+	 */
+	private _paymentTimeout(
+		paymentHash: Buffer,
+		what: 'Payment' | 'Keysend',
+		timeoutMs: number,
+		claim?: AsyncSpendClaim
+	): BeignetError {
+		const failed = this.node.failPaymentUnlessInFlight(paymentHash);
+		if (failed && claim) this._releaseAsyncSpendClaim(claim);
+		return new BeignetError(
+			'PAYMENT_TIMEOUT',
+			failed
+				? `${what} timed out after ${timeoutMs}ms`
+				: `${what} timed out after ${timeoutMs}ms; an HTLC is still in flight and the payment stays PENDING until it resolves; no further route is tried after the timeout`
+		);
+	}
+
+	/**
+	 * The BeignetError for a refusal the engine threw out of a send: its
+	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or, for an
+	 * untyped throw, the code its message implies. One mapping for every
+	 * payment method (issue #991): sendPaymentAsync used to let the engine's
+	 * LightningPaymentError through untouched, and the daemon, seeing no
+	 * BeignetError, answered PAYMENT_FAILED with a 502 that told an agent to
+	 * retry a payment that was already made. A BeignetError passes through.
+	 */
+	private _toBeignetPaymentError(err: unknown): BeignetError {
+		if (err instanceof BeignetError) return err;
+		const msg = err instanceof Error ? err.message : String(err);
+		let code = 'PAYMENT_FAILED';
+		if (err instanceof Error && 'code' in err) {
+			const lpErr = err as { code: string };
+			code = ENGINE_PAYMENT_ERROR_CODES[lpErr.code] || 'PAYMENT_FAILED';
+		} else if (msg.includes('No route found')) {
+			code = 'NO_ROUTE';
+		} else if (msg.includes('already in flight')) {
+			code = 'DUPLICATE_PAYMENT';
+		} else if (
+			msg.includes('No channel to first hop') ||
+			msg.includes('Peer not found')
+		) {
+			code = 'PEER_NOT_CONNECTED';
+		}
+		return new BeignetError(code, msg);
+	}
+
+	/**
+	 * Pay a BOLT 11 invoice and wait for its outcome, at most timeoutMs. At
+	 * the timeout the payment is failed only when no HTLC is out for it; with
+	 * one still in flight the record stays PENDING until that HTLC resolves,
+	 * and the PAYMENT_TIMEOUT says so (issue #976). A hash that was paid or
+	 * still has an HTLC out is refused as DUPLICATE_PAYMENT (#975).
+	 */
 	async payInvoice(
 		bolt11: string,
 		timeoutMs = 60_000,
@@ -9432,67 +10105,48 @@ export class BeignetNode extends EventEmitter {
 		// conversions above: a refused bound must leave nothing raised.
 		const maxCltvExpiryHeight = this._cltvCeiling(cltvLimit);
 
+		// This attempt's claim on the daily budget, opened before the send and
+		// charged by the payment:sent handler in create() rather than by the
+		// listener below, which may be gone by the time the settlement lands
+		// (a timeout with the HTLC still out, or a restart): one persisted
+		// ledger, one charger (issue #977). Its reservation is held for the
+		// whole in-flight window, which is what stops two concurrent payments
+		// both passing the daily limit before either is charged.
+		//
+		// The claims an earlier attempt on this hash already holds stay where
+		// they are, reservations and all. The engine refuses this attempt
+		// while any HTLC of that one is still out or once it paid (#975);
+		// when it does dispatch, its HTLC is a new one beside the resolved
+		// ones rather than a replacement, and the engine reports at most one
+		// settlement for the hash (it emits nothing further for a hash it has
+		// marked completed), so the rest have to go on holding budget on
+		// their own account.
+		let claim: AsyncSpendClaim | undefined;
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
 			this._checkSpendLimit(spendAmountSats);
-			this._pendingSpendSats += spendAmountSats;
+			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
 		}
 
-		// This call owns the hash's spend accounting for as long as its own
-		// listener is installed: the forwarding handler in create() would
-		// otherwise charge an async claim for the settlement the listener
-		// records, counting one payment twice.
-		//
-		// The claims a fire-and-forget attempt on this hash already holds stay
-		// where they are, reservations and all. This attempt adds an HTLC to
-		// the ones already out there rather than replacing them, and the engine
-		// reports at most one of them settling (it emits nothing further for a
-		// hash it has marked completed), so the rest have to go on holding
-		// budget on their own account.
-		this._acquireBlockingPayment(paymentHashHex);
-		let blockingReleased = false;
-		const releaseBlockingPayment = (): void => {
-			if (blockingReleased) return;
-			blockingReleased = true;
-			this._releaseBlockingPayment(paymentHashHex);
-		};
-
-		// One release shared by every exit, and idempotent, because more than
-		// one can run for a single payment (a timeout followed by a late
-		// payment:failed). The reservation is deliberately held for the whole
-		// in-flight window: it is what stops two concurrent payments both
-		// passing the daily limit before either records a spend, so this must
-		// never become a `finally` around the synchronous body.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (spendAmountSats <= 0 || released) return;
-			released = true;
-			this._pendingSpendSats -= spendAmountSats;
-		};
-
 		// Store metadata on the payment if provided. Guarded, because nothing
-		// between the reservation above and the executor below may strand it.
+		// between the claim above and the executor below may strand it.
 		try {
 			if (metadata) {
 				this.node.setPaymentMetadata(decoded.paymentHash, metadata);
 			}
 		} catch (err: unknown) {
-			releaseReservation();
-			releaseBlockingPayment();
+			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
 			throw err;
 		}
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				// Clean up the ghost payment to free channel capacity
-				this.node.failPayment(decoded.paymentHash);
+				// A ghost payment is failed to free its capacity, and its
+				// claim's reservation with it; one with an HTLC still out stays
+				// PENDING (issue #976) and keeps its claim for the settle.
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
-					)
+					this._paymentTimeout(decoded.paymentHash, 'Payment', timeoutMs, claim)
 				);
 			}, timeoutMs);
 
@@ -9500,26 +10154,21 @@ export class BeignetNode extends EventEmitter {
 				clearTimeout(timer);
 				this.node.removeListener('payment:sent', onSent);
 				this.node.removeListener('payment:failed', onFailed);
-				// Safe here rather than after the accounting below: the handler
-				// in create() is registered first, so it has already seen this
-				// same event and declined to charge for it.
-				releaseBlockingPayment();
 			};
 
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					// Released before the spend is recorded, so a concurrent
-					// _checkSpendLimit never sees the same sats counted twice.
-					releaseReservation();
-					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
+					// Already charged: the handler in create() is registered
+					// first, so it charged the claim before this listener ran.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -9551,41 +10200,20 @@ export class BeignetNode extends EventEmitter {
 				// the reservation outlived every refused send (no route, a
 				// duplicate, a peer that is gone) and ratcheted the counter up
 				// until the daily limit refused real payments (issue #474).
-				releaseReservation();
-				const msg = err instanceof Error ? err.message : String(err);
-				// Use typed error code if available, fall back to string matching
-				let code = 'PAYMENT_FAILED';
-				if (err instanceof Error && 'code' in err) {
-					const lpErr = err as { code: string };
-					const codeMap: Record<string, string> = {
-						NO_ROUTE: 'NO_ROUTE',
-						DUPLICATE_PAYMENT: 'DUPLICATE_PAYMENT',
-						NO_CHANNEL_TO_HOP: 'PEER_NOT_CONNECTED',
-						FEE_EXCEEDS_MAX: 'PAYMENT_FAILED',
-						// The caller's own bound (#751): its code, not a generic
-						// failure, so a swap provider can tell "no route under the
-						// refund height" from "no route at all".
-						CLTV_EXCEEDS_MAX: 'CLTV_EXCEEDS_MAX',
-						MISSING_AMOUNT: 'INVALID_PARAMS',
-						INVALID_INVOICE: 'INVALID_PARAMS',
-						INVOICE_EXPIRED: 'INVOICE_EXPIRED'
-					};
-					code = codeMap[lpErr.code] || 'PAYMENT_FAILED';
-				} else {
-					if (msg.includes('No route found')) code = 'NO_ROUTE';
-					else if (msg.includes('already in flight'))
-						code = 'DUPLICATE_PAYMENT';
-					else if (
-						msg.includes('No channel to first hop') ||
-						msg.includes('Peer not found')
-					)
-						code = 'PEER_NOT_CONNECTED';
-				}
-				reject(new BeignetError(code, msg));
+				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}
 
+	/**
+	 * payInvoice that never throws. A refused or failed payment comes back
+	 * as the hash's existing record when there is one: after a timeout with
+	 * an HTLC still out, the PENDING record, which stays PENDING until the
+	 * HTLC resolves (issue #976); for a duplicate refusal, the record the
+	 * engine refused from, the durable row included (#975). Otherwise a
+	 * synthetic FAILED record whose failureDescription carries the code.
+	 */
 	async payInvoiceSafe(
 		bolt11: string,
 		timeoutMs = 60_000,
@@ -9618,9 +10246,11 @@ export class BeignetNode extends EventEmitter {
 				/* bolt11 is malformed — use defaults */
 			}
 
-			// Return persisted record if available
+			// Return persisted record if available: the in-memory one, or for
+			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
-				const existing = this.getPayment(hashHex);
+				const existing =
+					this.getPayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
 			}
 
@@ -9664,7 +10294,9 @@ export class BeignetNode extends EventEmitter {
 
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi =
+						this.getPayment(paymentHashHex) ??
+						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -9820,13 +10452,9 @@ export class BeignetNode extends EventEmitter {
 			// identity, so a refused duplicate frees only this submission's
 			// claim and leaves the in-flight attempt's alone.
 			if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
-			if (
-				err instanceof Error &&
-				(err as { code?: string }).code === 'CLTV_EXCEEDS_MAX'
-			) {
-				throw new BeignetError('CLTV_EXCEEDS_MAX', err.message);
-			}
-			throw err;
+			// With its own code (issue #991): a duplicate answers 409 over
+			// HTTP, not the retryable 502 an unmapped throw was flattened to.
+			throw this._toBeignetPaymentError(err);
 		}
 		// Not every refusal throws. An expired invoice, a locally refused
 		// addHtlc and an undispatchable MPP part all RETURN a failed payment,
@@ -9871,16 +10499,14 @@ export class BeignetNode extends EventEmitter {
 				: undefined;
 		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
-		this._pendingSpendSats += amountSats;
-		// Idempotent, and shared by every exit, for the reason payInvoice's
-		// copy documents: the reservation is held for the whole in-flight
-		// window, and a keysend that never started holds no capacity.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (released) return;
-			released = true;
-			this._pendingSpendSats -= amountSats;
-		};
+		// This attempt's claim on the daily budget, charged by the
+		// payment:sent handler in create() as payInvoice's is (issue #977).
+		// The engine picks a keysend's preimage, so the hash is unknown until
+		// the send returns; the claim is opened under a provisional key so
+		// that its reservation holds across the call, and moved under the
+		// hash after it. A keysend that never started holds no capacity.
+		const provisionalKey = `keysend:${crypto.randomBytes(8).toString('hex')}`;
+		const claim = this._openAsyncSpendClaim(provisionalKey, amountSats);
 		const destination = Buffer.from(pubkey, 'hex');
 
 		let result: IPaymentInfo;
@@ -9892,28 +10518,34 @@ export class BeignetNode extends EventEmitter {
 				metadata
 			});
 		} catch (err: unknown) {
-			releaseReservation();
-			throw err;
+			if (claim) this._closeAsyncSpendClaim(provisionalKey, claim);
+			throw this._toBeignetPaymentError(err);
 		}
 		const paymentHashHex = result.paymentHash.toString('hex');
+		if (claim) {
+			this._rekeyAsyncSpendClaim(provisionalKey, paymentHashHex, claim);
+		}
 
-		// If already settled synchronously
+		// Settled or failed inside the call: the handler in create() saw that
+		// event before the claim carried this hash, so the claim is charged,
+		// or its reservation released, here. By identity, so a repeat of the
+		// event later finds nothing left under this claim.
 		if (result.status !== 'PENDING') {
-			releaseReservation();
-			if (result.status === 'COMPLETED') this._recordSpend(amountSats);
+			if (claim) {
+				if (result.status === 'COMPLETED') {
+					this._chargeAsyncSpendClaim(paymentHashHex, claim);
+				} else {
+					this._releaseAsyncSpendClaim(claim);
+				}
+			}
 			return this.toPaymentInfo(result);
 		}
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				this.node.failPayment(result.paymentHash);
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Keysend timed out after ${timeoutMs}ms`
-					)
+					this._paymentTimeout(result.paymentHash, 'Keysend', timeoutMs, claim)
 				);
 			}, timeoutMs);
 
@@ -9926,15 +10558,16 @@ export class BeignetNode extends EventEmitter {
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
-					this._recordSpend(amountSats);
+					// Already charged by the handler in create(), which is
+					// registered first.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -10028,6 +10661,33 @@ export class BeignetNode extends EventEmitter {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
 		if (!p) return null;
 		return this.toPaymentInfo(p);
+	}
+
+	/**
+	 * The durable record behind a DUPLICATE_PAYMENT refusal whose in-memory
+	 * record is gone (issue #975). The in-memory record is pruned 24 hours
+	 * after completion (oldest first past the size cap) while the row stays,
+	 * and the engine refuses to pay a hash whose row says it was paid, so a
+	 * refused re-send of a pruned paid invoice answers with its COMPLETED
+	 * record rather than a synthetic failure. Null for any other error: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's. A row
+	 * that cannot be read (the database is closed) is no record, so the safe
+	 * callers still never throw.
+	 */
+	private durablePaymentFor(err: unknown, hashHex: string): PaymentInfo | null {
+		if (
+			!(err instanceof BeignetError) ||
+			err.code !== BeignetErrorCode.DUPLICATE_PAYMENT
+		) {
+			return null;
+		}
+		try {
+			const durable = this.storage.loadPayment(hashHex);
+			return durable ? this.toPaymentInfo(durable) : null;
+		} catch {
+			return null;
+		}
 	}
 
 	/** Settled forwards, newest first. Msat values as strings (JSON-safe). */
@@ -10845,39 +11505,27 @@ export class BeignetNode extends EventEmitter {
 		// BOLT 11 paths, so the shared helper decides it here too.
 		const spendAmountSats = paymentSpendSats(bolt12Invoice.amount, amountSats);
 
+		// This attempt's claim on the daily budget, charged by the payment:sent
+		// handler in create() rather than by the listener below, for the
+		// reason payInvoice's copy documents (issue #977). Held for the whole
+		// in-flight window: it is what stops two concurrent offer payments
+		// both passing the daily limit before either is charged.
+		let claim: AsyncSpendClaim | undefined;
 		if (spendAmountSats > 0) {
 			this._checkMaxPayment(spendAmountSats);
 			this._checkSpendLimit(spendAmountSats);
-			this._pendingSpendSats += spendAmountSats;
+			claim = this._openAsyncSpendClaim(paymentHashHex, spendAmountSats);
 		}
-
-		// This call owns the hash's spend accounting for as long as its own
-		// listener is installed, for the reason payInvoice's copy documents:
-		// the forwarding handler in create() would otherwise charge an async
-		// claim on this hash for the settlement the listener below records.
-		this._acquireBlockingPayment(paymentHashHex);
-
-		// One release shared by every exit, and idempotent, because more than
-		// one can run for a single payment (a timeout followed by a late
-		// payment:failed). Held for the whole in-flight window: it is what
-		// stops two concurrent offer payments both passing the daily limit
-		// before either records a spend.
-		let released = false;
-		const releaseReservation = (): void => {
-			if (spendAmountSats <= 0 || released) return;
-			released = true;
-			this._pendingSpendSats -= spendAmountSats;
-		};
 
 		return new Promise<PaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				releaseReservation();
-				this.node.failPayment(bolt12Invoice.paymentHash);
 				reject(
-					new BeignetError(
-						'PAYMENT_TIMEOUT',
-						`Payment timed out after ${timeoutMs}ms`
+					this._paymentTimeout(
+						bolt12Invoice.paymentHash,
+						'Payment',
+						timeoutMs,
+						claim
 					)
 				);
 			}, timeoutMs);
@@ -10886,26 +11534,21 @@ export class BeignetNode extends EventEmitter {
 				clearTimeout(timer);
 				this.node.removeListener('payment:sent', onSent);
 				this.node.removeListener('payment:failed', onFailed);
-				// Safe here rather than after the accounting below: the handler
-				// in create() is registered first, so it has already seen this
-				// same event and declined to charge for it.
-				this._releaseBlockingPayment(paymentHashHex);
 			};
 
 			const onSent = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					// Released before the spend is recorded, so a concurrent
-					// _checkSpendLimit never sees the same sats counted twice.
-					releaseReservation();
-					if (spendAmountSats > 0) this._recordSpend(spendAmountSats);
+					// Already charged by the handler in create(), which is
+					// registered first.
 					resolve(this.toPaymentInfo(info));
 				}
 			};
 			const onFailed = (info: IPaymentInfo): void => {
 				if (info.paymentHash.toString('hex') === paymentHashHex) {
 					cleanup();
-					releaseReservation();
+					// The handler in create() ran first and released the claim
+					// if nothing is out for the hash any more.
 					const failDesc =
 						info.failureCode !== undefined
 							? describeFailureCode(info.failureCode)
@@ -10931,9 +11574,8 @@ export class BeignetNode extends EventEmitter {
 				// refused dispatch (no route, a duplicate, a missing amount)
 				// ratcheted the counter up until the daily limit refused real
 				// payments, as it did on the BOLT 11 path (issue #474).
-				releaseReservation();
-				const msg = err instanceof Error ? err.message : String(err);
-				reject(new BeignetError('PAYMENT_FAILED', msg));
+				if (claim) this._closeAsyncSpendClaim(paymentHashHex, claim);
+				reject(this._toBeignetPaymentError(err));
 			}
 		});
 	}
@@ -11855,17 +12497,227 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Payment Queue ───────────────
 
-	private getPaymentQueue(): PaymentQueue {
+	/**
+	 * How a payment the payment queue was dispatching ended, from this
+	 * node's own record for its invoice: one the process stopped during
+	 * (issue #967), or one whose HTLC was still out when the queue's own
+	 * payment timeout fired (issue #976). The queue's resolver for such an
+	 * entry: it must know this before sending the invoice again or recording
+	 * a verdict. The engine refuses to pay a hash that was paid or still has
+	 * an HTLC out (#975), so a re-send can no longer pay twice, but it would
+	 * come back from payInvoiceSafe as the old record, PENDING while its
+	 * HTLC is out; this resolver waits for the outcome instead.
+	 *
+	 * Resolves once every HTLC the node offered for the hash is terminal,
+	 * which for one stuck at a peer can take until its expiry. 'completed'
+	 * when the preimage is known or the record says COMPLETED; 'unpaid'
+	 * otherwise, since the PENDING record is committed before any HTLC is
+	 * offered and the HTLC view covers offered HTLCs even without a record:
+	 * resolved with no preimage means nothing was paid. The in-memory record
+	 * and preimage are pruned 24 hours after completion (and oldest first past
+	 * the size cap), and the cleanup tick can run before this does, so the
+	 * durable record is read before answering 'unpaid': pruning leaves it on
+	 * disk. Throws while there is no node to ask (restore pending, a capsule
+	 * restore rebuilding it, a restart required, destroyed) or the durable
+	 * record cannot be read; the queue then leaves the entry for the next
+	 * start.
+	 */
+	async resolveInterruptedPayment(
+		bolt11: string
+	): Promise<InterruptedPaymentOutcome> {
+		if (this.destroyed) {
+			throw new BeignetError(
+				BeignetErrorCode.NODE_DESTROYED,
+				'Node is shut down; an interrupted payment is settled at the next start'
+			);
+		}
+		if (this._restorePending || this._resuming) {
+			throw new BeignetError(
+				'NODE_RESTORE_PENDING',
+				'No node is running yet to settle an interrupted payment against'
+			);
+		}
+		if (this._restartRequired) {
+			throw new BeignetError(
+				'NODE_RESTART_REQUIRED',
+				'A capsule restore replaced this database; an interrupted payment ' +
+					'is settled after the restart'
+			);
+		}
+		let paymentHash: Buffer;
+		try {
+			// The decoder sendPayment uses. A string it cannot decode never
+			// reached an HTLC, and sending it again fails it as before.
+			paymentHash = decodeInvoice(bolt11).paymentHash;
+		} catch {
+			return { status: 'unpaid' };
+		}
+		const hashHex = paymentHash.toString('hex');
+		const view = await this.node.awaitPaymentResolution(paymentHash);
+		if (view.preimage || view.status === PaymentStatus.COMPLETED) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		// Only an OUTGOING record counts: the preimage store alone also holds
+		// this node's own invoices' preimages. A read that throws propagates,
+		// so the entry waits rather than being sent on a guess.
+		const durable = this.storage.loadPayment(hashHex);
+		if (
+			durable?.direction === PaymentDirection.OUTGOING &&
+			(durable.status === PaymentStatus.COMPLETED ||
+				durable.preimage !== undefined)
+		) {
+			return { status: 'completed', paymentHash: hashHex };
+		}
+		return { status: 'unpaid' };
+	}
+
+	/**
+	 * True when a new HTLC can go out now: some channel accepts one, or no
+	 * channel can ever come to (none at all, or only closing, closed or held
+	 * ones), where waiting would never end and a payment fails on its own
+	 * terms (issue #967).
+	 */
+	private canCarryHtlc(): boolean {
+		const live = this.node
+			.getChannelManager()
+			.listChannels()
+			.filter(canBecomeUsable);
+		return live.length === 0 || live.some((ch) => ch.acceptsNewHtlcs());
+	}
+
+	/**
+	 * Run `run` once this node can pay: after a pending guardian restore has
+	 * built the node, once the node is ready, and once some channel can carry
+	 * an HTLC. node:ready alone comes after the peers' init handshakes and
+	 * before any channel_reestablish, when every restored channel still
+	 * refuses new HTLCs: a payment sent then fails for want of a route, and
+	 * one held back by canSend waits for the next enqueue. Never while a
+	 * capsule restore rebuilds the node or a restart is required, and never
+	 * after shutdown. The payment queues start here (issue #967).
+	 */
+	whenReadyToPay(run: () => void): void {
+		if (this.destroyed) return;
+		if (this._restorePending) {
+			// Shutdown removes every listener, so this cannot outlive the node.
+			this.once('recovery:restored', () => this.whenReadyToPay(run));
+			return;
+		}
+		if (this._resuming || this._restartRequired) return;
+		const node = this.node;
+		// Bound to the node it was asked about: a capsule restore that
+		// rebuilds the node retires the wait.
+		const live = (): boolean =>
+			!this.destroyed &&
+			!this._resuming &&
+			!this._restartRequired &&
+			this.node === node;
+		let ready: Promise<void>;
+		try {
+			ready = node.waitForReady(BeignetNode.MAX_TIMER_MS);
+		} catch {
+			return;
+		}
+		ready
+			.then(
+				() => {
+					if (!live()) return;
+					if (this.canCarryHtlc()) {
+						run();
+						return;
+					}
+					// Looked at again when a channel becomes usable, and when one
+					// closes or goes away, which can leave no live channel.
+					// Shutdown removes every listener, so this cannot outlive
+					// the node; a retired wait removes itself on the next event.
+					const recheck = (): void => {
+						if (live() && !this.canCarryHtlc()) return;
+						this.removeListener('channel:usable', recheck);
+						this.removeListener(CHANNELS_CHANGED, recheck);
+						if (live()) run();
+					};
+					this.on('channel:usable', recheck);
+					this.on(CHANNELS_CHANGED, recheck);
+				},
+				() => {
+					// Destroyed (a shutdown, or a capsule restore rebuilding the
+					// node) before it was ready: nothing to start.
+				}
+			)
+			.catch((err: unknown) => {
+				try {
+					this.log('warn', 'Starting the payment queue failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// A throwing log listener must not become an unhandled
+					// rejection either.
+				}
+			});
+	}
+
+	/**
+	 * The one payment queue this process runs over the payment_queue table
+	 * (issue #978), built on first use. The daemon's routes under /queue and
+	 * enqueuePayment/listQueue/cancelQueuedPayment all serve this instance:
+	 * a second queue over the same table would restore and dispatch the same
+	 * rows. It persists through the node's CURRENT storage, so it survives an
+	 * in-process capsule resume that replaces the database.
+	 */
+	getPaymentQueue(): PaymentQueue {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
 					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-				(amount) => this.canSend(amount),
-				undefined,
-				this.storage
+				// No node yet (a guardian restore pending): no capacity, for
+				// now, rather than a throw (issue #967).
+				(amount) =>
+					(this.node as LightningNode | undefined)
+						? this.canSend(amount)
+						: { canSend: false, availableSats: 0 },
+				{
+					// A restored entry that was in flight is settled against
+					// the node's record before anything sends it again (issue
+					// #967).
+					resolveInterrupted: (b) => this.resolveInterruptedPayment(b),
+					// The capacity check for an entry whose amount is only in
+					// its invoice uses that amount, rounded up to whole sats
+					// as payInvoice admits it (issue #981). A string that does
+					// not decode throws, which the queue takes as no amount.
+					invoiceAmountSats: (b) =>
+						paymentSpendSats(decodeInvoiceInput(b).amountMsat)
+				},
+				this.liveQueueStorage()
 			);
+			// First built after shutdown began, while the database stays open
+			// for the wallet: the rows it restored must not dispatch against
+			// the stopped node and persist 'failed' (issue #958). Otherwise
+			// they dispatch once the node can pay, not on the next enqueue(),
+			// and one held back by canSend is looked at again whenever a
+			// channel can carry HTLCs again (issue #967).
+			if (this.destroyed) {
+				this.paymentQueue.stop();
+			} else {
+				this.whenReadyToPay(() => this.paymentQueue?.start());
+				this.on('channel:usable', () => this.paymentQueue?.poke());
+			}
 		}
 		return this.paymentQueue;
+	}
+
+	/**
+	 * The payment queue's view of storage: this.storage on every call, never
+	 * the handle the queue was built over. A capsule resume closes that
+	 * handle and installs a new one, and a write to the closed one throws
+	 * (issue #978).
+	 */
+	private liveQueueStorage(): IPaymentQueueStorage {
+		return {
+			saveQueueEntry: (entry) => this.storage.saveQueueEntry(entry),
+			updateQueueEntryStatus: (id, status, error, completedAt) =>
+				this.storage.updateQueueEntryStatus(id, status, error, completedAt),
+			deleteQueueEntry: (id) => this.storage.deleteQueueEntry(id),
+			loadAllQueueEntries: () => this.storage.loadAllQueueEntries()
+		};
 	}
 
 	enqueuePayment(
@@ -12466,7 +13318,11 @@ export class BeignetNode extends EventEmitter {
 		return this.node;
 	}
 
-	/** Access the underlying SqliteStorage — used by daemon for webhook/queue persistence. */
+	/**
+	 * The node's current SqliteStorage. An in-process capsule resume closes
+	 * it and installs a new one, so anything that persists through it reads
+	 * this on every call instead of keeping the handle (issue #978).
+	 */
 	getStorage(): SqliteStorage {
 		return this.storage;
 	}
@@ -12490,6 +13346,7 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._fallbackRecoveryTimer);
 			this._fallbackRecoveryTimer = undefined;
 		}
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		if (this._confirmTimer) {
@@ -12504,16 +13361,18 @@ export class BeignetNode extends EventEmitter {
 				/* best-effort: backup errors already surface via backup:failed */
 			});
 		}
-		// A restore-pending daemon never built the node or the wallet.
-		await (this.node as LightningNode | undefined)?.gracefulShutdown(timeoutMs);
-		this.storage.close();
-		this.removeAllListeners();
+		// A restore-pending daemon never built the node or the wallet. The
+		// node closes only its view of the database: the wallet writes
+		// through the database too, and its stop() waits for a refresh in
+		// flight and its queued writes. The node stops first, since its chain
+		// backend and funding provider use the wallet (issue #958).
 		try {
-			await (this.wallet as Wallet | undefined)?.stop();
-		} catch {
-			// Ignore shutdown errors
+			await (this.node as LightningNode | undefined)?.gracefulShutdown(
+				timeoutMs
+			);
+		} finally {
+			await this.stopWalletAndCloseStorage();
 		}
-		this.releaseLock();
 	}
 
 	async destroy(): Promise<void> {
@@ -12545,17 +13404,44 @@ export class BeignetNode extends EventEmitter {
 		}
 		this.stopRecoveryLeaseCheck();
 		this.clearAutoApplyTimers();
+		this.paymentQueue?.stop();
 		this.paymentQueue?.removeAllListeners();
 		this.directFundingSender?.stop();
 		// A restore-pending daemon never built the node or the wallet; the
 		// definite-assignment assertions on the fields do not change that.
-		(this.node as LightningNode | undefined)?.destroy();
-		this.storage.close();
+		// The node closes only its view of the database, as in
+		// gracefulShutdown (issue #958).
+		try {
+			(this.node as LightningNode | undefined)?.destroy();
+		} finally {
+			await this.stopWalletAndCloseStorage();
+		}
+	}
+
+	/**
+	 * The shared tail of gracefulShutdown and destroy, run after the node
+	 * has stopped and fenced its view of the database: the wallet, then the
+	 * database, then the lock. The wallet stops before the close so the
+	 * writes its stop() waits for land (issue #958). Listeners go first, so
+	 * nothing the wallet reports while it stops reaches the daemon's SSE or
+	 * webhook subscribers.
+	 */
+	private async stopWalletAndCloseStorage(): Promise<void> {
+		// The node's destroy() fences its view in its own close. A teardown
+		// step that throws before that close would leave every reference the
+		// node's subsystems hold writable while the wallet stops, so fence it
+		// here too. The close is idempotent (issue #958).
+		this._nodeStorageView?.close();
 		this.removeAllListeners();
 		try {
 			await (this.wallet as Wallet | undefined)?.stop();
 		} catch {
 			// Ignore shutdown errors
+		}
+		try {
+			this.storage.close();
+		} catch {
+			// best-effort: the lock must still be released
 		}
 		this.releaseLock();
 	}

@@ -23,8 +23,7 @@ import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
 import { ApiResponse, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
-import { WebhookManager } from './webhooks';
-import { PaymentQueue } from './payment-queue';
+import { IWebhookStorage, WebhookManager } from './webhooks';
 import {
 	HttpRateLimiter,
 	RateLimitOptions,
@@ -898,6 +897,17 @@ async function bootDaemon(
 			'guardianServe must be a boolean (BEIGNET_GUARDIAN_SERVE is exactly true or false)'
 		);
 	}
+	// Tor hybrid mode (issue #963): an exact boolean; the "needs torProxy"
+	// pairing is refused by BeignetNode itself so library callers get it too.
+	if (
+		opts.torProxyOnionOnly !== undefined &&
+		typeof opts.torProxyOnionOnly !== 'boolean'
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'torProxyOnionOnly must be a boolean (BEIGNET_TOR_PROXY_ONION_ONLY is exactly true or false)'
+		);
+	}
 	// FFOR roles (issue #729): exact booleans, and the issuer needs the
 	// witness it is co-hosted with (spec section 9.7.1).
 	for (const [name, v] of [
@@ -1050,7 +1060,10 @@ async function bootDaemon(
 	}
 	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
 	started.node = node;
-	const storage = node.getStorage();
+	// Every store below reads node.getStorage() on each call rather than
+	// keeping the handle: an in-process capsule resume closes the database
+	// the node booted on and installs the restored one, and a write to the
+	// closed handle throws (issue #978).
 	// Durable auth-key state: persisted rotate/revoke overrides live in the
 	// encrypted wallet_data table and are re-applied over the config-declared
 	// keys on every start (so a restart no longer resurrects a revoked or
@@ -1058,7 +1071,9 @@ async function bootDaemon(
 	authenticator.attachOverrideStore({
 		load: (): Record<string, StoredKeyOverride> | null => {
 			try {
-				const raw = storage.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
+				const raw = node
+					.getStorage()
+					.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
 				if (raw === null) return null;
 				const parsed = JSON.parse(raw);
 				return typeof parsed === 'object' &&
@@ -1071,20 +1086,29 @@ async function bootDaemon(
 			}
 		},
 		save: (overrides): void => {
-			storage.saveWalletData(
-				AUTH_KEY_OVERRIDES_STORAGE_KEY,
-				JSON.stringify(overrides)
-			);
+			node
+				.getStorage()
+				.saveWalletData(
+					AUTH_KEY_OVERRIDES_STORAGE_KEY,
+					JSON.stringify(overrides)
+				);
 		}
 	});
-	const webhookManager = new WebhookManager(storage);
-	const paymentQueue = new PaymentQueue(
-		(bolt11, timeout, maxFee, amount, meta) =>
-			node.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
-		(amount) => node.canSend(amount),
-		undefined,
-		storage
-	);
+	const webhookStorage: IWebhookStorage = {
+		saveWebhook: (id, url, events, secretHash, createdAt) =>
+			node.getStorage().saveWebhook(id, url, events, secretHash, createdAt),
+		deleteWebhook: (id) => node.getStorage().deleteWebhook(id),
+		deleteAllWebhooks: () => node.getStorage().deleteAllWebhooks(),
+		loadAllWebhooks: () => node.getStorage().loadAllWebhooks()
+	};
+	const webhookManager = new WebhookManager(webhookStorage);
+	// The node's queue, the one this process runs over the payment_queue
+	// table (issue #978): the routes under /queue and the node's own
+	// enqueuePayment/listQueue/cancelQueuedPayment serve the same instance.
+	// Building it here wires its start (once the node can pay, issue #967)
+	// and its poke on every channel:usable; a boot that fails from here on
+	// destroys the node, which stops the queue.
+	const paymentQueue = node.getPaymentQueue();
 	const rateLimiter = opts.rateLimit
 		? new HttpRateLimiter(opts.rateLimit)
 		: null;
@@ -3340,6 +3364,10 @@ async function bootDaemon(
 	let stopping: Promise<void> | null = null;
 	const stop = (timeoutMs = 30_000): Promise<void> => {
 		stopping ??= (async (): Promise<void> => {
+			// The database stays open while the wallet stops (issue #958); a
+			// queued payment dispatched against the stopped node would persist
+			// 'failed' there instead of staying queued for the next start.
+			paymentQueue.stop();
 			paymentQueue.removeAllListeners();
 			await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
 			if (rateLimiter) rateLimiter.destroy();
@@ -3379,6 +3407,10 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
+			// The queue's start (once the node can pay, issue #967) and its
+			// poke on channel:usable were wired when the node built it above;
+			// stop() halts the queue first, so a start that comes after it
+			// does nothing (issue #978).
 			resolve({ server, node, stop });
 		});
 	});

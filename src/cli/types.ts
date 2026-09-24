@@ -728,6 +728,11 @@ export interface BeignetConfig {
 	tlsKey?: string;
 	/** SOCKS5 proxy as "host:port" for outbound Lightning peer connections (e.g. Tor). */
 	torProxy?: string;
+	/** Use torProxy for `.onion` peers only and dial public clearnet peers
+	 *  directly (LND's `tor.skip-proxy-for-clearnet-targets`, "hybrid mode").
+	 *  Private and loopback hosts are always dialed directly. Needs torProxy.
+	 *  Env: BEIGNET_TOR_PROXY_ONION_ONLY (exactly `true`/`false`). */
+	torProxyOnionOnly?: boolean;
 	/** Addresses to advertise in node_announcement, as "host[:port]" strings
 	 *  (IPv4, "[ipv6]:port", Tor v3 ".onion", or DNS hostname). */
 	announceAddresses?: string[];
@@ -1307,6 +1312,13 @@ export interface BeignetNodeEvents {
 	'onchain:rbf': (data: { txids: string[] }) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
+	/**
+	 * The channel can take a new HTLC again: it reached NORMAL on
+	 * channel_ready, finished reestablishing on a reconnect, a splice locked
+	 * or unwound, or its funding quarantine lifted. Fires on every reconnect.
+	 * The payment queues start and retry on it (issue #967).
+	 */
+	'channel:usable': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {
 		channelId: string;
 		initiator: 'local' | 'remote';
