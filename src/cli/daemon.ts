@@ -193,6 +193,96 @@ export const AUTH_EXEMPT_ROUTES = new Set([
 ]);
 
 /**
+ * Logged once at boot when no credential is configured (issue #1005). The
+ * daemon keeps running: a loopback bind with no token is the documented
+ * pre-1005 default, and every install created by `beignet init` since then
+ * carries a token, so this line only reaches configs written by hand or by
+ * an older release.
+ */
+export const AUTH_OFF_WARNING =
+	'authentication is off: any local process can drive this daemon; run beignet init or set apiToken';
+
+// ── Browser guards (issue #1005) ──
+// A web page can reach a loopback daemon: fetch() in no-cors mode sends a
+// POST with a text/plain body and no preflight, an <img> or <form> carries
+// a cross-site request, and a DNS name that rebinds to 127.0.0.1 lets the
+// page read the answers. With a credential configured none of that works
+// (a browser cannot attach a bearer token cross-site), so the guards run
+// only while authentication is off, where they are the only defence.
+
+/**
+ * True when the Content-Type names application/json, with or without media
+ * type parameters ("application/json; charset=utf-8"), any case. A missing
+ * header is not JSON: a Blob body from fetch() sends none.
+ */
+export function isJsonContentType(header: string | undefined): boolean {
+	if (header === undefined) return false;
+	const mediaType = header.split(';', 1)[0].trim().toLowerCase();
+	return mediaType === 'application/json';
+}
+
+/** True for a bind address that means every interface (0.0.0.0, ::, [::]). */
+export function isWildcardBindHost(host: string): boolean {
+	const bare =
+		host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+	return bare === '0.0.0.0' || /^[0:]+$/.test(bare);
+}
+
+/** True for a literal loopback bind: the localhost name, ::1 or 127.0.0.0/8. */
+export function isLoopbackBindHost(host: string): boolean {
+	const bare =
+		host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+	return (
+		bare === 'localhost' ||
+		bare === '::1' ||
+		(net.isIPv4(bare) && bare.startsWith('127.'))
+	);
+}
+
+/**
+ * The host name a Host header carries, lower-cased, without its port and
+ * without IPv6 brackets; null when the value is not a host name with an
+ * optional port at all ("a b", "[::1", "a:b:c").
+ */
+export function hostNameOfHeader(header: string): string | null {
+	const value = header.trim();
+	if (value.startsWith('[')) {
+		const end = value.indexOf(']');
+		if (end === -1) return null;
+		const rest = value.slice(end + 1);
+		if (rest !== '' && !/^:\d{1,5}$/.test(rest)) return null;
+		const name = value.slice(1, end);
+		return net.isIPv6(name) ? name.toLowerCase() : null;
+	}
+	const match = /^([A-Za-z0-9._-]+)(?::(\d{1,5}))?$/.exec(value);
+	return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Whether a Host header may reach a daemon bound on `bindHost` while no
+ * credential is configured. Loopback names always may (localhost, ::1,
+ * 127.0.0.0/8), and so may the bound address itself when it is concrete.
+ * A missing Host (HTTP/1.0) counts as allowed only for a loopback bind.
+ * Any other name is a DNS name that resolved to this machine from a page
+ * the operator never meant to serve.
+ */
+export function isAllowedHostHeader(
+	header: string | undefined,
+	bindHost: string
+): boolean {
+	if (header === undefined) return isLoopbackBindHost(bindHost);
+	const name = hostNameOfHeader(header);
+	if (name === null) return false;
+	if (isLoopbackBindHost(name)) return true;
+	if (isWildcardBindHost(bindHost)) return false;
+	const bound =
+		bindHost.startsWith('[') && bindHost.endsWith(']')
+			? bindHost.slice(1, -1)
+			: bindHost;
+	return name === bound.toLowerCase();
+}
+
+/**
  * Routes a restore-pending daemon still serves (GET /events bypasses this
  * set through its own dispatcher arm, so SSE restore progress flows too).
  */
@@ -227,6 +317,12 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	IDEMPOTENCY_CONFLICT: 409,
 	BODY_TOO_LARGE: 413,
 	RATE_LIMITED: 429,
+	// Browser guards (issue #1005): the request's own shape is refused, so
+	// none of these is a node fault and none changes on a retry. 421 is
+	// Misdirected Request, the status for a Host the server does not serve.
+	UNSUPPORTED_MEDIA_TYPE: 415,
+	CROSS_SITE_REQUEST_REFUSED: 403,
+	HOST_NOT_ALLOWED: 421,
 	// L402 refusals are decisions about the caller's request, not node faults.
 	// They must not read as 5xx, which is the class agents retry on: retrying
 	// a refused challenge just fetches a new invoice and refuses that too.
@@ -647,6 +743,12 @@ export interface IStartedDaemon {
 	 * CLI signal handler both use it.
 	 */
 	stop: (timeoutMs?: number) => Promise<void>;
+	/**
+	 * The diagnostic logger the daemon resolved (an injected one, else the
+	 * console logger a logLevel configures), so the process that hosts the
+	 * daemon can report through the same channel. Absent when neither is set.
+	 */
+	logger?: ILogger;
 }
 
 export async function startDaemon(
@@ -698,10 +800,7 @@ async function bootDaemon(
 	// drive those same routes. `insecure: true` is the deliberate escape.
 	// A literal loopback IP or the localhost name only: a HOSTNAME beginning
 	// with "127." (e.g. 127.example.com) could resolve anywhere.
-	const isLoopbackHost =
-		host === 'localhost' ||
-		host === '::1' ||
-		(net.isIPv4(host) && host.startsWith('127.'));
+	const isLoopbackHost = isLoopbackBindHost(host);
 	if (!isLoopbackHost && !authenticator.enabled && opts.insecure !== true) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -1710,12 +1809,13 @@ async function bootDaemon(
 		},
 
 		'POST /invoice/validate': (body) => {
-			const { bolt11, amountSats } = body as {
+			const { bolt11, amountSats, maxFeeSats } = body as {
 				bolt11: string;
 				amountSats?: number;
+				maxFeeSats?: number;
 			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
-			return success(node.validatePayment(bolt11, amountSats));
+			return success(node.validatePayment(bolt11, amountSats, maxFeeSats));
 		},
 		'POST /invoice/create': (body) => {
 			const {
@@ -1990,15 +2090,23 @@ async function bootDaemon(
 			return success(node.decodeInvoice(bolt11));
 		},
 		'POST /invoice/pay': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
-				body as {
-					bolt11: string;
-					timeoutMs?: number;
-					maxFeeSats?: number;
-					amountSats?: number;
-					metadata?: Record<string, string>;
-					cltvLimit?: number;
-				};
+			const {
+				bolt11,
+				timeoutMs,
+				maxFeeSats,
+				maxFeeMsat,
+				amountSats,
+				metadata,
+				cltvLimit
+			} = body as {
+				bolt11: string;
+				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
+				amountSats?: number;
+				metadata?: Record<string, string>;
+				cltvLimit?: number;
+			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoice(
@@ -2007,7 +2115,8 @@ async function bootDaemon(
 					maxFeeSats,
 					amountSats,
 					metadata,
-					cltvLimit
+					cltvLimit,
+					maxFeeMsat
 				)
 			);
 		},
@@ -2041,15 +2150,23 @@ async function bootDaemon(
 			}
 		},
 		'POST /invoice/pay-safe': async (body) => {
-			const { bolt11, timeoutMs, maxFeeSats, amountSats, metadata, cltvLimit } =
-				body as {
-					bolt11: string;
-					timeoutMs?: number;
-					maxFeeSats?: number;
-					amountSats?: number;
-					metadata?: Record<string, string>;
-					cltvLimit?: number;
-				};
+			const {
+				bolt11,
+				timeoutMs,
+				maxFeeSats,
+				maxFeeMsat,
+				amountSats,
+				metadata,
+				cltvLimit
+			} = body as {
+				bolt11: string;
+				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
+				amountSats?: number;
+				metadata?: Record<string, string>;
+				cltvLimit?: number;
+			};
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(
 				await node.payInvoiceSafe(
@@ -2058,7 +2175,8 @@ async function bootDaemon(
 					maxFeeSats,
 					amountSats,
 					metadata,
-					cltvLimit
+					cltvLimit,
+					maxFeeMsat
 				)
 			);
 		},
@@ -2719,13 +2837,23 @@ async function bootDaemon(
 			return success({ removed: true });
 		},
 		'POST /offer/pay': async (body) => {
-			const { offer, amountSats, timeoutMs } = body as {
+			const { offer, amountSats, timeoutMs, maxFeeSats, maxFeeMsat } = body as {
 				offer: string;
 				amountSats?: number;
 				timeoutMs?: number;
+				maxFeeSats?: number;
+				maxFeeMsat?: number | string;
 			};
 			if (!offer) return failure('INVALID_PARAMS', 'offer required');
-			return success(await node.payOffer(offer, amountSats, timeoutMs));
+			return success(
+				await node.payOffer(
+					offer,
+					amountSats,
+					timeoutMs,
+					maxFeeSats,
+					maxFeeMsat
+				)
+			);
 		},
 
 		// ── Guardian Recovery (docs/RECOVERY-PROTOCOL.md section 8) ──
@@ -3026,14 +3154,86 @@ async function bootDaemon(
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
 
-	const requestHandler = async (
+	// The Host check is skipped for a wildcard bind (only reachable without
+	// auth under `insecure`): every name the machine answers to is the
+	// operator's choice there, and there is no one address to hold it to.
+	const skipHostGuard = isWildcardBindHost(host);
+	const browserGuardRefusal = (
+		req: http.IncomingMessage,
+		allowedOrigin: string | null
+	): { code: string; message: string } | null => {
+		const hasBody =
+			req.headers['transfer-encoding'] !== undefined ||
+			Number(req.headers['content-length']) > 0;
+		if (hasBody && !isJsonContentType(req.headers['content-type'])) {
+			return {
+				code: 'UNSUPPORTED_MEDIA_TYPE',
+				message: 'Request bodies must be sent as Content-Type: application/json'
+			};
+		}
+		const origin = req.headers['origin'];
+		if (allowedOrigin !== '*') {
+			if (origin !== undefined) {
+				if (allowedOrigin === null || origin !== allowedOrigin) {
+					return {
+						code: 'CROSS_SITE_REQUEST_REFUSED',
+						message:
+							"Cross-site browser requests are refused while authentication is off; configure apiToken or apiKeys, or set cors to this page's origin"
+					};
+				}
+			} else if (req.headers['sec-fetch-site'] === 'cross-site') {
+				return {
+					code: 'CROSS_SITE_REQUEST_REFUSED',
+					message:
+						'Cross-site browser requests are refused while authentication is off; configure apiToken or apiKeys'
+				};
+			}
+		}
+		if (!skipHostGuard && !isAllowedHostHeader(req.headers['host'], host)) {
+			return {
+				code: 'HOST_NOT_ALLOWED',
+				message:
+					'The Host header must name the loopback address this daemon is bound on (localhost, 127.0.0.1 or [::1]) while authentication is off'
+			};
+		}
+		return null;
+	};
+
+	// A fault the request pipeline did not classify: the detail goes to the
+	// operator (stderr when no logger is configured, so a generic 500 stays
+	// diagnosable), never to the client. Raw messages leak filesystem paths
+	// and database layout.
+	const reportFault = (context: string, err: unknown): void => {
+		const detail =
+			err instanceof Error ? err.stack ?? err.message : String(err);
+		if (logger) {
+			logger.error(`${context}: ${detail}`);
+		} else {
+			process.stderr.write(`[beignet-daemon] ${context}: ${detail}\n`);
+		}
+	};
+
+	const handleRequest = async (
 		req: http.IncomingMessage,
 		res: http.ServerResponse
 	): Promise<void> => {
-		const parsedUrl = new URL(
-			req.url || '/',
-			`http://${req.headers.host || 'localhost'}`
-		);
+		// Only the path and the query are read, so the target is parsed against
+		// a constant base. The Host header is caller-controlled, and a value the
+		// URL parser refuses ("a b", "[::1", "a:b:c") used to throw here, above
+		// every try/catch, and Node's default for the unhandled rejection
+		// terminated the process (issue #1003). A target the parser refuses on
+		// its own ("//[") is answered as a malformed request instead.
+		let parsedUrl: URL;
+		try {
+			parsedUrl = new URL(req.url || '/', 'http://localhost');
+		} catch {
+			res.setHeader('Content-Type', 'application/json');
+			res.statusCode = 400;
+			res.end(
+				JSON.stringify(failure('INVALID_PARAMS', 'Malformed request target'))
+			);
+			return;
+		}
 		// API versioning: strip /v1/ prefix for backward compat
 		let pathname = parsedUrl.pathname;
 		if (pathname.startsWith('/v1/')) {
@@ -3058,6 +3258,23 @@ async function bootDaemon(
 			res.statusCode = 204;
 			res.end();
 			return;
+		}
+
+		// ── Browser guards (issue #1005), only while authentication is off ──
+		// Ahead of the rate limiter and the auth middleware, so a configured
+		// credential costs this one branch and nothing else. They apply to
+		// every route, the auth-exempt ones included: a plain client sends no
+		// Origin and a loopback Host, and no foreign page has business with
+		// /health. The wildcard-CORS case is an insecure opt-in (refused at
+		// boot otherwise), where the operator asked for any page to be served.
+		if (!authenticator.enabled) {
+			const refusal = browserGuardRefusal(req, corsOrigin);
+			if (refusal) {
+				res.setHeader('Content-Type', 'application/json');
+				res.statusCode = statusForErrorCode(refusal.code);
+				res.end(JSON.stringify(failure(refusal.code, refusal.message)));
+				return;
+			}
 		}
 
 		// ── Rate limiting (opt-in) ──
@@ -3316,24 +3533,44 @@ async function bootDaemon(
 				res.end(JSON.stringify({ ok: false, error: err.toJSON() }));
 			} else {
 				// Unknown throw: log the detail server-side and answer with a
-				// generic message. Raw messages leak filesystem paths and
-				// database layout; HTTP 200 on errors blinds every proxy and
-				// health check in front of the daemon. An unhandled exception
-				// is worth a stderr line even when logging is not configured;
-				// discarding it makes the generic 500 undiagnosable.
-				const detail =
-					err instanceof Error ? err.stack ?? err.message : String(err);
-				if (logger) {
-					logger.error(`Unhandled error on ${routeKey}: ${detail}`);
-				} else {
-					process.stderr.write(
-						`[beignet-daemon] Unhandled error on ${routeKey}: ${detail}\n`
-					);
-				}
+				// generic message. HTTP 200 on errors blinds every proxy and
+				// health check in front of the daemon.
+				reportFault(`Unhandled error on ${routeKey}`, err);
 				res.statusCode = 500;
 				res.end(
 					JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
 				);
+			}
+		}
+	};
+
+	// Nothing may reject out of a request: an escaped rejection reaches
+	// Node's default handler, which terminates the process, so one request
+	// would take the node down (issue #1003). The routes' own catch above
+	// classifies their errors; this covers the prologue, the SSE, metrics and
+	// stop arms, and anything a later change puts outside that catch.
+	const requestHandler = async (
+		req: http.IncomingMessage,
+		res: http.ServerResponse
+	): Promise<void> => {
+		try {
+			await handleRequest(req, res);
+		} catch (err: unknown) {
+			reportFault(`Unhandled error on ${req.method} ${req.url ?? ''}`, err);
+			try {
+				if (!res.headersSent) {
+					res.setHeader('Content-Type', 'application/json');
+					res.statusCode = 500;
+					res.end(
+						JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
+					);
+				} else if (!res.writableEnded) {
+					// The status is already on the wire; end the body so the
+					// socket does not hang open.
+					res.end();
+				}
+			} catch {
+				// The socket is gone; there is nothing left to answer.
 			}
 		}
 	};
@@ -3346,11 +3583,17 @@ async function bootDaemon(
 			key: fs.readFileSync(opts.tlsKey)
 		};
 		server = https.createServer(tlsOptions, (req, res) => {
-			void requestHandler(req, res);
+			// Unreachable while requestHandler catches everything; kept so a
+			// regression there still cannot escape to the process.
+			requestHandler(req, res).catch((err: unknown) =>
+				reportFault('Request handler rejected', err)
+			);
 		});
 	} else {
 		server = http.createServer((req, res) => {
-			void requestHandler(req, res);
+			requestHandler(req, res).catch((err: unknown) =>
+				reportFault('Request handler rejected', err)
+			);
 		});
 	}
 
@@ -3407,11 +3650,12 @@ async function bootDaemon(
 		server.on('error', reject);
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
+			if (!authenticator.enabled) logger?.warn(AUTH_OFF_WARNING);
 			// The queue's start (once the node can pay, issue #967) and its
 			// poke on channel:usable were wired when the node built it above;
 			// stop() halts the queue first, so a start that comes after it
 			// does nothing (issue #978).
-			resolve({ server, node, stop });
+			resolve({ server, node, stop, logger });
 		});
 	});
 }

@@ -14,7 +14,8 @@ Both return plain JSON with hex string IDs and satoshi amounts (no Buffer, no bi
 ### CLI
 
 ```bash
-# Initialize (generates mnemonic, writes ~/.beignet/config.json)
+# Initialize (generates mnemonic and API token, writes ~/.beignet/config.json;
+# the token is printed once, and every command below reads it from the config)
 npx ts-node src/cli/cli.ts init --network regtest
 
 # Start the daemon (stays in foreground, listens on 127.0.0.1:2112)
@@ -209,15 +210,15 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
-| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
+| `payInvoice(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay invoice. **Blocks until settled or timeout** (default 60s). At the timeout the payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until that HTLC resolves, no further route is tried after the timeout, and the record is failed when the HTLC fails or its on-chain timeout resolves; the `PAYMENT_TIMEOUT` message says so (issue #976). `maxFeeSats` caps routing fees in whole sats; `maxFeeMsat` (a number or a decimal string) caps them exactly, for a caller holding an exact quote such as `estimatePayment`'s `estimatedFeeMsat`; with neither, the cap is 1% of the amount, never below 50 sats. The spending limits count the amount plus the cap (see Spending Limits). Pass one or the other: both at once is refused with `INVALID_PARAMS`; a route over the cap is refused with `FEE_EXCEEDS_MAX` (409 over HTTP, permanent for `isRetryableError` and `payInvoiceWithRetry`) and nothing is sent. `amountSats` is required for amount-less invoices. `metadata` attaches key-value labels. `cltvLimit` caps the payment's total CLTV expiry at that many blocks above the current tip (every attempt, retry and MPP part); when no route fits it fails with `CLTV_EXCEEDS_MAX` and nothing is sent. A swap provider paying the counterparty's invoice sets it from the on-chain refund height (#751). |
+| `payInvoiceSafe(bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Like `payInvoice` but **never throws**: catches all errors and resolves with the hash's existing record when there is one (after a timeout with an HTLC still out, the `PENDING` record, which no further route is tried for and which is failed when that HTLC fails or its on-chain timeout resolves; for a duplicate refusal, the record the engine refused from) and otherwise with `status: 'FAILED'`. The `failureDescription` field contains `[ERROR_CODE] message` for machine parsing. |
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
 | `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
 | `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
 | `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
-| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. |
+| `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
 
 #### BOLT 12 Offers
@@ -227,7 +228,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `createOffer({ description, amountSats?, issuer? })` | `OfferInfo` | Create a reusable BOLT 12 offer |
 | `decodeOfferString(offerStr)` | `OfferInfo` | Decode a BOLT 12 offer string without paying |
 | `listOffers()` | `OfferInfo[]` | List local offers |
-| `payOffer(offerStr, amountSats?, timeoutMs?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount |
+| `payOffer(offerStr, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat?)` | `Promise<PaymentInfo>` | Pay a BOLT 12 offer (requests invoice, then pays). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Drain mode and the spending limits apply to the returned invoice's amount. `maxFeeSats` / `maxFeeMsat` cap the routing fee exactly as `payInvoice`'s do (one or the other; both at once is `INVALID_PARAMS`, judged before the invoice is requested). The cap covers the public hops plus the invoice's own blinded-path fee, which the payee writes into the invoice and which is otherwise paid unbounded (#1001); an invoice path over the cap is skipped for the invoice's other paths, and when none fits the payment is refused with `FEE_EXCEEDS_MAX` and nothing is sent |
 
 #### Channel Readiness
 
@@ -241,7 +242,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `estimateRouteFee(bolt11, amountSats?)` | `RouteEstimate \| null` | Estimate fee without sending. Returns `{ feeSats, hops, cltvDelta }` or null |
+| `estimateRouteFee(bolt11, amountSats?)` | `RouteEstimate \| null` | Estimate fee without sending. Returns `{ feeSats, feeMsat, hops, cltvDelta }` or null. `feeSats` is rounded up, so it is safe to pass as `maxFeeSats`; `feeMsat` is the exact fee |
 | `probeRoute(destination, amountSats)` | `{ success, feeSats?, hops? }` | Probe route viability to a destination node |
 | `estimatePayment(bolt11, amountSats?)` | `PaymentEstimate \| null` | Full payment intelligence: success probability, route quality, estimated fee and time, warnings |
 
@@ -254,7 +255,7 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `getGraphChannel(scid)` | `GraphChannelInfo \| null` | Channel endpoints, capacity (from htlc_maximum_msat) and both directions' policies |
 | `describeGraph(limit?, offset?)` | `GraphDescribeResult` | Paged channel dump (limit defaults to 500, capped at 500) |
 | `queryRoute(destination, amountSats, maxFeeSats?)` | `RouteQueryResult` | Compute a route WITHOUT sending; hops feed `sendToRoute` |
-| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute` |
+| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute`. Drain mode and the spending limits apply to what the first hop carries (the amount plus every fee in the route), which is what leaves the node, and the settlement is charged to the daily spend at that figure; the first hop must carry at least the final hop's amount (`INVALID_PARAMS` otherwise) |
 
 #### Payment Proof
 
@@ -306,7 +307,10 @@ key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
 state) are AES-256-GCM encrypted, so backups made with `backup()` are encrypted
 too; restoring one requires the same mnemonic. Pre-encryption databases are
 migrated in place on first open. Set `storageEncryption: false` to opt out
-(plaintext storage).
+(plaintext storage). Lookup columns (payment hashes, channel ids, peer pubkeys,
+gossip) stay plaintext, so the database file, its sidecars and every backup
+are created `0600` and the data directory `0700` (see
+[File permissions](#file-permissions)).
 
 #### Static Channel Backup (SCB)
 
@@ -694,10 +698,31 @@ Every invoice payment (`payInvoice`, `payInvoiceSafe`, `payInvoiceWithRetry`,
 `sendPaymentAsync`, the queue and their routes) is checked and recorded at the
 amount that actually gets paid: the invoice's own amount whenever it carries
 one, and `amountSats` only for an amount-less invoice. A fractional msat amount
-rounds up. `validatePayment`, `estimatePayment` and `estimateRouteFee` preview
-the same amount. `payOffer` is checked and recorded the same way, against the
+rounds up. `payOffer` is checked and recorded the same way, against the
 amount of the BOLT 12 invoice the payee returns for the offer, which is what
 gets paid whatever `amountSats` asked for.
+
+Routing fees count too (issue #1008). Every Lightning pay path (`payInvoice`,
+`payInvoiceSafe`, `payInvoiceWithRetry`, the queue, `sendPaymentAsync`,
+`sendKeysend`, `payOffer` and their routes) sends under a fee cap: the caller's
+`maxFeeSats` / `maxFeeMsat`, or, when none is given, 1% of the amount rounded
+up and never below 50 sats. `maxPaymentSats` and the daily limit are judged on
+the amount PLUS that cap at admission, and the day is charged the amount plus
+the fee actually paid at settlement (the reservation stands in for a settlement
+whose record cannot say what it cost). A payment that fits a limit on its
+amount alone but not with its cap is refused with `SPENDING_LIMIT_EXCEEDED`,
+and the message says to lower `maxFeeSats` or the amount. `sendToRoute` and
+`POST /payment/send-to-route` are admitted and charged on what the first hop
+carries, which is the amount plus every fee in the route, with no cap on top.
+`validatePayment(bolt11, amountSats?, maxFeeSats?)` previews the same
+judgement for a BOLT 11 payment; `estimatePayment` and `estimateRouteFee`
+preview the amount. A settlement that lands while the process is down is
+charged by the boot reconciliation at the same figure as a live one: the
+amount plus the fee the record says was paid, or the reservation when no
+record can say. Excluded by design: the submarine swap provider's payment of
+the counterparty's invoice runs outside `maxPaymentSats`, the daily limit and
+the ledger; the provider's own per-swap fee cap and the swap-in it is funded
+from bound it.
 
 The ledger is persisted (issue #977): a restart within the UTC day resumes
 the day's total, and the budget a payment still holds while its HTLC is out
@@ -1009,7 +1034,8 @@ interface PaymentEstimate {
   routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
   warning?: string;
   alternativeAvailable: boolean; // MPP route exists
-  estimatedFeeSats: number;
+  estimatedFeeSats: number;     // rounded UP, safe to pass as maxFeeSats
+  estimatedFeeMsat: string;     // exact fee, decimal string
   hopCount: number;
 }
 
@@ -1195,6 +1221,7 @@ not repeat a 4xx unchanged.
 | `NOTHING_TO_CONSOLIDATE` | Wallet | 409 | Consolidation needs at least two spendable UTXOs |
 | `INSTANCE_ALREADY_RUNNING` | Wallet | n/a | Another instance holds the data-dir lock (startup only, never over HTTP) |
 | `PAYMENT_FAILED` | Payments | 502 | Lightning payment failed |
+| `FEE_EXCEEDS_MAX` | Payments | 409 | Every route costs more than the caller's `maxFeeSats` / `maxFeeMsat`; nothing was sent (permanent: the same request meets the same cap) |
 | `PAYMENT_TIMEOUT` | Payments | 504 | Payment did not settle within timeout. The payment is failed only when no HTLC is out for it; with one still in flight the record stays `PENDING` until it resolves, no further route is tried, and the record is failed when the HTLC fails or its on-chain timeout resolves; the message says so (issue #976) |
 | `INVOICE_EXPIRED` | Payments | 410 | Invoice has expired |
 | `NO_ROUTE` | Payments | 502 | No route found to destination |
@@ -1360,6 +1387,16 @@ one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
 seed. `GET /mnemonic` only reveals the configured seed, and only when
 `apiToken` or `apiKeys` is set (admin scope).
 
+`init` also mints an `apiToken` (32 random bytes, hex) whenever the config
+carries neither `apiToken` nor `apiKeys` and the environment supplies neither
+`BEIGNET_API_TOKEN` nor `BEIGNET_API_KEYS`. The token is saved to
+`config.json` and printed once, as `apiToken` with a `note` on how to send it;
+an existing token or key set is left alone and never printed. Running `init`
+on a config an older release wrote (mnemonic, no credential) adds a token the
+same way. `beignet start` with no credential at all keeps running but warns
+on stderr: `authentication is off: any local process can drive this daemon;
+run beignet init or set apiToken`.
+
 ### API key management
 
 ```bash
@@ -1489,7 +1526,10 @@ beignet wallet descriptors
 
 On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
 can later be bumped with `tx bump-fee` (or `tx boost`, which falls back to
-CPFP when RBF is unavailable).
+CPFP when RBF is unavailable). The wallet's staged send is reset after every
+`send`, `send-max`, `consolidate`, `psbt build` and boost, so a restart never
+replays an earlier call's recipients, and external signing keys are never
+written to storage.
 
 **Daily spend limit (combined):** when the daemon is started with
 `--daily-spend-limit`, `send` and `send-max` count amount + fee against the
@@ -1783,6 +1823,10 @@ beignet offer decode lno1...
 beignet offer pay lno1... 1000
 # Requests invoice from offer issuer, then pays it
 # {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED",...}}
+
+beignet offer pay lno1... 1000 --max-fee 5
+# Same, refusing to pay more than 5 sats of routing fee (public hops plus the
+# invoice's own blinded-path fee); over the cap nothing is sent
 ```
 
 ### Webhooks (CLI)
@@ -1863,6 +1907,25 @@ Every response follows this format:
   "htlcEvents": false
 }
 ```
+
+### File permissions
+
+The config file carries the mnemonic and the API token, so everything under
+`~/.beignet` is created owner-only: `~/.beignet` and the data directory are
+`0700`, and `config.json`, `daemon.pid`, the SQLite database with its `-wal`
+and `-shm` sidecars, the instance lock, database backups (`backup()`, the
+scheduled backup, `POST /backup`), restore copies and SCB exports are `0600`.
+The modes are set explicitly rather than trusted to the umask; the CLI also
+sets the process umask to `077` for `init`, `start`, `backup` and `restore`,
+so anything else those commands create is owner-only too. A library host that
+embeds `BeignetNode` keeps its own umask.
+
+A `config.json` or `~/.beignet` written by an earlier release is tightened the
+next time the config is read (every CLI command reads it), with one line on
+stderr naming the path: `beignet: tightened permissions on <path> (was 0644,
+now 0600)`. When the chmod is refused (a read-only or foreign filesystem) a
+warning is printed once instead and startup continues. On Windows, where ACLs
+govern access, none of this applies.
 
 ### Environment Variables
 
@@ -1979,7 +2042,7 @@ CLI flags > environment variables > config file > defaults.
 
 ## HTTP API
 
-The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`.
+The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`. A malformed request (an unparseable request target, or a `Host` header that is not a valid host) answers `400 INVALID_PARAMS` and never terminates the process; `beignet start` also logs any unhandled rejection or uncaught exception with its stack and keeps running.
 
 These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. The cache is in memory, so it does not survive a daemon restart.
 
@@ -1994,9 +2057,17 @@ When any credential is configured, all endpoints require an `Authorization: Bear
 
 - `GET /health`, `GET /ready` -- monitoring tools
 - `GET /openapi.json` -- API discovery
-- `GET /metrics` -- Prometheus scrapers
+- `GET /metrics` -- Prometheus scrapers, only with `metricsPublic` (it reports balances)
 
-If neither `apiToken` nor `apiKeys` is configured, all endpoints are open (backward-compatible). `GET /mnemonic` is only accessible when auth is configured (and only to `admin`).
+Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
+
+| Guard | Refusal |
+|-------|---------|
+| A request with a body must carry `Content-Type: application/json` (media type parameters such as `; charset=utf-8` are fine, case does not matter). A body with no Content-Type is refused too: `fetch()` in `no-cors` mode sends `text/plain` or nothing, with no preflight. | `415 UNSUPPORTED_MEDIA_TYPE` |
+| An `Origin` header must equal the configured `cors` origin string; with `cors` off, any `Origin` is refused, `null` included. Without an `Origin`, a `Sec-Fetch-Site: cross-site` request is refused (`same-origin`, `same-site` and `none` pass). With wildcard CORS (an `insecure` opt-in), any origin passes. | `403 CROSS_SITE_REQUEST_REFUSED` |
+| The `Host` header must name the loopback address the daemon is bound on: `localhost`, `127.0.0.0/8` or `[::1]`, with or without a port, or the configured `daemonHost` when it is a concrete address. A missing `Host` (HTTP/1.0) passes only on a loopback bind. This defeats DNS rebinding, where a page reads answers through a name that resolves to 127.0.0.1. Skipped for a wildcard bind (`0.0.0.0`, `::`, only possible under `insecure`). | `421 HOST_NOT_ALLOWED` |
+
+The guards run ahead of the rate limiter and the auth middleware and apply to every route, the auth-exempt ones and the SSE stream included; only `OPTIONS` (204) is exempt. Plain clients (curl, the CLI, the SDKs) send none of those headers, so they are unaffected; a reverse proxy in front of an unauthenticated daemon must forward a loopback `Host` (or the daemon needs a credential, which is the better fix). With a credential configured the guards do not run at all: a browser cannot attach a bearer token cross-site, and non-browser clients keep sending whatever Content-Type they like.
 
 **Scopes:**
 
@@ -2093,8 +2164,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
 | GET | `/invoices/held` | -- | List hold invoices with state + parked totals. Each row also carries `minFinalCltvExpiry` (the delta the invoice advertised and the final hop enforces on every arriving HTLC) and the realised expiry of the parked set: `earliestExpiry`, `cancelMarginBlocks` and `cancelHeight` (null before any part is committed). A swap provider checks `earliestExpiry` against its on-chain refund timeout before funding instead of trusting the advertised delta |
 | POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
-| POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
-| POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
+| POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels). Without `maxFeeSats`/`maxFeeMsat` the routing fee is capped at 1% of the amount, never below 50 sats; `maxPaymentSats` and the daily limit count the amount plus the cap (403 `SPENDING_LIMIT_EXCEEDED`, the message says whether to lower `maxFeeSats` or the amount). `cltvLimit` bounds the payment's total CLTV expiry in blocks above the current tip; no route under it answers `409 CLTV_EXCEEDS_MAX` with nothing sent, and a node without a tip yet answers `503 CHAIN_NOT_SYNCED`. |
+| POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, maxFeeMsat?, amountSats?, metadata?, cltvLimit? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. Same fee cap and limits as `/invoice/pay`; a limit refusal is reported in `failureDescription`. |
 | POST | `/invoice/pay-retry` | `{ bolt11, maxRetries?, backoffMs?, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Pay with exponential backoff retry. Returns `RetryPaymentResult` with `attempts`. |
 | POST | `/invoice/pay-async` | `{ bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit? }` | Fire-and-forget pay; returns `{ paymentHash, status }` immediately. Poll `GET /payment` for settlement. Answers 409 while draining and 403 over a spending limit. A refusal carries the same code and status as `/invoice/pay`: 409 `DUPLICATE_PAYMENT` for a hash already paid or still in flight, 502 `NO_ROUTE`, 400 `INVALID_INVOICE`, and so on, never a bare 502 `PAYMENT_FAILED` (issue #991). |
 | POST | `/payment/cancel` | `{ paymentHash }` | Cancel a pending outbound payment (marks as FAILED) |
@@ -2106,7 +2177,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/graph/channel` | `?scid=<BxTxO or hex>` | Channel endpoints, capacity and both directions' policies (404 if unknown) |
 | GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
 | POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
-| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query` |
+| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query`. Answers 409 while draining and 403 over a spending limit, judged on what the first hop carries (amount plus every fee); a first hop below the final amount or a negative amount is 400 `INVALID_PARAMS` |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
@@ -2126,7 +2197,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |
 | POST | `/offer/decode` | `{ offer }` | Decode a BOLT 12 offer string |
-| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. |
+| POST | `/offer/pay` | `{ offer, amountSats?, timeoutMs?, maxFeeSats?, maxFeeMsat? }` | Pay BOLT 12 offer. Answers 409 while draining and 403 over a spending limit, judged on the invoice the payee returns. `maxFeeSats` or `maxFeeMsat` (a number or a decimal string) caps the routing fee, including the invoice's own blinded-path fee; over the cap answers 409 `FEE_EXCEEDS_MAX` with nothing sent; both at once is 400 `INVALID_PARAMS`. |
 | GET | `/payment/proof` | `?paymentHash=<hex>` | Cryptographic payment proof (preimage, invoice, route) |
 | GET | `/payment/verify-proof` | `?paymentHash=<hex>` | Verify proof: `sha256(preimage) === paymentHash` |
 | GET | `/node/uri` | `?host=<addr>` | Node connection URI (`pubkey@host:port`). Optional external host override. |
@@ -2140,10 +2211,10 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
-| POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment |
+| POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment. Dispatched through `/invoice/pay-safe`, with the same default fee cap and limits |
 | GET | `/queue` | -- | List payment queue |
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
-| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
+| POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. Without `maxFeeSats` the fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
 | GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, pendingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat; `pendingSats` is what in-flight payments hold and `remainingSats` subtracts it). Persisted: the figures survive a restart within the UTC day, and a payment that settles after a timeout or a restart is still counted once |
 | GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
@@ -2226,7 +2297,7 @@ All responses include `X-API-Version: 1` header. Non-prefixed routes continue to
 
 ### CORS
 
-Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk.
+Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk. While authentication is off, the configured origin string is also the only `Origin` the browser guards admit (see [Authentication](#authentication)): a page at any other origin is refused with `403 CROSS_SITE_REQUEST_REFUSED` before the route runs.
 
 ```typescript
 startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *

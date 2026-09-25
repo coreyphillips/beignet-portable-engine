@@ -601,6 +601,15 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
+/**
+ * Blocks between our chain tip and the lowest outgoing cltv_expiry a forward
+ * may carry (issue #1009). An onward HTLC whose expiry has passed, or sits
+ * this close to the tip, is failed upstream with expiry_too_soon rather than
+ * offered downstream: the downstream cannot take it safely, and a peer that
+ * answers the offer by failing the channel would cost us the outgoing
+ * channel. LND's OutgoingCltvRejectDelta defaults to the same 3 blocks.
+ */
+export const OUTGOING_CLTV_REJECT_DELTA = 3;
 /** awaitPaymentResolution re-reads the HTLC view on this clock (#737). */
 const PAYMENT_RESOLUTION_POLL_MS = 250;
 /**
@@ -15606,10 +15615,14 @@ export class LightningNode extends EventEmitter {
 			// send removes our own introduction fee on the wire, so a
 			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
 			// review). prepareSelfIntroSend also validates the path, so an
-			// unusable self-intro path fails here by name.
+			// unusable self-intro path fails here by name. A grafted route is
+			// judged on what leaves us beyond what the recipient receives:
+			// that includes the payee-written blinded fee, which the route's
+			// reported fee used to leave out (issue #1001).
 			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
 			const effectiveFeeMsat =
-				selfIntroForCap?.wireRoute.totalFeeMsat ?? blindedRoute.totalFeeMsat;
+				selfIntroForCap?.wireRoute.totalFeeMsat ??
+				blindedRoute.totalAmountMsat - paymentAmountMsat;
 			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
 				throw new LightningPaymentError(
 					LightningErrorCode.FEE_EXCEEDS_MAX,
@@ -16472,10 +16485,15 @@ export class LightningNode extends EventEmitter {
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the
 		// record, or the parts' outcome (and the preimage) has no owner
-		// (#743 audit).
+		// (#743 audit). sentMsat is the sum of the parts' first-hop amounts,
+		// the invoice amount plus every part's fees: it is written here, with
+		// the first persist, because settledHtlcs holds incoming-side keys
+		// with no amounts and the MPP state is not restored at boot, so it
+		// cannot be summed at settlement (issue #1008).
 		const payment: IPaymentInfo = {
 			paymentHash,
 			amountMsat: totalMsat,
+			sentMsat: multiRoute.totalAmountMsat,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
 			createdAt: Date.now()
@@ -16852,6 +16870,40 @@ export class LightningNode extends EventEmitter {
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
 		} else if (channel.receivedHtlcExceedsDustExposure(htlcId)) {
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: TEMPORARY_CHANNEL_FAILURE;
+		} else if (channel.receivedHtlcExpiredOnArrival(htlcId)) {
+			// Admitted with a cltv_expiry at or below our tip (issue #1009):
+			// never settled or forwarded, failed back with the code the
+			// timeout scan uses for an inbound HTLC at its deadline. The
+			// channel used to be failed for this; the add turns on state the
+			// peer cannot see (our tip), so it is a fail-back like the horizon.
+			// Logged like the restore refusals: the old close was diagnosed
+			// from nothing but a force-close, and this is the same event class.
+			this.emitStructuredLog('htlc', 'refused_expired_on_arrival', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				cltvExpiry: htlcEntry.cltvExpiry,
+				height: this.currentBlockHeight,
+				finalHop
+			});
+			policyCode = finalHop
+				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+				: EXPIRY_TOO_SOON;
+		} else if (channel.receivedHtlcExceedsFunderFee(htlcId)) {
+			// We fund the channel and this add was admitted inside the
+			// funder-fee band (issue #1020): by the sender's own arithmetic our
+			// commitment fee could not be met above our reserve once it was in,
+			// but our output survived, so the channel took it rather than
+			// failing. Settling it would keep paying that fee out of our
+			// reserve; failing it back returns the peer's value and the fee
+			// weight in one removal round. Same answers as the dust arm above.
+			this.emitStructuredLog('htlc', 'refused_funder_fee', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString(),
+				finalHop
+			});
 			policyCode = finalHop
 				? INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				: TEMPORARY_CHANNEL_FAILURE;
@@ -21048,6 +21100,32 @@ export class LightningNode extends EventEmitter {
 			blinded: isBlindedForward
 		});
 
+		// The outgoing expiry against OUR chain tip (issue #1009). The delta
+		// checks further down relate the outgoing expiry only to the incoming
+		// one, so an onion whose outgoing_cltv_value already lay in the past,
+		// under an incoming HTLC generous enough to cover our delta, was
+		// relayed as it was: a downstream that refuses it costs the payer a
+		// retry, and one that fails its channel over it costs us the outgoing
+		// channel. Judged before the SCID lookup so that a JIT intercept and an
+		// async hold never park an HTLC that could not be forwarded now either.
+		// A blinded hop answers invalid_onion_blinding through failIncoming.
+		if (
+			this.currentBlockHeight > 0 &&
+			forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				incomingCltvExpiry,
+				outgoingCltvExpiry: forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'judged'
+			});
+			failIncoming(EXPIRY_TOO_SOON);
+			return;
+		}
+
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
@@ -21531,6 +21609,32 @@ export class LightningNode extends EventEmitter {
 		part: IHeldJitPart,
 		refundOwner: 'engine' | 'caller' = 'engine'
 	): ForwardPlacement {
+		// The tip may have moved since the forward was judged (issue #1009): a
+		// JIT part held for a splice, a held forward its receiver releases and
+		// a redispatched hold all reach this method later, sometimes many
+		// blocks later. Re-judged here, before the linkage is recorded and
+		// before the add, with the same fail-back and the same single-owner
+		// refund rule as a refused add below. Ahead of the hold-for-splice hook
+		// on purpose: a stale expiry is not a liquidity shortfall, and a splice
+		// would only make it staler.
+		if (
+			this.currentBlockHeight > 0 &&
+			part.forwardCltv <= this.currentBlockHeight + OUTGOING_CLTV_REJECT_DELTA
+		) {
+			this.emitStructuredLog('htlc', 'forward_expiry_too_soon', {
+				paymentHash: part.paymentHash.toString('hex'),
+				inChannelId: part.inChannelId.toString('hex'),
+				inHtlcId: Number(part.inHtlcId),
+				incomingCltvExpiry: part.incomingCltvExpiry,
+				outgoingCltvExpiry: part.forwardCltv,
+				height: this.currentBlockHeight,
+				stage: 'placement'
+			});
+			if (!part.failIncoming(EXPIRY_TOO_SOON) && refundOwner === 'engine') {
+				this.jitReceiveManager?.owedUpstreamFailure(part);
+			}
+			return 'refused';
+		}
 		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
 		const outChannel = this.channelManager.getChannel(outChannelId);
 		const outHtlcId = outChannel
@@ -22963,7 +23067,8 @@ export class LightningNode extends EventEmitter {
 				} else if (retryCtx.bolt12Invoice) {
 					retried = this.payBolt12Invoice(
 						retryCtx.bolt12Invoice,
-						retryCtx.excludedChannels
+						retryCtx.excludedChannels,
+						retryCtx.maxFeeMsat
 					);
 				} else {
 					retried = this.sendPayment(
@@ -23185,7 +23290,12 @@ export class LightningNode extends EventEmitter {
 	estimateRouteFee(
 		bolt11: string,
 		amountSats?: number
-	): { feeSats: number; hops: number; cltvDelta: number } | null {
+	): {
+		feeSats: number;
+		feeMsat: bigint;
+		hops: number;
+		cltvDelta: number;
+	} | null {
 		try {
 			const decoded = decodeInvoice(bolt11);
 			// Same precedence sendPayment applies (see estimatePayment).
@@ -23214,7 +23324,11 @@ export class LightningNode extends EventEmitter {
 			);
 			if (!route) return null;
 			return {
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded UP: a caller caps the payment at this figure, and the cap
+				// is enforced in msat, so a floored quote refuses its own route
+				// (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				cltvDelta: route.totalCltvDelta
 			};
@@ -23286,7 +23400,10 @@ export class LightningNode extends EventEmitter {
 
 			const successPct = Math.round(successProbability * 100);
 			const hopCount = route.hops.length;
-			const feeSats = Number(route.totalFeeMsat / 1000n);
+			// Rounded UP, like estimateRouteFee: maxFeeSats is whole sats checked
+			// against the route in msat, so a cap equal to a floored quote refused
+			// the very route it priced (issue #998).
+			const feeSats = Number((route.totalFeeMsat + 999n) / 1000n);
 
 			// Route quality based on hop count and probability
 			let routeQuality: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH';
@@ -23334,6 +23451,7 @@ export class LightningNode extends EventEmitter {
 				warning,
 				alternativeAvailable,
 				estimatedFeeSats: feeSats,
+				estimatedFeeMsat: route.totalFeeMsat,
 				hopCount
 			};
 		} catch {
@@ -23355,6 +23473,7 @@ export class LightningNode extends EventEmitter {
 	): {
 		success: boolean;
 		feeSats?: number;
+		feeMsat?: bigint;
 		hops?: number;
 		path?: Array<{ pubkey: string; shortChannelId: string }>;
 	} {
@@ -23389,7 +23508,9 @@ export class LightningNode extends EventEmitter {
 
 			return {
 				success: true,
-				feeSats: Number(route.totalFeeMsat / 1000n),
+				// Rounded up for the same reason as estimateRouteFee (issue #998).
+				feeSats: Number((route.totalFeeMsat + 999n) / 1000n),
+				feeMsat: route.totalFeeMsat,
 				hops: route.hops.length,
 				// A hop's shortChannelId is the channel used to REACH it, so this is
 				// exactly the set of SCIDs the onion will name. Surfacing them is what
@@ -25881,8 +26002,18 @@ export class LightningNode extends EventEmitter {
 					paymentHashHex !== undefined &&
 					this.heldInvoiceHashes.has(paymentHashHex) &&
 					resolution?.outcome !== 'settle';
+				// An add admitted past its expiry (issue #1009) is failed back
+				// by the policy block, never settled, so holding its preimage
+				// is no claim: every invoice we ever issued has its preimage
+				// here, and such an entry is inside the claim buffer by
+				// definition. Without this arm a block landing while the peer
+				// still owes the ack of our fail-back closed the very channel
+				// the fail-back keeps open. A genuinely FULFILLED one is claimed.
+				const expiredUnclaimed =
+					htlc.expiredOnArrival === true && htlc.state !== HtlcState.FULFILLED;
 				const haveClaim =
 					!parkedHold &&
+					!expiredUnclaimed &&
 					(htlc.state === HtlcState.FULFILLED ||
 						(paymentHashHex !== undefined &&
 							this.preimages.has(paymentHashHex)));
@@ -27030,10 +27161,19 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Pay a BOLT 12 invoice by extracting payment info and delegating to sendPayment.
 	 * This creates a BOLT 11-like payment flow using the BOLT 12 invoice details.
+	 *
+	 * `maxFeeMsat` caps the fee actually paid, as sendPayment's does: the
+	 * public hops plus the invoice's own blinded-path fee, which the payee
+	 * writes and which used to be paid uncapped and unreported (issue
+	 * #1001). A blinded path over the cap is skipped in favour of the
+	 * invoice's other paths; when every usable path is over it the payment is
+	 * refused with FEE_EXCEEDS_MAX before anything is sent. Undefined leaves
+	 * the fee uncapped. The cap is kept for the payment's retries.
 	 */
 	payBolt12Invoice(
 		invoice: IBolt12Invoice,
-		excludedChannels?: Set<string>
+		excludedChannels?: Set<string>,
+		maxFeeMsat?: bigint
 	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
@@ -27062,6 +27202,7 @@ export class LightningNode extends EventEmitter {
 			)?.bolt12ExcludedPathIndices;
 			let blindedRoute: IRoute | null = null;
 			let pathIndex = 0;
+			let overCap = false;
 			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
 				if (excludedPaths?.has(i)) continue;
 				const payInfo = invoice.blindedPayInfo?.[i] ?? {
@@ -27093,8 +27234,9 @@ export class LightningNode extends EventEmitter {
 				// another usable path (issue #550 review). Validate now and
 				// keep scanning on a typed local refusal.
 				if (blindedRoute) {
+					let selfIntro: { wireRoute: { totalFeeMsat: bigint } } | null;
 					try {
-						this.prepareSelfIntroSend(blindedRoute);
+						selfIntro = this.prepareSelfIntroSend(blindedRoute);
 					} catch (err) {
 						if (
 							err instanceof LightningPaymentError &&
@@ -27106,10 +27248,31 @@ export class LightningNode extends EventEmitter {
 						}
 						throw err;
 					}
+					// The fee this path would actually cost: a self-introduction
+					// send sheds our own introduction fee on the wire; a grafted
+					// route pays the public hops plus the path's blinded fee
+					// (issue #1001). A path over the cap is skipped, not fatal:
+					// the invoice may advertise a cheaper one.
+					if (maxFeeMsat !== undefined) {
+						const feeMsat =
+							selfIntro?.wireRoute.totalFeeMsat ??
+							blindedRoute.totalAmountMsat - amountMsat;
+						if (feeMsat > maxFeeMsat) {
+							overCap = true;
+							blindedRoute = null;
+							continue;
+						}
+					}
 				}
 				if (blindedRoute) pathIndex = i;
 			}
 			if (!blindedRoute) {
+				if (overCap) {
+					throw new LightningPaymentError(
+						LightningErrorCode.FEE_EXCEEDS_MAX,
+						'Route fee exceeds maximum'
+					);
+				}
 				throw new Error('No route to BOLT 12 blinded path introduction node');
 			}
 			return this.dispatchBolt12Route(
@@ -27117,7 +27280,8 @@ export class LightningNode extends EventEmitter {
 				invoice,
 				finalCltvExpiry,
 				excludedChannels,
-				pathIndex
+				pathIndex,
+				maxFeeMsat
 			);
 		}
 
@@ -27138,12 +27302,20 @@ export class LightningNode extends EventEmitter {
 		if (!route) {
 			throw new Error('No route found to BOLT 12 invoice destination');
 		}
+		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				'Route fee exceeds maximum'
+			);
+		}
 
 		return this.dispatchBolt12Route(
 			route,
 			invoice,
 			finalCltvExpiry,
-			excludedChannels
+			excludedChannels,
+			undefined,
+			maxFeeMsat
 		);
 	}
 
@@ -27162,13 +27334,16 @@ export class LightningNode extends EventEmitter {
 	 * reaches the onion failure handler, so nothing else would clean it up
 	 * and nothing can retry it. A pre-existing context is left alone; during
 	 * a retry the failure handler owns its rollback and give-up behavior.
+	 * The fee cap rides in the context so a retry is held to the same bound
+	 * as the first attempt (issue #1001).
 	 */
 	private dispatchBolt12Route(
 		route: IRoute,
 		invoice: IBolt12Invoice,
 		finalCltvExpiry: number,
 		excludedChannels?: Set<string>,
-		pathIndex?: number
+		pathIndex?: number,
+		maxFeeMsat?: bigint
 	): IPaymentInfo {
 		const hashHex = invoice.paymentHash.toString('hex');
 		const created = !this.paymentRetryContexts.has(hashHex);
@@ -27177,7 +27352,8 @@ export class LightningNode extends EventEmitter {
 				bolt12Invoice: invoice,
 				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
-				maxRetries: this.maxPaymentRetries
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat
 			});
 		}
 		const ctx = this.paymentRetryContexts.get(hashHex)!;
