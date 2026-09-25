@@ -2,7 +2,7 @@
 
 This local fork runs the real Beignet Bitcoin and Lightning engine inside a browser worker or React Native Hermes. Keys, signatures, BOLT 8 transport encryption, channel state and payment state stay in the device runtime. The optional sibling `beignet-relay` forwards encrypted Lightning bytes and Electrum JSON; it is not a wallet daemon and never receives a seed or signing key.
 
-Source baseline: upstream Beignet `0.22.0`, commit `7f53b7a` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.22.0-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
+Source baseline: upstream Beignet `0.23.0`, commit `b884425c` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.23.0-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
 
 ## Build and validation
 

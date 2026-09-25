@@ -997,12 +997,17 @@ export async function createPortableRuntime(options: any) {
 				return value;
 			}
 			case 'POST /invoice/pay-safe':
+				// cltvLimit is deliberately not forwarded (PATCHES.md). maxFeeMsat is
+				// the exact cap 0.23.0 accepts beside maxFeeSats; the node refuses
+				// both at once and applies its default cap when neither is given.
 				return n.payInvoiceSafe(
 					b.bolt11,
 					b.timeoutMs,
 					b.maxFeeSats,
 					b.amountSats,
-					b.metadata
+					b.metadata,
+					undefined,
+					b.maxFeeMsat
 				);
 			case 'POST /channel/splice-quote':
 				return n.spliceQuote(b.channelId, b.direction, b.feeratePerkw);

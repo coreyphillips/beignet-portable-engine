@@ -10,6 +10,7 @@
 import * as http from 'http';
 import * as fs from 'fs';
 import * as nodePath from 'path';
+import { randomBytes } from 'crypto';
 import { generateMnemonic } from '../utils/helpers';
 import {
 	loadConfig,
@@ -20,11 +21,13 @@ import {
 	removePidFile,
 	getDaemonPort
 } from './config';
-import { startDaemon } from './daemon';
+import { AUTH_OFF_WARNING, startDaemon } from './daemon';
 import { daemonOptions } from './daemon-options';
 import { defaultDataDirForMnemonic } from './beignet-node';
 import { performDbRestore } from './restore';
 import { InstanceLockError } from './instance-lock';
+import { installProcessFaultHandlers } from './process-faults';
+import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
@@ -155,6 +158,17 @@ async function httpRequest(
 	});
 }
 
+/**
+ * Owner-only creation for every file this process makes (issue #1004): the
+ * paths that write secrets set their modes explicitly, but SQLite's WAL and
+ * shm sidecars, backups and anything else created without a mode inherit the
+ * umask. Set here in the CLI only: a host embedding BeignetNode owns its own
+ * process umask, so no library path ever calls this. Windows has no umask.
+ */
+function restrictUmask(): void {
+	if (process.platform !== 'win32') process.umask(0o077);
+}
+
 async function main(): Promise<void> {
 	const cmd = filteredArgs[0];
 
@@ -165,8 +179,10 @@ async function main(): Promise<void> {
 
 	switch (cmd) {
 		case 'init':
+			restrictUmask();
 			return handleInit();
 		case 'start':
+			restrictUmask();
 			return handleStart();
 		case 'stop':
 			return handleStop();
@@ -351,8 +367,10 @@ async function main(): Promise<void> {
 		case 'auth':
 			return handleAuth();
 		case 'backup':
+			restrictUmask();
 			return handleBackup();
 		case 'restore':
+			restrictUmask();
 			return handleRestore();
 		case 'recovery':
 			return handleRecovery();
@@ -367,18 +385,48 @@ async function main(): Promise<void> {
 	}
 }
 
+/** True when the config file or the environment carries an API credential. */
+function hasApiCredential(config: BeignetConfig): boolean {
+	if (config.apiToken) return true;
+	if (Array.isArray(config.apiKeys) && config.apiKeys.length > 0) return true;
+	return Boolean(process.env.BEIGNET_API_TOKEN || process.env.BEIGNET_API_KEYS);
+}
+
+const API_TOKEN_NOTE =
+	'apiToken was generated and saved to config.json; the CLI reads it from there, and HTTP clients send it as "Authorization: Bearer <apiToken>"';
+
+/**
+ * Mint a bearer token for a config that has no credential (issue #1005). A
+ * loopback daemon with no token can be driven by any web page, so every
+ * install `init` creates carries one; an existing token or key set is left
+ * alone and never printed. Returns the minted token, or undefined when the
+ * config already had a credential (in the file or in the environment, where
+ * a minted token would be shadowed and mislead whoever reads the output).
+ */
+function mintApiTokenIfAbsent(config: BeignetConfig): string | undefined {
+	if (hasApiCredential(config)) return undefined;
+	const apiToken = randomBytes(32).toString('hex');
+	config.apiToken = apiToken;
+	return apiToken;
+}
+
 function handleInit(): void {
 	const config = loadConfig();
 	const network = parseFlag('--network') || config.network || 'mainnet';
 	const alias = parseFlag('--alias') || config.alias;
 
 	if (config.mnemonic) {
+		// A config an older release wrote has a mnemonic and no token: it gets
+		// one here, the same way a fresh one does.
+		const apiToken = mintApiTokenIfAbsent(config);
+		if (apiToken) saveConfig(config);
 		output({
 			ok: true,
 			result: {
 				message: 'Config already exists',
 				mnemonic: config.mnemonic,
-				network: config.network
+				network: config.network,
+				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
 			}
 		});
 		return;
@@ -391,9 +439,18 @@ function handleInit(): void {
 		network: network as BeignetConfig['network']
 	};
 	if (alias) newConfig.alias = alias;
+	const apiToken = mintApiTokenIfAbsent(newConfig);
 	saveConfig(newConfig);
 
-	output({ ok: true, result: { message: 'Initialized', mnemonic, network } });
+	output({
+		ok: true,
+		result: {
+			message: 'Initialized',
+			mnemonic,
+			network,
+			...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
+		}
+	});
 }
 
 async function handleStart(): Promise<void> {
@@ -495,7 +552,27 @@ async function handleStart(): Promise<void> {
 	const isDaemon = hasFlag('--daemon');
 
 	try {
-		const { stop } = await startDaemon(daemonOptions(config, daemonPort));
+		const { stop, logger } = await startDaemon(
+			daemonOptions(config, daemonPort)
+		);
+
+		// No credential at all (issue #1005): the daemon logs this at warn
+		// level, which the default silent log level swallows, so the CLI says
+		// it on stderr itself whenever the daemon's logger would not.
+		const daemonWarns =
+			config.logLevel === 'debug' ||
+			config.logLevel === 'info' ||
+			config.logLevel === 'warn';
+		if (!hasApiCredential(config) && !daemonWarns) {
+			process.stderr.write(`beignet: warning: ${AUTH_OFF_WARNING}\n`);
+		}
+
+		// A fault nothing caught (an unhandled rejection, an uncaught
+		// exception) is logged with its stack and the process stays up
+		// (issue #1003): Node's default would terminate it, and a node that
+		// exits cannot claim or time out its HTLCs. Registered here, not in
+		// the library, because a host owns its process.
+		installProcessFaultHandlers(logger);
 
 		// Clean shutdown on signals: the same teardown POST /stop runs, so an
 		// in-flight backup completes and SQLite closes before the process ends.
@@ -2323,15 +2400,22 @@ async function handleOffer(): Promise<void> {
 					offer: filteredArgs[2]
 				})
 			);
-		case 'pay':
+		case 'pay': {
+			// amountSats is positional and optional, so the token after the
+			// offer may already be a flag.
+			const amountArg = filteredArgs[3];
+			const maxFee = parseFlag('--max-fee');
 			return outputResult(
 				await httpRequest('POST', '/offer/pay', {
 					offer: filteredArgs[2],
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined
+					amountSats:
+						amountArg && !amountArg.startsWith('--')
+							? parseInt(amountArg, 10)
+							: undefined,
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
 				})
 			);
+		}
 		default:
 			output({
 				ok: false,
@@ -2417,7 +2501,8 @@ async function handleBackup(): Promise<void> {
 			encoded: string;
 			channelCount: number;
 		};
-		fs.writeFileSync(destPath, encoded);
+		// Owner-only, like the copy the daemon keeps in the data directory.
+		writeFileAtomic(destPath, encoded);
 		return output({
 			ok: true,
 			result: { written: true, path: destPath, channelCount }
@@ -2640,7 +2725,7 @@ async function handleRestore(): Promise<void> {
 		const dbPath = nodePath.join(dataDir, `${network}.db`);
 		const lockPath = nodePath.join(dataDir, `${network}.lock`);
 		try {
-			fs.mkdirSync(dataDir, { recursive: true });
+			ensurePrivateDir(dataDir);
 			const result = performDbRestore(file, dbPath, lockPath);
 			output({
 				ok: true,
@@ -2714,7 +2799,7 @@ function printHelp(): void {
 Usage: beignet <command> [options]
 
 Setup:
-  init [--network N] [--alias A]         Generate mnemonic + config
+  init [--network N] [--alias A]         Generate mnemonic, API token + config
   start [flags]                          Start node daemon
   stop                                   Stop daemon
 
@@ -2990,7 +3075,7 @@ BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
   offer list                             List local offers
   offer decode <offer>                   Decode a BOLT 12 offer string
-  offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+  offer pay <offer> [amountSats] [--max-fee <sats>]  Pay a BOLT 12 offer
 
 Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]

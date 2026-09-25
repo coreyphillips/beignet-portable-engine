@@ -815,6 +815,15 @@ export interface IPaymentInfo {
 	paymentHash: Buffer;
 	preimage?: Buffer;
 	amountMsat: bigint;
+	/**
+	 * The msat that left this node, fees included, when amountMsat is not
+	 * that figure. A single-path send records its first-hop amount in
+	 * amountMsat, so it needs nothing here; an MPP send records the invoice
+	 * amount there and the sum of its parts' first-hop amounts here, written
+	 * with the record's first persist. A part refused at dispatch is not
+	 * subtracted, so this can overstate by that part.
+	 */
+	sentMsat?: bigint;
 	status: PaymentStatus;
 	direction: PaymentDirection;
 	route?: IRoute;
@@ -1747,6 +1756,9 @@ export interface IPaymentEstimate {
 	routeQuality: 'HIGH' | 'MEDIUM' | 'LOW';
 	warning?: string;
 	alternativeAvailable: boolean;
+	/** Route fee rounded UP to whole sats, so it is safe to pass as maxFeeSats. */
 	estimatedFeeSats: number;
+	/** The exact route fee. */
+	estimatedFeeMsat: bigint;
 	hopCount: number;
 }
