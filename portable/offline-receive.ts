@@ -15,6 +15,23 @@ type Job = {
 	invoice?: any;
 	done?: boolean;
 };
+/**
+ * What the primary answered the last time it was asked for its receive
+ * terms: true when it settles offline receives, false with the refusal when
+ * it does not, null before it has been asked.
+ */
+export type OfflineReceiveAvailability = {
+	available: boolean | null;
+	reason: string | null;
+	probedAt: number | null;
+};
+const UNPROBED: OfflineReceiveAvailability = Object.freeze({
+	available: null,
+	reason: null,
+	probedAt: null
+});
+/** The bound on one receive-terms quote, a review's and a probe's alike. */
+const QUOTE_TIMEOUT_MS = 15000;
 const live = (e: any) => e && !['CLOSED', 'ABORTED'].includes(e.state);
 const fail = (code: string, message: string): never => {
 	throw Object.assign(new Error(message), { code, status: 409 });
@@ -27,6 +44,14 @@ export class OfflineReceive {
 	private creating = false;
 	private syncing = false;
 	private stopped = false;
+	// The last receive-terms answer, and whose it was: a wallet that moves to
+	// another primary starts over at unprobed rather than carrying the old
+	// primary's answer across.
+	private probed: OfflineReceiveAvailability & { peer: string | null } = {
+		...UNPROBED,
+		peer: null
+	};
+	private probing: { peer: string; done: Promise<OfflineReceiveAvailability> } | undefined;
 	constructor(
 		private node: BeignetNode,
 		private save: (jobs: Job[]) => void,
@@ -128,11 +153,59 @@ export class OfflineReceive {
 		if (!this.channelFor(peer, amountSats)) this.unavailable(peer);
 		return this.terms(peer, amountSats);
 	}
-	private async terms(peer: string, amountSats: number): Promise<any> {
-		this.checkAmount(amountSats);
-		const terms = await this.node
-			.getFforReceiveService()
-			.request(peer, { op: 'quote' }, 15000);
+	/**
+	 * Whether this peer settles offline receives, as it last answered: true,
+	 * false with the refusal, or null until it has been asked (the primary has
+	 * not connected yet, or it is not the peer that answered). Advisory: quote
+	 * and create still ask the primary themselves, so a primary that changed
+	 * its mind is still refused before an invoice is shared.
+	 */
+	availability(peer: string): OfflineReceiveAvailability {
+		const { peer: answered, ...state } = this.probed;
+		return answered === peer ? state : { ...UNPROBED };
+	}
+	/**
+	 * Ask the primary for its receive terms and keep the answer, so the wallet
+	 * can say whether "Receive offline" is on offer before anyone types an
+	 * amount. Bounded like a review's quote, never throws, and one probe at a
+	 * time per peer: a call while one is in flight shares its answer.
+	 */
+	probe(peer: string): Promise<OfflineReceiveAvailability> {
+		if (this.stopped) return Promise.resolve(this.availability(peer));
+		if (this.probing?.peer === peer) return this.probing.done;
+		const settled = () => this.availability(peer);
+		const done = this.fetchTerms(peer)
+			.then(settled, settled)
+			.finally(() => {
+				if (this.probing?.done === done) this.probing = undefined;
+			});
+		this.probing = { peer, done };
+		return done;
+	}
+	private answered(peer: string, available: boolean, reason: string | null) {
+		// A stop rejects every pending request with its own text; that is not
+		// the primary's answer.
+		if (this.stopped) return;
+		this.probed = { peer, available, reason, probedAt: this.now() };
+	}
+	/**
+	 * The primary's receive terms, or a RECEIVE_UNAVAILABLE refusal. Every
+	 * outcome is recorded: an older primary never answers and the timeout is
+	 * its answer, one with settlement off refuses, and a review that reaches
+	 * the primary learns what a probe would have.
+	 */
+	private async fetchTerms(
+		peer: string
+	): Promise<{ feeBaseMsat: number; feePpm: number }> {
+		let terms: any;
+		try {
+			terms = await this.node
+				.getFforReceiveService()
+				.request(peer, { op: 'quote' }, QUOTE_TIMEOUT_MS);
+		} catch (error: any) {
+			this.answered(peer, false, String(error?.message ?? error));
+			throw error;
+		}
 		if (
 			terms?.version !== 1 ||
 			!Number.isSafeInteger(terms.feeBaseMsat) ||
@@ -141,17 +214,23 @@ export class OfflineReceive {
 			!Number.isSafeInteger(terms.feePpm) ||
 			terms.feePpm < 0 ||
 			terms.feePpm > 100000
-		)
-			fail(
-				'RECEIVE_UNAVAILABLE',
-				'Your node returned unsupported receive terms.'
-			);
+		) {
+			const reason = 'Your node returned unsupported receive terms.';
+			this.answered(peer, false, reason);
+			fail('RECEIVE_UNAVAILABLE', reason);
+		}
+		this.answered(peer, true, null);
+		return { feeBaseMsat: terms.feeBaseMsat, feePpm: terms.feePpm };
+	}
+	private async terms(peer: string, amountSats: number): Promise<any> {
+		this.checkAmount(amountSats);
+		const terms = await this.fetchTerms(peer);
 		return {
 			available: true,
 			peer,
 			amountSats,
 			feeSats: 0,
-			terms: { feeBaseMsat: terms.feeBaseMsat, feePpm: terms.feePpm },
+			terms,
 			expiresAt: this.now() + 60000
 		};
 	}

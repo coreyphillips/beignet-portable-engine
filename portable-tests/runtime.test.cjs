@@ -131,3 +131,77 @@ test('the direct-funding policy lets every beignet payer grow the home channel',
   assert.equal('allowSplice' in held, false);
   assert.equal('allowUnpairedSplice' in held, false);
 });
+
+test('the networks accepted at creation are the networks advertised', async () => {
+	const volume = memory();
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		const config = await runtime.request({ path: '/api/config' });
+		assert.deepEqual(config.supportedNetworks, [
+			'mainnet',
+			'testnet',
+			'signet',
+			'regtest'
+		]);
+		// With no Electrum transport, creation stops right after the network
+		// check, so the refusal names which side of that check a network fell
+		// on without opening a database or a socket.
+		const refusal = async (network) => {
+			try {
+				await runtime.request({
+					method: 'POST',
+					path: '/api/wallets',
+					body: { network }
+				});
+			} catch (e) {
+				return e.code;
+			}
+			return null;
+		};
+		for (const network of config.supportedNetworks)
+			assert.equal(await refusal(network), 'ELECTRUM_REQUIRED', network);
+		for (const network of ['testnet4', 'bitcoin', 'liquid', ''])
+			assert.equal(await refusal(network), 'INVALID_NETWORK', network);
+		assert.equal(volume.read('/wallet/registry.json'), null);
+	} finally {
+		await runtime.close();
+	}
+});
+
+test('the config flag says the engine implements offline receiving; the record says whether the primary answered', async () => {
+	const volume = memory();
+	volume.write(
+		'/wallet/registry.json',
+		Buffer.from(
+			JSON.stringify({
+				record: {
+					id: 'stopped',
+					network: 'regtest',
+					name: 'Stopped fixture',
+					lfbw: {
+						enabled: true,
+						mode: 'external',
+						primaryPubkey: '02' + '33'.repeat(32),
+						setup: 'ready'
+					}
+				},
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+			})
+		)
+	);
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		// Engine-wide and answered before any wallet exists: it cannot speak
+		// for a primary, so it keeps meaning "the engine implements this".
+		const config = await runtime.request({ path: '/api/config' });
+		assert.equal(config.offlineReceiveAvailable, true);
+		// Per wallet: null until the primary has connected and answered.
+		const [record] = await runtime.request({ path: '/api/wallets' });
+		assert.equal(record.lfbw.offlineReceiveAvailable, null);
+		assert.equal(record.lfbw.offlineReceiveReason, null);
+		assert.equal('offlineReceiveAvailable' in record.lfbw, true);
+	} finally {
+		await runtime.close();
+	}
+});
