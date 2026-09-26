@@ -45,7 +45,16 @@ export function queryElectrum(
 			if (!data.includes('\n')) return;
 			try {
 				const result = JSON.parse(data.slice(0, data.indexOf('\n')));
-				if (result.error) return finish(new Error('Chain evidence refused'));
+				if (result.error)
+					return finish(
+						// The server answered and refused the call, which for a
+						// transaction lookup means it does not have the
+						// transaction. Marked so a caller can tell it from a
+						// server that could not be asked (fork issue #7).
+						Object.assign(new Error('Chain evidence refused'), {
+							code: 'CHAIN_EVIDENCE_REFUSED'
+						})
+					);
 				finish(undefined, result.result);
 			} catch (error) {
 				finish(error);
@@ -89,7 +98,7 @@ export function matchTransaction(
  * settled channel from one whose funding is still only a mempool promise, and
  * it presents both as ordinary spendable balance.
  *
- * Returns null when the answer is not known — an unreachable server, a server
+ * Returns null when the answer is not known: an unreachable server, a server
  * that has never seen the transaction, or a malformed reply. Null is treated as
  * "unknown" everywhere it is consumed, never as "unconfirmed": a chain lookup
  * that failed must not turn into a claim about someone's money.
@@ -138,12 +147,23 @@ export async function verifySubmission(
 	txid: string,
 	network: string
 ) {
-	const raw = await queryElectrum(
-		socketFactory,
-		electrum,
-		'blockchain.transaction.get',
-		[txid, false]
-	);
+	let raw: string;
+	try {
+		raw = await queryElectrum(
+			socketFactory,
+			electrum,
+			'blockchain.transaction.get',
+			[txid, false]
+		);
+	} catch (error: any) {
+		// The server answered that it does not have the transaction: an
+		// adopted zero-conf splice the network has not seen yet lands here
+		// (fork issue #7). Evidence of a different kind from a server that
+		// could not be asked, which still throws through.
+		if (error?.code === 'CHAIN_EVIDENCE_REFUSED')
+			return { matched: false, unseen: true };
+		throw error;
+	}
 	const scriptHash = matchTransaction(entry, txid, raw, network);
 	if (!scriptHash) return null;
 	const history = await queryElectrum(

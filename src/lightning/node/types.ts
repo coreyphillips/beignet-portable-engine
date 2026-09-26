@@ -10,7 +10,7 @@ import { IRoutingHintHop, Network } from '../invoice/types';
 import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute, INodeAddress } from '../gossip/types';
+import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
@@ -902,12 +902,30 @@ export interface IPaymentRetryContext {
 	 * before the HTLC is added. Preserved across retries.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Channel policies this payment's own failures taught us (issue #1056):
+	 * the signed channel_update a fee_insufficient, incorrect_cltv_expiry or
+	 * amount_below_minimum failure carried, verified against the erring hop
+	 * and its outgoing channel. Keyed by SCID plus direction bit
+	 * (policyOverrideKey), one per edge, read by this payment's retries and
+	 * by nothing else: BOLT 4 lets the origin use such an update for the
+	 * same payment and forbids applying it to the network graph (issue
+	 * #182). A retry routes over the re-priced channel instead of excluding
+	 * it.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
 }
 
 /** Options-object form of sendPayment's positional arguments. */
 export interface ISendPaymentOptions {
 	excludedChannels?: Set<string>;
 	maxFeeMsat?: bigint;
+	/**
+	 * Channel policies to route with in place of the graph's, keyed as
+	 * IPaymentRetryContext.policyOverrides. Scoped to this payment; the
+	 * graph is not touched.
+	 */
+	policyOverrides?: Map<string, IChannelUpdateMessage>;
 	/** Amount for an amount-less invoice. */
 	amountMsat?: bigint;
 	/**
@@ -1025,6 +1043,20 @@ export interface IChannelInfo {
 	 * localBalanceMsat stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceMsat?: bigint;
+	/**
+	 * The in-flight splice's transaction id (display byte order, like
+	 * fundingTxid). Present exactly when pendingSpliceLocalBalanceMsat is:
+	 * the splice is past its point of no return and not yet adopted, so a
+	 * wallet can recognise the transaction moving its own coins as this
+	 * channel's rather than as a send (issue #1060).
+	 */
+	pendingSpliceTxid?: string;
+	/**
+	 * Funding txids this channel ran on before fundingTxid, oldest first
+	 * (display byte order), one per adopted splice. Absent on a channel
+	 * that has never been spliced (issue #1060).
+	 */
+	previousFundingTxids?: string[];
 	/**
 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
@@ -1216,6 +1248,20 @@ export interface ILightningError {
 	channelId?: Buffer;
 	message: string;
 	timestamp: number;
+	/**
+	 * The transaction a broadcast error is about (display byte order), when
+	 * the watcher could name it (issue #1062). Carried by BROADCAST_FAILED,
+	 * BROADCAST_PERMANENT_FAILURE and SPLICE_BROADCAST_REFUSED.
+	 */
+	txid?: string;
+	/**
+	 * True when the node itself still holds this transaction and re-sends
+	 * it on every block (a pending funding, an in-flight or adopted but
+	 * unconfirmed splice), so the watcher's own queue giving up on it is not
+	 * the end of the attempt. False when that queue was the only driver (a
+	 * close, a sweep) or the transaction is not one this node tracks.
+	 */
+	retained?: boolean;
 }
 
 export interface IPaymentPart {

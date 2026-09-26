@@ -128,6 +128,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payments': {
 				get: {
 					summary: 'List payments with optional filtering',
+					description:
+						'Newest first. Read through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000). A database read that fails answers 500, never a shorter list.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -271,6 +273,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoices': {
 				get: {
 					summary: 'List created invoices',
+					description:
+						'status is PAID on a completed receive for the hash, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads EXPIRED or PENDING later. A database read that fails answers 500.',
 					tags: ['Invoices'],
 					responses: {
 						'200': {
@@ -519,6 +523,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/invoice': {
 				get: {
 					summary: 'Get a specific invoice by payment hash',
+					description:
+						'status is judged as GET /invoices judges it: PAID from the in-memory record or the database row, so it never reverts to EXPIRED or PENDING after the engine prunes the record.',
 					tags: ['Invoices'],
 					parameters: [
 						{
@@ -720,7 +726,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/close': {
 				post: {
 					summary:
-						'Cooperatively close a channel. The payout goes to a wallet-scanned address: the current unused wallet address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address, else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway',
+						"Cooperatively close a channel. The payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -991,6 +997,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/payment': {
 				get: {
 					summary: 'Get a specific payment by hash',
+					description:
+						'The in-memory record, else its database row, so a payment is found however long ago it completed. NOT_FOUND only when neither exists; a database read that fails answers 500.',
 					tags: ['Payments'],
 					parameters: [
 						{
@@ -2760,7 +2768,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3869,6 +3877,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Local balance the channel settles to when its in-flight splice locks; present only mid-splice (localBalanceSats stays pre-splice until splice_locked)'
 						},
+						pendingSpliceTxid: {
+							type: 'string',
+							description:
+								'The in-flight splice transaction id, display byte order like fundingTxid; present exactly when pendingSpliceLocalBalanceSats is, so a wallet can recognise the transaction moving its coins as this channel and not as a send (issue #1060)'
+						},
+						previousFundingTxids: {
+							type: 'array',
+							items: { type: 'string' },
+							description:
+								'Funding transaction ids this channel ran on before fundingTxid, oldest first, display byte order, one per adopted splice; absent on a channel that has never been spliced (issue #1060)'
+						},
 						htlcUsable: {
 							type: 'boolean',
 							description:
@@ -4028,7 +4047,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										properties: {
 											pubkey: { type: 'string' },
 											shortChannelId: { type: 'string' },
-											feeMsat: { type: 'integer' }
+											feeMsat: {
+												type: 'integer',
+												description:
+													'Fee this hop kept, in msat: what it received less what it forwarded. 0 at the final hop.'
+											}
 										}
 									}
 								},

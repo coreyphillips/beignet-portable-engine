@@ -14,6 +14,7 @@ import {
 import { verifyElectrumNetwork } from './network';
 import * as rules from './lfbw.cjs';
 import { runChannelize } from './channelize.cjs';
+import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export const DEFAULT_PRIMARY =
@@ -468,6 +469,16 @@ export async function createPortableRuntime(options: any) {
 						});
 					});
 				}
+				// A broadcast the network refused is the one outcome a splice-out
+				// row cannot learn from the chain. The engine names the
+				// transaction, its channel and whether it still re-sends it on
+				// every block (beignet #1062); the row carries that reason and
+				// stays pending, never failed on the error alone (fork #7).
+				watchBroadcastErrors({
+					node,
+					activity,
+					save: () => save('/wallet/activity.json', activity)
+				});
 				// A first connection after a cold start has been seen to come up
 				// dead: the handshake completes, the primary never answers
 				// channel_reestablish, and nothing notices until the first ping
@@ -746,13 +757,6 @@ export async function createPortableRuntime(options: any) {
 		});
 
 	/**
-	 * How long a splice submission may show no chain effect before the wallet
-	 * stops calling it "pending". Long enough to cover a slow negotiation and a
-	 * reconnect, short enough that nobody is left watching a spinner for a
-	 * payment that was never broadcast.
-	 */
-	const STALLED_SUBMISSION_MS = 600000;
-	/**
 	 * The engine's payer state, read the way the umbrel app reads it: a witness
 	 * that left is a payment out of our hands until the chain settles it, and
 	 * only a pre-witness state or a refusal leaves nothing spent.
@@ -768,15 +772,6 @@ export async function createPortableRuntime(options: any) {
 					  status === 'OFFERED'
 					? 'failed'
 					: null;
-	/**
-	 * Whether the engine is still working on a splice for this channel. Absence
-	 * of both markers is not proof that nothing happened, which is why a stalled
-	 * row becomes uncertain rather than failed.
-	 */
-	const spliceInFlight = (channel: any) =>
-		!!channel &&
-		(channel.payThroughSplice !== undefined ||
-			channel.pendingSpliceLocalBalanceSats !== undefined);
 	const reconcileActivity = async () => {
 		if (!node || reconciling || durabilityFailed || recoveryHold()) return;
 		reconciling = true;
@@ -811,57 +806,25 @@ export async function createPortableRuntime(options: any) {
 					}
 					continue;
 				}
+				// A splice-out: what the channel and the chain say about it, and
+				// the reason the engine gave when the network refused it, are
+				// read in portable/splice-status.cjs (fork issue #7).
 				const channel = channels.find((c) => c.channelId === row.channelId);
-				const candidate = row.txid ?? channel?.fundingTxid;
 				if (
-					!candidate ||
-					candidate === row.previousFundingTxid ||
-					!row.previousFundingTxid ||
-					row.previousFundingOutputIndex == null
-				) {
-					// A splice replaces the channel's funding, so an unchanged
-					// funding txid means this submission never took effect on
-					// chain. Reconciliation can only ever promote a row to
-					// completed, so without this a submission that was never
-					// broadcast stays "pending" for the life of the wallet: no
-					// transaction to look up, nothing arriving at the
-					// destination, and no amount of waiting or mining changes
-					// it. Say so instead, once it has clearly stopped
-					// progressing.
-					if (
-						row.status === 'pending' &&
-						!row.txid &&
-						row.previousFundingTxid &&
-						Date.now() - (row.createdAt ?? 0) > STALLED_SUBMISSION_MS &&
-						!spliceInFlight(channel)
-					) {
-						row.status = 'uncertain';
-						row.statusNote =
-							'This payment has not appeared on the Bitcoin network and your wallet is no longer working on it. Check this address and your balance before sending again.';
-						changed = true;
-					}
-					continue;
-				}
-				try {
-					const proof = await verifySubmission(
-						options.socketFactory,
-						options.electrum ?? record.electrum,
+					await reconcileSpliceRow({
 						row,
-						candidate,
-						record.network
-					);
-					if (!proof?.matched) continue;
-					row.txid = candidate;
-					row.reference = candidate;
-					row.status = proof.confirmed ? 'completed' : 'pending';
-					row.title = proof.confirmed
-						? 'Bitcoin sent'
-						: 'Bitcoin payment pending';
-					row.statusNote = proof.confirmed
-						? 'Transaction confirmed.'
-						: 'Transaction verified. Waiting for confirmation.';
+						channel,
+						verify: (candidate: string) =>
+							verifySubmission(
+								options.socketFactory,
+								options.electrum ?? record.electrum,
+								row,
+								candidate,
+								record.network
+							)
+					})
+				)
 					changed = true;
-				} catch {}
 			}
 			if (changed) save('/wallet/activity.json', activity);
 		} finally {

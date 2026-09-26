@@ -38,6 +38,7 @@ import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { nodeStorageView } from './node-storage-view';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
 import {
@@ -61,7 +62,8 @@ import {
 	MemoryL402CredentialStore,
 	readCappedBody
 } from '../lightning/l402';
-import { IPaymentInfo } from '../lightning/node/types';
+import { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import { IInvoiceInfo } from '../lightning/storage/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
@@ -431,6 +433,10 @@ export interface BeignetNodeOptions {
 		message: string;
 		timestamp: number;
 		channelId?: string;
+		/** The transaction a broadcast error is about, display order (issue #1062). */
+		txid?: string;
+		/** The node still holds that transaction and rebroadcasts it every block. */
+		retained?: boolean;
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
@@ -865,6 +871,22 @@ export function spendLimitSats(amountMsat: bigint): number {
 }
 
 /**
+ * The fee hop `i` of a route kept, in msat: what it received (its own
+ * amountToForwardMsat, the amount the previous node forwards TO it) less what
+ * it forwarded to the next hop. The final hop keeps nothing, and a record
+ * whose hop amounts are missing reports 0 rather than a NaN (issue #1056).
+ */
+export function hopFeeMsat(
+	hops: ReadonlyArray<{ amountToForwardMsat?: bigint }>,
+	i: number
+): number {
+	const received = hops[i]?.amountToForwardMsat;
+	const forwarded = hops[i + 1]?.amountToForwardMsat;
+	if (typeof received !== 'bigint' || typeof forwarded !== 'bigint') return 0;
+	return received > forwarded ? Number(received - forwarded) : 0;
+}
+
+/**
  * The amount an invoice payment has to be admitted and accounted for, in sats.
  *
  * The ENCODED amount wins wherever the invoice carries one, because that is
@@ -921,6 +943,14 @@ function sentSats(info: IPaymentInfo): number | undefined {
 		return undefined;
 	}
 	return spendLimitSats(info.amountMsat);
+}
+
+/**
+ * Whether a payment record marks its invoice paid: a completed receive for
+ * the hash. Null and undefined (no record) read as unpaid.
+ */
+function settlesInvoice(p: IPaymentInfo | null | undefined): boolean {
+	return p?.status === 'COMPLETED' && p.direction === 'INCOMING';
 }
 
 /**
@@ -2877,34 +2907,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// Forward errors to callback or absorb to prevent process crash
-		this.node.on(
-			'node:error',
-			(err: {
-				code: string;
-				message: string;
-				timestamp: number;
-				channelId?: Buffer;
-			}) => {
-				if (opts.onError) {
-					opts.onError({
-						code: err.code,
-						message: err.message,
-						timestamp: err.timestamp,
-						channelId: err.channelId ? err.channelId.toString('hex') : undefined
-					});
-				}
-				// Carry the channel id, as onError already does. Without it a
-				// subscriber (SSE, webhooks) cannot tell which channel an error
-				// belongs to, so an error raised while a channel is being opened
-				// is indistinguishable from an unrelated one on another channel.
-				this.emit('node:error', {
-					code: err.code,
-					message: err.message,
-					timestamp: err.timestamp,
-					channelId: err.channelId ? err.channelId.toString('hex') : undefined
-				});
-			}
-		);
+		this.wireNodeErrorRelay(opts.onError);
 
 		// Forward payment events with JSON-safe types + structured logging
 		this.node.on('payment:received', (info: IPaymentInfo) => {
@@ -6006,10 +6009,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Sum of local balances in force-closed / closing channels — funds being
+	 * Sum of local balances in force-closed / closing channels: funds being
 	 * recovered on-chain (claimable, possibly still timelocked), which are not
 	 * counted as live lightning balance and not yet in the wallet. Surfaces
 	 * funds that would otherwise be invisible after a force-close.
+	 *
+	 * "Not yet in the wallet" is checked, not assumed (issue #1065): the
+	 * wallet balance counts the sweep of our balance output from its mempool
+	 * sighting on, while the channel stays FORCE_CLOSED until every tracked
+	 * output is IRREVOCABLE_DEPTH deep, so the same sats used to be reported
+	 * here and in onchainBalanceSats for 100+ blocks. A FORCE_CLOSED channel
+	 * leaves this figure in the same read in which the wallet history first
+	 * holds that sweep, never earlier. The test is re-derived on every read,
+	 * so a sweep the wallet drops again (evicted, replaced by a version it has
+	 * not seen, a restart before its first sync) puts the channel back here
+	 * in that read. SHUTTING_DOWN and NEGOTIATING_CLOSING are counted whole,
+	 * as before.
 	 */
 	private getPendingCloseBalanceSats(): number {
 		const recovering = new Set<ChannelState>([
@@ -6019,11 +6034,72 @@ export class BeignetNode extends EventEmitter {
 		]);
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (recovering.has(ch.state)) {
-				totalMsat += ch.localBalanceMsat;
+			if (!recovering.has(ch.state)) continue;
+			if (
+				ch.state === ChannelState.FORCE_CLOSED &&
+				this.isForceCloseBalanceInWallet(ch.channelId)
+			) {
+				continue;
 			}
+			totalMsat += ch.localBalanceMsat;
 		}
 		return Number(totalMsat / 1000n);
+	}
+
+	/**
+	 * True once the wallet history holds the sweep of our balance output on
+	 * the force-close commitment the monitor classified: our to_remote on any
+	 * of the peer's commitments, our commitment to_local on ours (a
+	 * second-level HTLC to_local is an HTLC resolution, not the balance).
+	 * HTLC outputs resolve separately and are no part of localBalanceMsat, so
+	 * they play no part here. The sweep is the spend the monitor saw
+	 * (resolutionTxid), else the sweep it built (sweepTxHex). The history
+	 * entry is the test rather than a UTXO because a later wallet spend
+	 * removes the UTXO but not the entry; a ghosted entry (exists false) is
+	 * one the wallet no longer observes. No monitor, no classified
+	 * commitment, no balance output or no sweep yet means the funds are
+	 * still pending close.
+	 */
+	private isForceCloseBalanceInWallet(channelId: Buffer): boolean {
+		const monitor = this.node.getChannelManager().getMonitor(channelId);
+		const broadcast = monitor?.getFullState().commitmentBroadcast;
+		if (!monitor || !broadcast) return false;
+		let balanceOutputType: OutputType;
+		switch (broadcast.commitmentType) {
+			case CommitmentType.OUR_COMMITMENT:
+				balanceOutputType = OutputType.TO_LOCAL;
+				break;
+			case CommitmentType.THEIR_CURRENT_COMMITMENT:
+			case CommitmentType.THEIR_REVOKED_COMMITMENT:
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				balanceOutputType = OutputType.TO_REMOTE;
+				break;
+			default:
+				return false;
+		}
+		const balanceOutput = monitor
+			.getTrackedOutputs()
+			.find(
+				(o) =>
+					o.txid === broadcast.txid &&
+					o.outputType === balanceOutputType &&
+					!o.isSecondLevelHtlc
+			);
+		if (!balanceOutput) return false;
+		let sweepTxid = balanceOutput.resolutionTxid;
+		if (!sweepTxid && balanceOutput.sweepTxHex) {
+			const bitcoin = require('bitcoinjs-lib');
+			try {
+				sweepTxid = bitcoin.Transaction.fromHex(
+					balanceOutput.sweepTxHex
+				).getId();
+			} catch {
+				return false;
+			}
+		}
+		if (!sweepTxid) return false;
+		const entry = this.wallet.transactions[sweepTxid];
+		return entry !== undefined && entry.exists !== false;
 	}
 
 	/**
@@ -6085,41 +6161,61 @@ export class BeignetNode extends EventEmitter {
 	 * Best-effort derivation of a wallet-owned output script for force-close
 	 * sweeps. Returns undefined if the wallet can't produce an address yet
 	 * (e.g. Electrum not connected). Never throws.
+	 *
+	 * Both legs pay the wallet's internal (change) chain, never the receive
+	 * chain (issue #1064). A receive address is what getNewAddress and
+	 * POST /address/new hand out to payers and what a saved receive request
+	 * holds, and the next unused receive address is exactly the one handed
+	 * out most recently and not yet paid, so a close payout sent there read
+	 * as the payer paying that request: wallet-core marked the request partly
+	 * paid (or paid) and dropped the payout's own row. No request, route or
+	 * API ever hands out a change address, so a payout on the change chain
+	 * can never be mistaken for a request's payment. It is still an address
+	 * the wallet scans, so the payout sits in the balance and in the
+	 * transaction list as its own received row.
 	 */
 	private async resolveWalletSweepScript(): Promise<Buffer | undefined> {
-		// Preferred: the current unused wallet address. This requires Electrum
-		// to gap-scan for the next unused index.
+		// Preferred: the next unused change address. This requires Electrum
+		// to gap-scan for the next unused change index.
 		const fresh = await this.resolveCurrentWalletAddressScript();
 		if (fresh) return fresh;
-		// Fallback: deterministically derive a wallet-owned address (index 0) with
-		// NO network dependency. Reusing index 0 is a minor privacy tradeoff, but
-		// it guarantees force-close sweeps always target a wallet-scanned address
-		// rather than the invisible funding-key P2WPKH — even when Electrum is down
-		// at startup, which is exactly when an offline force-close is detected on
-		// restart and a sweep gets built. recoverFallbackFunds remains a safety net
-		// for funds stranded by older sessions. (The cooperative-close path
-		// deliberately does NOT use this leg: on a mature wallet index 0 can
-		// sit outside the 20-address scan window behind the current index, and
-		// nothing rescues it, so the close chain prefers its cached script and
-		// then the rescuable funding key instead; issue #542 review.)
+		// Fallback: the wallet's stored change address, read locally with NO
+		// network dependency. It guarantees force-close sweeps always target a
+		// wallet-scanned address rather than the invisible funding-key P2WPKH,
+		// even when Electrum is down at startup, which is exactly when an
+		// offline force-close is detected on restart and a sweep gets built.
+		// The stored change index is the one normal sends take their change
+		// from, so it always sits inside the change scan window
+		// (updateAddressIndexes clamps it there). Not a fixed change index 0:
+		// on a used wallet it can sit outside that window, the same reason
+		// receive index 0 was kept out of the cooperative close chain (issue
+		// #542 review). The one side effect is address reuse: a send that is
+		// still unconfirmed at the next refresh took its change from this same
+		// index, so the sweep can share the address with it. That is a
+		// privacy tradeoff only; both outputs are the wallet's. recoverFallbackFunds
+		// remains a safety net for funds stranded by older sessions.
 		const bitcoin = require('bitcoinjs-lib');
 		try {
-			const address = await this.wallet.getAddress({ index: '0' });
-			if (address) {
+			const change = await this.wallet.getChangeAddress();
+			if (change.isOk() && change.value?.address) {
 				return bitcoin.address.toOutputScript(
-					address,
+					change.value.address,
 					this.getBitcoinNetwork()
 				);
 			}
 		} catch {
-			// give up — caller keeps the funding-key fallback + background refresh
+			// give up: caller keeps the funding-key fallback + background refresh
 		}
 		return undefined;
 	}
 
 	/**
-	 * The current unused wallet address as an output script, or undefined when
+	 * The next unused change address as an output script, or undefined when
 	 * the wallet cannot produce one (Electrum needed for the gap scan).
+	 * The change chain, never the receive chain: see resolveWalletSweepScript
+	 * (issue #1064). The lookup is the same getNextAvailableAddress call that
+	 * gap-scans both chains, so the Electrum dependency and the timeouts the
+	 * callers wrap around it are unchanged; only the chain read out differs.
 	 */
 	private async resolveCurrentWalletAddressScript(): Promise<
 		Buffer | undefined
@@ -6129,7 +6225,7 @@ export class BeignetNode extends EventEmitter {
 			const res = await this.wallet.getNextAvailableAddress();
 			if (res.isOk()) {
 				return bitcoin.address.toOutputScript(
-					res.value.addressIndex.address,
+					res.value.changeAddressIndex.address,
 					this.getBitcoinNetwork()
 				) as Buffer;
 			}
@@ -7373,17 +7469,24 @@ export class BeignetNode extends EventEmitter {
 		// funding-key script was invisible to the wallet: the payout sat
 		// confirmed on-chain while the balance read zero until
 		// recoverFallbackFunds swept it, a second transaction and fee. The
-		// chain: the current unused wallet address (BOUNDED, because the
-		// lookup can enter an Electrum handshake with no timeout of its own
-		// and the close must reach the engine regardless), then the sweep
-		// script resolved at startup, then the funding-key P2WPKH that
-		// recoverFallbackFunds can still rescue. The index-0 leg the
-		// force-close startup resolution uses is deliberately NOT in this
-		// chain: on a mature wallet index 0 can sit outside the 20-address
-		// scan window behind the current index and nothing rescues it, which
-		// would recreate the invisible payout this change removes (issue #542
-		// review). Every leg is derived locally from our own keys, so the
-		// chain always terminates in a script we control.
+		// chain: the next unused CHANGE address (BOUNDED, because the lookup
+		// can enter an Electrum handshake with no timeout of its own and the
+		// close must reach the engine regardless), then the sweep script
+		// resolved at startup (also on the change chain), then the
+		// funding-key P2WPKH that recoverFallbackFunds can still rescue. The
+		// change chain, never the receive chain (issue #1064): the next
+		// unused receive address is the one most recently handed out to a
+		// payer by getNewAddress / POST /address/new and not yet paid, so a
+		// payout there read as that receive request being paid, while no
+		// request or route ever hands out a change address. The offline leg
+		// the force-close startup resolution uses (the stored change address;
+		// receive index 0 before issue #1064) is deliberately NOT in this
+		// chain: index 0 could sit outside the 20-address scan window behind
+		// the current index with nothing to rescue it, which would recreate
+		// the invisible payout this change removes (issue #542 review), and
+		// the startup script already covers an Electrum outage at close
+		// time. Every leg is derived locally from our own keys, so the chain
+		// always terminates in a script we control.
 		let scriptPubkey = await this.boundedCurrentWalletAddressScript();
 		if (!scriptPubkey) scriptPubkey = this.sweepDestinationScript;
 		if (!scriptPubkey) {
@@ -8272,6 +8375,38 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
+	/**
+	 * Relay the engine's node:error to the onError callback and to this
+	 * emitter (SSE, webhooks), JSON-safe. The channel id rides as hex, as
+	 * onError always did: without it a subscriber cannot tell which channel
+	 * an error belongs to, so an error raised while a channel is being
+	 * opened is indistinguishable from an unrelated one. txid and retained
+	 * (issue #1062) ride whenever the engine set them, so a broadcast
+	 * failure names its transaction and says whether the node is still
+	 * re-sending it.
+	 */
+	private wireNodeErrorRelay(onError: BeignetNodeOptions['onError']): void {
+		this.node.on('node:error', (err: ILightningError) => {
+			const data: {
+				code: string;
+				message: string;
+				timestamp: number;
+				channelId?: string;
+				txid?: string;
+				retained?: boolean;
+			} = {
+				code: err.code,
+				message: err.message,
+				timestamp: err.timestamp,
+				channelId: err.channelId ? err.channelId.toString('hex') : undefined
+			};
+			if (err.txid !== undefined) data.txid = err.txid;
+			if (err.retained !== undefined) data.retained = err.retained;
+			if (onError) onError(data);
+			this.emit('node:error', data);
+		});
+	}
+
 	private toChannelInfo(ch: {
 		channelId: Buffer;
 		peerPubkey: string;
@@ -8286,6 +8421,8 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw?: number;
 		htlcCount?: number;
 		pendingSpliceLocalBalanceMsat?: bigint;
+		pendingSpliceTxid?: string;
+		previousFundingTxids?: string[];
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
@@ -8346,6 +8483,13 @@ export class BeignetNode extends EventEmitter {
 			info.pendingSpliceLocalBalanceSats = Number(
 				ch.pendingSpliceLocalBalanceMsat / 1000n
 			);
+		// The splice txid and the retired fundings (issue #1060): a wallet
+		// matches its own deposits against them, so a channel's splice is
+		// not shown as a send. Already display order from the node layer.
+		if (ch.pendingSpliceTxid !== undefined)
+			info.pendingSpliceTxid = ch.pendingSpliceTxid;
+		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
+			info.previousFundingTxids = [...ch.previousFundingTxids];
 		// The dashboard's Send gating reads these off the wire; dropping them
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.
@@ -10554,7 +10698,7 @@ export class BeignetNode extends EventEmitter {
 			// a duplicate refusal the durable row the engine refused from.
 			if (hashHex !== 'unknown') {
 				const existing =
-					this.getPayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
+					this.livePayment(hashHex) ?? this.durablePaymentFor(err, hashHex);
 				if (existing) return existing;
 			}
 
@@ -10599,7 +10743,7 @@ export class BeignetNode extends EventEmitter {
 				// Don't retry permanent failures
 				if (!isRetryableError(err)) {
 					const pi =
-						this.getPayment(paymentHashHex) ??
+						this.livePayment(paymentHashHex) ??
 						this.durablePaymentFor(err, paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
@@ -10639,7 +10783,7 @@ export class BeignetNode extends EventEmitter {
 
 				// Check drain mode before retrying
 				if (this._draining) {
-					const pi = this.getPayment(paymentHashHex);
+					const pi = this.livePayment(paymentHashHex);
 					if (pi) return { ...pi, attempts: attempt };
 					return {
 						paymentHash: paymentHashHex,
@@ -10660,7 +10804,7 @@ export class BeignetNode extends EventEmitter {
 					const amountSats = Number(decoded.amountMsat / 1000n);
 					const check = this.canSend(amountSats);
 					if (!check.canSend) {
-						const pi = this.getPayment(paymentHashHex);
+						const pi = this.livePayment(paymentHashHex);
 						if (pi) return { ...pi, attempts: attempt };
 						return {
 							paymentHash: paymentHashHex,
@@ -10677,7 +10821,7 @@ export class BeignetNode extends EventEmitter {
 		}
 
 		// All retries exhausted
-		const pi = this.getPayment(paymentHashHex);
+		const pi = this.livePayment(paymentHashHex);
 		if (pi) return { ...pi, attempts: maxRetries + 1 };
 		return {
 			paymentHash: paymentHashHex,
@@ -10921,8 +11065,17 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Every payment the node has a record of, newest first (issue #1063).
+	 * The engine keeps a completed or failed record in memory for 24 hours
+	 * (oldest first past 10,000) while its durable row stays, so the rows
+	 * are read under the map on every call: the live record wins where both
+	 * exist, the row stands in where the map has forgotten. A wallet must
+	 * never show less than it already knew, so a row set that cannot be
+	 * read fails the call rather than answering with the map alone.
+	 */
 	listPayments(filter?: PaymentFilter): PaymentInfo[] {
-		let payments = this.node.listPayments().map((p) => this.toPaymentInfo(p));
+		let payments = this.paymentRecords().map((p) => this.toPaymentInfo(p));
 
 		// Sort by createdAt descending (newest first)
 		payments.sort((a, b) => b.createdAt - a.createdAt);
@@ -10959,10 +11112,47 @@ export class BeignetNode extends EventEmitter {
 		return payments;
 	}
 
+	/**
+	 * The record for a hash: the in-memory one, else its durable row, in the
+	 * order _settledRecordAtBoot reads them (issue #1063). Null when neither
+	 * exists. A row that cannot be read throws rather than reading as absent:
+	 * a NOT_FOUND for a payment the caller already knew is the answer this
+	 * exists to prevent.
+	 */
 	getPayment(paymentHash: string): PaymentInfo | null {
+		const live = this.livePayment(paymentHash);
+		if (live) return live;
+		const durable = this.storage.loadPayment(paymentHash);
+		return durable ? this.toPaymentInfo(durable) : null;
+	}
+
+	/**
+	 * The in-memory record only. The pay paths read this, not getPayment: a
+	 * fresh NO_ROUTE or FEE_EXCEEDS_MAX on a hash with a days-old FAILED row
+	 * is this attempt's outcome, and the row is an earlier attempt's, so
+	 * falling through to the row would report the old failure as the new
+	 * one. They take the row only for a DUPLICATE_PAYMENT refusal, through
+	 * durablePaymentFor, where the row is what the engine refused from.
+	 */
+	private livePayment(paymentHash: string): PaymentInfo | null {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
-		if (!p) return null;
-		return this.toPaymentInfo(p);
+		return p ? this.toPaymentInfo(p) : null;
+	}
+
+	/**
+	 * The durable rows under the in-memory map, keyed by hash, the live
+	 * record winning. One storage read per call; a row set that cannot be
+	 * read throws.
+	 */
+	private paymentRecords(): IPaymentInfo[] {
+		const byHash = new Map<string, IPaymentInfo>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			byHash.set(paymentHash, payment);
+		}
+		for (const p of this.node.listPayments()) {
+			byHash.set(p.paymentHash.toString('hex'), p);
+		}
+		return [...byHash.values()];
 	}
 
 	/**
@@ -11372,14 +11562,20 @@ export class BeignetNode extends EventEmitter {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
 		}
 		if (p.route) {
+			const hops = p.route.hops;
 			info.route = {
-				hops: p.route.hops.map((h) => ({
+				hops: hops.map((h, i) => ({
 					pubkey: h.pubkey.toString('hex'),
 					shortChannelId: h.shortChannelId.toString('hex'),
-					feeMsat: h.feeBaseMsat
+					// The fee this hop kept: what it received less what it
+					// forwarded to the next hop. The final hop keeps nothing.
+					// This reported the hop's fee_base_msat before, so a route
+					// paying 753 msat over 0-base hops read 0 at every hop
+					// (issue #1056).
+					feeMsat: hopFeeMsat(hops, i)
 				})),
 				totalFeeMsat: Number(p.route.totalFeeMsat),
-				hopCount: p.route.hops.length
+				hopCount: hops.length
 			};
 		}
 		if (p.metadata) info.metadata = p.metadata;
@@ -11927,9 +12123,52 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Invoices (List) ───────────────
 
+	/**
+	 * An invoice with its status: PAID on a completed receive for its hash,
+	 * from the in-memory record or, once that is pruned, the durable row
+	 * (issue #1063); EXPIRED past its expiry otherwise; PENDING until then.
+	 */
 	getInvoice(paymentHash: string): InvoiceInfo | null {
 		const inv = this.node.getInvoice(paymentHash);
 		if (!inv) return null;
+		const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+		const paid = live
+			? settlesInvoice(live)
+			: settlesInvoice(this.storage.loadPayment(inv.paymentHash));
+		return this.toInvoiceInfo(inv, paid);
+	}
+
+	/**
+	 * Every invoice with its status, judged as getInvoice judges one. The
+	 * durable rows are read at most once per call, for the invoices the map
+	 * has no record of; a wallet polls this every few seconds, and a row
+	 * lookup per invoice would not scale with its history.
+	 */
+	listInvoices(): InvoiceInfo[] {
+		let durablePaid: Set<string> | undefined;
+		return this.node.listInvoices().map((inv) => {
+			const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
+			let paid: boolean;
+			if (live) {
+				paid = settlesInvoice(live);
+			} else {
+				if (!durablePaid) durablePaid = this.durablePaidHashes();
+				paid = durablePaid.has(inv.paymentHash);
+			}
+			return this.toInvoiceInfo(inv, paid);
+		});
+	}
+
+	/** The hashes whose durable row is a completed receive. */
+	private durablePaidHashes(): Set<string> {
+		const paid = new Set<string>();
+		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
+			if (settlesInvoice(payment)) paid.add(paymentHash);
+		}
+		return paid;
+	}
+
+	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
 		const info: InvoiceInfo = {
 			bolt11: inv.bolt11,
 			paymentHash: inv.paymentHash
@@ -11940,13 +12179,7 @@ export class BeignetNode extends EventEmitter {
 		if (inv.description) info.description = inv.description;
 		if (inv.expiry !== undefined) info.expiry = inv.expiry;
 		if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-		// Derive status
-		const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-		if (
-			payment &&
-			payment.status === 'COMPLETED' &&
-			payment.direction === 'INCOMING'
-		) {
+		if (paid) {
 			info.status = 'PAID';
 		} else if (
 			inv.createdAt !== undefined &&
@@ -11958,39 +12191,6 @@ export class BeignetNode extends EventEmitter {
 			info.status = 'PENDING';
 		}
 		return info;
-	}
-
-	listInvoices(): InvoiceInfo[] {
-		return this.node.listInvoices().map((inv) => {
-			const info: InvoiceInfo = {
-				bolt11: inv.bolt11,
-				paymentHash: inv.paymentHash
-			};
-			if (inv.amountMsat !== undefined) {
-				info.amountSats = Number(inv.amountMsat / 1000n);
-			}
-			if (inv.description) info.description = inv.description;
-			if (inv.expiry !== undefined) info.expiry = inv.expiry;
-			if (inv.createdAt !== undefined) info.createdAt = inv.createdAt;
-			// Derive status from payment map + expiry
-			const payment = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
-			if (
-				payment &&
-				payment.status === 'COMPLETED' &&
-				payment.direction === 'INCOMING'
-			) {
-				info.status = 'PAID';
-			} else if (
-				inv.createdAt !== undefined &&
-				inv.expiry !== undefined &&
-				Date.now() / 1000 > inv.createdAt + inv.expiry
-			) {
-				info.status = 'EXPIRED';
-			} else {
-				info.status = 'PENDING';
-			}
-			return info;
-		});
 	}
 
 	// ─────────────── Health ───────────────

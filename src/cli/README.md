@@ -160,8 +160,8 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `openChannelAndWait(pubkey, amountSats, opts?)` | `Promise<ChannelInfo>` | Open channel + wait for NORMAL state. `opts: { pushSats?, timeoutMs? }` |
 | `openZeroConfChannel(pubkey, sats, pushSats?)` | `ChannelInfo` | Open zero-conf channel (peer must be trusted) |
 | `openChannelV2(pubkey, params)` | `ChannelInfo` | Open dual-funded v2 channel |
-| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout resolves to a wallet-scanned address first. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
-| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; a capsule-restored channel needs `acceptStaleStateRisk: true` |
+| `closeChannel(channelId, acceptStaleStateRisk?)` | `Promise<{ ok, error? }>` | Cooperative close (`await` it): the payout goes to a wallet-scanned address on the change chain, never to a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true`, because a mutual close signs the balances that row carries |
+| `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `dailySpendLimitSats` |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
@@ -176,7 +176,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 |--------|---------|-------------|
 | `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
 | `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
-| `listInvoices()` | `InvoiceInfo[]` | List all created invoices |
+| `listInvoices()` | `InvoiceInfo[]` | List all created invoices. `status` is `PAID` on a completed receive for the hash, from the in-memory record or, once the engine has pruned it, the database row (one database read per call), so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling. `minFinalCltvExpiry` is 1..2016 blocks and sets the BOLT 11 `c` tag |
 | `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |
 | `cancelHoldInvoice(paymentHash)` | `{ paymentHash, htlcsFailed }` | Fail parked HTLCs back (`incorrect_or_unknown_payment_details`) and close the invoice |
@@ -215,8 +215,8 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | `sendPaymentAsync(bolt11, maxFeeSats?, amountSats?, metadata?, cltvLimit?)` | `{ paymentHash, status: 'PENDING' \| 'FAILED' }` | Fire-and-forget pay. Returns immediately, `FAILED` when the engine refused the submission outright (an expired invoice, an HTLC the channel would not take). Poll `getPayment()` for settlement. Drain mode and the spending limits are applied at submission, so it can throw `SERVICE_DRAINING` or `SPENDING_LIMIT_EXCEEDED`; the limits use the invoice's own amount whenever it carries one, since that is what gets paid. |
 | `payInvoiceWithRetry(bolt11, opts?)` | `Promise<RetryPaymentResult>` | Pay with exponential backoff retry. `opts: { maxRetries? (3), backoffMs? (2000), maxFeeSats?, amountSats?, metadata?, cltvLimit? }`. Emits `payment:retry` events. |
 | `cancelPayment(paymentHash)` | `{ ok: true }` | Cancel a pending outbound payment (marks as FAILED). The HTLC cannot be retracted, so a cancelled payment keeps holding its amount against the daily limit until that HTLC settles or fails back, or the 24h window ends; `getDailySpendInfo().pendingSats` shows what is held. |
-| `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. |
-| `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment |
+| `listPayments(filter?)` | `PaymentInfo[]` | List payments sorted by createdAt desc. Filter by `status`, `direction`, `since`, `limit`, `offset`, `metadataKey`, `metadataValue`. Reads through to the node database: a completed or failed payment stays listed with its status after the engine prunes its in-memory record (24 hours after completion, oldest first past 10,000), however long the node has been running. A database read that fails fails the call rather than returning a shorter list. |
+| `getPayment(paymentHash)` | `PaymentInfo \| null` | Get specific payment: the in-memory record, else its database row, so a payment is found however long ago it completed |
 | `setPaymentMetadata(paymentHash, metadata)` | `void` | Attach key-value metadata to an existing payment |
 | `sendKeysend(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Spontaneous payment (no invoice). **Blocks until settled or timeout** (default 60s), with the same timeout rule as `payInvoice`. Without `maxFeeSats` the routing fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. |
 | `sendKeysendSafe(pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata?)` | `Promise<PaymentInfo>` | Like `sendKeysend` but **never throws** — resolves with `status: 'FAILED'` instead. |
@@ -780,7 +780,7 @@ node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we off
 node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
 node.on('peer:connect', ({ pubkey }) => { ... });
 node.on('peer:disconnect', ({ pubkey }) => { ... });
-node.on('node:error', ({ code, message, timestamp }) => { ... });
+node.on('node:error', ({ code, message, timestamp, channelId, txid, retained }) => { ... }); // channelId when the error belongs to a channel; txid + retained on the broadcast codes (issue #1062)
 node.on('node:ready', () => { ... });           // node fully operational
 node.on('payment:retry', ({ paymentHash, attempt, maxRetries, nextRetryMs, error }) => { ... });
 node.on('backup:completed', ({ path, timestamp }) => { ... });
@@ -801,6 +801,7 @@ interface NodeInfo {
   blockHeight: number;
   onchainBalanceSats: number;
   lightningBalanceSats: number;
+  pendingCloseBalanceSats: number; // local balance of closing channels not yet in the wallet (see below)
   channelCount: number;      // every known channel row, incl. CLOSED/FORCE_CLOSED
   openChannelCount: number;  // channels not in a terminal state
   peerCount: number;
@@ -829,10 +830,13 @@ interface ChannelInfo {
   remoteBalanceSats: number;
   capacitySats: number;
   isAnchor: boolean;        // true if anchor channel (option_anchors_zero_fee_htlc_tx)
-  fundingTxid?: string;     // funding transaction ID hex
+  fundingTxid?: string;     // funding transaction ID hex (display order)
   shortChannelId?: string;  // e.g. "800000x1x0"
   feeratePerKw?: number;    // current commitment feerate
   htlcCount?: number;       // number of active HTLCs
+  pendingSpliceLocalBalanceSats?: number;  // local balance once the in-flight splice locks; present only mid-splice
+  pendingSpliceTxid?: string;              // the in-flight splice's txid, display order; present exactly when pendingSpliceLocalBalanceSats is (issue #1060)
+  previousFundingTxids?: string[];         // fundings retired by adopted splices, oldest first, display order; absent when never spliced (issue #1060)
   closeStatus?: {           // present for closing/closed channels
     closer: 'local' | 'remote' | 'cooperative' | 'unknown';
     reason?: string;        // 'user' or an automatic close code; absent for peer closes
@@ -1144,7 +1148,7 @@ interface BeignetNodeEvents {
   'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
   'peer:connect': (data: { pubkey: string }) => void;
   'peer:disconnect': (data: { pubkey: string }) => void;
-  'node:error': (data: { code: string; message: string; timestamp: number }) => void;
+  'node:error': (data: { code: string; message: string; timestamp: number; channelId?: string; txid?: string; retained?: boolean }) => void;
   'node:ready': () => void;
   'payment:retry': (data: { paymentHash: string; attempt: number; maxRetries: number; nextRetryMs: number; error: string }) => void;
   'backup:completed': (data: { path: string; timestamp: number }) => void;
@@ -1163,6 +1167,8 @@ interface LogEntry {
 }
 ```
 
+`pendingCloseBalanceSats` is the local balance of every SHUTTING_DOWN, NEGOTIATING_CLOSING and FORCE_CLOSED channel whose funds the wallet does not count yet. A FORCE_CLOSED channel leaves the figure in the same read in which the wallet history first holds the sweep of its balance output (our to_remote on the peer's commitment, our to_local on ours), which the wallet counts from the mempool on, so a sat of the channel is in `onchainBalanceSats` or in `pendingCloseBalanceSats`, never both. If the wallet drops the sweep again (evicted, replaced, a restart before its first sync), the channel is back in the figure in that read.
+
 ### Channel States
 
 Channels progress through these states:
@@ -1175,7 +1181,8 @@ Channels progress through these states:
 | `AWAITING_REESTABLISH` | No | Reconnected after disconnect, re-syncing state |
 | `SHUTTING_DOWN` | No | Cooperative close initiated, no new HTLCs |
 | `NEGOTIATING_CLOSING` | No | Exchanging closing fee proposals |
-| `CLOSED` | No | Channel closed (cooperative or forced) |
+| `FORCE_CLOSED` | No | A unilateral close is on chain and the chain monitor is sweeping our outputs |
+| `CLOSED` | No | Channel closed (cooperative or forced). A force close gets here once every output that is ours to claim is swept and 100 blocks deep; the peer's own output (its to_remote on our commitment, its to_local on its own current one) does not hold the transition, since only the peer can spend it |
 
 Only channels in `NORMAL` state can send/receive payments.
 
@@ -1605,11 +1612,15 @@ beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId> [--accept-stale-state-risk]
 beignet channel forceclose <channelId> [--accept-stale-state-risk]
-# Both closes pay out to a wallet-owned address the wallet scans (the current
-# unused address when the wallet can produce one; consecutive closes may get
-# the same address until it sees use), falling back to the startup sweep
-# address and then the funding-key address, so the closed balance is tracked
-# and spendable without a rescue sweep.
+# Both closes pay out to a wallet-owned address the wallet scans, on the
+# internal change chain: the next unused change address when the wallet can
+# produce one (consecutive closes may get the same address until it sees use),
+# falling back to the startup sweep address (the stored change address when
+# Electrum was down at startup) and then the funding-key address, so the
+# closed balance is tracked and spendable without a rescue sweep. Never a
+# receive address: the next unused receive address is the one `address new` /
+# `POST /address/new` handed out most recently, and a payout there would read
+# as that receive request being paid (issue #1064).
 # A channel restored from a Recovery Capsule refuses either close without the
 # flag. Cooperative: a mutual close pays out restored balances that cannot be
 # proven current. Force: if the peer holds a newer state the broadcast is
@@ -2104,13 +2115,13 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
-| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |
+| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable). Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
 | GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
 | GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
-| GET | `/invoices` | -- | List created invoices |
+| GET | `/invoices` | -- | List created invoices. `status` is `PAID` on a completed receive, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads `EXPIRED` or `PENDING` later |
 | GET | `/channel` | `?channelId=<hex>` | Get channel (query param or body) |
 | GET | `/channel/health` | `?channelId=<hex>` | Channel health assessment with liquidity warnings |
-| GET | `/payment` | `?paymentHash=<hex>` | Get payment (query param or body) |
+| GET | `/payment` | `?paymentHash=<hex>` | Get payment (query param or body): the in-memory record, else its database row, so a payment is found however long ago it completed |
 | GET | `/trusted-peers` | -- | List trusted peers |
 | GET | `/offers` | -- | List BOLT 12 offers |
 | GET | `/events` | -- | SSE event stream (auth-gated) |
@@ -2142,8 +2153,8 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channels/ensure-minimum` | `{ count, satsPerChannel, timeoutMs? }` | Auto-open channels to meet minimum count |
 | POST | `/channel/connect-and-open` | `{ pubkey, host, port, amountSats, pushSats? }` | Connect + open in one call |
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
-| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the flag is required for a capsule-restored channel |
-| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the flag is required for a capsule-restored channel |
+| POST | `/channel/close` | `{ channelId, acceptStaleStateRisk? }` | Coop close; the payout goes to the wallet's change chain, never a handed-out receive address. The flag is required for a capsule-restored channel |
+| POST | `/channel/forceclose` | `{ channelId, acceptStaleStateRisk? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. The flag is required for a capsule-restored channel |
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
@@ -2245,6 +2256,13 @@ Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, 
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+- `node:error` carries `code`, `message`, `timestamp` and, when the error belongs to a channel, `channelId`. The three broadcast codes also carry `txid` (display order) and `retained` (issue #1062):
+
+  | Code | Meaning | `retained` |
+  |------|---------|------------|
+  | `BROADCAST_FAILED` | The chain watcher could not hand a transaction to the backend; it retries on the next block | `true` when the node itself also holds the transaction (a pending funding, an in-flight or adopted but unconfirmed splice) |
+  | `BROADCAST_PERMANENT_FAILURE` | The watcher's retries ran out and it dropped the transaction from its queue | `true` means the node still re-sends it on every block until it confirms; `false` (a close, a sweep) means nothing else will |
+  | `SPLICE_BROADCAST_REFUSED` | The backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason, with the backend's reason in the message | always `true` |
 - The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount, minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks, cancelHeight}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount, count and expiry fields describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
 
 Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
