@@ -26,6 +26,15 @@ const ENGINE_VERSION =
 	typeof __BEIGNET_ENGINE_VERSION__ === 'string'
 		? __BEIGNET_ENGINE_VERSION__
 		: 'unknown-portable';
+// The networks a wallet can be created on. GET /api/config advertises this
+// same list, so a client that trusts the config can create every wallet the
+// engine accepts and no other (fork issue #4).
+const SUPPORTED_NETWORKS: readonly string[] = Object.freeze([
+	'mainnet',
+	'testnet',
+	'signet',
+	'regtest'
+]);
 function failure(code: string, message: string, status = 400): never {
 	throw Object.assign(new Error(message), { code, status });
 }
@@ -131,6 +140,25 @@ export async function createPortableRuntime(options: any) {
 		recoveryImport.complete = true;
 		persist();
 	};
+	/**
+	 * Whether this wallet's primary settles offline receives, as it last
+	 * answered the probe: true, false with the refusal, or null before an
+	 * answer (the wallet is stopped, the primary has not connected yet, or it
+	 * was just changed). GET /api/config's offlineReceiveAvailable says the
+	 * engine implements the feature; this pair says whether the primary serves
+	 * it, which is what the receive screen needs before offering it.
+	 */
+	const offlineReceiveAvailability = () => {
+		const pk = record?.lfbw?.primaryPubkey;
+		const state =
+			offlineReceive && typeof pk === 'string'
+				? offlineReceive.availability(pk)
+				: { available: null, reason: null };
+		return {
+			offlineReceiveAvailable: state.available,
+			offlineReceiveReason: state.reason
+		};
+	};
 	const publicRecord = () =>
 		record
 			? clone({
@@ -140,7 +168,8 @@ export async function createPortableRuntime(options: any) {
 						lastChannelize: record.lfbwLast ?? null,
 						lastSplice,
 						unpairedFunding,
-						lastOffer
+						lastOffer,
+						...offlineReceiveAvailability()
 					},
 					status: node ? 'running' : 'stopped',
 					healthy: healthy(),
@@ -203,6 +232,23 @@ export async function createPortableRuntime(options: any) {
 		} finally {
 			redialing = false;
 		}
+	};
+	/**
+	 * Ask the primary whether it settles offline receives, off the connect
+	 * path: the connect handler runs inside the peer manager's bring-up, and
+	 * the answer only informs the receive screen. The coordinator bounds the
+	 * ask like a review's quote and keeps the answer per peer, so a changed
+	 * primary is asked afresh on its first connection.
+	 */
+	const probeOfflineReceive = () => {
+		const pending = setTimeout(() => {
+			pendingTimers.delete(pending);
+			if (closed || !node || !offlineReceive || recoveryHold()) return;
+			const pk = record?.lfbw?.primaryPubkey;
+			if (typeof pk !== 'string' || !primaryConnected()) return;
+			void offlineReceive.probe(pk).catch(() => {});
+		}, 0);
+		pendingTimers.add(pending);
 	};
 	let setupRunning = false;
 	/**
@@ -450,6 +496,7 @@ export async function createPortableRuntime(options: any) {
 				};
 				node.on('peer:connect', (first: any) => {
 					if (peerKey(first) !== record?.lfbw?.primaryPubkey) return;
+					probeOfflineReceive();
 					const pending = setTimeout(() => {
 						pendingTimers.delete(pending);
 						if (closed || !node) return;
@@ -497,6 +544,11 @@ export async function createPortableRuntime(options: any) {
 					load(`/wallet/offline-receive-${record.id}.json`, [])
 				);
 				await setup();
+				// The engine's own reconnect can bring the primary up before the
+				// coordinator exists, and setup() joins a dial already in flight,
+				// so a primary that is connected but unasked by now is asked here.
+				if (offlineReceiveAvailability().offlineReceiveAvailable === null)
+					probeOfflineReceive();
 				receiveTimer = setInterval(() => {
 					if (!closed && !durabilityFailed && !recoveryHold()) void offlineReceive?.sync().catch(() => {});
 				}, 2000);
@@ -871,10 +923,18 @@ export async function createPortableRuntime(options: any) {
 				return n.listPayments();
 			case 'GET /invoices':
 				return n.listInvoices();
-			case 'GET /receive/offline':
-				return (
-					offlineReceive?.capacity(record.lfbw.primaryPubkey) ?? { maxSats: 0 }
-				);
+			case 'GET /receive/offline': {
+				// Capacity is the channel's side of the answer; whether the primary
+				// settles at all is the probed side, repeated here beside it.
+				const probed = offlineReceiveAvailability();
+				return {
+					...(offlineReceive?.capacity(record.lfbw.primaryPubkey) ?? {
+						maxSats: 0
+					}),
+					available: probed.offlineReceiveAvailable,
+					reason: probed.offlineReceiveReason
+				};
+			}
 			case 'GET /receive/quote':
 				return offlineReceive!.quote(
 					record.lfbw.primaryPubkey,
@@ -1209,10 +1269,12 @@ export async function createPortableRuntime(options: any) {
 				defaultNetwork: record?.network ?? 'mainnet',
 				defaultElectrum: options.electrum ?? record?.electrum ?? null,
 				hasDefaultElectrum: !!(options.electrum ?? record?.electrum),
-				supportedNetworks: ['mainnet', 'testnet', 'regtest'],
+				supportedNetworks: [...SUPPORTED_NETWORKS],
 				electrumPresets: [],
 				torAvailable: false,
 				jitQuoteAvailable: true,
+				// The engine implements offline receiving. Whether this wallet's
+				// primary serves it is the probed pair on the wallet record.
 				offlineReceiveAvailable: true,
 				recoveryAvailable: true,
 				recoveryAutoApplyAvailable: true,
@@ -1233,7 +1295,7 @@ export async function createPortableRuntime(options: any) {
 					409
 				);
 			const network = body.network ?? 'mainnet';
-			if (!['mainnet', 'testnet', 'signet', 'regtest'].includes(network))
+			if (!SUPPORTED_NETWORKS.includes(network))
 				failure('INVALID_NETWORK', 'Unsupported Bitcoin network');
 			const electrum = options.electrum ?? body.electrum;
 			if (!electrum)

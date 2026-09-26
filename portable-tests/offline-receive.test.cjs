@@ -236,3 +236,120 @@ test('a retried create is not refused over its own reservation', async () => {
 		{ code: 'FEE_CHANGED' }
 	);
 });
+
+/** A wallet whose primary answers the receive-terms quote as `answer` says. */
+function primary(answer) {
+	let requests = 0,
+		now = 1000;
+	const node = {
+		listChannels: () => [],
+		fforEpochs: () => [],
+		getFforReceiveService: () => ({
+			request: async (_peer, body, timeout) => {
+				requests++;
+				assert.deepEqual(body, { op: 'quote' });
+				assert.equal(timeout, 15000);
+				return answer();
+			}
+		})
+	};
+	const coordinator = new OfflineReceive(node, () => {}, [], () => now);
+	return {
+		coordinator,
+		get requests() {
+			return requests;
+		},
+		set now(v) {
+			now = v;
+		}
+	};
+}
+const unprobed = { available: null, reason: null, probedAt: null };
+test('a primary that answers the quote with an unsupported version leaves the flag false with the reason', async () => {
+	const p = primary(async () => ({ version: 2, feeBaseMsat: 0, feePpm: 0 }));
+	const answer = await p.coordinator.probe(peer);
+	assert.deepEqual(answer, {
+		available: false,
+		reason: 'Your node returned unsupported receive terms.',
+		probedAt: 1000
+	});
+	assert.deepEqual(p.coordinator.availability(peer), answer);
+	assert.equal(p.requests, 1);
+});
+test('a primary that refuses, or never answers within the bound, is recorded with that refusal', async () => {
+	const refused = primary(async () => {
+		throw Object.assign(new Error('Your node does not provide offline receiving.'), {
+			code: 'RECEIVE_UNAVAILABLE'
+		});
+	});
+	await refused.coordinator.probe(peer);
+	assert.deepEqual(refused.coordinator.availability(peer), {
+		available: false,
+		reason: 'Your node does not provide offline receiving.',
+		probedAt: 1000
+	});
+	const silent = primary(async () => {
+		throw Object.assign(new Error('Your node did not answer the receive request.'), {
+			code: 'RECEIVE_UNAVAILABLE'
+		});
+	});
+	await silent.coordinator.probe(peer);
+	assert.equal(silent.coordinator.availability(peer).available, false);
+	assert.match(silent.coordinator.availability(peer).reason, /did not answer/);
+});
+test('a supported answer sets the flag true, and a review that reaches the primary records what it learned', async () => {
+	const p = primary(async () => ({ version: 1, feeBaseMsat: 10, feePpm: 5 }));
+	await p.coordinator.probe(peer);
+	assert.deepEqual(p.coordinator.availability(peer), {
+		available: true,
+		reason: null,
+		probedAt: 1000
+	});
+	// The quote path asks the same question, so its answer counts too: a
+	// primary that stopped settling since the probe flips the flag, and the
+	// review is still refused before an invoice is shared.
+	let answer = async () => ({ version: 1, feeBaseMsat: 0, feePpm: 0 });
+	let now = 1000;
+	const node = {
+		listChannels: () => [empty(80000)],
+		fforEpochs: () => [],
+		getFforReceiveService: () => ({ request: () => answer() })
+	};
+	const reviewed = new OfflineReceive(node, () => {}, [], () => now);
+	assert.deepEqual(reviewed.availability(peer), unprobed);
+	await reviewed.quote(peer, 30000);
+	assert.deepEqual(reviewed.availability(peer), {
+		available: true,
+		reason: null,
+		probedAt: 1000
+	});
+	now = 2000;
+	answer = async () => ({ version: 3 });
+	await assert.rejects(reviewed.quote(peer, 30000), { code: 'RECEIVE_UNAVAILABLE' });
+	assert.deepEqual(reviewed.availability(peer), {
+		available: false,
+		reason: 'Your node returned unsupported receive terms.',
+		probedAt: 2000
+	});
+});
+test('a wallet whose primary has not connected leaves the flag null, and so does a changed primary', async () => {
+	const p = primary(async () => ({ version: 1, feeBaseMsat: 0, feePpm: 0 }));
+	assert.deepEqual(p.coordinator.availability(peer), unprobed);
+	assert.equal(p.requests, 0);
+	await p.coordinator.probe(peer);
+	assert.equal(p.coordinator.availability(peer).available, true);
+	assert.deepEqual(p.coordinator.availability('03' + '33'.repeat(32)), unprobed);
+});
+test('probes in flight for one primary share a request, and a stopped coordinator asks nothing', async () => {
+	let resolve;
+	const p = primary(() => new Promise((r) => (resolve = r)));
+	const first = p.coordinator.probe(peer);
+	const second = p.coordinator.probe(peer);
+	assert.equal(p.requests, 1);
+	resolve({ version: 1, feeBaseMsat: 0, feePpm: 0 });
+	assert.deepEqual(await first, await second);
+	assert.equal((await first).available, true);
+	p.coordinator.stop();
+	assert.equal((await p.coordinator.probe(peer)).available, true);
+	assert.equal(p.requests, 1);
+});
