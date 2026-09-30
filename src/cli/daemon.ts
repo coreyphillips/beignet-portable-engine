@@ -8,6 +8,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as https from 'https';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import { Console } from 'console';
 import {
 	BeignetNode,
@@ -21,9 +22,14 @@ import { parseGuardianEntry } from '../lightning/recovery';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { L402Error } from '../lightning/l402';
-import { ApiResponse, RouteHop, SpliceResult } from './types';
+import { ApiResponse, PaymentInfo, RouteHop, SpliceResult } from './types';
 import { getOpenApiSpec } from './openapi';
-import { IWebhookStorage, WebhookManager } from './webhooks';
+import {
+	IWebhookStorage,
+	WEBHOOK_SECRETS_STORAGE_KEY,
+	WebhookManager,
+	webhookTargetRefusal
+} from './webhooks';
 import {
 	HttpRateLimiter,
 	RateLimitOptions,
@@ -68,13 +74,30 @@ export interface DaemonOptions extends BeignetNodeOptions {
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
+const MIN_EXPOSED_CREDENTIAL_LENGTH = 16;
+// Open GET /events streams, per credential and in all, and the backlog a
+// stream may hold before it is dropped.
+const SSE_MAX_CLIENTS_PER_KEY = 16;
+const SSE_MAX_CLIENTS = 64;
+const SSE_MAX_BUFFERED_BYTES = 1_048_576;
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const IDEMPOTENCY_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+// The CachedResponse entries that carry a paymentHash, and the keyed payments
+// still in flight, kept across restarts (#1132, #1153): a retry that missed
+// its marker would pay again under a fresh hash.
+const PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY = 'daemon:payment-timeout-markers:v1';
 
 interface CachedResponse {
 	response: unknown;
 	bodyHash: string;
 	expiresAt: number;
+	/**
+	 * Set instead of a response for a keyed POST /offer/pay or POST /keysend
+	 * that timed out, or was still in flight when the daemon stopped: the
+	 * payment the key started, whose outcome answers each retry (#1094,
+	 * #1133, #1153).
+	 */
+	paymentHash?: string;
 }
 
 // Every request header a browser client may send. A preflight is answered
@@ -105,7 +128,19 @@ const IDEMPOTENT_ROUTES = new Set([
 	// response cannot tell "not broadcast" from "broadcast, answer lost", and
 	// checking the chain instead races the mempool.
 	'POST /send',
-	'POST /send-max'
+	'POST /send-max',
+	// Each call requests a fresh BOLT 12 invoice with a fresh payment hash, so
+	// the engine's duplicate-hash refusal cannot catch a retry (#1018).
+	'POST /offer/pay',
+	// A retried splice-out moves the funds twice (to an external address, a
+	// real spend), and a retried open opens a second channel. open-and-wait
+	// is left out: its wait usually outlasts the timeout, and a thrown
+	// timeout is not cached, so a keyed retry would open again anyway.
+	'POST /channel/splice-out',
+	'POST /channel/open',
+	'POST /channel/open-v2',
+	'POST /channel/open-zeroconf',
+	'POST /channel/connect-and-open'
 ]);
 
 function success<T>(result: T): ApiResponse<T> {
@@ -121,11 +156,13 @@ function failure(code: string, message: string): ApiResponse<never> {
  * refusal in band, and wrapping that in success() produced a third shape:
  * 200 ok:true around ok:false, the only daemon answer where a failure is
  * indistinguishable from a success to a client that reads the envelope and
- * stops there (issue #618).
+ * stops there (issue #618). The refusal is thrown, not returned: the
+ * idempotency cache keeps returned envelopes, and replaying a transient
+ * SPLICE_BUSY for 24 hours would stop a keyed retry from ever running.
  */
 function spliceOrRefuse(result: SpliceResult): ApiResponse<SpliceResult> {
 	const refusal = spliceRefusalError(result);
-	if (refusal) return failure(refusal.code, refusal.message);
+	if (refusal) throw refusal;
 	return success(result);
 }
 
@@ -142,10 +179,17 @@ export async function parseBody(
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let totalBytes = 0;
+		let overLimit = false;
 		req.on('data', (chunk: Buffer) => {
+			if (overLimit) return;
 			totalBytes += chunk.length;
 			if (totalBytes > MAX_BODY_BYTES) {
-				req.destroy();
+				// The rest is read and dropped rather than the socket destroyed,
+				// which reset the connection before the 413 could be written.
+				// Closing right after the answer does the same to a client
+				// still sending: the reset discards the 413 it has not read.
+				overLimit = true;
+				chunks.length = 0;
 				reject(
 					new BeignetError(
 						'BODY_TOO_LARGE',
@@ -157,6 +201,7 @@ export async function parseBody(
 			chunks.push(chunk);
 		});
 		req.on('end', () => {
+			if (overLimit) return;
 			if (chunks.length === 0) {
 				resolve({});
 				return;
@@ -173,7 +218,7 @@ export async function parseBody(
 			}
 		});
 		req.on('error', () => {
-			// Stream was destroyed due to body size limit
+			// The client went away mid-body; no one is left to read the answer.
 			reject(
 				new BeignetError(
 					'BODY_TOO_LARGE',
@@ -807,6 +852,23 @@ async function bootDaemon(
 			`Refusing to bind ${host} without authentication. Configure apiToken or apiKeys, or set insecure: true to accept the risk.`
 		);
 	}
+	// Beyond loopback a guessable credential is the only lock, and the rate
+	// limiter that would slow the guessing is off unless configured.
+	const shortCredential = [
+		opts.apiToken,
+		...(opts.apiKeys ?? []).map((k) => k.key)
+	].some(
+		(secret) =>
+			typeof secret === 'string' &&
+			secret.length > 0 &&
+			secret.length < MIN_EXPOSED_CREDENTIAL_LENGTH
+	);
+	if (!isLoopbackHost && shortCredential && opts.insecure !== true) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Refusing to bind ${host} with an apiToken or apiKeys secret shorter than ${MIN_EXPOSED_CREDENTIAL_LENGTH} characters. Use a longer random secret (openssl rand -hex 32), or set insecure: true to accept the risk.`
+		);
+	}
 	if (opts.cors === true && !authenticator.enabled && opts.insecure !== true) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -1061,6 +1123,16 @@ async function bootDaemon(
 			);
 		}
 	}
+	// Zero is meaningful: only peers holding a channel get in.
+	if (
+		opts.maxInboundPeers !== undefined &&
+		(!Number.isInteger(opts.maxInboundPeers) || opts.maxInboundPeers < 0)
+	) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'maxInboundPeers must be a non-negative integer (BEIGNET_MAX_INBOUND_PEERS)'
+		);
+	}
 	// Routing fee defaults ride in channel_update as u32/u32/u16 (BOLT 7),
 	// so a value the wire cannot hold refuses startup here, naming the env
 	// var, before it can wrap into an advertised policy the operator never
@@ -1198,7 +1270,21 @@ async function bootDaemon(
 			node.getStorage().saveWebhook(id, url, events, secretHash, createdAt),
 		deleteWebhook: (id) => node.getStorage().deleteWebhook(id),
 		deleteAllWebhooks: () => node.getStorage().deleteAllWebhooks(),
-		loadAllWebhooks: () => node.getStorage().loadAllWebhooks()
+		loadAllWebhooks: () => node.getStorage().loadAllWebhooks(),
+		// With storage encryption off the secrets stay in memory, as the
+		// writer lease keeps its key out of an unencrypted file.
+		saveWebhookSecrets: (secrets) => {
+			const storage = node.getStorage();
+			if (!storage.secretsEncryptedAtRest()) return;
+			storage.saveWalletData(
+				WEBHOOK_SECRETS_STORAGE_KEY,
+				JSON.stringify(secrets)
+			);
+		},
+		loadWebhookSecrets: () => {
+			const raw = node.getStorage().loadWalletData(WEBHOOK_SECRETS_STORAGE_KEY);
+			return raw === null ? null : (JSON.parse(raw) as Record<string, string>);
+		}
 	};
 	const webhookManager = new WebhookManager(webhookStorage);
 	// The node's queue, the one this process runs over the payment_queue
@@ -1215,6 +1301,68 @@ async function bootDaemon(
 
 	// Idempotency cache
 	const idempotencyCache = new Map<string, CachedResponse>();
+	// A marker lost here lets a retry pay twice, so a row that cannot be read
+	// fails the boot rather than starting without it.
+	const storedMarkers = node
+		.getStorage()
+		.loadWalletData(PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY);
+	if (storedMarkers !== null) {
+		const markers = JSON.parse(storedMarkers) as Record<
+			string,
+			Omit<CachedResponse, 'response'>
+		>;
+		for (const [key, m] of Object.entries(markers)) {
+			if (
+				!/^[0-9a-f]{64}$/.test(m?.bodyHash) ||
+				!Number.isFinite(m.expiresAt) ||
+				!/^[0-9a-f]{64}$/.test(m.paymentHash ?? '')
+			) {
+				throw new Error(`Unreadable payment timeout marker for ${key}`);
+			}
+			idempotencyCache.set(key, {
+				response: undefined,
+				bodyHash: m.bodyHash,
+				expiresAt: m.expiresAt,
+				paymentHash: m.paymentHash
+			});
+		}
+	}
+	// A keyed /offer/pay or /keysend still in flight, stored with the timeout
+	// markers from before its HTLC goes out until its handler settles (#1153):
+	// a stop or crash before the route's timeout never reaches the catch that
+	// writes the timeout marker. A restart loads it as one.
+	const inFlightPaymentMarkers = new Map<
+		string,
+		Omit<CachedResponse, 'response'>
+	>();
+	/** False when the write failed, which it reports. */
+	const saveTimeoutMarkers = (): boolean => {
+		const markers: Record<
+			string,
+			Omit<CachedResponse, 'response'>
+		> = Object.fromEntries(inFlightPaymentMarkers);
+		for (const [
+			key,
+			{ bodyHash, expiresAt, paymentHash }
+		] of idempotencyCache) {
+			if (paymentHash !== undefined) {
+				markers[key] = { bodyHash, expiresAt, paymentHash };
+			}
+		}
+		try {
+			node
+				.getStorage()
+				.saveWalletData(
+					PAYMENT_TIMEOUT_MARKERS_STORAGE_KEY,
+					JSON.stringify(markers)
+				);
+			return true;
+		} catch (err) {
+			// The marker in memory still answers retries until a restart.
+			reportFault('Could not persist the payment timeout markers', err);
+			return false;
+		}
+	};
 	// #768: a key only reaches the cache once its handler has RETURNED, so two
 	// requests carrying the same key that overlap both miss the cache and both
 	// run the handler (two broadcasts on /send). This map reserves the key
@@ -1222,23 +1370,64 @@ async function bootDaemon(
 	// handler's promise and answers with its result, a different-body overlap
 	// gets the 409 without running anything. The entry is dropped when the
 	// handler settles, after which the cache takes over as before (a returned
-	// envelope is cached, a throw caches nothing).
+	// envelope is cached, a throw caches nothing but an /offer/pay or /keysend
+	// timeout's payment hash).
 	const idempotencyInFlight = new Map<
 		string,
 		{ bodyHash: string; promise: Promise<unknown> }
 	>();
+	/**
+	 * The answer to a keyed /offer/pay or /keysend retry whose first attempt
+	 * timed out (#1094): the completed payment once it settled, a 409 carrying
+	 * its hash while it can still settle, and null once it cannot, when the
+	 * key may pay again. 409 rather than the first 504, which would invite
+	 * another retry.
+	 */
+	const timedOutPaymentReplay = (
+		paymentHash: string
+	): ApiResponse<PaymentInfo> | null => {
+		const outcome = node.paymentOutcome(paymentHash);
+		if (outcome === 'gone') return null;
+		const paid = outcome === 'settled' ? node.getPayment(paymentHash) : null;
+		if (paid?.status === 'COMPLETED') return success(paid);
+		const err = new BeignetError(
+			'DUPLICATE_PAYMENT',
+			'The payment this idempotency key started is still in flight; ' +
+				`nothing was paid again. GET /payment?paymentHash=${paymentHash} ` +
+				'reports its outcome.'
+		);
+		err.paymentHash = paymentHash;
+		return { ok: false, error: err.toJSON() };
+	};
 	const idempotencyCleanupTimer = setInterval(() => {
 		const now = Date.now();
+		let markerChanged = false;
 		for (const [key, entry] of idempotencyCache) {
-			if (now >= entry.expiresAt) idempotencyCache.delete(key);
+			if (now < entry.expiresAt) continue;
+			// An HTLC can stay out for up to 2016 blocks, well past the TTL,
+			// and dropping the marker then would let the key pay again.
+			if (
+				entry.paymentHash !== undefined &&
+				node.paymentOutcome(entry.paymentHash) === 'live'
+			) {
+				entry.expiresAt = now + IDEMPOTENCY_TTL_MS;
+				markerChanged = true;
+				continue;
+			}
+			if (entry.paymentHash !== undefined) markerChanged = true;
+			idempotencyCache.delete(key);
 		}
+		if (markerChanged) saveTimeoutMarkers();
 	}, IDEMPOTENCY_CLEANUP_INTERVAL_MS);
 	if (idempotencyCleanupTimer.unref) idempotencyCleanupTimer.unref?.();
 	started.release.push(() => clearInterval(idempotencyCleanupTimer));
 
 	type RouteHandler = (
 		body: Record<string, unknown>,
-		query: URLSearchParams
+		query: URLSearchParams,
+		/** Set on a keyed request: called with the payment hash before the
+		 *  HTLC goes out. */
+		onPaymentHash?: (paymentHash: string) => void
 	) => unknown;
 
 	const routes: Record<string, RouteHandler> = {
@@ -1310,7 +1499,6 @@ async function bootDaemon(
 		'GET /health': () => success(node.getHealth()),
 		'GET /ready': () => success({ ready: node.isReady() }),
 		'GET /readiness': () => success(node.getMainnetReadiness()),
-		'GET /openapi.json': () => getOpenApiSpec(),
 		'GET /stats': (_body, query) => {
 			const windowMs = parseIntParam(query, 'window', { min: 0 });
 			return success(node.getStats(windowMs));
@@ -1539,9 +1727,12 @@ async function bootDaemon(
 			return success(await node.buildPsbt(outputs, satsPerVbyte));
 		},
 		'POST /psbt/import-signed': (body) => {
-			const { psbtBase64 } = body as { psbtBase64?: string };
+			const { psbtBase64, unsignedPsbtBase64 } = body as {
+				psbtBase64?: string;
+				unsignedPsbtBase64?: string;
+			};
 			if (!psbtBase64) return failure('INVALID_PARAMS', 'psbtBase64 required');
-			return success(node.importSignedPsbt(psbtBase64));
+			return success(node.importSignedPsbt(psbtBase64, unsignedPsbtBase64));
 		},
 		'POST /psbt/combine': (body) => {
 			const { psbts } = body as { psbts?: string[] };
@@ -2211,7 +2402,7 @@ async function bootDaemon(
 				})
 			);
 		},
-		'POST /keysend': async (body) => {
+		'POST /keysend': async (body, _query, onPaymentHash) => {
 			const { pubkey, amountSats, timeoutMs, maxFeeSats, metadata } = body as {
 				pubkey: string;
 				amountSats: number;
@@ -2228,10 +2419,20 @@ async function bootDaemon(
 						amountSats,
 						timeoutMs,
 						maxFeeSats,
-						metadata
+						metadata,
+						onPaymentHash
 					)
 				);
 			} catch (err: unknown) {
+				// Thrown, not returned, so a keyed timeout is remembered by its
+				// hash rather than cached as an envelope that expires (#1133).
+				if (
+					err instanceof BeignetError &&
+					err.code === 'PAYMENT_TIMEOUT' &&
+					err.paymentHash !== undefined
+				) {
+					throw err;
+				}
 				const msg = err instanceof Error ? err.message : String(err);
 				const code = err instanceof BeignetError ? err.code : 'PAYMENT_FAILED';
 				return failure(code, msg);
@@ -2837,7 +3038,7 @@ async function bootDaemon(
 			if (!removed) return failure('NOT_FOUND', 'Offer not found');
 			return success({ removed: true });
 		},
-		'POST /offer/pay': async (body) => {
+		'POST /offer/pay': async (body, _query, onPaymentHash) => {
 			const { offer, amountSats, timeoutMs, maxFeeSats, maxFeeMsat } = body as {
 				offer: string;
 				amountSats?: number;
@@ -2852,7 +3053,8 @@ async function bootDaemon(
 					amountSats,
 					timeoutMs,
 					maxFeeSats,
-					maxFeeMsat
+					maxFeeMsat,
+					onPaymentHash
 				)
 			);
 		},
@@ -3065,14 +3267,17 @@ async function bootDaemon(
 
 		// ── Webhooks ──
 		'POST /webhooks/register': (body) => {
-			const { url, events, secret } = body as {
+			const { url, events, secret, allowPrivateNetwork } = body as {
 				url: string;
 				events: string[];
 				secret?: string;
+				allowPrivateNetwork?: boolean;
 			};
 			if (!url || !events || !Array.isArray(events) || events.length === 0) {
 				return failure('INVALID_PARAMS', 'url and events array required');
 			}
+			const refusal = webhookTargetRefusal(url, allowPrivateNetwork === true);
+			if (refusal) throw refusal;
 			return success(webhookManager.register(url, events, secret));
 		},
 		'DELETE /webhooks/unregister': (body) => {
@@ -3150,7 +3355,21 @@ async function bootDaemon(
 	routes['POST /channel/update-fee'] =
 		routes['POST /channel/update-commitment-feerate'];
 
-	const sseClients: Set<http.ServerResponse> = new Set();
+	// Open event streams, each with the credential it authenticated as.
+	const sseClients = new Map<http.ServerResponse, string>();
+	// Node buffers every frame for a client that stops reading, so one that
+	// has fallen too far behind is dropped instead of written to.
+	const sseWrite = (client: http.ServerResponse, chunk: string): void => {
+		if (client.destroyed) return;
+		if (client.writableLength > SSE_MAX_BUFFERED_BYTES) {
+			client.destroy();
+			return;
+		}
+		client.write(chunk);
+	};
+
+	// Serialized once: the route needs no credential, and the spec is 155 kB.
+	const openApiJson = Buffer.from(JSON.stringify(getOpenApiSpec()));
 
 	const corsOrigin =
 		opts.cors === true ? '*' : typeof opts.cors === 'string' ? opts.cors : null;
@@ -3285,10 +3504,11 @@ async function bootDaemon(
 		// caller-controlled and varying it would mint a fresh bucket per
 		// guess. X-Forwarded-For is honored only from configured
 		// trustedProxies; otherwise a proxy's clients share its bucket.
+		// Auth-exempt routes count too: they are the ones anyone can call.
 		const authExempt =
 			AUTH_EXEMPT_ROUTES.has(routeKey) ||
 			(routeKey === 'GET /metrics' && opts.metricsPublic === true);
-		if (rateLimiter && !authExempt) {
+		if (rateLimiter) {
 			const clientKey = clientKeyForRequest(
 				req.socket.remoteAddress,
 				req.headers['x-forwarded-for'],
@@ -3304,6 +3524,7 @@ async function bootDaemon(
 
 		// ── SSE endpoint ──
 		if (routeKey === 'GET /events') {
+			let streamKey = 'unauthenticated';
 			if (authenticator.enabled) {
 				const auth = authenticator.authenticate(req.headers['authorization']);
 				if (!auth.ok) {
@@ -3326,6 +3547,26 @@ async function bootDaemon(
 					);
 					return;
 				}
+				streamKey = auth.keyName === null ? 'apiToken' : `key:${auth.keyName}`;
+			}
+			const sameKey = [...sseClients.values()].filter(
+				(key) => key === streamKey
+			).length;
+			if (
+				sseClients.size >= SSE_MAX_CLIENTS ||
+				sameKey >= SSE_MAX_CLIENTS_PER_KEY
+			) {
+				res.setHeader('Content-Type', 'application/json');
+				res.statusCode = 429;
+				res.end(
+					JSON.stringify(
+						failure(
+							'RATE_LIMITED',
+							`Too many open event streams (at most ${SSE_MAX_CLIENTS_PER_KEY} per credential, ${SSE_MAX_CLIENTS} in all)`
+						)
+					)
+				);
+				return;
 			}
 			const sseHeaders: Record<string, string> = {
 				'Content-Type': 'text/event-stream',
@@ -3342,10 +3583,10 @@ async function bootDaemon(
 			// SSE comment line: parsers ignore it; flushes headers to the client
 			// immediately instead of buffering until the first event/keepalive.
 			res.write(': connected\n\n');
-			sseClients.add(res);
+			sseClients.set(res, streamKey);
 			// Send keepalive every 30s to prevent proxy timeouts
 			const keepalive = setInterval(() => {
-				res.write(': keepalive\n\n');
+				sseWrite(res, ': keepalive\n\n');
 			}, 30_000);
 			req.on('close', () => {
 				clearInterval(keepalive);
@@ -3440,6 +3681,12 @@ async function bootDaemon(
 			return;
 		}
 
+		if (routeKey === 'GET /openapi.json') {
+			res.setHeader('Content-Length', openApiJson.length);
+			res.end(openApiJson);
+			return;
+		}
+
 		// Handle /stop specially — graceful shutdown
 		if (req.method === 'POST' && pathname === '/stop') {
 			const stopBody = await parseBody(req).catch(() => ({}));
@@ -3482,17 +3729,51 @@ async function bootDaemon(
 			const idempotencyKey = req.headers['x-idempotency-key'] as
 				| string
 				| undefined;
+			// A key the route would drop leaves the caller believing a retry is
+			// safe when it is not, so refuse before the handler runs. GET and
+			// DELETE are idempotent by method, where a key misleads no one.
+			if (
+				idempotencyKey &&
+				req.method === 'POST' &&
+				!IDEMPOTENT_ROUTES.has(routeKey)
+			) {
+				endWithResult(
+					res,
+					failure(
+						'INVALID_PARAMS',
+						`${routeKey} does not honour X-Idempotency-Key; nothing was ` +
+							'run. Resend without the header.'
+					)
+				);
+				return;
+			}
 			if (idempotencyKey && IDEMPOTENT_ROUTES.has(routeKey)) {
 				const cacheKey = `${routeKey}:${idempotencyKey}`;
-				const bodyHash = JSON.stringify(body);
+				// A digest, so a stored timeout marker stays small whatever the body.
+				const bodyHash = createHash('sha256')
+					.update(JSON.stringify(body))
+					.digest('hex');
 				const cached = idempotencyCache.get(cacheKey);
 				if (cached) {
 					if (cached.bodyHash !== bodyHash) {
 						endIdempotencyConflict(res);
 						return;
 					}
-					endWithResult(res, cached.response);
-					return;
+					if (cached.paymentHash === undefined) {
+						endWithResult(res, cached.response);
+						return;
+					}
+					// The marker stays after a settled answer: a response cached in
+					// its place would not survive a restart, and the retry after
+					// one would pay again.
+					const replay = timedOutPaymentReplay(cached.paymentHash);
+					if (replay !== null) {
+						endWithResult(res, replay);
+						return;
+					}
+					// The first attempt can no longer settle, so this one runs.
+					idempotencyCache.delete(cacheKey);
+					saveTimeoutMarkers();
 				}
 				const inFlight = idempotencyInFlight.get(cacheKey);
 				if (inFlight) {
@@ -3505,15 +3786,56 @@ async function bootDaemon(
 					endWithResult(res, await inFlight.promise);
 					return;
 				}
+				const onPaymentHash = (paymentHash: string): void => {
+					inFlightPaymentMarkers.set(cacheKey, {
+						bodyHash,
+						expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+						paymentHash
+					});
+					// Unstored, a crash from here lets the retry pay again.
+					if (!saveTimeoutMarkers()) {
+						inFlightPaymentMarkers.delete(cacheKey);
+						throw new BeignetError(
+							'NOT_PERSISTED',
+							'Could not store the payment before sending it; nothing was sent'
+						);
+					}
+				};
 				// Wrapped so a synchronous throw rejects the shared promise
 				// instead of escaping before the reservation is released.
-				const pending = (async (): Promise<unknown> => handler(body, query))();
+				const pending = (async (): Promise<unknown> =>
+					handler(body, query, onPaymentHash))();
 				idempotencyInFlight.set(cacheKey, { bodyHash, promise: pending });
 				let result: unknown;
+				let markersChanged = false;
 				try {
 					result = await pending;
+				} catch (err: unknown) {
+					// A thrown error is not cached, but an offer payment's or a
+					// keysend's timeout can leave an HTLC out that still
+					// settles, and a rerun would pay under a fresh hash (a new
+					// invoice, a new preimage) that the engine cannot tie to
+					// the first. A retried /invoice/pay meets the engine's
+					// duplicate refusal on its own hash instead.
+					if (
+						(routeKey === 'POST /offer/pay' || routeKey === 'POST /keysend') &&
+						err instanceof BeignetError &&
+						err.code === 'PAYMENT_TIMEOUT' &&
+						err.paymentHash !== undefined
+					) {
+						idempotencyCache.set(cacheKey, {
+							response: undefined,
+							bodyHash,
+							expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+							paymentHash: err.paymentHash
+						});
+						markersChanged = true;
+					}
+					throw err;
 				} finally {
 					idempotencyInFlight.delete(cacheKey);
+					if (inFlightPaymentMarkers.delete(cacheKey)) markersChanged = true;
+					if (markersChanged) saveTimeoutMarkers();
 				}
 				idempotencyCache.set(cacheKey, {
 					response: result,
@@ -3619,7 +3941,7 @@ async function bootDaemon(
 			// SSE responses hold their sockets open indefinitely; destroy them
 			// so the server can actually finish closing. destroy() fires each
 			// request's close handler, which clears its keepalive interval.
-			for (const client of sseClients) {
+			for (const client of sseClients.keys()) {
 				client.destroy();
 			}
 			sseClients.clear();
@@ -3634,8 +3956,8 @@ async function bootDaemon(
 		node.on(eventName, (data: unknown) => {
 			if (sseClients.size === 0) return;
 			const message = formatSseFrame(eventName, data);
-			for (const client of sseClients) {
-				client.write(message);
+			for (const client of sseClients.keys()) {
+				sseWrite(client, message);
 			}
 		});
 	}

@@ -137,6 +137,7 @@ import { Transaction } from '../transaction';
 import {
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
+	MAX_REMEMBERED_PSBT_BUILDS,
 	STOP_REFRESH_WAIT_MS,
 	TRANSACTION_DEFAULTS
 } from './constants';
@@ -222,6 +223,11 @@ export class Wallet {
 	// further behind lowers the tip, and that server may announce new blocks
 	// while it catches up to the one a transaction was mined in (issue #935).
 	private _replacedTipHeight = 0;
+	// The previous output of every input of each PSBT buildPsbt returned, keyed
+	// by the PSBT's unsigned transaction. importSignedPsbt finalizes nothing
+	// else unless the caller hands it the unsigned PSBT, so an output rewritten
+	// between build and sign is refused. Memory only.
+	private readonly _builtPsbts: Map<string, bitcoin.TxOutput[]> = new Map();
 	private _disableMessagesOnCreate: boolean;
 	private _disableRefreshOnCreate: boolean;
 	// Raised by stop(). Work that outlived the shutdown, above all the refresh
@@ -5074,6 +5080,7 @@ export class Wallet {
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
 			const psbt = psbtRes.value;
+			this._rememberBuiltPsbt(psbt);
 			const txData = this.transaction.data;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
@@ -5118,9 +5125,9 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		} finally {
-			// The response carries everything the caller needs; the later
-			// steps (signPsbtWithOurKey, combinePsbts, importSignedPsbt) work
-			// on the PSBT alone and never read the staged send.
+			// The response carries everything the caller needs, and none of
+			// the later steps (signPsbtWithOurKey, combinePsbts,
+			// importSignedPsbt) reads the staged send.
 			await this.transaction.clearStoredSendTransaction();
 		}
 	}
@@ -5129,26 +5136,40 @@ export class Wallet {
 	 * Imports an externally signed PSBT, validates that EVERY input carries a
 	 * valid signature, finalizes and extracts the transaction WITHOUT
 	 * broadcasting it. Broadcast separately via broadcastTransaction.
+	 * The PSBT must spend the same inputs to the same outputs as one this
+	 * wallet's buildPsbt returned, or as unsignedPsbtBase64 when given (a PSBT
+	 * built by another instance, e.g. a multisig cosigner). Inputs the signer
+	 * already finalized are refused, since their signatures cannot be checked.
 	 * Multisig (P2WSH m-of-n witnessScript) inputs finalize only when at
 	 * least m VALID partial signatures from script keys are present; below
 	 * the threshold the error names how many signatures it has and needs.
+	 * Errs when an input spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO, since cosigners with no record of
+	 * the coin can only check the PSBT against itself.
 	 * @param {string} psbtBase64
+	 * @param {string} [unsignedPsbtBase64] the PSBT buildPsbt returned
 	 * @returns {Result<IImportSignedPsbtResponse>}
 	 */
 	public importSignedPsbt(
-		psbtBase64: string
+		psbtBase64: string,
+		unsignedPsbtBase64?: string
 	): Result<IImportSignedPsbtResponse> {
 		try {
 			if (!psbtBase64) return err('No PSBT provided.');
 			const network = this.getBitcoinNetwork();
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
+			const buildRes = this._checkAgainstBuild(psbt, unsignedPsbtBase64);
+			if (buildRes.isErr()) return err(buildRes.error.message);
 			for (let i = 0; i < psbt.inputCount; i++) {
+				const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+				if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
 				const input = psbt.data.inputs[i];
-				// Inputs already finalized by the signer carry their signature in
-				// the final script and cannot be re-validated via partialSig.
-				const finalized = !!(input.finalScriptSig || input.finalScriptWitness);
-				if (finalized) continue;
+				if (input.finalScriptSig || input.finalScriptWitness) {
+					return err(
+						`Input ${i} is already finalized, so its signature cannot be checked. Import the PSBT before it is finalized.`
+					);
+				}
 				const hasSignature =
 					(input.partialSig?.length ?? 0) > 0 ||
 					!!input.tapKeySig ||
@@ -5176,6 +5197,112 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses a PSBT unless its unsigned transaction (every input outpoint and
+	 * sequence, every output script and value) and the previous output each
+	 * input claims to spend are those of the build: unsignedPsbtBase64 when
+	 * given, otherwise a PSBT this wallet's buildPsbt returned.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {string} [unsignedPsbtBase64]
+	 * @returns {Result<string>}
+	 */
+	private _checkAgainstBuild(
+		psbt: bitcoin.Psbt,
+		unsignedPsbtBase64?: string
+	): Result<string> {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		let built: bitcoin.TxOutput[] | undefined;
+		if (unsignedPsbtBase64) {
+			const unsigned = bitcoin.Psbt.fromBase64(unsignedPsbtBase64, {
+				network: this.getBitcoinNetwork()
+			});
+			if (unsigned.data.getTransaction().toString('hex') !== unsignedTx) {
+				return err(
+					'The PSBT does not spend the same inputs to the same outputs as the unsigned PSBT.'
+				);
+			}
+			built = this._psbtPrevouts(unsigned);
+		} else {
+			built = this._builtPsbts.get(unsignedTx);
+			if (!built) {
+				return err(
+					'The PSBT does not match any this wallet built: its inputs or outputs were changed, or it was built elsewhere (pass the unsigned PSBT to import it).'
+				);
+			}
+		}
+		const prevouts = this._psbtPrevouts(psbt);
+		for (let i = 0; i < prevouts.length; i++) {
+			if (
+				!prevouts[i].script.equals(built[i].script) ||
+				prevouts[i].value !== built[i].value
+			) {
+				return err(
+					`Input ${i} claims a different previous output than the one built.`
+				);
+			}
+		}
+		return ok('The PSBT matches the build.');
+	}
+
+	/**
+	 * Records the previous outputs of a PSBT buildPsbt is about to return, so
+	 * importSignedPsbt can recognise it. Only the newest
+	 * MAX_REMEMBERED_PSBT_BUILDS are kept.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 */
+	private _rememberBuiltPsbt(psbt: bitcoin.Psbt): void {
+		const unsignedTx = psbt.data.getTransaction().toString('hex');
+		this._builtPsbts.delete(unsignedTx);
+		this._builtPsbts.set(unsignedTx, this._psbtPrevouts(psbt));
+		for (const oldest of this._builtPsbts.keys()) {
+			if (this._builtPsbts.size <= MAX_REMEMBERED_PSBT_BUILDS) break;
+			this._builtPsbts.delete(oldest);
+		}
+	}
+
+	/**
+	 * The previous output (script and value) each PSBT input spends, from its
+	 * witnessUtxo or the output of nonWitnessUtxo the input points at. bitcoinjs
+	 * checks segwit v0 signatures against nonWitnessUtxo when present and
+	 * taproot ones against witnessUtxo, so an input carrying both is refused
+	 * unless they agree. Throws when an input carries neither, its
+	 * nonWitnessUtxo is another transaction, or the two disagree.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @returns {bitcoin.TxOutput[]}
+	 */
+	private _psbtPrevouts(psbt: bitcoin.Psbt): bitcoin.TxOutput[] {
+		return psbt.txInputs.map((txInput, i) => {
+			const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+			let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
+			if (nonWitnessUtxo) {
+				const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+				const out = prevTx.getHash().equals(txInput.hash)
+					? prevTx.outs[txInput.index]
+					: undefined;
+				if (!out) {
+					throw new Error(`Input ${i} does not carry the output it spends.`);
+				}
+				if (
+					witnessUtxo &&
+					(!witnessUtxo.script.equals(out.script) ||
+						witnessUtxo.value !== out.value)
+				) {
+					throw new Error(
+						`Input ${i} carries two different records of the output it spends.`
+					);
+				}
+				prevOut = out;
+			}
+			if (!prevOut) {
+				throw new Error(`Input ${i} does not carry the output it spends.`);
+			}
+			return { script: prevOut.script, value: prevOut.value };
+		});
 	}
 
 	/**
@@ -5254,8 +5381,10 @@ export class Wallet {
 	 * Adds OUR partial signature(s) to a PSBT without finalizing it (multisig
 	 * cosigner flow). Inputs are matched through their bip32Derivation
 	 * entries: any entry whose pubkey equals the key this wallet derives at
-	 * that path gets signed. Inputs we already signed are skipped. Requires
-	 * the mnemonic; watch-only wallets get the typed WatchOnlySigningError.
+	 * that path gets signed. Inputs we already signed are skipped. Errs when
+	 * an input we would sign spends a previous output that disagrees with its
+	 * witnessUtxo or this wallet's UTXO. Requires the mnemonic; watch-only
+	 * wallets get the typed WatchOnlySigningError.
 	 * @param {string} psbtBase64
 	 * @returns {Result<string>} The PSBT (base64) including our signatures.
 	 */
@@ -5282,7 +5411,11 @@ export class Wallet {
 					const alreadySigned = (input.partialSig ?? []).some((ps) =>
 						ps.pubkey.equals(keyPair.publicKey)
 					);
-					if (!alreadySigned) psbt.signInput(i, keyPair);
+					if (!alreadySigned) {
+						const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
+						if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+						psbt.signInput(i, keyPair);
+					}
 					break;
 				}
 			}
@@ -5295,6 +5428,68 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	/**
+	 * Refuses input i unless the previous output its signature commits
+	 * to agrees with the input's witnessUtxo and with this wallet's record of
+	 * the coin. bitcoinjs signs segwit v0 and legacy inputs over the output in
+	 * nonWitnessUtxo when present, while buildPsbt priced the fee from the
+	 * server-reported value (also written to witnessUtxo). A real previous
+	 * transaction added later for an under-reported coin would otherwise get
+	 * a valid signature that pays the difference as fee. A cosigner that has
+	 * no record of the coin still checks witnessUtxo.
+	 * @private
+	 * @param {bitcoin.Psbt} psbt
+	 * @param {number} i
+	 * @returns {Result<string>}
+	 */
+	private _checkPsbtPrevOut(psbt: bitcoin.Psbt, i: number): Result<string> {
+		const { witnessUtxo, nonWitnessUtxo } = psbt.data.inputs[i];
+		const { hash, index } = psbt.txInputs[i];
+		const txid = Buffer.from(hash).reverse().toString('hex');
+		const outpoint = `${txid}:${index}`;
+		let prevOut: bitcoin.TxOutput | undefined = witnessUtxo;
+		if (nonWitnessUtxo) {
+			const prevTx = bitcoin.Transaction.fromBuffer(nonWitnessUtxo);
+			prevOut = prevTx.getHash().equals(hash) ? prevTx.outs[index] : undefined;
+			if (!prevOut) {
+				return err(
+					`Input ${i}: nonWitnessUtxo is not the transaction holding ${outpoint}.`
+				);
+			}
+		}
+		if (!prevOut) return err(`Input ${i} does not carry the output it spends.`);
+		const records: { source: string; script: Buffer; value: number }[] = [];
+		if (witnessUtxo) {
+			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
+		}
+		const utxo = this.data.utxos.find(
+			(u) => u.tx_hash.toLowerCase() === txid && u.tx_pos === index
+		);
+		if (utxo) {
+			records.push({
+				source: 'this wallet',
+				script: bitcoin.address.toOutputScript(
+					utxo.address,
+					this.getBitcoinNetwork()
+				),
+				value: utxo.value
+			});
+		}
+		for (const record of records) {
+			if (!prevOut.script.equals(record.script)) {
+				return err(
+					`Input ${i}: ${outpoint} pays a different script than ${record.source} records.`
+				);
+			}
+			if (prevOut.value !== record.value) {
+				return err(
+					`Input ${i}: ${outpoint} holds ${prevOut.value} sats, not the ${record.value} ${record.source} records.`
+				);
+			}
+		}
+		return ok('Previous output matches.');
 	}
 
 	/**
@@ -5537,6 +5732,11 @@ export class Wallet {
 			return err(txResponse.error.message);
 		}
 		const txData = txResponse.value.data;
+		// canBoost only reads the height stored at the last refresh. A replacement
+		// for a transaction that has since confirmed is rejected by every node.
+		if ((txData[0]?.result?.confirmations ?? 0) > 0) {
+			return err('Transaction is already confirmed. Unable to RBF.');
+		}
 
 		const wallet = this.data;
 		const addressTypeKeys = objectKeys(EAddressType);
@@ -5599,9 +5799,6 @@ export class Wallet {
 				});
 				if (tx.isErr()) {
 					return err(tx.error.message);
-				}
-				if (tx.value.data[0].data.height > 0) {
-					return err('Transaction is already confirmed. Unable to RBF.');
 				}
 				const txVout = tx.value.data[0].result.vout[input.vout];
 				if (txVout.scriptPubKey?.address) {

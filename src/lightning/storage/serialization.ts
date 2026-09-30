@@ -405,6 +405,13 @@ export interface ISerializedChannelState {
 	htlcs: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	/**
+	 * Unrevoked remote commitment txs kept for watchtower backups. A point
+	 * repeats once per funding output it was signed over.
+	 */
+	watchtowerRemoteCommitmentTxs?: Array<{ point: string; tx: string }>;
+	/** Revoked remote commitment txs whose watchtower hand-off failed. */
+	watchtowerBackupsOwed?: Array<{ secret: string; tx: string }>;
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
 	/**
@@ -906,6 +913,17 @@ export function serializeChannelState(
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
+			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
+					txs.map((tx) => ({ point, tx: tx.toString('hex') }))
+			  )
+			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					secret: e.perCommitmentSecret.toString('hex'),
+					tx: e.tx.toString('hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
@@ -1330,6 +1348,22 @@ export function deserializeChannelState(
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
 		revokedHtlcSnapshots,
+		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
+			? s.watchtowerRemoteCommitmentTxs.reduce(
+					(cache, e) =>
+						cache.set(e.point, [
+							...(cache.get(e.point) ?? []),
+							Buffer.from(e.tx, 'hex')
+						]),
+					new Map<string, Buffer[]>()
+			  )
+			: undefined,
+		watchtowerBackupsOwed: s.watchtowerBackupsOwed?.length
+			? s.watchtowerBackupsOwed.map((e) => ({
+					perCommitmentSecret: Buffer.from(e.secret, 'hex'),
+					tx: Buffer.from(e.tx, 'hex')
+			  }))
+			: undefined,
 		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
 			Buffer.from(h, 'hex')
