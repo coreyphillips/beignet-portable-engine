@@ -420,11 +420,12 @@ function handleInit(): void {
 		// one here, the same way a fresh one does.
 		const apiToken = mintApiTokenIfAbsent(config);
 		if (apiToken) saveConfig(config);
+		// The seed is printed only when it is created: a scripted re-run
+		// would otherwise copy it into whatever logs its output.
 		output({
 			ok: true,
 			result: {
 				message: 'Config already exists',
-				mnemonic: config.mnemonic,
 				network: config.network,
 				...(apiToken ? { apiToken, note: API_TOKEN_NOTE } : {})
 			}
@@ -730,30 +731,33 @@ function readPsbtArg(arg?: string): string | undefined {
 async function handlePsbt(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'build':
+		case 'build': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/build', {
 					outputs: [
 						{
-							address: filteredArgs[2],
-							amountSats: parseInt(filteredArgs[3], 10)
+							address: pos[2],
+							amountSats: parseInt(pos[3], 10)
 						}
 					],
-					satsPerVbyte: filteredArgs[4]
-						? parseInt(filteredArgs[4], 10)
-						: undefined
+					satsPerVbyte: pos[4] ? parseInt(pos[4], 10) : undefined
 				})
 			);
-		case 'import-signed':
+		}
+		case 'import-signed': {
+			const pos = positionalArgs();
 			return outputResult(
 				await httpRequest('POST', '/psbt/import-signed', {
-					psbtBase64: readPsbtArg(filteredArgs[2])
+					psbtBase64: readPsbtArg(pos[2]),
+					unsignedPsbtBase64: readPsbtArg(pos[3])
 				})
 			);
+		}
 		case 'combine':
 			return outputResult(
 				await httpRequest('POST', '/psbt/combine', {
-					psbts: filteredArgs
+					psbts: positionalArgs()
 						.slice(2)
 						.map((arg) => readPsbtArg(arg))
 						.filter((psbt): psbt is string => !!psbt)
@@ -765,7 +769,7 @@ async function handlePsbt(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file> [unsignedPsbt|file]|combine <psbt|file> <psbt|file> ...]'
 				}
 			});
 			process.exitCode = 1;
@@ -1747,7 +1751,7 @@ async function handleWebhooks(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>] [--allow-private-network]'
 					}
 				});
 				process.exitCode = 1;
@@ -1760,7 +1764,8 @@ async function handleWebhooks(): Promise<void> {
 						.split(',')
 						.map((e) => e.trim())
 						.filter((e) => e.length > 0),
-					secret: parseFlag('--secret')
+					secret: parseFlag('--secret'),
+					allowPrivateNetwork: hasFlag('--allow-private-network') || undefined
 				})
 			);
 		}
@@ -2843,8 +2848,12 @@ On-chain:
   psbt build <address> <sats> [satsPerVbyte]
                                          Build an UNSIGNED PSBT for an external
                                          signer (hardware wallet)
-  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
-                                         returns txid/txHex WITHOUT broadcast
+  psbt import-signed <psbtBase64|file> [unsignedPsbt|file]
+                                         Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast.
+                                         Pass the unsigned PSBT from psbt build
+                                         once the daemon has restarted or made
+                                         50 newer builds
   psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs (includes frozen flag)
@@ -2940,7 +2949,8 @@ Channels:
   channel forceclose <id>                Force close
                                          --accept-stale-state-risk: required
                                          for a channel restored from a
-                                         Recovery Capsule, whose commitment
+                                         Recovery Capsule, or on a fenced or
+                                         quarantined device, whose commitment
                                          the peer may have already revoked
   channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]
@@ -3099,9 +3109,11 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
                                          is known rather than failing
 
 Webhooks (event push; see also GET /events SSE):
-  webhooks register <url> <events> [--secret S]
-                                         Register a callback URL; <events> is
-                                         comma-separated (or '*' for all)
+  webhooks register <url> <events> [--secret S] [--allow-private-network]
+                                         Register an http(s) callback URL;
+                                         <events> is comma-separated (or '*'
+                                         for all). Loopback and private hosts
+                                         need --allow-private-network
   webhooks unregister <id>               Remove a webhook
   webhooks list                          List registered webhooks
 

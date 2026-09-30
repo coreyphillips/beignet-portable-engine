@@ -334,6 +334,9 @@ export interface INodeConfig {
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
+	/** Inbound peer connections (default 125). Once this many are up, only
+	 *  peers holding a channel with this node are admitted. */
+	maxInboundPeers?: number;
 	/** Resource management config */
 	resourceConfig?: IResourceConfig;
 	/** Storage backend for persistence */
@@ -914,6 +917,8 @@ export interface IPaymentRetryContext {
 	 * it.
 	 */
 	policyOverrides?: Map<string, IChannelUpdateMessage>;
+	/** Caller metadata, carried onto the record every attempt creates. */
+	metadata?: Record<string, string>;
 }
 
 /** Options-object form of sendPayment's positional arguments. */
@@ -936,6 +941,12 @@ export interface ISendPaymentOptions {
 	 * on-chain refund height less its claim margin.
 	 */
 	maxCltvExpiryHeight?: number;
+	/**
+	 * Labels stored on the payment record, as setPaymentMetadata stores them.
+	 * Refused with an InvalidRequestError, before anything is sent, when they
+	 * are too large for the recovery guardians to accept.
+	 */
+	metadata?: Record<string, string>;
 }
 
 export interface ICreateInvoiceOptions {
@@ -1592,6 +1603,13 @@ export interface IKeysendOptions {
 	customRecords?: Map<number, Buffer>;
 	/** Payment metadata (optional) */
 	metadata?: Record<string, string>;
+	/**
+	 * The 32-byte preimage to pay under (optional; a fresh random one by
+	 * default). A caller that must record the payment hash before the HTLC
+	 * goes out picks it. One whose hash was already paid or is in flight is
+	 * refused with DUPLICATE_PAYMENT.
+	 */
+	preimage?: Buffer;
 }
 
 /**

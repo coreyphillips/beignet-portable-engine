@@ -721,6 +721,10 @@ export interface BeignetConfig {
 	/** Accept inbound Lightning peers over WebSocket on this port (opt-in;
 	 *  coexists with the TCP listener on listenPort). */
 	websocketPort?: number;
+	/** Inbound peer connections (default 125); once this many are up, only
+	 *  peers holding a channel with this node are admitted. Env:
+	 *  BEIGNET_MAX_INBOUND_PEERS. */
+	maxInboundPeers?: number;
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;
@@ -833,7 +837,9 @@ export interface BeignetConfig {
 	 *  default: being a settlement peer locks liquidity for the whole epoch.
 	 *  Env: BEIGNET_FFOR_SETTLE (exact true/false), with
 	 *  BEIGNET_FFOR_MAX_BUDGET_MSAT, BEIGNET_FFOR_MAX_EPOCH_BLOCKS,
-	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor. */
+	 *  BEIGNET_FFOR_FEE_BASE_MSAT and BEIGNET_FFOR_FEE_PPM as the terms floor.
+	 *  An epoch reaching more than 5040 blocks past the tip is refused
+	 *  whatever maxEpochBlocks says. */
 	fforSettle?: {
 		enabled: boolean;
 		maxBudgetMsat?: string | number;
@@ -963,7 +969,7 @@ export interface EventMessage {
 export interface ApiResponse<T> {
 	ok: boolean;
 	result?: T;
-	error?: { code: string; message: string };
+	error?: { code: string; message: string; paymentHash?: string };
 }
 
 export interface PaymentFilter {
