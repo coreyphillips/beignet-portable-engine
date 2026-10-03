@@ -410,6 +410,12 @@ export interface IChannelState {
 	 */
 	pendingFeerateSignable?: boolean;
 	pendingFeerateCommitted?: boolean;
+	/**
+	 * Our fee update was revoked by the peer, whose answering commitment_signed
+	 * is still owed. Kept separately from the fee value so an unchanged rate
+	 * still completes its round before cooperative close. Absent on older rows.
+	 */
+	awaitingLocalFeeCommitment?: boolean;
 
 	/**
 	 * The feerate baked into OUR current local commitment — the exact rate the
@@ -440,6 +446,30 @@ export interface IChannelState {
 	htlcs: Map<string, IHtlcEntry>;
 
 	/**
+	 * RECEIVED HTLCs we fulfilled or failed that have left `htlcs`, while the
+	 * local commitment the stored remote signature covers still carries their
+	 * outputs.
+	 *
+	 * The peer's revoke_and_ack for our removal settles it everywhere but
+	 * there: the entry is deleted and the balance moves, and the commitment we
+	 * hold, the only one we can broadcast, stays the one the peer signed
+	 * before the removal until its next commitment_signed replaces it. Until
+	 * then the force-close rebuild (buildLocalCommitment signedLocal=true) and
+	 * the classification of our own commitment read the entries kept here, so
+	 * that what we broadcast is what the signature covers and the output is
+	 * claimed with the preimage and the stored HTLC signature.
+	 *
+	 * Written by handleRevokeAndAck, cleared by the next commitment_signed we
+	 * accept, and narrowed by a force close to the entries the stored
+	 * signature turned out to cover. Besides those two readers only the
+	 * node's claim backstop looks here, to close ahead of a fulfilled entry's
+	 * expiry: balances, the commitments being signed or verified and the
+	 * peer's commitment are all past the removal already. Optional: absent
+	 * means none.
+	 */
+	signedLocalRemovals?: IHtlcEntry[];
+
+	/**
 	 * Per-remote-commitment HTLC snapshots, keyed by remote commitment number.
 	 * Records which HTLCs were present in each remote commitment we signed, so
 	 * that if the counterparty broadcasts a REVOKED commitment whose HTLCs have
@@ -448,6 +478,8 @@ export interface IChannelState {
 	 * reclaims formerly-in-flight HTLC value the penalty was meant to confiscate.
 	 */
 	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
+	/** Sticky once a concurrent book is adopted, including after retirement. */
+	compactHtlcHistory?: true;
 
 	/**
 	 * Watchtower: the remote commitment transactions we signed that the peer
@@ -515,10 +547,11 @@ export interface IChannelState {
 	 * acknowledged with a revoke_and_ack. On reconnection the peer may have
 	 * lost any of these (a receiver forgets uncommitted updates; a crashed
 	 * receiver restores a state that predates them), so they MUST be
-	 * retransmitted BEFORE any retransmitted commitment_signed. Entries up to
-	 * pendingLocalUpdatesSignedCount were covered by our last sent
-	 * commitment_signed and are dropped when the peer's revoke_and_ack
-	 * arrives; later entries belong to the next round and remain queued.
+	 * retransmitted. Entries up to pendingLocalUpdatesSignedCount were
+	 * covered by our last sent commitment_signed and are dropped when the
+	 * peer's revoke_and_ack arrives; later entries belong to the next round
+	 * and remain queued. A retransmitted commitment_signed goes out behind
+	 * the entries it covers and ahead of the later ones (issue #1300).
 	 */
 	pendingLocalUpdates: Array<{ type: number; payload: Buffer }>;
 	/** How many pendingLocalUpdates our last sent commitment_signed covers. */

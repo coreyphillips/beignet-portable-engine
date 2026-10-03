@@ -48,9 +48,38 @@ export interface NodeInfo {
 	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
 	openChannelCount: number;
 	peerCount: number;
+	/** True while an inbound listener (TCP or WebSocket) is bound. */
 	listening: boolean;
+	/**
+	 * The TCP listen port this node was asked for, present whenever one was
+	 * configured, bound or not. `listening` and `listenError` say which.
+	 */
+	listenPort?: number;
+	/** Why the configured TCP listener is not bound; absent while it is. */
+	listenError?: ListenerProblem;
 	/** WebSocket listener port when accepting inbound WS peers (opt-in). */
 	websocketPort?: number;
+	/** Why the configured WebSocket listener is not bound; absent while it is. */
+	websocketListenError?: ListenerProblem;
+}
+
+/**
+ * Why a configured inbound listener is not bound (issues #861 and #933).
+ * `failed`: the OS refused the bind (the port is taken, or not permitted);
+ * nothing retries it, restart once the port is free. `held`: a guardian
+ * mode's startup quarantine refuses the bind until writer ownership is
+ * confirmed and any startup repair is receipted, and it binds then.
+ * `fenced`: another device owns this node's recovery namespace, so the
+ * listener stays down (the fence also closes one that was bound).
+ */
+export interface ListenerProblem {
+	/** The port that was asked for. */
+	port: number;
+	state: 'failed' | 'held' | 'fenced';
+	/** The OS error, or why the bind is held. */
+	message: string;
+	/** The OS error code (EADDRINUSE, EACCES, ...) when the OS refused. */
+	errno?: string;
 }
 
 export type PeerState = 'ready' | 'connected' | 'connecting' | 'disconnected';
@@ -143,6 +172,13 @@ export interface ChannelInfo {
 	previousFundingTxids?: string[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
+	ffor?: {
+		state: string;
+		concurrent: boolean;
+		concurrentVersion?: 1 | 2;
+		reservedInboundSats: number;
+		unresolvedSlots: number;
+	};
 	/**
 	 * The channel was restored from a Recovery Capsule and its state has not
 	 * been proven current, so it takes no new HTLCs and is offered to no
@@ -847,6 +883,10 @@ export interface BeignetConfig {
 		feeBaseMsat?: number;
 		feePpm?: number;
 	};
+	/** Advertise concurrent receive. Defaults to true. */
+	fforConcurrent?: boolean;
+	/** Accept new concurrent books when settlement is enabled. Defaults to true. */
+	fforSettleConcurrent?: boolean;
 	/** FFOR receipt witness (spec section 9.6). Env: BEIGNET_FFOR_WITNESS
 	 *  (exact true/false), BEIGNET_FFOR_WITNESS_MAX_MAILBOXES,
 	 *  BEIGNET_FFOR_WITNESS_MAX_BYTES. */
@@ -1530,6 +1570,7 @@ export interface BeignetNodeEvents {
 		epoch: Record<string, unknown>;
 	}) => void;
 	'ffor:settled': (data: Record<string, unknown>) => void;
+	'ffor:slot-resolved': (data: Record<string, unknown>) => void;
 	'ffor:delegated-failed': (data: Record<string, unknown>) => void;
 	'ffor:enforce': (data: {
 		channelId: string;

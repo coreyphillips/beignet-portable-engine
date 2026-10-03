@@ -172,8 +172,13 @@ import {
 	FF_ACTIVATE_TYPE,
 	FF_CLOSE_ACK_TYPE,
 	FF_CLOSE_TYPE,
+	FF_CONCURRENT_VERSION,
+	FF_CONCURRENT_RESERVED_VERSION,
+	isFforConcurrentVersion,
 	FF_EPOCH_START_TOLERANCE_BLOCKS,
 	FF_INIT_TYPE,
+	FF_SYNC_TYPE,
+	FF_SYNC_REPLY_TYPE,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
@@ -191,7 +196,9 @@ import {
 	IFforEpochRecord,
 	IFforErrorMessage,
 	IFforInitMessage,
-	IFforReestablishTlv
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
 } from '../ffor/types';
 import { IFforWitnessProvision } from '../ffor/witness-types';
 import {
@@ -206,6 +213,8 @@ import {
 	decodeFforCloseMessage,
 	decodeFforErrorMessage,
 	decodeFforInitMessage,
+	decodeFforSyncMessage,
+	decodeFforSyncReplyMessage,
 	encodeFforAbortUnsigned,
 	encodeFforAcceptUnsigned,
 	encodeFforActivateAckUnsigned,
@@ -214,7 +223,10 @@ import {
 	encodeFforCloseUnsigned,
 	encodeFforErrorMessage,
 	encodeFforInitUnsigned,
+	encodeFforSyncUnsigned,
+	encodeFforSyncReplyUnsigned,
 	fforMessageDigest,
+	fforSyncSnapshotContent,
 	fforWireBytes,
 	verifyFforMessage
 } from '../ffor/messages';
@@ -721,6 +733,41 @@ export interface IForceClosePlanRefused {
 }
 
 /**
+ * Up to this many kept received removals, a refused force-close rebuild is
+ * retried for every selection of them. Six is 63 further rebuilds at most,
+ * each one transaction build and one signature check, and it is far more
+ * than a single revoke_and_ack leaves behind outside a large multi-part
+ * settle.
+ */
+const KEPT_REMOVAL_FULL_SEARCH = 6;
+
+/**
+ * The smaller selections of the kept received removals a force close tries
+ * once the stored signature has refused the whole list, largest first.
+ *
+ * The list is a reading of our own records and the signature is the fact, so
+ * an entry the signature does not cover must cost only itself, not the
+ * entries beside it. Up to KEPT_REMOVAL_FULL_SEARCH entries every selection
+ * is tried, which is exact. Past that the search would double with each
+ * entry, so only the shapes a stale list can realistically take are tried:
+ * one entry too many (each all-but-one selection) and none of it valid (the
+ * empty selection).
+ */
+function keptRemovalSelections(kept: IHtlcEntry[] | undefined): IHtlcEntry[][] {
+	const n = kept?.length ?? 0;
+	if (!kept || n === 0) return [];
+	if (n > KEPT_REMOVAL_FULL_SEARCH) {
+		return [...kept.map((_, drop) => kept.filter((__, i) => i !== drop)), []];
+	}
+	const selections: IHtlcEntry[][] = [];
+	// Every mask but the full one, which was the first rebuild.
+	for (let mask = (1 << n) - 2; mask >= 0; mask--) {
+		selections.push(kept.filter((_, i) => (mask & (1 << i)) !== 0));
+	}
+	return selections.sort((a, b) => b.length - a.length);
+}
+
+/**
  * A force close that is going to work: everything fallible is already done,
  * and the live channel has not been touched.
  */
@@ -764,6 +811,13 @@ export interface IForceClosePlanReady {
 	 * with, so a duplicated buffer signs nothing.
 	 */
 	localNonce: Uint8Array | null;
+	/**
+	 * The received removals the commitment still carries: the part of
+	 * signedLocalRemovals the stored signature turned out to cover, or
+	 * undefined for none. Written back by applyForceClosePlan, so the monitor
+	 * classifies the broadcast against the same entries it was built from.
+	 */
+	signedLocalRemovals: IHtlcEntry[] | undefined;
 	/** The id the CHANNEL_CLOSED action carries. */
 	channelId: Buffer;
 }
@@ -856,6 +910,46 @@ export interface ITaprootClosingCache {
  */
 export const REVERTED_SPLICES_KEPT = 8;
 
+/**
+ * FFOR: the BOLT 2 update stream. While a channel holds its retransmission
+ * chain (Channel.fforHoldStream) every message of these types it would send
+ * joins the chain instead of leaving, so none overtakes a signature made
+ * before it.
+ */
+const FFOR_HELD_STREAM_TYPES: ReadonlySet<number> = new Set<number>([
+	MessageType.UPDATE_ADD_HTLC,
+	MessageType.UPDATE_FULFILL_HTLC,
+	MessageType.UPDATE_FAIL_HTLC,
+	MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+	MessageType.UPDATE_FEE,
+	MessageType.START_BATCH,
+	MessageType.COMMITMENT_SIGNED,
+	MessageType.REVOKE_AND_ACK
+]);
+
+/** The kinds of channel operation an FFOR epoch judges (_fforUpdateRefusal). */
+type FforUpdateKind =
+	| 'add'
+	| 'settle'
+	| 'fee'
+	| 'blockheight'
+	| 'commit'
+	| 'stfu'
+	| 'shutdown'
+	| 'splice';
+
+/** Who originates the operation and, for a settle, what it removes and how. */
+interface IFforUpdateContext {
+	/** Ours (refused with a local ERROR) or the peer's (a wire failure). */
+	origin: 'local' | 'peer';
+	/**
+	 * A settle's target: its id, its direction on this side (an id names a
+	 * voucher only in the direction the vouchers run), and whether it
+	 * fulfils or fails.
+	 */
+	settle?: { id: bigint; direction: HtlcDirection; op: 'fulfill' | 'fail' };
+}
+
 export class Channel {
 	private _state: IChannelState;
 	private _signer: ISigner | null = null;
@@ -884,12 +978,81 @@ export class Channel {
 	 * voucher; every other settle of a parked voucher is refused.
 	 */
 	private _fforInternalSettle = false;
+	private _fforSyncBudget = { startedAt: 0, count: 0 };
 	/**
-	 * FFOR (R, DRAINING): BOLT 2 retransmissions of the drain (the fulfils,
-	 * fails and commitment_signed) held back because the peer reestablished
-	 * reporting ACTIVE; released when its ff_close_ack arrives. Memory-only.
+	 * FFOR: set while handleFforInit offers the epoch's own vouchers; every
+	 * other add of ours is refused while the setup runs.
+	 */
+	private _fforInternalAdd = false;
+	/**
+	 * FFOR (R, DRAINING): the peer reestablished reporting a state before
+	 * DRAINING, so it does not hold our ff_close, and the retransmission
+	 * chain it would refuse is held back until its ff_close_ack arrives
+	 * again. While set, every BOLT 2 stream message this channel would send
+	 * joins _fforHeldReplay behind that chain (fforHoldStream is the one
+	 * place that decides it), and no new add of ours is taken. Memory-only:
+	 * a disconnect ends it and the next reestablish decides afresh.
+	 */
+	private _fforHolding = false;
+	/**
+	 * FFOR (R, DRAINING): the held chain, in wire order. It starts as the
+	 * BOLT 2 retransmissions of the reestablish that began the hold and
+	 * grows with whatever the channel would have sent since. Released, in
+	 * that order, by the peer's ff_close_ack. Memory-only.
 	 */
 	private _fforHeldReplay: ChannelAction[] = [];
+	/**
+	 * FFOR (R, DRAINING): the stream the last release handed to the dispatch,
+	 * until the write that leads it is known to have landed. If that write
+	 * fails the dispatch withholds every message of it, and the hold stands
+	 * again with this as its chain (fforNoteStateWritten), so nothing made
+	 * afterwards on this connection leaves ahead of what never left.
+	 * Memory-only.
+	 */
+	private _fforReleasedStream: ChannelAction[] | null = null;
+	/**
+	 * FFOR concurrent receive (R, DRAINING): a dispute was just recorded
+	 * while the chain is held. Nothing on this connection releases the chain
+	 * any more, and our own settles are refused until the channel
+	 * reestablishes, so that reestablish is asked for: the manager takes
+	 * this (fforTakeReconnectRequest) and has the connection dropped, the
+	 * way it does for a blocked transition. Set only as the dispute is
+	 * first recorded, which the record remembers, so one epoch asks once.
+	 */
+	private _fforReconnectWanted = false;
+	/**
+	 * FFOR concurrent receive: setFforCapabilities changed the record's
+	 * capability hold and no durable write has carried the change yet. Every
+	 * reestablish asks for that write while this is set, whether or not it
+	 * sends anything, and only a write that landed clears it
+	 * (fforNoteStateWritten): a write that failed is asked for again.
+	 */
+	private _fforCapabilityHoldUnsaved = false;
+	/**
+	 * FFOR concurrent receive (S, ACTIVE): our ff_activate_ack has been
+	 * produced but is not on the wire yet. handleFforActivate moves the
+	 * record to ACTIVE and ends our quiescence as it returns the ack, and the
+	 * ack leaves only when the durable write lands (and, in quorum mode, when
+	 * its frame is durable). Until it leaves R is ACTIVATING and quiescent
+	 * and fails the channel on any update, so a concurrent S takes no add
+	 * and no settle of its own (_fforConcurrentRefusal). A baseline S is
+	 * frozen in ACTIVE and needs no such rule.
+	 *
+	 * Set where the ack is produced (handleFforActivate, and its replay at a
+	 * reestablish), cleared by the dispatch that puts it on the wire
+	 * (fforNoteActivateAckSent). Memory-only: a restart sets it from the
+	 * record (the constructor), since a row cannot say whether the ack left,
+	 * and the first reestablish settles it from what R reports.
+	 */
+	private _fforActivateAckUnsent = false;
+	/**
+	 * FFOR concurrent receive (R, DRAINING): the peer reestablished
+	 * reporting a state before DRAINING, so it does not hold our ff_close
+	 * and would fail the channel on a voucher fail. No new voucher fail is
+	 * issued until its ff_close_ack arrives again. Memory-only: every
+	 * reestablish answers it afresh.
+	 */
+	private _fforPeerLacksClose = false;
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
@@ -1258,6 +1421,13 @@ export class Channel {
 	constructor(state: IChannelState, signer?: ISigner) {
 		this._state = state;
 		this._signer = signer || null;
+		const f = state.ffor;
+		this._fforActivateAckUnsent =
+			f !== null &&
+			f !== undefined &&
+			f.role === 'S' &&
+			f.state === FforState.ACTIVE &&
+			isFforConcurrentVersion(f.concurrentVersion);
 	}
 
 	/**
@@ -3148,8 +3318,10 @@ export class Channel {
 			];
 		}
 
-		// FFOR section 7.5.5: no ordinary update from ACTIVATING on.
-		const fforAddRefusal = this._fforUpdateRefusal('add');
+		// FFOR: no ordinary add of ours from the first setup message (the
+		// setup barrier, issue #1289), and no ordinary update from ACTIVATING
+		// on (section 7.5.5).
+		const fforAddRefusal = this._fforLocalAddRefusal();
 		if (fforAddRefusal) {
 			return [
 				{
@@ -3254,6 +3426,19 @@ export class Channel {
 		const funderRefusal = this._remoteFunderFeeRefusal([amountMsat]);
 		if (funderRefusal) {
 			return [{ type: ChannelActionType.ERROR, message: funderRefusal }];
+		}
+
+		// FFOR concurrent receive: while a voucher book is live the funder,
+		// whichever side that is, keeps the fee-spike buffer over the whole
+		// mixed commitment (CONCURRENT-RECEIVE.md section 3.1). The ceiling
+		// above already folds this in (_fforMixedBufferCeilingMsat), so an
+		// amount past it has met "Insufficient balance"; asked again here so
+		// the rule holds at the admission point whatever the ceiling says.
+		const mixedBufferRefusal = this._fforMixedBufferRefusal([
+			{ amountMsat, direction: HtlcDirection.OFFERED }
+		]);
+		if (mixedBufferRefusal) {
+			return [{ type: ChannelActionType.ERROR, message: mixedBufferRefusal }];
 		}
 
 		// Cap total dust-HTLC exposure (BOLT 2 recommendation): dust HTLCs are
@@ -3421,7 +3606,12 @@ export class Channel {
 
 		// FFOR section 7.5.5: from ACTIVATING on neither side may add. The
 		// freeze is durable and the peer signed it, so a violation is provable.
-		const fforPeerAddRefusal = this._fforUpdateRefusal('add');
+		// The setup barrier before it is local only (_fforSetupAddRefusal): a
+		// peer add in NEGOTIATING is a voucher or fails the round, and neither
+		// is answered on the wire here.
+		const fforPeerAddRefusal = this._fforUpdateRefusal('add', {
+			origin: 'peer'
+		});
 		if (fforPeerAddRefusal) {
 			return this._failChannelWithWireError(fforPeerAddRefusal);
 		}
@@ -3605,6 +3795,22 @@ export class Channel {
 				}
 				funderFeeFailback = true;
 			}
+		}
+
+		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 3.1): while a
+		// voucher book is live the funder keeps the fee-spike buffer over the
+		// full mixed commitment, whoever funds and whoever adds. A peer add
+		// that breaks it is new work to reject, but never by failing the
+		// channel: that would cost the vouchers the channel they live on. It
+		// is admitted and stamped for the same fail-back as the funder-fee
+		// band above, which the node sends once the add is committed.
+		if (
+			!funderFeeFailback &&
+			this._fforMixedBufferRefusal([
+				{ amountMsat: msg.amountMsat, direction: HtlcDirection.RECEIVED }
+			]) !== null
+		) {
+			funderFeeFailback = true;
 		}
 
 		// The dust-exposure ceiling is deliberately NOT enforced here. BOLT 2
@@ -3814,7 +4020,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'local',
+			settle: { id: htlcId, direction: HtlcDirection.RECEIVED, op: 'fulfill' }
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -3914,7 +4123,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'peer',
+			settle: { id: msg.id, direction: HtlcDirection.OFFERED, op: 'fulfill' }
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -3967,8 +4180,25 @@ export class Channel {
 		// the only remaining source, so swallowing it here would strand the
 		// upstream leg of a forward forever (issue 295). Every listener on the
 		// resulting event is repeat-tolerant.
+		const ffor = this._state.ffor;
+		const redeemed =
+			!!ffor &&
+			ffor.role === 'S' &&
+			this._fforIsConcurrent(ffor) &&
+			entry.fforVoucher === true &&
+			!this._addNotYetCommitted(entry);
+		if (redeemed) {
+			const slot = matchVoucher(this._fforBook(ffor!), entry);
+			if (slot) {
+				ffor!.slotRedeemed ??= ffor!.paymentHashes.map(() => false);
+				ffor!.slotRedeemed[slot.k - 1] = true;
+			}
+		}
 		if (entry.state === HtlcState.FULFILLED) {
 			return [
+				...(redeemed
+					? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+					: []),
 				{
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: msg.id,
@@ -3999,6 +4229,9 @@ export class Channel {
 		// happens when the commitment exchange confirms via revoke_and_ack.
 
 		return [
+			...(redeemed
+				? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+				: []),
 			{
 				type: ChannelActionType.HTLC_FULFILLED,
 				htlcId: msg.id,
@@ -4047,7 +4280,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'local',
+			settle: { id: htlcId, direction, op: 'fail' }
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -4149,7 +4385,10 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforSettleRefusal = this._fforUpdateRefusal('settle', htlcId);
+		const fforSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'local',
+			settle: { id: htlcId, direction: HtlcDirection.RECEIVED, op: 'fail' }
+		});
 		if (fforSettleRefusal) {
 			return [
 				{
@@ -4225,7 +4464,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'peer',
+			settle: { id: msg.id, direction: HtlcDirection.OFFERED, op: 'fail' }
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -4280,7 +4523,8 @@ export class Channel {
 				type: ChannelActionType.HTLC_FAILED,
 				htlcId: msg.id,
 				reason: msg.reason
-			}
+			},
+			...this._fforNoteSettledVoucherFailed(entry)
 		];
 	}
 
@@ -4313,7 +4557,11 @@ export class Channel {
 		}
 
 		// FFOR section 7.5.5: under the epoch freeze only the drain settles.
-		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', msg.id);
+		// The peer's id names an HTLC we offered.
+		const fforPeerSettleRefusal = this._fforUpdateRefusal('settle', {
+			origin: 'peer',
+			settle: { id: msg.id, direction: HtlcDirection.OFFERED, op: 'fail' }
+		});
 		if (fforPeerSettleRefusal) {
 			return this._failChannelWithWireError(fforPeerSettleRefusal);
 		}
@@ -4375,7 +4623,8 @@ export class Channel {
 				htlcId: msg.id,
 				reason,
 				malformedCode: msg.failureCode
-			}
+			},
+			...this._fforNoteSettledVoucherFailed(entry)
 		];
 	}
 
@@ -4384,10 +4633,11 @@ export class Channel {
 	 * peer's revoke_and_ack acknowledges the commitment that contains it. On
 	 * reconnection the peer may have lost it (uncommitted updates are
 	 * forgotten across a disconnect, and a restarted peer restores a state
-	 * that may predate it), so handleReestablish retransmits the queue BEFORE
-	 * any retransmitted commitment_signed. Receivers treat replays
-	 * idempotently (duplicate add ids are ignored; a fulfill/fail of an
-	 * already fulfilled/failed HTLC is a no-op).
+	 * that may predate it), so handleReestablish retransmits the queue: the
+	 * entries our last commitment_signed covered ahead of that signature when
+	 * it is retransmitted, the entries queued after it behind it. Receivers
+	 * treat replays idempotently (duplicate add ids are ignored; a
+	 * fulfill/fail of an already fulfilled/failed HTLC is a no-op).
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
 		this._state.pendingLocalUpdates.push({
@@ -4572,6 +4822,12 @@ export class Channel {
 			spliceHtlcSignatures: Buffer[];
 		}
 	): ChannelAction[] {
+		const fforRefusal = this.fforCommitmentRefusal();
+		if (fforRefusal)
+			return [
+				{ type: ChannelActionType.ERROR, message: fforRefusal, cleanup: 'none' }
+			];
+
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -4639,6 +4895,12 @@ export class Channel {
 						return this._failChannelWithWireError(splicedTrimmed);
 					}
 				}
+				// FFOR concurrent receive, the voucher-subset invariant
+				// (CONCURRENT-RECEIVE.md section 4): never sign the peer a
+				// commitment that has dropped an unresolved voucher. Refused
+				// before anything is written, like the backstop above.
+				const subset = this._fforVoucherSubsetRefusal('remote', point, number);
+				if (subset) return this._failChannelWithWireError(subset);
 			}
 		}
 
@@ -4929,7 +5191,9 @@ export class Channel {
 		this._lastReestablishOutcome = null;
 		// FFOR section 7.5.5: from ACTIVATING on there is nothing to sign
 		// until the drain; a commitment_signed under the freeze is a violation.
-		const fforCommitRefusal = this._fforUpdateRefusal('commit');
+		const fforCommitRefusal = this._fforUpdateRefusal('commit', {
+			origin: 'peer'
+		});
 		if (fforCommitRefusal) {
 			return this._failChannelWithWireError(fforCommitRefusal);
 		}
@@ -5112,6 +5376,21 @@ export class Channel {
 				return this._failChannelWithWireError('Invalid HTLC signature');
 			}
 
+			// FFOR concurrent receive, the voucher-subset invariant
+			// (CONCURRENT-RECEIVE.md section 4): the commitment these
+			// signatures cover must still carry every unresolved voucher, or
+			// the revoke_and_ack below would give up the one that does.
+			// Checked once the signatures verify and before anything is
+			// stored, so a refusal leaves the commitment we hold, and the
+			// signature that goes with it, untouched. FFOR does not run on
+			// taproot channels, so the arm above needs no twin.
+			const subset = this._fforVoucherSubsetRefusal(
+				'local',
+				nextPerCommitmentPoint,
+				nextCommitmentNumber
+			);
+			if (subset) return this._failChannelWithWireError(subset);
+
 			// Store remote's signature
 			this._state.remoteCommitmentSignature = msg.signature;
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
@@ -5127,8 +5406,18 @@ export class Channel {
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
 
+		// The verified signature completes the peer's half of our fee round,
+		// including an update that kept the same rate. Its revoke_and_ack has
+		// already promoted that rate before this message can arrive on the wire.
+		this._state.awaitingLocalFeeCommitment = false;
+
 		// The HTLC SET the signature covers, same purpose (issue #643).
 		this._markOfferedAddsRemoteSigned();
+		// And the received removals it no longer carries: the peer signed this
+		// commitment after revoking for them, so the outputs kept for the
+		// previous signature are not in the commitment we now hold.
+		this._fforRecordVoucherOutcomes();
+		this._state.signedLocalRemovals = undefined;
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -5173,6 +5462,20 @@ export class Channel {
 			) {
 				entry.addLocallyRevoked = true;
 				this._state.needsCommitment = true;
+			}
+			// A peer add we removed before this signature arrived is covered by
+			// it all the same: the commitment just verified carries its output
+			// until the peer revokes for the removal, which has not happened or
+			// the entry would be gone. Nothing we sign reads the flag once the
+			// add is FULFILLED or FAILED, so no commitment_signed is owed for
+			// it; the flag only tells _retainSignedLocalRemoval that the stored
+			// signature carries the output (issue #1291).
+			if (
+				entry.addLocallyRevoked === false &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				entry.addLocallyRevoked = true;
 			}
 			if (
 				entry.removalLocallyRevoked === false &&
@@ -5269,6 +5572,33 @@ export class Channel {
 			// FFOR: the round boundary at which S's voucher round completes.
 			...this._fforAfterRound('cs')
 		];
+	}
+
+	/**
+	 * Keep a received HTLC the peer has just revoked the removal of where the
+	 * force-close rebuild can still find it (IChannelState.signedLocalRemovals).
+	 *
+	 * That revoke_and_ack ends the removal on the PEER's commitment, and the
+	 * entry leaves the map with it. Our own commitment is one message behind:
+	 * the signature we hold is over the commitment from before the removal,
+	 * HTLC output included, until the peer's next commitment_signed arrives. A
+	 * force close in between broadcasts that commitment or nothing, and with
+	 * the entry simply gone the rebuild produced one the signature does not
+	 * cover, so prepareForceClose refused for as long as the peer withheld its
+	 * signature.
+	 *
+	 * addLocallyRevoked bounds it the way addRemoteSigned bounds the offered
+	 * side. We may fail an add before the peer has signed it into any
+	 * commitment of ours, and there the stored signature covers a commitment
+	 * that never had the output. The flag flips in the handleCommitmentSigned
+	 * that stores the covering signature, whatever state the entry is in by
+	 * then; absent reads as "already signed", as it does everywhere else.
+	 */
+	private _retainSignedLocalRemoval(entry: IHtlcEntry): void {
+		if (entry.addLocallyRevoked === false) return;
+		const retained = this._state.signedLocalRemovals ?? [];
+		retained.push({ ...entry });
+		this._state.signedLocalRemovals = retained;
 	}
 
 	/**
@@ -5420,10 +5750,32 @@ export class Channel {
 			if (entry.removalRemoteCommitted === false) {
 				continue;
 			}
+			const f = this._state.ffor;
+			if (
+				f?.role === 'S' &&
+				this._fforIsConcurrent(f) &&
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.fforVoucher &&
+				entry.removalLocallyRevoked === true &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				const slot = matchVoucher(this._fforBook(f), entry);
+				if (slot) {
+					f.voucherOutcomes ??= f.paymentHashes.map(() => null);
+					f.voucherOutcomes[slot.k - 1] ??= {
+						outcome:
+							entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'cancelled',
+						localCommitmentNumber: this._state.localCommitmentNumber,
+						remoteCommitmentNumber: this._remoteRevocationCount()
+					};
+				}
+			}
 			if (entry.state === HtlcState.FULFILLED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
 					this._state.localBalanceMsat += entry.amountMsat;
+					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered and remote fulfilled: credit remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
@@ -5433,6 +5785,7 @@ export class Channel {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received but failed: refund remote balance
 					this._state.remoteBalanceMsat += entry.amountMsat;
+					this._retainSignedLocalRemoval(entry);
 				} else {
 					// We offered but it failed: refund our balance
 					this._state.localBalanceMsat += entry.amountMsat;
@@ -5455,6 +5808,7 @@ export class Channel {
 		) {
 			if (this._state.role === ChannelRole.OPENER) {
 				this._state.localConfig.feeratePerKw = this._state.pendingFeeratePerKw;
+				this._state.awaitingLocalFeeCommitment = true;
 			} else {
 				this._state.remoteConfig.feeratePerKw = this._state.pendingFeeratePerKw;
 			}
@@ -5561,7 +5915,7 @@ export class Channel {
 		}
 
 		// FFOR section 5: the feerate is frozen for the epoch.
-		const fforFeeRefusal = this._fforUpdateRefusal('fee');
+		const fforFeeRefusal = this._fforUpdateRefusal('fee', { origin: 'local' });
 		if (fforFeeRefusal) {
 			return [
 				{
@@ -5699,7 +6053,9 @@ export class Channel {
 	 */
 	handleUpdateFee(msg: IUpdateFeeMessage): ChannelAction[] {
 		// FFOR section 5: the feerate is frozen for the epoch, on both sides.
-		const fforPeerFeeRefusal = this._fforUpdateRefusal('fee');
+		const fforPeerFeeRefusal = this._fforUpdateRefusal('fee', {
+			origin: 'peer'
+		});
 		if (fforPeerFeeRefusal) {
 			return this._failChannelWithWireError(fforPeerFeeRefusal);
 		}
@@ -5889,7 +6245,9 @@ export class Channel {
 			];
 		}
 		// FFOR section 7.5.5: no update of any kind under the epoch freeze.
-		const fforBlockheightRefusal = this._fforUpdateRefusal('blockheight');
+		const fforBlockheightRefusal = this._fforUpdateRefusal('blockheight', {
+			origin: 'peer'
+		});
 		if (fforBlockheightRefusal) {
 			return this._failChannelWithWireError(fforBlockheightRefusal);
 		}
@@ -6985,7 +7343,15 @@ export class Channel {
 			// HTLC output. So the signature decides: rebuild with the unstamped
 			// adds read as unsigned, and take the first rebuild the stored
 			// signature covers.
-			for (const candidate of this._viewsWithUnstampedAddsUnsigned(closing)) {
+			//
+			// The received removals kept for this rebuild are decided the same
+			// way, entry by entry: a signature that replaced the stored one
+			// without passing through handleCommitmentSigned (a splice adoption)
+			// was never asked about them, so the rebuilds that keep only part of
+			// the list, or none of it, are tried as well. And so is the reading
+			// of a received add as unsigned (issue #1295): the rebuild that
+			// carries it is asked last.
+			for (const candidate of this._fallbackCloseViews(closing)) {
 				const rebuilt = buildLocalCommitment(
 					candidate,
 					perCommitmentPoint,
@@ -7032,6 +7398,7 @@ export class Channel {
 				: null,
 			v2Adoption,
 			localNonce,
+			signedLocalRemovals: witnessedView.signedLocalRemovals,
 			channelId: closing.channelId!
 		};
 	}
@@ -7199,6 +7566,79 @@ export class Channel {
 	}
 
 	/**
+	 * Every other close view prepareForceClose may try once the stored
+	 * signature has turned down the first rebuild, in order: the unstamped
+	 * adds read as unsigned, then the same views again for each smaller
+	 * selection of the received removals kept for the signed commitment
+	 * (signedLocalRemovals), and last all of those once more with the
+	 * received adds the flags call unsigned read as signed in.
+	 *
+	 * The later halves make those readings additive. Whatever a close could
+	 * broadcast without a kept entry, or with an add the rebuild now leaves
+	 * out, it still can, because the signature is asked about that rebuild
+	 * too and covers at most one of them.
+	 */
+	private *_fallbackCloseViews(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		yield* this._keptRemovalCloseViews(closing);
+		const carried = this._viewWithUnsignedReceivedAddsCarried(closing);
+		if (!carried) return;
+		yield carried;
+		yield* this._keptRemovalCloseViews(carried);
+	}
+
+	/** The unstamped-add views of `closing`, for it and each smaller kept selection. */
+	private *_keptRemovalCloseViews(
+		closing: IChannelState
+	): Generator<IChannelState> {
+		yield* this._viewsWithUnstampedAddsUnsigned(closing);
+		for (const kept of keptRemovalSelections(closing.signedLocalRemovals)) {
+			const view = {
+				...closing,
+				signedLocalRemovals: kept.length > 0 ? kept : undefined
+			} as IChannelState;
+			yield view;
+			yield* this._viewsWithUnstampedAddsUnsigned(view);
+		}
+	}
+
+	/**
+	 * The close view with every received add the flags call unsigned
+	 * (addLocallyRevoked === false) read as signed in, or null when there is
+	 * no such add.
+	 *
+	 * The signedLocal rebuild leaves those adds out, because the flag only
+	 * clears when a commitment_signed carrying the add is accepted (issue
+	 * #1295). That is a reading of our own records all the same, and the
+	 * stored signature is the fact: carrying them is what every rebuild did
+	 * before, so it stays on as the last thing asked and nothing that closed
+	 * then can fail to close now. All of them together, since a
+	 * commitment_signed covers every add sent before it.
+	 *
+	 * A copy down to the entries it changes, as in
+	 * _viewsWithUnstampedAddsUnsigned: a question asked of a candidate, not a
+	 * repair of the live rows.
+	 */
+	private _viewWithUnsignedReceivedAddsCarried(
+		closing: IChannelState
+	): IChannelState | null {
+		let changed = false;
+		const htlcs = new Map(closing.htlcs);
+		for (const [id, entry] of closing.htlcs) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				entry.addLocallyRevoked !== false
+			) {
+				continue;
+			}
+			htlcs.set(id, { ...entry, addLocallyRevoked: true });
+			changed = true;
+		}
+		return changed ? ({ ...closing, htlcs } as IChannelState) : null;
+	}
+
+	/**
 	 * Commit the planned close to the live channel.
 	 *
 	 * Nothing here can fail. Everything that could refuse was decided in
@@ -7234,6 +7674,15 @@ export class Channel {
 		}
 		if (plan.localNonce) {
 			this._state.localNonce = plan.localNonce;
+		}
+		// The kept removals the signature did not cover are not in the
+		// commitment on the network, so they stop being candidates for its
+		// outputs. Left alone for a close against a splice below its lock
+		// depth: the channel stays on the other funding there, whose own
+		// signature a re-drive asks afresh, and the monitor reads the plan's
+		// view for this one.
+		if (!plan.provisionalSpliceClose) {
+			this._state.signedLocalRemovals = plan.signedLocalRemovals;
 		}
 		this._state.state = ChannelState.FORCE_CLOSED;
 
@@ -7309,7 +7758,9 @@ export class Channel {
 			];
 		}
 		// FFOR section 7.5.5: no close negotiation while the epoch is live.
-		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown');
+		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown', {
+			origin: 'local'
+		});
 		if (fforShutdownRefusal) {
 			return [
 				{
@@ -7450,7 +7901,9 @@ export class Channel {
 		// FFOR section 7.5.5: no close negotiation while the epoch is live; a
 		// shutdown would also move the channel out of NORMAL and strand the
 		// drain.
-		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown');
+		const fforShutdownRefusal = this._fforUpdateRefusal('shutdown', {
+			origin: 'peer'
+		});
 		if (fforShutdownRefusal) {
 			return this._failChannelWithWireError(fforShutdownRefusal);
 		}
@@ -7561,15 +8014,40 @@ export class Channel {
 			}
 		}
 
-		// If no pending HTLCs, move to negotiating
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) === 0 &&
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) === 0
-		) {
+		// Negotiation starts only on an empty channel (closingBlockedBy). With
+		// anything still in flight the channel waits in SHUTTING_DOWN, where the
+		// messages that finish it keep flowing, and
+		// beginClosingNegotiationIfReady moves it on when the last one lands.
+		if (this.closingBlockedBy() === null) {
 			this._state.state = ChannelState.NEGOTIATING_CLOSING;
 		}
 
 		return actions;
+	}
+
+	/**
+	 * SHUTTING_DOWN to NEGOTIATING_CLOSING, at the moment the channel becomes
+	 * empty (issue #1307).
+	 *
+	 * handleShutdown makes the same move when the peer's shutdown finds the
+	 * channel already empty. When it does not, the channel stays in
+	 * SHUTTING_DOWN until the commitment round that removes the last HTLC
+	 * completes, and that round ends in a revoke_and_ack, received or sent,
+	 * not in a shutdown. The manager calls this after each of the two, and
+	 * starts the negotiation when it answers true.
+	 *
+	 * Both shutdowns must have been exchanged: SHUTTING_DOWN means ours is
+	 * out (we started, or answered the peer's), and remoteShutdownScript is
+	 * set by the peer's. A held restore (issue #469) is left where it is; the
+	 * signing stages refuse it themselves.
+	 */
+	beginClosingNegotiationIfReady(): boolean {
+		if (this._state.state !== ChannelState.SHUTTING_DOWN) return false;
+		if (this._state.remoteShutdownScript === null) return false;
+		if (this.closingBlockedBy() !== null) return false;
+		if (this.isMutualCloseHeld()) return false;
+		this._state.state = ChannelState.NEGOTIATING_CLOSING;
+		return true;
 	}
 
 	/**
@@ -7604,15 +8082,14 @@ export class Channel {
 
 		// Fund-safety: the closing tx pays out localBalanceMsat/remoteBalanceMsat
 		// only, so any in-flight HTLC's value would be silently burned to fees.
-		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved.
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
+		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved
+		// and no update is pending (closingBlockedBy).
+		const proposeBlockedBy = this.closingBlockedBy();
+		if (proposeBlockedBy !== null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Cannot propose closing fee: pending HTLCs'
+					message: `Cannot propose closing fee: ${proposeBlockedBy}`
 				}
 			];
 		}
@@ -7719,14 +8196,22 @@ export class Channel {
 		// lands here mid-replay. The stall also self-heals: we stay in the
 		// current state (channel + funding watch intact), the replayed round
 		// drains the count, and the shutdown exchange re-kicks negotiation.
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
+		//
+		// The same answer for a peer that proposes while a removal is still in
+		// flight (issue #1307). Until that removal is irrevocably committed
+		// the HTLC is on neither balance, so the peer's signature over the two
+		// balances VERIFIES on our side too, and answering it would sign the
+		// HTLC's value away. BOLT 2 forbids the sender and leaves us free to
+		// fail the channel or ignore the message; ignoring signs nothing, keeps
+		// the state and the funding watch, lets the removal finish (after which
+		// negotiation starts from our side, beginClosingNegotiationIfReady) and
+		// leaves the unilateral exit to the usual backstops if it never does.
+		const signedBlockedBy = this.closingBlockedBy();
+		if (signedBlockedBy !== null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Unexpected closing_signed: pending HTLCs'
+					message: `Unexpected closing_signed: ${signedBlockedBy}`
 				}
 			];
 		}
@@ -8302,11 +8787,9 @@ export class Channel {
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
 		}
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
-			return err('Cannot send closing_complete: pending HTLCs');
+		const sendBlockedBy = this.closingBlockedBy();
+		if (sendBlockedBy !== null) {
+			return err(`Cannot send closing_complete: ${sendBlockedBy}`);
 		}
 		if (!this._state.simpleClose) {
 			return err('Cannot send closing_complete: simple close not negotiated');
@@ -8459,11 +8942,11 @@ export class Channel {
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
 		}
-		if (
-			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
-			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
-		) {
-			return err('Unexpected closing_complete: pending HTLCs');
+		// Same gate and same answer as handleClosingSigned: never the closee
+		// signature while anything is unresolved, and a bare local refusal.
+		const completeBlockedBy = this.closingBlockedBy();
+		if (completeBlockedBy !== null) {
+			return err(`Unexpected closing_complete: ${completeBlockedBy}`);
 		}
 		if (!this._state.simpleClose) {
 			return err('Unexpected closing_complete: simple close not negotiated');
@@ -8659,6 +9142,15 @@ export class Channel {
 		// but the refusal keeps the stages uniform.
 		if (this.isMutualCloseHeld()) {
 			return this.refuseHeldMutualClose();
+		}
+		// Completing broadcasts the close our closing_complete signed. That one
+		// is only sent on an empty channel and nothing can enter a channel in
+		// NEGOTIATING_CLOSING, so it takes a row from before the gate existed
+		// to get here with something unresolved; the check keeps the stages
+		// uniform, as the hold check above does.
+		const sigBlockedBy = this.closingBlockedBy();
+		if (sigBlockedBy !== null) {
+			return err(`Unexpected closing_sig: ${sigBlockedBy}`);
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {
@@ -9101,7 +9593,10 @@ export class Channel {
 		this._quiescence.reset();
 		this._stfuReplyOwed = false;
 		this._fforStfuReplyStale = false;
+		this._fforHolding = false;
 		this._fforHeldReplay = [];
+		this._fforReleasedStream = null;
+		this._fforReconnectWanted = false;
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 
@@ -10794,20 +11289,75 @@ export class Channel {
 			this._state.spliceInFlight?.sentTxSignatures === true &&
 			this._state.spliceInFlight?.receivedTxSignatures === true;
 
+		// FFOR: replace unsigned voucher fails before reconnect replay.
+		// A signed fail remains covered by its original signature (issue #1308).
+		if (!spliceActive) {
+			this._fforWithdrawFailsAtReestablish();
+		}
+
 		// ── Retransmit un-acked update messages (BOLT 2) ──
 		// Every queued update the peer has not acknowledged with a
 		// revoke_and_ack may have been lost with the connection (the peer
 		// forgets uncommitted updates; a restarted peer restores a state that
-		// may predate them). Replay them verbatim BEFORE any retransmitted
-		// commitment_signed so the signature always follows the updates it
-		// covers. Peers that did keep them treat the replays idempotently
+		// may predate them). Replay them verbatim, in the order they were
+		// sent. Peers that did keep them treat the replays idempotently
 		// (duplicate add ids ignored; fulfill/fail of an already
 		// fulfilled/failed HTLC is a no-op).
+		//
+		// A retransmitted commitment_signed must follow exactly the updates it
+		// covers (issue #1300). The queue's first pendingLocalUpdatesSignedCount
+		// entries are the ones our last commitment_signed covered; anything
+		// behind them was sent after it, while its revoke_and_ack was still
+		// outstanding. Replayed ahead of that signature, a later update lands
+		// in the view the peer verifies the signature against, and the peer
+		// fails the channel on a signature that was never wrong. So when the
+		// peer missed the signature the later updates are held back here and
+		// go out after it (and after any revoke_and_ack retransmitted behind
+		// it), which is where they sat on the original connection. They stay
+		// queued and needsCommitment stays set, so our NEXT signature covers
+		// them once the peer's revoke_and_ack for this one arrives. With no
+		// signature to retransmit the whole queue goes out here, as before.
+		const peerMissedCommitment =
+			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
+			this._state.remoteCommitmentNumber > 0n;
+		const laterUpdates: ChannelAction[] = [];
 		if (!spliceActive || pendingLock) {
-			for (const update of this._state.pendingLocalUpdates) {
-				actions.push(replayMsg(update.type as MessageType, update.payload));
+			const queue = this._state.pendingLocalUpdates;
+			const signedCount = this._state.pendingLocalUpdatesSignedCount;
+			const peerHasCommitment =
+				msg.nextCommitmentNumber === this._state.remoteCommitmentNumber + 1n;
+			// A count that is not a number names no boundary: everything stays
+			// ahead of the signature, as it did before the boundary was read.
+			const covered =
+				peerMissedCommitment && Number.isInteger(signedCount)
+					? Math.min(Math.max(signedCount, 0), queue.length)
+					: queue.length;
+			for (let i = 0; i < queue.length; i++) {
+				const update = queue[i];
+				// A fee already covered by the commitment the peer holds must not
+				// start another fee round on replay. The lost revoke_and_ack will
+				// acknowledge it; unsigned updates and a missing commitment still
+				// need their original replay.
+				if (
+					peerHasCommitment &&
+					Number.isInteger(signedCount) &&
+					i < signedCount &&
+					update.type === MessageType.UPDATE_FEE
+				) {
+					continue;
+				}
+				const replay = replayMsg(update.type as MessageType, update.payload);
+				if (i < covered) {
+					actions.push(replay);
+				} else {
+					laterUpdates.push(replay);
+				}
 			}
 		}
+		// Position of the commitment_signed retransmission, if one is made
+		// below: the later updates only wait for a signature that actually
+		// leaves.
+		const beforeCommitmentRetransmit = actions.length;
 
 		// ── Retransmit our pending-lock commitment BATCH if the peer missed it ──
 		// The generic single-message path below can't: it holds neither the
@@ -10921,8 +11471,25 @@ export class Channel {
 			}
 		}
 
+		// No commitment_signed was retransmitted after all (nothing cached to
+		// replay, or a batch that could not be rebuilt): the later updates take
+		// the place they always had, ahead of a deferred revoke_and_ack.
+		const commitmentRetransmitted = actions.length > beforeCommitmentRetransmit;
+		if (!commitmentRetransmitted) {
+			actions.push(...laterUpdates);
+		}
+
 		// Deferred revoke_and_ack (original order: commitment_signed first).
 		actions.push(...revokeRetransmit);
+
+		// Updates sent after the retransmitted commitment_signed. Behind the
+		// deferred revoke_and_ack too: nothing the peer does with a
+		// revoke_and_ack depends on an update of ours, while a later settle can
+		// depend on the revoke_and_ack (the peer refuses a settle of an HTLC
+		// whose add we have not revoked for).
+		if (commitmentRetransmitted) {
+			actions.push(...laterUpdates);
+		}
 
 		// option_taproot: adopt the peer's freshly-regenerated verification nonce so
 		// the next commitment round can co-sign (the peer's old nonce was lost on its
@@ -10942,6 +11509,21 @@ export class Channel {
 		) {
 			this._state.state = this._state.preReestablishState;
 			this._state.preReestablishState = null;
+			// A row in NEGOTIATING_CLOSING that is not empty goes back to
+			// SHUTTING_DOWN (issue #1307). Rows written before the close path
+			// waited for removals can be in that state with an HTLC entry still
+			// on them, and NEGOTIATING_CLOSING refuses every message the replay
+			// above needs answered (update_fulfill_htlc, update_fail_htlc,
+			// commitment_signed, revoke_and_ack), so the removal could never
+			// finish and no signing stage would ever pass its gate. Back in
+			// SHUTTING_DOWN the round completes and
+			// beginClosingNegotiationIfReady starts the negotiation again.
+			if (
+				this._state.state === ChannelState.NEGOTIATING_CLOSING &&
+				this.closingBlockedBy() !== null
+			) {
+				this._state.state = ChannelState.SHUTTING_DOWN;
+			}
 		}
 
 		// ── Interactive-tx resumption ──
@@ -10957,21 +11539,49 @@ export class Channel {
 		}
 
 		// ── FFOR section 7.5.5 retransmission rules ──
-		actions.push(...this._handleReestablishFfor(msg));
+		// A reestablish decides the hold afresh, from a clean set. A peer may
+		// send a second channel_reestablish on a connection we are already
+		// holding on (two of our nodes never do), and the answer above is
+		// then the whole retransmission again: appended to the chain of the
+		// first, the release would send everything twice. Nothing in the old
+		// chain needs keeping. Whatever joined it after the first reestablish
+		// advanced the channel's state as if it had been sent, so the answer
+		// above reproduces it for the numbers the peer now reports: an update
+		// of ours from pendingLocalUpdates, a commitment_signed signed while
+		// holding from the retransmission cache, a revoke_and_ack likewise.
+		this._fforHolding = false;
+		this._fforHeldReplay = [];
+		this._fforReleasedStream = null;
+		const fforActions = this._handleReestablishFfor(msg);
+		if (this._fforAckLeadsReplay(fforActions)) {
+			// A concurrent S that owes R its ff_activate_ack again may also
+			// hold ordinary updates it sent after activating. R is still
+			// ACTIVATING until the ack arrives and fails the channel on any
+			// update before it, so the ack leaves ahead of every BOLT 2
+			// retransmission. A baseline S has nothing to retransmit here.
+			actions = [...fforActions, ...actions];
+		} else {
+			actions.push(...fforActions);
+		}
 		if (this._fforShouldHoldDrain(msg)) {
 			// R in DRAINING facing an S that does not hold ff_close: the drain's
 			// fulfils, fails and commitment_signed would land in S's ACTIVE
 			// freeze. Hold them; handleFforCloseAck releases them.
-			const held = actions.filter(
-				(a) =>
-					a.type === ChannelActionType.SEND_MESSAGE &&
-					(a.messageType === MessageType.UPDATE_FULFILL_HTLC ||
-						a.messageType === MessageType.UPDATE_FAIL_HTLC ||
-						a.messageType === MessageType.COMMITMENT_SIGNED ||
-						a.messageType === MessageType.REVOKE_AND_ACK)
-			);
-			this._fforHeldReplay = held;
-			actions = actions.filter((a) => !held.includes(a));
+			//
+			// A concurrent epoch holds only when a voucher fail is queued (S,
+			// still ACTIVE, fails the channel on one), and then holds the
+			// whole retransmission chain in its order, ordinary updates
+			// included: the commitment_signed that covers the fail covers
+			// them too.
+			//
+			// From here until the release the channel is NORMAL again, and
+			// whatever it sends next (a settle, the revoke_and_ack that
+			// answers the peer's commitment_signed, a fresh commitment_signed)
+			// was made after the chain and must reach the peer after it.
+			// fforHoldStream keeps that order for this batch and for every
+			// later one.
+			this._fforHolding = true;
+			actions = this.fforHoldStream(actions);
 		}
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
@@ -11081,7 +11691,17 @@ export class Channel {
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
 		// disk.
-		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+		//
+		// A capability hold a reestablish set or lifted is written too, even
+		// when nothing is sent (CONCURRENT-RECEIVE.md section 8: the hold
+		// lasts until a compatible init, so it must outlive this process).
+		// The marker is not consumed here: the write may fail, and then the
+		// record in memory already carries the change and no later
+		// reestablish would see one. It stands until a write lands.
+		if (
+			this._fforCapabilityHoldUnsaved ||
+			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 
@@ -11270,7 +11890,9 @@ export class Channel {
 
 		// FFOR section 7.5.5: no stfu, splice or close negotiation while the
 		// epoch is live, except the one that carries ff_activate.
-		const fforStfuRefusal = this._fforUpdateRefusal('stfu');
+		const fforStfuRefusal = this._fforUpdateRefusal('stfu', {
+			origin: 'local'
+		});
 		if (fforStfuRefusal) {
 			return [
 				{
@@ -11356,7 +11978,9 @@ export class Channel {
 
 		// FFOR section 7.5.5: a peer stfu under the epoch freeze is a protocol
 		// error; R's own activation stfu is the exception the flag names.
-		const fforPeerStfuRefusal = this._fforUpdateRefusal('stfu');
+		const fforPeerStfuRefusal = this._fforUpdateRefusal('stfu', {
+			origin: 'peer'
+		});
 		if (fforPeerStfuRefusal) {
 			return this._failChannelWithWireError(fforPeerStfuRefusal);
 		}
@@ -11563,7 +12187,9 @@ export class Channel {
 	 * stops reporting.
 	 */
 	spliceBusyReason(): string | null {
-		const fforSpliceBusy = this._fforUpdateRefusal('splice');
+		const fforSpliceBusy = this._fforUpdateRefusal('splice', {
+			origin: 'local'
+		});
 		if (fforSpliceBusy) return fforSpliceBusy;
 		if (this._state.state !== ChannelState.NORMAL) {
 			// A disconnect wraps a NORMAL channel in AWAITING_REESTABLISH and
@@ -11616,7 +12242,9 @@ export class Channel {
 		locktime = 0
 	): ChannelAction[] {
 		// FFOR section 7.5.5: no splice while the epoch is live.
-		const fforSpliceRefusal = this._fforUpdateRefusal('splice');
+		const fforSpliceRefusal = this._fforUpdateRefusal('splice', {
+			origin: 'local'
+		});
 		if (fforSpliceRefusal) {
 			return [
 				{
@@ -11994,7 +12622,9 @@ export class Channel {
 			];
 		}
 		// FFOR section 7.5.5: no splice while the epoch is live.
-		const fforPeerSpliceRefusal = this._fforUpdateRefusal('splice');
+		const fforPeerSpliceRefusal = this._fforUpdateRefusal('splice', {
+			origin: 'peer'
+		});
 		if (fforPeerSpliceRefusal) {
 			return this._failChannelWithWireError(fforPeerSpliceRefusal);
 		}
@@ -13648,8 +14278,10 @@ export class Channel {
 		}
 		// When the peer funds, its commitment fee bounds what we may add too
 		// (issue #1020): fold the mirror in so the router never offers a
-		// channel whose add _remoteFunderFeeRefusal then refuses.
-		return this._remoteFunderCeilingMsat(own);
+		// channel whose add _remoteFunderFeeRefusal then refuses. The same
+		// for the buffer a live concurrent voucher book adds on top
+		// (_fforMixedBufferRefusal); unchanged when there is none.
+		return this._fforMixedBufferCeilingMsat(this._remoteFunderCeilingMsat(own));
 	}
 
 	/**
@@ -13902,7 +14534,7 @@ export class Channel {
 	 * and the adds cannot happen inside one synchronous drive.
 	 */
 	canOfferHtlcSet(amounts: bigint[]): boolean {
-		if (amounts.length > 0 && this._fforUpdateRefusal('add')) return false;
+		if (amounts.length > 0 && this._fforLocalAddRefusal()) return false;
 		if (amounts.length === 0) return true;
 		if (this._state.restoreRevokedRisk === true) return false;
 		if (
@@ -13936,6 +14568,16 @@ export class Channel {
 		if (sum > this.getSpendableOutboundMsat()) return false;
 		if (this._remoteFunderFeeRefusal(amounts)) return false;
 		if (
+			this._fforMixedBufferRefusal(
+				amounts.map((amountMsat) => ({
+					amountMsat,
+					direction: HtlcDirection.OFFERED
+				}))
+			)
+		) {
+			return false;
+		}
+		if (
 			dust > 0n &&
 			this._dustExposureMsat() + dust > Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
 		) {
@@ -13944,8 +14586,21 @@ export class Channel {
 		return true;
 	}
 
-	acceptsNewHtlcs(lookThroughReestablish = false, reservationHint = false): boolean {
-		if (!reservationHint && this._fforUpdateRefusal('add')) return false;
+	acceptsNewHtlcs(
+		lookThroughReestablish = false,
+		reservationHint = false
+	): boolean {
+		// The reservation hint describes a frozen channel for a voucher
+		// invoice, which names S through it while the epoch is ACTIVE. No
+		// voucher invoice exists before ACTIVE and a setup may still abort,
+		// so the setup barrier answers the hint as it answers everything else.
+		if (this._fforSetupAddRefusal()) return false;
+		if (
+			!reservationHint &&
+			this._fforUpdateRefusal('add', { origin: 'local' })
+		) {
+			return false;
+		}
 		if (this._state.restoreRevokedRisk === true) return false;
 		if (isRecencyUnproven(this._state)) return false;
 		if (this._state.fundingUnaccounted === true) return false;
@@ -14929,6 +15584,14 @@ export class Channel {
 			fields.lastSignedCommitLeaseBlockheight =
 				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
 				getLocalCommitmentLeaseBlockheight(adopted);
+			// signedLocalRemovals is deliberately carried over (issue #1291).
+			// A splice-side signature from a commitment batch covers the same
+			// HTLC set as the current-funding one it arrived with, kept
+			// removals included, so clearing here would close the exit a
+			// window opened during pending-lock still needs. One taken from the
+			// splice's first commitment exchange may predate or postdate the
+			// list; prepareForceClose settles that against the signature itself,
+			// entry by entry (_fallbackCloseViews).
 		} else {
 			fields.needsCommitment = true;
 		}
@@ -15026,6 +15689,79 @@ export class Channel {
 		this._quiescence.exitQuiescence();
 		this._spliceSession = null;
 		this._resetSpliceDriver();
+	}
+
+	/**
+	 * BOLT 2 gate for closing negotiation: what still stands between this
+	 * channel and an empty one, or null when nothing does (issue #1307).
+	 *
+	 * "Once shutdown is complete, the channel is empty of HTLCs, there are no
+	 * commitments for which a revocation is owed, and all updates are included
+	 * on both commitments, ... closing fee negotiation begins." The closing
+	 * transaction pays the two balances and nothing else, so whatever is on
+	 * neither balance when a close is signed goes to the miners.
+	 *
+	 * 'pending HTLCs':
+	 *  - any entry in the HTLC map, in any state. An entry leaves the map only
+	 *    when its removal is irrevocably committed by the peer, and only then
+	 *    is its amount credited. A FULFILLED or FAILED entry is therefore as
+	 *    unresolved as a live one: debited from the offerer, credited to
+	 *    nobody. countPendingHtlcs, which the close path used to ask, sees
+	 *    PENDING and COMMITTED only.
+	 *  - a received removal the peer has revoked for and not yet signed out of
+	 *    our commitment (signedLocalRemovals, issue #1291). Its amount is
+	 *    settled; what is outstanding is the peer's commitment_signed and our
+	 *    revoke_and_ack for it, which the peer waits for before it is empty.
+	 *
+	 * 'pending updates':
+	 *  - a signature we owe, a commitment of ours the peer has not revoked
+	 *    for, an update of ours it has not acknowledged, a batch half
+	 *    collected;
+	 *  - a staged update_fee or update_blockheight, including its last leg:
+	 *    once the peer's revoke_and_ack has promoted our own, the peer still
+	 *    owes us the commitment_signed at the new value, and the commitment
+	 *    we hold is signed at the old one until it arrives.
+	 *
+	 * Every close-path gate asks this and nothing narrower: handleShutdown,
+	 * beginClosingNegotiationIfReady, proposeClosingFee, handleClosingSigned,
+	 * sendClosingComplete, handleClosingComplete, handleClosingSig, and the
+	 * reestablish restore of a NEGOTIATING_CLOSING row. It is also wider than
+	 * hasPendingHtlcs below (the quiescence gate), for which a fully committed
+	 * live HTLC is not pending.
+	 */
+	closingBlockedBy(): 'pending HTLCs' | 'pending updates' | null {
+		if (this._state.htlcs.size > 0) return 'pending HTLCs';
+		if ((this._state.signedLocalRemovals?.length ?? 0) > 0) {
+			return 'pending HTLCs';
+		}
+		if (
+			this.needsCommitment() ||
+			this.isAwaitingRemoteRevocation() ||
+			(this._state.pendingLocalUpdates?.length ?? 0) > 0 ||
+			this._pendingBatch !== null ||
+			this._state.pendingFeeratePerKw !== undefined ||
+			this._state.awaitingLocalFeeCommitment === true ||
+			this._state.pendingLeaseBlockheight !== undefined
+		) {
+			return 'pending updates';
+		}
+		// The last leg of our own fee or blockheight round. Rows written before
+		// the signed values were recorded have nothing to compare.
+		if (
+			this._state.lastSignedCommitFeeratePerKw !== undefined &&
+			this._state.lastSignedCommitFeeratePerKw !==
+				getLocalCommitmentFeeRate(this._state)
+		) {
+			return 'pending updates';
+		}
+		if (
+			this._state.lastSignedCommitLeaseBlockheight !== undefined &&
+			this._state.lastSignedCommitLeaseBlockheight !==
+				getLocalCommitmentLeaseBlockheight(this._state)
+		) {
+			return 'pending updates';
+		}
+		return null;
 	}
 
 	/**
@@ -22364,35 +23100,152 @@ export class Channel {
 	/**
 	 * Section 7.5.5: from ACTIVATING on, no ordinary update from either side;
 	 * DRAINING admits only the voucher fulfils and fails and their rounds.
+	 * A concurrent epoch (CONCURRENT-RECEIVE.md section 3) is frozen only
+	 * while ACTIVATING: ACTIVE and DRAINING carry ordinary traffic.
 	 */
 	fforIsFrozen(): boolean {
 		const f = this._fforLive();
+		if (f === null) return false;
+		if (this._fforIsConcurrent(f)) return f.state === FforState.ACTIVATING;
 		return (
-			f !== null &&
-			(f.state === FforState.ACTIVATING ||
-				f.state === FforState.ACTIVE ||
-				f.state === FforState.DRAINING)
+			f.state === FforState.ACTIVATING ||
+			f.state === FforState.ACTIVE ||
+			f.state === FforState.DRAINING
+		);
+	}
+
+	/**
+	 * Whether the epoch selected concurrent receive version 1
+	 * (CONCURRENT-RECEIVE.md section 1.1). Read from the record alone: the
+	 * selection is persisted with the transcript and never inferred from
+	 * what a connection advertises.
+	 */
+	private _fforIsConcurrent(f: IFforEpochRecord): boolean {
+		return isFforConcurrentVersion(f.concurrentVersion);
+	}
+
+	/**
+	 * Concurrent receive (CONCURRENT-RECEIVE.md section 8): record whether
+	 * the connection this reestablish runs on negotiated the base and
+	 * concurrent capabilities. Called by the manager from the current init
+	 * exchange immediately before handleReestablish, on every reestablish.
+	 * An incompatible one holds new admission of a live concurrent epoch
+	 * (IFforEpochRecord.capabilityHold); a later compatible one lifts the
+	 * hold. Nothing else writes it, and handleReestablish persists a change.
+	 */
+	setFforCapabilities(concurrentNegotiated: boolean): void {
+		const f = this._state.ffor;
+		if (!f) return;
+		const live = this._fforLive();
+		const hold =
+			live !== null && this._fforIsConcurrent(live) && !concurrentNegotiated;
+		if ((f.capabilityHold === true) === hold) return;
+		if (hold) {
+			f.capabilityHold = true;
+		} else {
+			delete f.capabilityHold;
+		}
+		this._fforCapabilityHoldUnsaved = true;
+	}
+
+	/**
+	 * Why a concurrent ACTIVE or DRAINING epoch takes no NEW work of ours
+	 * right now (an ordinary add, a delegated settlement, an invoice), or
+	 * null. Existing obligations are never held by this.
+	 */
+	fforAdmissionHold(): string | null {
+		const f = this._fforLive();
+		if (!f || !this._fforIsConcurrent(f)) return null;
+		if (f.state !== FforState.ACTIVE && f.state !== FforState.DRAINING) {
+			return null;
+		}
+		if (f.activationMismatch) {
+			return 'the epoch is in dispute';
+		}
+		if (this._fforHolding) {
+			// CONCURRENT-RECEIVE.md section 3: a close transition may briefly
+			// serialize new ordinary adds. This one waits for the peer's
+			// ff_close_ack, which may never come on this connection, so a new
+			// add is refused rather than parked behind the chain.
+			return 'the close of the voucher book is being recovered with the peer';
+		}
+		if (f.capabilityHold === true) {
+			return 'the peer did not advertise option_ff_receive and option_ff_concurrent on this connection';
+		}
+		return null;
+	}
+
+	/**
+	 * The setup admission barrier: the refusal an add of OURS earns while the
+	 * epoch is NEGOTIATING or VOUCHERS_COMMITTED, or null.
+	 *
+	 * Setup starts on an idle channel (section 9.5.1 step 1) and the
+	 * activation binds the commitments the voucher round leaves. An ordinary
+	 * add interleaved with that round rides into the epoch under the freeze
+	 * when it is dust (step 5 counts outputs), fails the count when it is
+	 * not, and either way moves the commitment numbers ff_accept and
+	 * ff_activate bind (issue #1289). So from the first setup message only
+	 * the epoch's own voucher adds pass, until the epoch is ACTIVATING (the
+	 * section 7.5.5 freeze takes over) or ABORTED or CLOSED (nothing is
+	 * refused).
+	 *
+	 * Local only, and adds only. The peer's adds are not judged here: R must
+	 * take S's vouchers, and a stray one fails the round as before. Settles,
+	 * commitments and revocations are not judged either, so whatever is on
+	 * the channel can still be finished.
+	 */
+	private _fforSetupAddRefusal(): string | null {
+		const f = this._fforLive();
+		if (!f) return null;
+		if (
+			f.state !== FforState.NEGOTIATING &&
+			f.state !== FforState.VOUCHERS_COMMITTED
+		) {
+			return null;
+		}
+		// The epoch's own vouchers, which S offers while NEGOTIATING.
+		if (f.state === FforState.NEGOTIATING && this._fforInternalAdd) {
+			return null;
+		}
+		return `FFOR epoch is ${
+			FforState[f.state]
+		}: no ordinary add while the setup runs`;
+	}
+
+	/** What refuses an add of ours: the setup barrier, then the epoch freeze. */
+	private _fforLocalAddRefusal(): string | null {
+		return (
+			this._fforSetupAddRefusal() ??
+			this._fforUpdateRefusal('add', { origin: 'local' })
 		);
 	}
 
 	/**
 	 * The refusal an ordinary channel operation earns under the epoch
-	 * freeze, or null. `htlcId` names the S-offered id a settle targets: in
-	 * DRAINING the vouchers' own fulfils and fails are the drain and pass.
+	 * freeze, or null. `ctx.settle` names the HTLC a settle targets, by its
+	 * id and its direction on this side: in DRAINING the vouchers' own
+	 * fulfils and fails are the drain and pass.
+	 *
+	 * A baseline epoch (no selected concurrent version) is judged by the
+	 * rules of base section 7.5.5 below, which read neither the origin nor
+	 * whether a settle fulfils or fails. An epoch that selected concurrent
+	 * receive is judged by _fforConcurrentRefusal instead.
 	 */
+	fforCommitmentRefusal(): string | null {
+		return this._fforUpdateRefusal('commit', { origin: 'local' });
+	}
+
 	private _fforUpdateRefusal(
-		kind:
-			| 'add'
-			| 'settle'
-			| 'fee'
-			| 'blockheight'
-			| 'commit'
-			| 'stfu'
-			| 'shutdown'
-			| 'splice',
-		htlcId?: bigint
+		kind: FforUpdateKind,
+		ctx: IFforUpdateContext
 	): string | null {
 		const any = this._state.ffor;
+		if (any?.concurrentVersionMismatch)
+			return 'FFOR: stored concurrent version is unsupported or inconsistent';
+		if (any && this._fforIsConcurrent(any)) {
+			return this._fforConcurrentRefusal(any, kind, ctx);
+		}
+		const settle = ctx.settle;
 		// Section 9.5.1 step 3: a parked voucher is fulfilled or failed only by
 		// the epoch's own drain or unwind, in every state before CLOSED.
 		if (
@@ -22400,11 +23253,11 @@ export class Channel {
 			any.role === 'R' &&
 			any.state !== FforState.CLOSED &&
 			kind === 'settle' &&
-			htlcId !== undefined &&
+			settle !== undefined &&
 			!this._fforInternalSettle &&
-			this._fforVoucherEntry(any, htlcId) !== undefined
+			this._fforVoucherEntry(any, settle.id, settle.direction) !== undefined
 		) {
-			return `FFOR voucher ${htlcId} is parked: only the epoch's drain or unwind settles it`;
+			return `FFOR voucher ${settle.id} is parked: only the epoch's drain or unwind settles it`;
 		}
 		const f = this._fforLive();
 		if (!f) return null;
@@ -22416,8 +23269,8 @@ export class Channel {
 			// vouchers and the commitment rounds they need, nothing else.
 			if (
 				kind === 'settle' &&
-				htlcId !== undefined &&
-				this._fforVoucherEntry(f, htlcId) !== undefined
+				settle !== undefined &&
+				this._fforVoucherEntry(f, settle.id, settle.direction) !== undefined
 			) {
 				return null;
 			}
@@ -22425,6 +23278,488 @@ export class Channel {
 			return `FFOR epoch is DRAINING: only the voucher drain may ${kind}`;
 		}
 		return null;
+	}
+
+	/**
+	 * _fforUpdateRefusal for an epoch that selected concurrent receive
+	 * version 1 (CONCURRENT-RECEIVE.md sections 1.2, 3, 6 and 7). The
+	 * decision table, by epoch state:
+	 *
+	 *   NEGOTIATING, VOUCHERS_COMMITTED: nothing is refused here (our own
+	 *     ordinary adds meet the setup barrier, _fforSetupAddRefusal).
+	 *   ACTIVATING: everything is refused. The channel is quiescent and the
+	 *     activation binds the commitments as they stand.
+	 *   ACTIVE, DRAINING: ordinary adds, fulfils and fails and the
+	 *     commitment rounds they need pass, in both directions. Our own add
+	 *     is refused under an admission hold (fforAdmissionHold); the
+	 *     peer's is not. Our own add and settle are refused on S until its
+	 *     ff_activate_ack has left (_fforActivateAckUnsent), and our own
+	 *     settle on R while a disputed close keeps its chain held.
+	 *     update_fee, update_blockheight, a new stfu, splice and cooperative
+	 *     close stay refused: version 1 keeps the setup feerate and the
+	 *     funding until the book closes.
+	 *   ABORTED, CLOSED: nothing is refused.
+	 *
+	 * A settle that names a voucher is judged separately, in every state
+	 * before CLOSED (_fforConcurrentVoucherRefusal).
+	 *
+	 * Refused means a local ERROR for an operation of ours and a wire
+	 * failure for the peer's, as in baseline: the caller decides which.
+	 */
+	private _fforConcurrentRefusal(
+		f: IFforEpochRecord,
+		kind: FforUpdateKind,
+		ctx: IFforUpdateContext
+	): string | null {
+		if (f.state === FforState.CLOSED) return null;
+		if (kind === 'settle' && ctx.settle !== undefined) {
+			const voucher = this._fforVoucherEntry(
+				f,
+				ctx.settle.id,
+				ctx.settle.direction
+			);
+			if (voucher !== undefined) {
+				return this._fforConcurrentVoucherRefusal(f, ctx.settle, ctx.origin);
+			}
+		}
+		switch (f.state) {
+			case FforState.ACTIVATING:
+				return `FFOR epoch is ACTIVATING: no ${kind} until the activation is acknowledged`;
+			case FforState.ACTIVE:
+			case FforState.DRAINING:
+				// S, whose ff_activate_ack has not left: R is ACTIVATING and
+				// quiescent until it arrives, and fails the channel on an
+				// update. Nothing of ours is originated before the ack.
+				if (
+					ctx.origin === 'local' &&
+					(kind === 'add' || kind === 'settle') &&
+					f.role === 'S' &&
+					f.state === FforState.ACTIVE &&
+					this._fforActivateAckUnsent
+				) {
+					return `FFOR epoch is ACTIVE: no ${kind} until ff_activate_ack has been sent`;
+				}
+				switch (kind) {
+					case 'add': {
+						// Section 8: an incompatible reconnect holds NEW
+						// admission of ours and nothing else. The peer's add is
+						// its own origination, judged by its own hold.
+						if (ctx.origin !== 'local') return null;
+						const hold = this.fforAdmissionHold();
+						return hold === null
+							? null
+							: `FFOR epoch is ${FforState[f.state]}: no new add while ${hold}`;
+					}
+					case 'settle':
+						// A disputed close keeps the chain held for the rest of
+						// the connection (handleFforCloseAck), so a settle of
+						// ours could only wait behind it for the reconnect.
+						// Refused as it is while awaiting reestablish, and for
+						// the same remedy: the caller keeps what it owes and
+						// settles when the channel has reestablished, which
+						// the dispute asked for as it was recorded
+						// (_fforReconnectWanted). The peer's settle is taken,
+						// and answered behind the chain.
+						if (
+							ctx.origin === 'local' &&
+							this._fforHolding &&
+							f.activationMismatch
+						) {
+							return `FFOR epoch is ${
+								FforState[f.state]
+							}: no settle until the channel reestablishes, the close is in dispute and its retransmissions are held`;
+						}
+						return null;
+					case 'commit':
+						return null;
+					default:
+						return `FFOR epoch is ${
+							FforState[f.state]
+						}: no ${kind} while the voucher book is live`;
+				}
+			default:
+				return null;
+		}
+	}
+
+	/**
+	 * A settle of a voucher under a concurrent epoch. The vouchers are HTLCs
+	 * S offered, so only R settles one (a local operation there) and only S
+	 * hears of it (a peer message there).
+	 *
+	 * R, our own settle. A voucher is parked (base section 9.5.1 step 3):
+	 *   - before ACTIVE, never;
+	 *   - ACTIVE: a fulfil only from the epoch's own redemption, with a
+	 *     preimage it has verified (CONCURRENT-RECEIVE.md section 6); a fail
+	 *     never, since only the final close authorizes one (section 7);
+	 *   - DRAINING: a fulfil from the epoch's drain; a fail from the drain,
+	 *     and only for a slot the ff_close_ack marks unsettled for which no
+	 *     preimage is held (base section 7.5.6);
+	 *   - ABORTED: only the epoch's unwind.
+	 * Three node paths reach a voucher from outside the epoch and stay
+	 * refused in every state: a preimage learned on chain, the expiry
+	 * scanner's off-chain fail, and the restart fulfil of a settled payment.
+	 *
+	 * S, the peer's settle:
+	 *   - a fulfil is accepted in ACTIVE and DRAINING whatever S's own slot
+	 *     accounting says: the preimage is the claim (section 6), and the
+	 *     stock handler checks it against the HTLC. Before ACTIVE it is a
+	 *     violation, since no t_k has left S;
+	 *   - a fail is the abort unwind before ACTIVE and the drain in
+	 *     DRAINING. In ACTIVE it is a violation: S keeps its commitments,
+	 *     which carry the voucher, so R's claim stays enforceable on chain.
+	 */
+	private _fforConcurrentVoucherRefusal(
+		f: IFforEpochRecord,
+		settle: { id: bigint; direction: HtlcDirection; op: 'fulfill' | 'fail' },
+		origin: 'local' | 'peer'
+	): string | null {
+		const id = settle.id;
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			(f.state === FforState.ACTIVE || f.state === FforState.DRAINING) &&
+			settle.op === 'fail'
+		) {
+			return `FFOR voucher ${id} remains reserved until its claim is resolved`;
+		}
+		const parked = `FFOR voucher ${id} is parked: only the epoch's own drain, redemption or unwind settles it`;
+		if (f.role === 'R') {
+			// The vouchers are received on R: a peer settle never names one.
+			if (origin !== 'local' || !this._fforInternalSettle) return parked;
+			switch (f.state) {
+				case FforState.ABORTED:
+					return null;
+				case FforState.ACTIVE:
+					return settle.op === 'fulfill'
+						? null
+						: `FFOR voucher ${id} cannot be failed while the epoch is ACTIVE: only the final close authorizes a fail`;
+				case FforState.DRAINING: {
+					if (settle.op === 'fulfill') return null;
+					const k = Number(id - (f.sHtlcIdBase ?? 0n)) + 1;
+					if (f.knownPreimages[k - 1]) {
+						return `FFOR voucher ${id} is not failed: its preimage is held`;
+					}
+					if (!f.settledBitmap || bitmapGet(f.settledBitmap, k)) {
+						return `FFOR voucher ${id} is not failed: the close acknowledgement does not mark it unsettled`;
+					}
+					return null;
+				}
+				default:
+					return parked;
+			}
+		}
+		// S: the vouchers are offered here, so a settle of ours cannot name
+		// one off chain at all.
+		if (origin !== 'peer') {
+			return `FFOR voucher ${id} is settled by the receiver, not by us`;
+		}
+		switch (f.state) {
+			case FforState.NEGOTIATING:
+			case FforState.VOUCHERS_COMMITTED:
+				return settle.op === 'fulfill'
+					? `FFOR voucher ${id} fulfilled before the epoch is ACTIVE`
+					: null;
+			case FforState.ACTIVATING:
+				return `FFOR epoch is ACTIVATING: no settle until the activation is acknowledged`;
+			case FforState.ACTIVE:
+				return settle.op === 'fulfill'
+					? null
+					: `FFOR voucher ${id} failed while the epoch is ACTIVE: only the final close authorizes a fail`;
+			default:
+				// DRAINING: the drain. ABORTED: the unwind.
+				return null;
+		}
+	}
+
+	/**
+	 * The voucher-subset invariant (CONCURRENT-RECEIVE.md section 4): every
+	 * commitment of a concurrent ACTIVE or DRAINING epoch preserves each
+	 * unresolved voucher's direction, id, hash, amount and expiry. Returns
+	 * why the commitment about to be signed (`remote`) or accepted (`local`)
+	 * does not, or null.
+	 *
+	 * For every slot it requires the keyed entry (received on R, offered on
+	 * S) to exist as a voucher with the book's tuple, unless the slot may be
+	 * absent (_fforSlotMayBeAbsent); and it requires the built commitment to
+	 * carry, for every such entry with no removal in flight, an untrimmed
+	 * output of that direction, hash, amount and expiry. Ordinary HTLCs may
+	 * sit beside them: this is a subset rule, not the exact count the
+	 * activation checks.
+	 *
+	 * Both builders read the same HTLC map, so this cannot be failed by a
+	 * peer: it is an assertion over our own state, catching a local fault or
+	 * a trimmed voucher before a signature or a revocation makes it
+	 * permanent. A refusal fails the channel on the wire with nothing signed,
+	 * stored or revoked, so the commitments we hold still carry the vouchers.
+	 */
+	private _fforVoucherSubsetRefusal(
+		view: 'local' | 'remote',
+		perCommitmentPoint: Buffer,
+		commitmentNumber: bigint
+	): string | null {
+		const f = this._fforLive();
+		if (!f || !this._fforIsConcurrent(f)) return null;
+		if (f.state !== FforState.ACTIVE && f.state !== FforState.DRAINING) {
+			return null;
+		}
+		const direction =
+			f.role === 'R' ? HtlcDirection.RECEIVED : HtlcDirection.OFFERED;
+		const tuple = (hash: Buffer, amountSat: bigint, expiry: number): string =>
+			`${hash.toString('hex')}:${amountSat}:${expiry}`;
+		const required = new Map<string, number>();
+		for (const slot of this._fforBook(f)) {
+			const entry = this._state.htlcs.get(this._fforVoucherKey(f, slot.k));
+			if (!entry || entry.fforVoucher !== true) {
+				if (this._fforSlotMayBeAbsent(f, slot.k)) continue;
+				return `FFOR voucher ${slot.k} is unresolved and missing from the channel`;
+			}
+			if (
+				entry.direction !== direction ||
+				entry.id !== slot.sHtlcId ||
+				!entry.paymentHash.equals(slot.paymentHash) ||
+				entry.amountMsat !== slot.amountMsat ||
+				entry.cltvExpiry !== slot.voucherExpiry
+			) {
+				return `FFOR voucher ${slot.k} no longer matches the book`;
+			}
+			if (
+				f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+				entry.state === HtlcState.FAILED
+			) {
+				return `FFOR voucher ${slot.k} cannot be cancelled while its claim is reserved`;
+			}
+			// A fulfil or fail in flight is the authorized transition: the
+			// output may already be gone from this view.
+			if (entry.state !== HtlcState.COMMITTED) continue;
+			const key = tuple(
+				slot.paymentHash,
+				slot.amountMsat / 1000n,
+				slot.voucherExpiry
+			);
+			required.set(key, (required.get(key) ?? 0) + 1);
+		}
+		if (required.size === 0) return null;
+		let built: IBuiltCommitment;
+		try {
+			built =
+				view === 'local'
+					? buildLocalCommitment(
+							this._state,
+							perCommitmentPoint,
+							commitmentNumber
+					  )
+					: buildRemoteCommitment(
+							this._state,
+							perCommitmentPoint,
+							commitmentNumber
+					  );
+		} catch {
+			// Unbuildable here is unbuildable at the signing or verifying step
+			// beside this one, which answers with its own reason.
+			return null;
+		}
+		const carried = new Map<string, number>();
+		for (const out of built.htlcOutputs) {
+			if (out.direction !== direction) continue;
+			const key = tuple(out.paymentHash, out.amount, out.cltvExpiry);
+			carried.set(key, (carried.get(key) ?? 0) + 1);
+		}
+		for (const [key, count] of required) {
+			if ((carried.get(key) ?? 0) < count) {
+				return `FFOR: the ${view} commitment does not carry every unresolved voucher`;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Whether slot k's voucher may be gone from the channel under an
+	 * authorized transition (CONCURRENT-RECEIVE.md sections 4, 6 and 7).
+	 *
+	 * R removes a voucher only by fulfilling it, which needs its preimage,
+	 * or by failing it in DRAINING when the ff_close_ack marks it unsettled.
+	 * So on R a slot with neither a held preimage nor a clear bit of a
+	 * final acknowledgement must still be there.
+	 *
+	 * S cannot tell from this record: it accepts a valid fulfil whatever
+	 * its own slot accounting says, and keeps no note of having done so.
+	 * Interim: PR 2's terminal slot records replace this derivation on both
+	 * sides and close that gap on S.
+	 */
+	private _fforSlotMayBeAbsent(f: IFforEpochRecord, k: number): boolean {
+		if (f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION) {
+			if (f.voucherOutcomes?.[k - 1]?.outcome === 'fulfilled') return true;
+			// R's map is one signature ahead of its stored local commitment.
+			// The retained entry bridges that interval and is still claimable.
+			return (
+				f.role === 'R' &&
+				(this._state.signedLocalRemovals ?? []).some(
+					(entry) =>
+						entry.state === HtlcState.FULFILLED &&
+						entry.fforVoucher === true &&
+						entry.direction === HtlcDirection.RECEIVED &&
+						matchVoucher(this._fforBook(f), entry)?.k === k
+				)
+			);
+		}
+		if (f.role !== 'R') return true;
+		if (f.knownPreimages[k - 1]) return true;
+		return (
+			f.state === FforState.DRAINING &&
+			f.settledBitmap !== null &&
+			!bitmapGet(f.settledBitmap, k)
+		);
+	}
+
+	/**
+	 * The concurrent epoch whose voucher book puts the mixed-commitment
+	 * fee-spike buffer in force, if any: ACTIVE or DRAINING with at least
+	 * one voucher still on the channel.
+	 */
+	private _fforMixedBufferEpoch(): IFforEpochRecord | null {
+		const f = this._fforLive();
+		if (!f || !this._fforIsConcurrent(f)) return null;
+		if (f.state !== FforState.ACTIVE && f.state !== FforState.DRAINING) {
+			return null;
+		}
+		return this._fforVoucherEntries(f).size > 0 ? f : null;
+	}
+
+	/**
+	 * What the funder holds above its reserve, and what it pays for, over
+	 * the full mixed commitment with `candidates` added: every HTLC output
+	 * either commitment carries (the dearest reading,
+	 * _funderConservativeView, which counts outputs whoever funds) and the
+	 * candidates, against the funder's LIVE balance less what the
+	 * candidates draw from it (an add comes out of its offerer's balance).
+	 * The live balance already excludes every HTLC still in flight, the
+	 * vouchers included, so the voucher value is charged once.
+	 */
+	private _fforMixedBufferView(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): { headroomMsat: bigint; untrimmed: number; feeratePerKw: number } {
+		const weFund = this._state.role === ChannelRole.OPENER;
+		const outputs = this._funderConservativeView(candidates);
+		let drawnMsat = 0n;
+		for (const c of candidates) {
+			if ((c.direction === HtlcDirection.OFFERED) === weFund) {
+				drawnMsat += c.amountMsat;
+			}
+		}
+		return {
+			headroomMsat: weFund
+				? this._funderHeadroomMsat(
+						this._state.localBalanceMsat + outputs.creditMsat - drawnMsat
+				  )
+				: this._remoteFunderHeadroomMsat(
+						this._state.remoteBalanceMsat - drawnMsat
+				  ),
+			untrimmed: outputs.untrimmed,
+			feeratePerKw: Math.max(
+				getLocalCommitmentFeeRate(this._state),
+				getRemoteCommitmentFeeRate(this._state)
+			)
+		};
+	}
+
+	/**
+	 * CONCURRENT-RECEIVE.md section 3.1 with base section 7.6: while a
+	 * concurrent voucher book is live, the funder keeps above its reserve
+	 * the commitment cost at TWICE the feerate for the full mixed
+	 * commitment, not only for the K vouchers the setup checked. Returns
+	 * why `candidates` would break that, or null.
+	 *
+	 * The stock add path holds this buffer only when we fund and we add
+	 * (getSpendableOutboundMsat) and prices the other three cases at the
+	 * live rate. The book makes it mandatory in all four: the vouchers stay
+	 * until T_exp, update_fee is refused while they do, and a funder that
+	 * kept only the live fee could not afford a force close after a fee
+	 * rise. Our own add is refused locally; a peer add is stamped for a
+	 * fail-back once committed (handleUpdateAddHtlc), never failed on the
+	 * wire. Either way no voucher is touched.
+	 */
+	private _fforMixedBufferRefusal(
+		candidates: { amountMsat: bigint; direction: HtlcDirection }[]
+	): string | null {
+		if (!this._fforMixedBufferEpoch()) return null;
+		const view = this._fforMixedBufferView(candidates);
+		if (
+			view.headroomMsat >=
+			this._funderCostMsat(view.feeratePerKw * 2, view.untrimmed)
+		) {
+			return null;
+		}
+		return 'FFOR voucher book is live: the funder cannot keep the fee-spike buffer over the commitment with this HTLC';
+	}
+
+	/**
+	 * The outbound ceiling folded with _fforMixedBufferRefusal, so the
+	 * router never selects an add it then refuses: the largest single add
+	 * of ours the buffer admits, at most `spendableMsat`. When we fund, the
+	 * add comes out of the balance that pays the fee; when the peer funds,
+	 * it only adds an output, so the answer is all, a trimmed amount or
+	 * nothing. Unchanged when no concurrent book is live.
+	 */
+	private _fforMixedBufferCeilingMsat(spendableMsat: bigint): bigint {
+		if (!this._fforMixedBufferEpoch()) return spendableMsat;
+		const weFund = this._state.role === ChannelRole.OPENER;
+		const view = this._fforMixedBufferView([]);
+		const costWith = (extra: number): bigint =>
+			this._funderCostMsat(view.feeratePerKw * 2, view.untrimmed + extra);
+		const room = (costMsat: bigint): bigint =>
+			weFund
+				? view.headroomMsat - costMsat
+				: view.headroomMsat >= costMsat
+				? spendableMsat
+				: -1n;
+		// The smallest amount that is an output on a commitment: the lower
+		// dust limit, as _funderConservativeView counts. An epoch runs only
+		// on an anchor channel, where no second-level fee enters the trim.
+		const outputFloorMsat =
+			bigIntMin(
+				this._state.localConfig.dustLimitSatoshis,
+				this._state.remoteConfig.dustLimitSatoshis
+			) * 1000n;
+		const asOutput = room(costWith(1));
+		let ceilingMsat =
+			asOutput >= outputFloorMsat
+				? asOutput
+				: bigIntMin(room(costWith(0)), outputFloorMsat - 1n);
+		if (ceilingMsat < 0n) ceilingMsat = 0n;
+		return ceilingMsat < spendableMsat ? ceilingMsat : spendableMsat;
+	}
+
+	/**
+	 * S, concurrent epoch in DRAINING: the receiver failed a voucher our
+	 * ff_close_ack marked settled. The fail is accepted (the receiver gives
+	 * up its own claim; base section 7.5.6 says it MUST NOT, but the loss is
+	 * its own) and reported, since a receiver that fails a paid slot has
+	 * lost the preimage or its record of the acknowledgement.
+	 */
+	private _fforNoteSettledVoucherFailed(entry: IHtlcEntry): ChannelAction[] {
+		const f = this._state.ffor;
+		if (
+			!f ||
+			f.role !== 'S' ||
+			!this._fforIsConcurrent(f) ||
+			f.state !== FforState.DRAINING ||
+			entry.fforVoucher !== true ||
+			f.sHtlcIdBase === null ||
+			!f.settledBitmap
+		) {
+			return [];
+		}
+		const k = Number(entry.id - f.sHtlcIdBase) + 1;
+		if (k < 1 || k > f.params.maxPayments || !bitmapGet(f.settledBitmap, k)) {
+			return [];
+		}
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: `FFOR: the receiver failed voucher ${k}, which the close acknowledgement marks settled`,
+				cleanup: 'none'
+			}
+		];
 	}
 
 	/** The book, rebuilt from the record (section 7.5.3). */
@@ -22454,12 +23789,21 @@ export class Channel {
 		return f.role === 'R' ? `received-${id}` : `offered-${id}`;
 	}
 
-	/** The voucher entry an S-offered id names, if it is one of the book's. */
+	/**
+	 * The voucher entry a settle names, if it is one of the book's. HTLC ids
+	 * count per offerer, so an id is a voucher's only in the direction the
+	 * vouchers run on this side (S offered them, R received them): an HTLC R
+	 * offered may carry the same number and is not one.
+	 */
 	private _fforVoucherEntry(
 		f: IFforEpochRecord,
-		htlcId: bigint
+		htlcId: bigint,
+		direction: HtlcDirection
 	): IHtlcEntry | undefined {
 		if (f.sHtlcIdBase === null) return undefined;
+		const voucherDirection =
+			f.role === 'R' ? HtlcDirection.RECEIVED : HtlcDirection.OFFERED;
+		if (direction !== voucherDirection) return undefined;
 		const k = Number(htlcId - f.sHtlcIdBase) + 1;
 		if (k < 1 || k > f.params.maxPayments) return undefined;
 		const entry = this._state.htlcs.get(this._fforVoucherKey(f, k));
@@ -22580,6 +23924,14 @@ export class Channel {
 		witnessPeers?: Buffer[];
 		/** TLV 15: hash-chained vouchers (section 9.5.4); uniform amounts only. */
 		hashChain?: boolean;
+		/**
+		 * TLV 17: ask for the concurrent receive profile, version 1
+		 * (CONCURRENT-RECEIVE.md section 1.1). Selected only by S's exact
+		 * signed echo; independent hashes only.
+		 */
+		concurrent?: boolean;
+		/** Exact signed profile request. Version 2 retains unresolved reserves. */
+		concurrentVersion?: 1 | 2;
 	}): ChannelAction[] {
 		const pre = this._fforSetupPreconditionError();
 		if (pre) {
@@ -22590,6 +23942,41 @@ export class Channel {
 					cleanup: 'none'
 				}
 			];
+		}
+		if (
+			request.concurrentVersion !== undefined &&
+			(!request.concurrent ||
+				!isFforConcurrentVersion(request.concurrentVersion))
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot start FFOR epoch: unsupported concurrent version or missing concurrent request',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (request.concurrent) {
+			// CONCURRENT-RECEIVE.md section 1.1: both feature pairs on both
+			// sides before the request, and section 1: no hash chain. Refused
+			// here rather than sent for S to refuse: an ff_init burns its
+			// epoch id.
+			const concurrentRefusal =
+				this._fforCtx?.concurrentNegotiated !== true
+					? 'option_ff_concurrent is not negotiated with this peer'
+					: request.hashChain
+					? 'the concurrent profile takes independent hashes, not a hash chain (CONCURRENT-RECEIVE.md section 1)'
+					: null;
+			if (concurrentRefusal) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Cannot start FFOR epoch: ${concurrentRefusal}`,
+						cleanup: 'none'
+					}
+				];
+			}
 		}
 		if (
 			request.hashChain &&
@@ -22621,7 +24008,13 @@ export class Channel {
 			...(request.witnessPeers && request.witnessPeers.length > 0
 				? { witnessPeers: request.witnessPeers.map((p) => Buffer.from(p)) }
 				: {}),
-			...(request.hashChain ? { hashChain: true } : {})
+			...(request.hashChain ? { hashChain: true } : {}),
+			...(request.concurrent
+				? {
+						concurrentVersion:
+							request.concurrentVersion ?? FF_CONCURRENT_VERSION
+				  }
+				: {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('R'));
 		if (bookError) {
@@ -22903,6 +24296,39 @@ export class Channel {
 				);
 			}
 		}
+		// CONCURRENT-RECEIVE.md section 1.1: a request for the concurrent
+		// profile (TLV 17) is refused unless both feature pairs are negotiated,
+		// the profile is the one version 1 defines (Variant D, checked above,
+		// and independent hashes), the value is the one we select, and this
+		// peer offers it. Never answered as a baseline epoch instead: the
+		// refusal burns the epoch id, and a baseline attempt is a new epoch.
+		const concurrent = msg.concurrentVersion !== undefined;
+		if (concurrent) {
+			if (ctx.concurrentNegotiated !== true) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'concurrent_version requested without option_ff_receive and option_ff_concurrent negotiated'
+				);
+			}
+			if (msg.hashChain) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'the concurrent profile takes no hash chain (ff_init TLV 15 must be absent)'
+				);
+			}
+			if (!isFforConcurrentVersion(msg.concurrentVersion)) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					`concurrent_version ${msg.concurrentVersion} not supported`
+				);
+			}
+			if (policy?.allowConcurrent === false) {
+				return refuse(
+					FforAbortReason.TERMS_REFUSED,
+					'concurrent receive not offered by this peer'
+				);
+			}
+		}
 		const params: IFforEpochParams = {
 			variant: msg.variant,
 			budgetMsat: msg.budgetMsat,
@@ -22916,7 +24342,8 @@ export class Channel {
 			rPerCommitmentPoints: msg.rPerCommitmentPoints,
 			voucherAmountsMsat: msg.voucherAmountsMsat,
 			...(msg.witnessPeers ? { witnessPeers: msg.witnessPeers } : {}),
-			...(msg.hashChain ? { hashChain: true } : {})
+			...(msg.hashChain ? { hashChain: true } : {}),
+			...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 		};
 		const bookError = checkVoucherBook(params, this._fforBookContext('S'));
 		if (bookError) return refuse(FforAbortReason.TERMS_REFUSED, bookError);
@@ -22974,7 +24401,10 @@ export class Channel {
 				paymentHashes: hashes,
 				sHtlcIdBase,
 				voucherAmountsMsat: params.voucherAmountsMsat,
-				initHash: tInit
+				initHash: tInit,
+				// The exact signed echo is the only thing that selects the
+				// concurrent profile (CONCURRENT-RECEIVE.md section 1.1).
+				...(concurrent ? { concurrentVersion: msg.concurrentVersion } : {})
 			})
 		);
 		if (!acceptBody) {
@@ -22989,6 +24419,12 @@ export class Channel {
 			initWire
 		);
 		f.acceptWire = acceptWire;
+		// Selected with the transcript it rides in: on the record before the
+		// persist that precedes ff_accept.
+		if (isFforConcurrentVersion(msg.concurrentVersion)) {
+			f.concurrentVersion = msg.concurrentVersion;
+			this._state.compactHtlcHistory = true;
+		}
 		f.sCommitmentNumber = this._state.localCommitmentNumber;
 		f.sHtlcIdBase = sHtlcIdBase;
 		f.paymentHashes = hashes;
@@ -23005,39 +24441,52 @@ export class Channel {
 			sendMsg(MessageType.FF_ACCEPT, acceptBody)
 		];
 		// Step 3: the K adds, in k order, each with the section 9.5.1 onion.
-		for (const entry of this._fforBook(f)) {
-			const expectedId = this._state.localHtlcCounter;
-			const onion = buildVoucherOnion({
-				recipientNodeId: ctx.remoteNodeId,
-				epochId: msg.epochId,
-				k: entry.k,
-				amountMsat: entry.amountMsat,
-				voucherExpiry: entry.voucherExpiry,
-				paymentHash: entry.paymentHash
-			});
-			const addActions = this.addHtlc(
-				entry.amountMsat,
-				entry.paymentHash,
-				entry.voucherExpiry,
-				onion
-			);
-			const failed =
-				addActions.some((a) => a.type === ChannelActionType.ERROR) ||
-				expectedId !== entry.sHtlcId;
-			if (failed) {
-				const err = addActions.find((a) => a.type === ChannelActionType.ERROR);
-				const text =
-					err && err.type === ChannelActionType.ERROR
-						? err.message
-						: 'voucher id diverged from s_htlc_id_base';
-				actions.push(
-					...this._fforAbortLocal(f, FforAbortReason.VOUCHER_ROUND_FAILED, text)
+		// The record is NEGOTIATING already, so the setup barrier stands: these
+		// are the epoch's own adds and the only ones it lets through.
+		this._fforInternalAdd = true;
+		try {
+			for (const entry of this._fforBook(f)) {
+				const expectedId = this._state.localHtlcCounter;
+				const onion = buildVoucherOnion({
+					recipientNodeId: ctx.remoteNodeId,
+					epochId: msg.epochId,
+					k: entry.k,
+					amountMsat: entry.amountMsat,
+					voucherExpiry: entry.voucherExpiry,
+					paymentHash: entry.paymentHash
+				});
+				const addActions = this.addHtlc(
+					entry.amountMsat,
+					entry.paymentHash,
+					entry.voucherExpiry,
+					onion
 				);
-				return actions;
+				const failed =
+					addActions.some((a) => a.type === ChannelActionType.ERROR) ||
+					expectedId !== entry.sHtlcId;
+				if (failed) {
+					const err = addActions.find(
+						(a) => a.type === ChannelActionType.ERROR
+					);
+					const text =
+						err && err.type === ChannelActionType.ERROR
+							? err.message
+							: 'voucher id diverged from s_htlc_id_base';
+					actions.push(
+						...this._fforAbortLocal(
+							f,
+							FforAbortReason.VOUCHER_ROUND_FAILED,
+							text
+						)
+					);
+					return actions;
+				}
+				const added = this._state.htlcs.get(`offered-${entry.sHtlcId}`);
+				if (added) added.fforVoucher = true;
+				actions.push(...addActions);
 			}
-			const added = this._state.htlcs.get(`offered-${entry.sHtlcId}`);
-			if (added) added.fforVoucher = true;
-			actions.push(...addActions);
+		} finally {
+			this._fforInternalAdd = false;
 		}
 		return actions;
 	}
@@ -23097,6 +24546,30 @@ export class Channel {
 				f,
 				FforAbortReason.PROTOCOL_ERROR,
 				'ff_accept TLV 11 is not the digest of our ff_init'
+			);
+		}
+		// CONCURRENT-RECEIVE.md section 1.1: the concurrent profile is selected
+		// by S's exact signed echo of the value we requested and by nothing
+		// else. An echo we did not ask for is a violation; a missing or
+		// different one is a refusal of the terms (an older S ignores the odd
+		// TLV and answers without it). Either way the setup aborts and its
+		// epoch id is spent: it never continues as a baseline epoch.
+		const requestedVersion = f.params.concurrentVersion;
+		if (requestedVersion === undefined) {
+			if (msg.concurrentVersion !== undefined) {
+				return this._fforAbortLocal(
+					f,
+					FforAbortReason.PROTOCOL_ERROR,
+					'ff_accept echoes a concurrent_version we did not request'
+				);
+			}
+		} else if (msg.concurrentVersion !== requestedVersion) {
+			return this._fforAbortLocal(
+				f,
+				FforAbortReason.TERMS_REFUSED,
+				msg.concurrentVersion === undefined
+					? 'ff_accept lacks the concurrent_version echo'
+					: `ff_accept echoes concurrent_version ${msg.concurrentVersion}, not the ${requestedVersion} requested`
 			);
 		}
 		const K = f.params.maxPayments;
@@ -23190,6 +24663,11 @@ export class Channel {
 			);
 		}
 		f.acceptWire = acceptWire;
+		// The exact echo of the one version we request, checked above.
+		if (isFforConcurrentVersion(requestedVersion)) {
+			f.concurrentVersion = requestedVersion;
+			this._state.compactHtlcHistory = true;
+		}
 		f.sCommitmentNumber = msg.sCommitmentNumber;
 		f.sHtlcIdBase = msg.sHtlcIdBase;
 		f.paymentHashes = msg.paymentHashes;
@@ -23225,6 +24703,19 @@ export class Channel {
 	private _fforClassifyAdd(entry: IHtlcEntry): void {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R' || !f.acceptWire) return;
+		// A concurrent epoch keeps taking ordinary adds after the round, and
+		// S's offered ids never return to the voucher range, so an add is a
+		// voucher only where one can arrive: in the round window, or replayed
+		// into an aborted setup. An add that repeats a book tuple later (the
+		// slot's voucher already redeemed or drained) must not recreate the
+		// voucher (CONCURRENT-RECEIVE.md section 6); it is an ordinary HTLC.
+		if (
+			this._fforIsConcurrent(f) &&
+			f.state !== FforState.NEGOTIATING &&
+			f.state !== FforState.ABORTED
+		) {
+			return;
+		}
 		const match = matchVoucher(this._fforBook(f), {
 			id: entry.id,
 			amountMsat: entry.amountMsat,
@@ -23292,6 +24783,7 @@ export class Channel {
 		if (f.state === FforState.DRAINING) {
 			return this._fforMaybeClosed(f, boundary);
 		}
+		if (f.state === FforState.ACTIVE) return this._fforRedeem(f);
 		return [];
 	}
 
@@ -23595,7 +25087,16 @@ export class Channel {
 				`ff_activate epoch_start_height ${msg.epochStartHeight} not within ${FF_EPOCH_START_TOLERANCE_BLOCKS} of tip ${this._currentBlockHeight}`
 			);
 		}
-		const bookError = checkVoucherBook(f.params, this._fforBookContext('S'));
+		// The book checks charge budget_msat to S's balance themselves, and
+		// the voucher round already took it out (addHtlc debits each add, and
+		// the debit stays for as long as the entry does). Every voucher still
+		// on the channel goes back in, so the recheck judges the book against
+		// the balance S held before the round and the value is charged once.
+		const bookCtx = this._fforBookContext('S');
+		for (const voucher of this._fforVoucherEntries(f).values()) {
+			bookCtx.sLocalBalanceMsat += voucher.amountMsat;
+		}
+		const bookError = checkVoucherBook(f.params, bookCtx);
 		if (bookError) {
 			return this._fforAbortLocal(f, FforAbortReason.BOOK_MISMATCH, bookError);
 		}
@@ -23621,6 +25122,9 @@ export class Channel {
 		f.activateWire = wire;
 		f.activateAckWire = fforWireBytes(FF_ACTIVATE_ACK_TYPE, ack);
 		f.state = FforState.ACTIVE;
+		// Until the dispatch reports the ack sent, a concurrent S originates
+		// nothing: R is still ACTIVATING (see _fforActivateAckUnsent).
+		this._fforActivateAckUnsent = true;
 		// ACTIVE is on disk before the ack leaves (the persist leads the batch
 		// and a failed persist withholds the send); the ack ends quiescence.
 		return [
@@ -23998,6 +25502,35 @@ export class Channel {
 		return Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 	}
 
+	/**
+	 * The verified local signature has removed these retained outputs. The
+	 * peer already revoked their removals, so both views now agree on the
+	 * economic outcome. Record it before discarding the retained entries.
+	 */
+	private _fforRecordVoucherOutcomes(): void {
+		const f = this._state.ffor;
+		if (!f || f.role !== 'R') return;
+		const book = this._fforBook(f);
+		for (const entry of this._state.signedLocalRemovals ?? []) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				!entry.fforVoucher ||
+				(entry.state !== HtlcState.FULFILLED &&
+					entry.state !== HtlcState.FAILED)
+			)
+				continue;
+			const slot = matchVoucher(book, entry);
+			if (!slot || f.voucherOutcomes?.[slot.k - 1]) continue;
+			f.voucherOutcomes ??= f.paymentHashes.map(() => null);
+			f.voucherOutcomes[slot.k - 1] = {
+				outcome:
+					entry.state === HtlcState.FULFILLED ? 'fulfilled' : 'cancelled',
+				localCommitmentNumber: this._state.localCommitmentNumber + 1n,
+				remoteCommitmentNumber: this._remoteRevocationCount()
+			};
+		}
+	}
+
 	/** Section 7.5.1: CLOSED once no voucher remains in either commitment. */
 	private _fforMaybeClosed(
 		f: IFforEpochRecord,
@@ -24005,7 +25538,27 @@ export class Channel {
 	): ChannelAction[] {
 		if (f.state !== FforState.DRAINING) return [];
 		if (this._fforVoucherEntries(f).size > 0) return [];
-		if (this.hasPendingHtlcs()) return [];
+		if (
+			this._fforIsConcurrent(f) &&
+			f.paymentHashes.some((_, i) => !f.voucherOutcomes?.[i])
+		)
+			return [];
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			f.paymentHashes.some(
+				(_, i) => f.voucherOutcomes?.[i]?.outcome !== 'fulfilled'
+			)
+		)
+			return [];
+		// Baseline: the channel carries nothing but the drain, so CLOSED also
+		// waits for every pending update. A concurrent epoch carries ordinary
+		// traffic, which may never pause, and CLOSED means every VOUCHER is
+		// irrevocably resolved, not every ordinary HTLC (CONCURRENT-RECEIVE.md
+		// section 7): an ordinary update in flight neither delays CLOSED nor
+		// closes the channel.
+		//
+		// Concurrent terminal records establish removal in both views.
+		if (!this._fforIsConcurrent(f) && this.hasPendingHtlcs()) return [];
 		// R's map empties at S's revoke_and_ack for R's removal commitment,
 		// while R's OWN commitment still carries the vouchers until S's next
 		// commitment_signed and R's revoke of the old one. CLOSED is "no
@@ -24016,6 +25569,260 @@ export class Channel {
 		// Section 7: unique across all epochs, closed ones included.
 		this._fforBurnEpochId(f.epochId);
 		return [];
+	}
+
+	/** R: fetch receipts without stopping admission or replacing an outstanding nonce. */
+	fforSync(): ChannelAction[] {
+		const f = this._state.ffor;
+		if (
+			!f ||
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			f.state !== FforState.ACTIVE ||
+			!f.hAct ||
+			f.closeSent ||
+			f.activationMismatch ||
+			f.capabilityHold
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: no synchronized ACTIVE concurrent epoch to fetch',
+					cleanup: 'none'
+				}
+			];
+		}
+		if (this._state.state !== ChannelState.NORMAL)
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: channel must reestablish before fetching receipts',
+					cleanup: 'none'
+				}
+			];
+		if (!f.syncRequestWire) {
+			const body = this._fforSign(
+				FF_SYNC_TYPE,
+				encodeFforSyncUnsigned({
+					channelId: this._state.channelId!,
+					epochId: f.epochId,
+					activationHash: f.hAct,
+					nonce: crypto.randomBytes(32)
+				})
+			);
+			if (!body)
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'FFOR: signing ff_sync failed',
+						cleanup: 'none'
+					}
+				];
+			f.syncRequestWire = fforWireBytes(FF_SYNC_TYPE, body);
+		}
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			replayMsg(MessageType.FF_SYNC, f.syncRequestWire.subarray(2))
+		];
+	}
+
+	private _fforSyncError(epochId: Buffer, message: string): ChannelAction[] {
+		return [
+			{
+				type: ChannelActionType.ERROR,
+				message: `FFOR: ${message}`,
+				cleanup: 'none'
+			},
+			sendMsg(
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({
+					channelId: this._state.channelId!,
+					epochId,
+					data: Buffer.from(message)
+				})
+			)
+		];
+	}
+
+	/** S: publish only durable settlement or redemption, with a stable sequence. */
+	handleFforSync(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforSyncMessage;
+		try {
+			msg = decodeFforSyncMessage(payload);
+		} catch {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: undecodable ff_sync',
+					cleanup: 'none'
+				}
+			];
+		}
+		const refuse = (message: string): ChannelAction[] =>
+			this._fforSyncError(msg.epochId, message);
+		if (
+			!f ||
+			f.role !== 'S' ||
+			!this._fforIsConcurrent(f) ||
+			!msg.channelId.equals(this._state.channelId!) ||
+			!msg.epochId.equals(f.epochId) ||
+			!f.hAct ||
+			!msg.activationHash.equals(f.hAct)
+		)
+			return refuse('ff_sync does not name an activated concurrent epoch');
+		const now = Date.now();
+		if (now - this._fforSyncBudget.startedAt >= 1000)
+			this._fforSyncBudget = { startedAt: now, count: 0 };
+		if (++this._fforSyncBudget.count > 8)
+			return refuse('ff_sync rate limit reached');
+		if (!verifyFforMessage(FF_SYNC_TYPE, payload, f.remoteNodeId))
+			return refuse('invalid ff_sync signature');
+		if (
+			(f.state === FforState.DRAINING || f.state === FforState.CLOSED) &&
+			f.closeAckWire
+		)
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				replayMsg(MessageType.FF_CLOSE_ACK, f.closeAckWire.subarray(2))
+			];
+		if (
+			f.state !== FforState.ACTIVE ||
+			f.activationMismatch ||
+			this._fforActivateAckUnsent
+		)
+			return refuse('ff_sync is unavailable before synchronized activation');
+		const settled = Buffer.alloc(bitmapLength(f.params.maxPayments));
+		const preimages: IFforSyncReplyMessage['preimages'] = [];
+		for (let k = 1; k <= f.params.maxPayments; k++) {
+			if (
+				f.slotStates[k - 1] !== FforSlotState.SETTLED &&
+				f.voucherOutcomes?.[k - 1]?.outcome !== 'fulfilled'
+			)
+				continue;
+			const preimage = f.preimages[k - 1];
+			if (
+				!preimage ||
+				!crypto
+					.createHash('sha256')
+					.update(preimage)
+					.digest()
+					.equals(f.paymentHashes[k - 1])
+			)
+				return refuse('reportable slot lacks its claim proof');
+			bitmapSet(settled, k);
+			preimages.push({ k, preimage });
+		}
+		const snapshot = { numSlots: f.params.maxPayments, settled, preimages };
+		const previous = f.syncSnapshotWire
+			? decodeFforSyncReplyMessage(f.syncSnapshotWire.subarray(2))
+			: null;
+		const changed = previous
+			? !fforSyncSnapshotContent(previous).equals(
+					fforSyncSnapshotContent(snapshot)
+			  )
+			: preimages.length > 0;
+		if (previous && previous.preimages.some((p) => !bitmapGet(settled, p.k)))
+			return refuse('reportable snapshot cannot shrink');
+		const snapshotSeq = (previous?.snapshotSeq ?? 0n) + (changed ? 1n : 0n);
+		if (snapshotSeq > 0xffffffffffffffffn)
+			return refuse('snapshot sequence exhausted');
+		const body = this._fforSign(
+			FF_SYNC_REPLY_TYPE,
+			encodeFforSyncReplyUnsigned({ ...msg, ...snapshot, snapshotSeq })
+		);
+		if (!body) return refuse('signing ff_sync_reply failed');
+		f.syncSnapshotWire = fforWireBytes(FF_SYNC_REPLY_TYPE, body);
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{ ...sendMsg(MessageType.FF_SYNC_REPLY, body), durabilityCritical: true }
+		];
+	}
+
+	/** R: retain proof independently of correlated monotonic snapshot progress. */
+	handleFforSyncReply(payload: Buffer): ChannelAction[] {
+		const f = this._state.ffor;
+		let msg: IFforSyncReplyMessage;
+		try {
+			msg = decodeFforSyncReplyMessage(payload);
+		} catch {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: undecodable ff_sync_reply',
+					cleanup: 'none'
+				}
+			];
+		}
+		const refuse = (message: string): ChannelAction[] =>
+			this._fforSyncError(msg.epochId, message);
+		if (
+			!f ||
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			![FforState.ACTIVE, FforState.DRAINING, FforState.CLOSED].includes(
+				f.state
+			) ||
+			!msg.channelId.equals(this._state.channelId!) ||
+			!msg.epochId.equals(f.epochId) ||
+			!f.hAct ||
+			!msg.activationHash.equals(f.hAct) ||
+			msg.numSlots !== f.params.maxPayments ||
+			!verifyFforMessage(FF_SYNC_REPLY_TYPE, payload, f.remoteNodeId)
+		)
+			return refuse('invalid ff_sync_reply identity or signature');
+		if (
+			msg.preimages.some(
+				(p) =>
+					!crypto
+						.createHash('sha256')
+						.update(p.preimage)
+						.digest()
+						.equals(f.paymentHashes[p.k - 1])
+			)
+		)
+			return refuse('ff_sync_reply preimage does not match its slot');
+		const previous = f.syncSnapshotWire
+			? decodeFforSyncReplyMessage(f.syncSnapshotWire.subarray(2))
+			: null;
+		const request = f.syncRequestWire
+			? decodeFforSyncMessage(f.syncRequestWire.subarray(2))
+			: null;
+		const matches = !!request && request.nonce.equals(msg.nonce);
+		const conflict =
+			!!previous &&
+			((msg.snapshotSeq === previous.snapshotSeq &&
+				!fforSyncSnapshotContent(previous).equals(
+					fforSyncSnapshotContent(msg)
+				)) ||
+				(msg.snapshotSeq > previous.snapshotSeq &&
+					previous.preimages.some((p) => !bitmapGet(msg.settled, p.k))));
+		const learned: ChannelAction[] = [];
+		for (const p of msg.preimages)
+			learned.push(...(this._fforKeepPreimage(f, p.preimage) ?? []));
+		if (conflict) {
+			f.syncConflictWire ??= fforWireBytes(FF_SYNC_REPLY_TYPE, payload);
+			f.activationMismatch = true;
+		} else if (
+			matches &&
+			f.state === FforState.ACTIVE &&
+			!f.closeAckWire &&
+			(!previous || msg.snapshotSeq > previous.snapshotSeq)
+		) {
+			f.syncSnapshotWire = fforWireBytes(FF_SYNC_REPLY_TYPE, payload);
+		}
+		if (matches) delete f.syncRequestWire;
+		if (f.state === FforState.DRAINING) this._fforWithdrawFails(f, false);
+		return [
+			...learned,
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(f.state === FforState.ACTIVE
+				? this._fforRedeem(f)
+				: this._fforDrain(f)),
+			...(conflict
+				? refuse('conflicting signed receipt snapshot retained')
+				: [])
+		];
 	}
 
 	/** R: ff_close (section 7.5.4), or its resend while the ack is owed. */
@@ -24133,7 +25940,10 @@ export class Channel {
 			if (f.slotStates[k - 1] === FforSlotState.SETTLING) {
 				f.slotStates[k - 1] = FforSlotState.SETTLED;
 			}
-			if (f.slotStates[k - 1] === FforSlotState.SETTLED) {
+			if (
+				f.slotStates[k - 1] === FforSlotState.SETTLED ||
+				f.slotRedeemed?.[k - 1]
+			) {
 				bitmapSet(bitmap, k);
 				preimages.push({ k, preimage: f.preimages[k - 1] });
 			}
@@ -24161,6 +25971,7 @@ export class Channel {
 		f.settledBitmap = bitmap;
 		f.closeAckWire = fforWireBytes(FF_CLOSE_ACK_TYPE, ack);
 		f.state = FforState.DRAINING;
+		if (this._fforIsConcurrent(f)) this._fforMaybeClosed(f, 'raa');
 		return [
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.FF_CLOSE_ACK, ack)
@@ -24194,18 +26005,73 @@ export class Channel {
 		const wire = fforWireBytes(FF_CLOSE_ACK_TYPE, payload);
 		if (f.closeAckWire) {
 			if (f.closeAckWire.equals(wire)) {
-				// A retransmission: release any drain messages held back while
-				// the peer did not hold ff_close, then re-drive what is owed.
-				const held = this._fforHeldReplay;
-				this._fforHeldReplay = [];
-				return [...held, ...this._fforDrain(f)];
+				// A retransmission: release the chain held back while the peer
+				// did not hold ff_close, then re-drive what is owed.
+				const held = this._fforReleaseHeld();
+				// The peer holds the close again: voucher fails may flow.
+				this._fforPeerLacksClose = false;
+				const released = [...held, ...this._fforDrain(f)];
+				if (held.length > 0) {
+					// Remembered until the leading write is known to have
+					// landed, the re-driven drain included: it is part of what
+					// a failed write withholds.
+					this._fforReleasedStream = released.filter(
+						(a) =>
+							a.type === ChannelActionType.SEND_MESSAGE &&
+							FFOR_HELD_STREAM_TYPES.has(a.messageType)
+					);
+				}
+				return released;
+			}
+			const differs: ChannelAction = {
+				type: ChannelActionType.ERROR,
+				message: 'FFOR: ff_close_ack differs from the one processed',
+				cleanup: 'none'
+			};
+			// S signed two different final acknowledgements for one epoch (it
+			// came back from a row that predates a settlement, or worse). The
+			// second is refused: its bitmap replaces nothing, and a chain held
+			// for the first stays held, since this connection cannot release
+			// it.
+			//
+			// Its preimages are kept all the same (issue #1308, both
+			// profiles). A preimage that hashes to a book entry is a claim
+			// whatever message carried it: S may have settled the slot for a
+			// payer after it lost the close. Each reaches the chain monitors
+			// before the persist, as in the accepting branch below, and a fail
+			// of that voucher is replaced by the fulfil only while no signature
+			// covers it (_fforWithdrawFails).
+			const kept: ChannelAction[] = [];
+			for (const p of msg.preimages) {
+				kept.push(...(this._fforKeepPreimage(f, p.preimage) ?? []));
+			}
+			const withdrew = this._fforWithdrawFails(f, false);
+			let disputed = false;
+			if (
+				f.state === FforState.DRAINING &&
+				this._fforIsConcurrent(f) &&
+				!f.activationMismatch
+			) {
+				// A concurrent epoch would otherwise go on taking ordinary
+				// work into a round it cannot sign, so the dispute is
+				// recorded: no new add of ours (fforAdmissionHold), no settle
+				// of ours behind a chain that will not leave
+				// (_fforConcurrentRefusal), and the host is told. A baseline
+				// epoch carries no ordinary traffic and records none.
+				f.activationMismatch = true;
+				disputed = true;
+				// The chain stays held and our own settles are refused until
+				// the channel reestablishes: ask for that reestablish, once.
+				// At it S reports DRAINING, no hold applies, and everything
+				// drains.
+				if (this._fforHolding) this._fforReconnectWanted = true;
 			}
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'FFOR: ff_close_ack differs from the one processed',
-					cleanup: 'none'
-				}
+				...kept,
+				...(kept.length > 0 || withdrew || disputed
+					? [{ type: ChannelActionType.PERSIST_STATE } as ChannelAction]
+					: []),
+				differs
 			];
 		}
 		if (f.state !== FforState.ACTIVE || !f.closeSent || !f.hAct) {
@@ -24287,12 +26153,42 @@ export class Channel {
 		}
 		f.settledBitmap = Buffer.from(msg.settled);
 		f.closeAckWire = wire;
+		delete f.syncRequestWire;
 		f.state = FforState.DRAINING;
+		if (this._fforIsConcurrent(f)) this._fforMaybeClosed(f, 'cs');
 		return [
 			...learned,
 			{ type: ChannelActionType.PERSIST_STATE },
 			...this._fforDrain(f)
 		];
+	}
+
+	/** Redeem only known claims while the concurrent book stays open. */
+	private _fforRedeem(f: IFforEpochRecord): ChannelAction[] {
+		if (
+			f.role !== 'R' ||
+			!this._fforIsConcurrent(f) ||
+			f.state !== FforState.ACTIVE ||
+			this._state.state !== ChannelState.NORMAL ||
+			this._quiescence.isQuiescing() ||
+			this._fforHolding ||
+			f.concurrentVersionMismatch
+		)
+			return [];
+		const actions: ChannelAction[] = [];
+		this._fforInternalSettle = true;
+		try {
+			for (const [k, entry] of this._fforVoucherEntries(f)) {
+				const preimage = f.knownPreimages[k - 1];
+				if (entry.state !== HtlcState.COMMITTED || !preimage) continue;
+				const fulfill = this.fulfillHtlc(entry.id, preimage);
+				if (!fulfill.some((action) => action.type === ChannelActionType.ERROR))
+					actions.push(...fulfill);
+			}
+		} finally {
+			this._fforInternalSettle = false;
+		}
+		return actions;
 	}
 
 	/**
@@ -24304,7 +26200,8 @@ export class Channel {
 		if (f.state !== FforState.DRAINING || !f.settledBitmap) return [];
 		if (this._state.state !== ChannelState.NORMAL) return [];
 		if (this._quiescence.isQuiescing()) return [];
-		if (this._fforHeldReplay.length > 0) return [];
+		// Nothing new is drained into a held chain: the release re-drives.
+		if (this._fforHolding) return [];
 		const actions: ChannelAction[] = [];
 		this._fforInternalSettle = true;
 		try {
@@ -24315,7 +26212,14 @@ export class Channel {
 					const r = this.fulfillHtlc(entry.id, preimage);
 					if (!r.some((a) => a.type === ChannelActionType.ERROR))
 						actions.push(...r);
-				} else if (!bitmapGet(f.settledBitmap, k)) {
+				} else if (
+					f.concurrentVersion !== FF_CONCURRENT_RESERVED_VERSION &&
+					!bitmapGet(f.settledBitmap, k)
+				) {
+					// A concurrent S that reestablished short of DRAINING takes
+					// ordinary traffic and voucher fulfils, but fails the
+					// channel on a voucher fail: none until its ack returns.
+					if (this._fforIsConcurrent(f) && this._fforPeerLacksClose) continue;
 					const r = this.failHtlc(entry.id, this._fforVoucherFailReason(entry));
 					if (!r.some((a) => a.type === ChannelActionType.ERROR))
 						actions.push(...r);
@@ -24344,9 +26248,8 @@ export class Channel {
 				}
 			];
 		}
-		const h = crypto.createHash('sha256').update(preimage).digest();
-		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
-		if (idx < 0) {
+		const learned = this._fforKeepPreimage(f, preimage);
+		if (learned === null) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -24355,6 +26258,34 @@ export class Channel {
 				}
 			];
 		}
+		// Section 7.5.6: an unsigned, held fail may give way to the fulfil.
+		// A signed fail stays unchanged, with its preimage kept for the chain.
+		if (f.state === FforState.DRAINING) {
+			this._fforWithdrawFails(f, false);
+		}
+		return [
+			...learned,
+			{ type: ChannelActionType.PERSIST_STATE },
+			...(f.state === FforState.DRAINING
+				? this._fforDrain(f)
+				: this._fforRedeem(f))
+		];
+	}
+
+	/**
+	 * R: keep a preimage that hashes to an entry of the book, whatever
+	 * carried it, with the ones a chained book derives from it. Returns the
+	 * PREIMAGE_LEARNED actions for what was new (the chain monitors and the
+	 * durable preimage store learn it before the persist that follows), or
+	 * null when it matches no voucher of this epoch.
+	 */
+	private _fforKeepPreimage(
+		f: IFforEpochRecord,
+		preimage: Buffer
+	): ChannelAction[] | null {
+		const h = crypto.createHash('sha256').update(preimage).digest();
+		const idx = f.paymentHashes.findIndex((x) => x.equals(h));
+		if (idx < 0) return null;
 		const learned: ChannelAction[] = [];
 		if (!f.knownPreimages[idx]) {
 			f.knownPreimages[idx] = Buffer.from(preimage);
@@ -24381,11 +26312,73 @@ export class Channel {
 				});
 			}
 		}
-		return [
-			...learned,
-			{ type: ChannelActionType.PERSIST_STATE },
-			...(f.state === FforState.DRAINING ? this._fforDrain(f) : [])
-		];
+		return learned;
+	}
+
+	/**
+	 * Replace an unsigned voucher fail only while it is held locally or is
+	 * about to be replayed after a disconnect. Once a signature covers the
+	 * fail, preserve that signature and the update it covered regardless of
+	 * the peer's reestablish counters. Keep the preimage for on-chain recovery.
+	 */
+	private _fforWithdrawFails(
+		f: IFforEpochRecord,
+		atReestablish: boolean
+	): boolean {
+		if (f.role !== 'R' || f.state !== FforState.DRAINING) return false;
+		if (!atReestablish && !this._fforHolding) return false;
+		const queue = this._state.pendingLocalUpdates;
+		const signedCount = this._state.pendingLocalUpdatesSignedCount;
+		const isFailOf = (type: number, payload: Buffer, id: bigint): boolean =>
+			(type === MessageType.UPDATE_FAIL_HTLC ||
+				type === MessageType.UPDATE_FAIL_MALFORMED_HTLC) &&
+			payload.length >= 40 &&
+			payload.readBigUInt64BE(32) === id;
+		let withdrew = false;
+		for (const [k, entry] of this._fforVoucherEntries(f)) {
+			const preimage = f.knownPreimages[k - 1];
+			if (!preimage) continue;
+			if (
+				entry.state !== HtlcState.FAILED ||
+				entry.removalRemoteCommitted !== false
+			) {
+				continue;
+			}
+			const index = queue.findIndex((u) =>
+				isFailOf(u.type, u.payload, entry.id)
+			);
+			if (index < 0 || index < signedCount) continue;
+			const fulfil = encodeUpdateFulfillHtlcMessage({
+				channelId: this._state.channelId!,
+				id: entry.id,
+				paymentPreimage: preimage
+			});
+			if (!atReestablish) {
+				const held = this._fforHeldReplay.findIndex(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						isFailOf(a.messageType, a.payload, entry.id)
+				);
+				if (held < 0) continue;
+				this._fforHeldReplay[held] = sendMsg(
+					MessageType.UPDATE_FULFILL_HTLC,
+					fulfil
+				);
+			}
+			entry.state = HtlcState.FULFILLED;
+			queue[index] = {
+				type: MessageType.UPDATE_FULFILL_HTLC,
+				payload: fulfil
+			};
+			withdrew = true;
+		}
+		return withdrew;
+	}
+
+	/** Replace only unsigned voucher fails before the reconnect replay. */
+	private _fforWithdrawFailsAtReestablish(): void {
+		const f = this._state.ffor;
+		if (f) this._fforWithdrawFails(f, true);
 	}
 
 	/**
@@ -24399,6 +26392,13 @@ export class Channel {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R') return 'no epoch of ours';
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.concurrentVersionMismatch)
+			return 'stored concurrent version is unsupported or inconsistent';
+		if (
+			f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION &&
+			(f.state !== FforState.ACTIVE || f.closeSent)
+		)
+			return 'invoice admission has stopped';
 		if (f.issuerProvisioned) {
 			return `the issuer sells this book: voucher ${k} gets no invoice from R`;
 		}
@@ -24511,6 +26511,11 @@ export class Channel {
 			{ type: ChannelActionType.ERROR, message, cleanup: 'none' }
 		];
 		if (!f || f.role !== 'R') return refuse('FFOR: no epoch of ours');
+		if (f.concurrentVersion === FF_CONCURRENT_RESERVED_VERSION) {
+			return refuse(
+				'FFOR: version 2 requires an independent issuer admission-stop protocol before issuer provisioning'
+			);
+		}
 		const exposed = f.exposedSlots.indexOf(true);
 		if (exposed >= 0) {
 			return refuse(
@@ -24539,6 +26544,22 @@ export class Channel {
 				}
 			];
 		}
+		if (
+			this._fforIsConcurrent(f) &&
+			f.slotStates[k - 1] !== FforSlotState.UNUSED &&
+			(state === FforSlotState.UNUSED ||
+				upstream !== f.slotUpstream[k - 1] ||
+				(f.slotStates[k - 1] === FforSlotState.SETTLED &&
+					state !== FforSlotState.SETTLED))
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'FFOR: delegated settlement identity cannot regress',
+					cleanup: 'none'
+				}
+			];
+		}
 		f.slotStates[k - 1] = state;
 		f.slotUpstream[k - 1] = upstream;
 		return [{ type: ChannelActionType.PERSIST_STATE }];
@@ -24554,6 +26575,12 @@ export class Channel {
 		if (!f || f.role !== 'S') return 'no epoch';
 		if (f.state !== FforState.ACTIVE) return `epoch is ${FforState[f.state]}`;
 		if (f.activationMismatch) return 'activation hash mismatch at reestablish';
+		// CONCURRENT-RECEIVE.md section 8: no new delegated admission after an
+		// incompatible reconnect, until a compatible one. An ordinary
+		// disconnect sets no hold, so the offline service is not interrupted.
+		if (this._fforIsConcurrent(f) && f.capabilityHold === true) {
+			return 'capability hold: the peer did not advertise option_ff_receive and option_ff_concurrent on its last connection';
+		}
 		if (f.closeProcessed) return 'ff_close processed';
 		// Fail closed: with no tip we cannot tell whether D has passed.
 		if (tipHeight <= 0) return 'tip height unknown';
@@ -24561,15 +26588,160 @@ export class Channel {
 			return 'settlement_deadline reached';
 		}
 		if (k < 1 || k > f.params.maxPayments) return 'no such slot';
+		if (f.slotRedeemed?.[k - 1]) return 'voucher already redeemed';
 		return null;
 	}
 
-	/** R in DRAINING whose peer reports a state before DRAINING for our epoch. */
+	/**
+	 * Whether the channel wants its connection dropped so that it
+	 * reestablishes (see _fforReconnectWanted). Reading it clears it.
+	 */
+	fforTakeReconnectRequest(): boolean {
+		const wanted = this._fforReconnectWanted;
+		this._fforReconnectWanted = false;
+		return wanted;
+	}
+
+	/**
+	 * The manager's dispatch reports what became of a durable write of this
+	 * channel's state. A write that landed carried everything in the record,
+	 * so nothing of it is still owed to storage, and a release it led is
+	 * final. A write that failed takes back the release it led.
+	 */
+	fforNoteStateWritten(landed: boolean): void {
+		if (landed) {
+			this._fforCapabilityHoldUnsaved = false;
+			this._fforReleasedStream = null;
+			return;
+		}
+		// The write that leads a release failed, so the dispatch withholds
+		// the chain. The hold was ended when the release was built; it stands
+		// again, with the chain intact, and whatever this channel makes
+		// before the connection is dropped joins it instead of leaving
+		// alone. Nothing releases it a second time on this connection: the
+		// reestablish that follows the forced disconnect retransmits it.
+		if (this._fforReleasedStream !== null) {
+			this._fforHolding = true;
+			this._fforHeldReplay = this._fforReleasedStream;
+			this._fforReleasedStream = null;
+		}
+	}
+
+	/**
+	 * The manager's dispatch is putting our ff_activate_ack on the wire: its
+	 * durable write landed and nothing withholds it. From here a concurrent S
+	 * may originate ordinary traffic (see _fforActivateAckUnsent).
+	 */
+	fforNoteActivateAckSent(): void {
+		this._fforActivateAckUnsent = false;
+	}
+
+	/**
+	 * The one place that keeps the BOLT 2 stream in order behind a held
+	 * retransmission chain (see _fforHolding). Given a batch of actions this
+	 * channel produced, it moves every update, commitment_signed and
+	 * revoke_and_ack the batch would send to the end of the chain and returns
+	 * the batch without them; with nothing held it returns the batch itself.
+	 *
+	 * handleReestablish runs its own answer through it to begin the hold, and
+	 * the manager runs every batch through it before dispatch, so no producer
+	 * needs to know a chain is held: a settle of ours, the revoke_and_ack
+	 * that answers the peer's commitment_signed and the commitment_signed an
+	 * auto-sign makes all join the chain in the order they were made. The
+	 * channel's state has advanced as if they were sent, exactly as for a
+	 * message written to a socket that then dies, so a disconnect needs no
+	 * unwinding: the next reestablish retransmits from that state. Later
+	 * updates stay behind the held signature and wait for its revocation
+	 * before the next commitment can cover them.
+	 *
+	 * Everything else in the batch (the persist, the events, the epoch's own
+	 * messages, a wire error) is untouched.
+	 */
+	fforHoldStream(actions: ChannelAction[]): ChannelAction[] {
+		if (!this._fforHolding) return actions;
+		const kept: ChannelAction[] = [];
+		for (const action of actions) {
+			if (
+				action.type === ChannelActionType.SEND_MESSAGE &&
+				FFOR_HELD_STREAM_TYPES.has(action.messageType)
+			) {
+				this._fforHeldReplay.push(action);
+			} else {
+				kept.push(action);
+			}
+		}
+		return kept.length === actions.length ? actions : kept;
+	}
+
+	/**
+	 * End the hold and hand back the chain, in order, behind a persist of its
+	 * own. That persist writes the state every message in the chain was made
+	 * from, so each one is authorized by a durable write that precedes it
+	 * whatever became of the write of the batch it was taken out of, and the
+	 * ones that are not replays are recorded for retransmission with it.
+	 */
+	private _fforReleaseHeld(): ChannelAction[] {
+		const held = this._fforHeldReplay;
+		this._fforHolding = false;
+		this._fforHeldReplay = [];
+		if (held.length === 0) return [];
+		return [{ type: ChannelActionType.PERSIST_STATE }, ...held];
+	}
+
+	/**
+	 * R in DRAINING whose peer reports a state before DRAINING for our epoch.
+	 * A baseline S is frozen there and takes nothing, so every drain
+	 * retransmission is held. A concurrent S takes ordinary updates and
+	 * voucher fulfils while ACTIVE and refuses only a voucher fail, so the
+	 * retransmissions are held only when one is queued.
+	 */
 	private _fforShouldHoldDrain(msg: IChannelReestablishMessage): boolean {
 		const f = this._state.ffor;
 		if (!f || f.role !== 'R' || f.state !== FforState.DRAINING) return false;
 		if (!msg.ffor || !msg.ffor.epochId.equals(f.epochId)) return false;
-		return msg.ffor.state < FforState.DRAINING;
+		if (msg.ffor.state >= FforState.DRAINING) return false;
+		return !this._fforIsConcurrent(f) || this._fforVoucherFailQueued(f);
+	}
+
+	/**
+	 * Whether an update_fail_htlc or update_fail_malformed_htlc of ours for
+	 * a voucher awaits retransmission. Both bodies begin `[32: channel_id]
+	 * [8: id]`, and the ids we fail are S's offered ids, among which the
+	 * book's range names the vouchers and nothing else.
+	 */
+	private _fforVoucherFailQueued(f: IFforEpochRecord): boolean {
+		if (f.sHtlcIdBase === null) return false;
+		const first = f.sHtlcIdBase;
+		const last = first + BigInt(f.params.maxPayments - 1);
+		for (const update of this._state.pendingLocalUpdates ?? []) {
+			if (
+				update.type !== MessageType.UPDATE_FAIL_HTLC &&
+				update.type !== MessageType.UPDATE_FAIL_MALFORMED_HTLC
+			) {
+				continue;
+			}
+			if (update.payload.length < 40) continue;
+			const id = update.payload.readBigUInt64BE(32);
+			if (id >= first && id <= last) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Whether the FFOR part of a reestablish answer must leave before the
+	 * BOLT 2 retransmissions: a concurrent epoch whose answer retransmits
+	 * ff_activate_ack (CONCURRENT-RECEIVE.md section 1.2 keeps base section
+	 * 7.5.5's acknowledgement-loss rule, and a concurrent S may have sent
+	 * updates since).
+	 */
+	private _fforAckLeadsReplay(fforActions: ChannelAction[]): boolean {
+		const f = this._state.ffor;
+		if (!f || !this._fforIsConcurrent(f)) return false;
+		return fforActions.some(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.FF_ACTIVATE_ACK
+		);
 	}
 
 	/** The section 11.1 reestablish TLV for our epoch, if any. */
@@ -24618,6 +26790,12 @@ export class Channel {
 		const peer =
 			msg.ffor && msg.ffor.epochId.equals(f.epochId) ? msg.ffor : null;
 		const peerState: FforState | null = peer ? peer.state : null;
+		// Answered afresh on every reestablish (see _fforPeerLacksClose).
+		this._fforPeerLacksClose =
+			f.role === 'R' &&
+			f.state === FforState.DRAINING &&
+			peerState !== null &&
+			peerState < FforState.DRAINING;
 		const actions: ChannelAction[] = [];
 		const error = (message: string): void => {
 			actions.push({ type: ChannelActionType.ERROR, message, cleanup: 'none' });
@@ -24722,6 +26900,20 @@ export class Channel {
 						replayMsg(MessageType.FF_CLOSE, f.closeWire.subarray(2))
 					);
 				}
+				if (
+					f.role === 'R' &&
+					this._fforIsConcurrent(f) &&
+					!f.activationMismatch &&
+					!f.closeSent
+				) {
+					if (f.syncRequestWire) {
+						actions.push(
+							{ type: ChannelActionType.PERSIST_STATE },
+							replayMsg(MessageType.FF_SYNC, f.syncRequestWire.subarray(2))
+						);
+					}
+					actions.push(...this._fforRedeem(f));
+				}
 				break;
 			case FforState.DRAINING:
 			case FforState.CLOSED:
@@ -24761,6 +26953,14 @@ export class Channel {
 				actions.push(...this._fforMaybeUnwind(f));
 				break;
 		}
+		// Settled afresh at every reestablish: the ack is owed to the wire
+		// exactly when this answer replays it (R reported a state before
+		// ACTIVE), and the dispatch clears it as the replay leaves.
+		this._fforActivateAckUnsent = actions.some(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.FF_ACTIVATE_ACK
+		);
 		return actions;
 	}
 }

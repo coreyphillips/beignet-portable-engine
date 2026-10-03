@@ -708,6 +708,7 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		// peer, a peer contradicting an ACTIVE epoch (enforce on-chain), and
 		// the witness and issuer roles' events.
 		'ffor:state',
+		'ffor:slot-resolved',
 		'ffor:settled',
 		'ffor:delegated-failed',
 		'ffor:enforce',
@@ -2981,7 +2982,11 @@ async function bootDaemon(
 			);
 			if ('refusal' in dest) return failure('INVALID_PARAMS', dest.refusal);
 			await node.backup(dest.path);
-			return success({ backed_up: true, macPath: backupMacPath(dest.path) });
+			return success({
+				backed_up: true,
+				path: dest.path,
+				macPath: backupMacPath(dest.path)
+			});
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
 		// Newest valid SCB returned by a peer via BOLT 1 peer storage. Recovery
@@ -3081,7 +3086,11 @@ async function bootDaemon(
 			success(
 				await node
 					.getOfflineReceive()
-					.quote(query.get('peer') || '', Number(query.get('amountSats')))
+					.quote(
+						query.get('peer') || '',
+						Number(query.get('amountSats')),
+						query.get('requestId') ?? undefined
+					)
 			),
 		'POST /receive/invoice': async (body) => {
 			const b = body as { peer: string };
@@ -3134,6 +3143,11 @@ async function bootDaemon(
 					body as Parameters<typeof node.fforProvisionIssuer>[0]
 				)
 			),
+		'POST /ffor/sync': (body) => {
+			const { channelId } = body as { channelId?: string };
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(node.fforSync(channelId));
+		},
 		'POST /ffor/recover': async (body) =>
 			success(
 				await node.fforRecover(body as Parameters<typeof node.fforRecover>[0])

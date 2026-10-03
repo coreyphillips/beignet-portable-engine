@@ -103,9 +103,9 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 			'/Users/coreyphillips/Documents/synonym/beignet',
 		'dist/cli/beignet-node.js'
 	));
-	const { EmbeddedWalletClient } = await import('../../shared/src/index.js');
-	const { createRelay } = await import('../../beignet-relay/relay.js');
-	const WebSocket = require('../../beignet-relay/node_modules/ws');
+	const { EmbeddedWalletClient } = await import(path.join(process.env.BEIGNET_WALLET_CORE_DIR || path.resolve(__dirname, '../../shared'), 'src/index.js'));
+	const { createRelay } = await import(path.join(process.env.BEIGNET_RELAY_DIR || path.resolve(__dirname, '../../beignet-relay'), 'relay.js'));
+	const WebSocket = require('ws');
 	const temp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	const peerPort = await freePort();
 	const primary = await BeignetNode.create({

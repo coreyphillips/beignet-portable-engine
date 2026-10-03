@@ -332,6 +332,16 @@ export interface INodeConfig {
 	 * a daemon passes `enabled: false` unless its operator opted in.
 	 */
 	fforSettle?: import('../ffor/types').IFforSettlePolicy;
+	/**
+	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md). Enabled by
+	 * default when option_ff_receive and option_quiesce are present.
+	 * Explicit true requires both dependencies. Explicit false clears bits
+	 * 562/563 and refuses peers requiring the feature. Epochs still select
+	 * their profile explicitly. To refuse only new concurrent books, set
+	 * `fforSettle.allowConcurrent: false` and retain this advertisement for
+	 * existing books. The feature assignment remains experimental.
+	 */
+	fforConcurrent?: { enabled: boolean };
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Inbound peer connections (default 125). Once this many are up, only

@@ -40,8 +40,12 @@ export interface SocketLike {
 /** Returns an already connecting socket, emitting connect/data/error/close asynchronously. */
 export type SocketFactory = (target: TransportTarget) => SocketLike;
 export interface PortableRuntimeOptions {
-/** Optional local development diagnostics; never persisted or sent to the relay. */
-onDiagnostic?(error:{phase:string;message:string;stack?:string}):void;
+	/** Optional local development diagnostics; never persisted or sent to the relay. */
+	onDiagnostic?(error: {
+		phase: string;
+		message: string;
+		stack?: string;
+	}): void;
 	databaseFactory(path: string): SQLiteCompatDatabase;
 	volume: DurableVolume;
 	socketFactory: SocketFactory;
@@ -67,3 +71,35 @@ export declare function createRelaySocketFactory(config: {
 	electrum: TransportTarget;
 	WebSocket?: any;
 }): SocketFactory;
+
+/** Remaining inbound held by an immutable offline book, separate from new-request capacity. */
+export interface OfflineReservation {
+	state: string;
+	concurrent: boolean;
+	concurrentVersion?: 1 | 2;
+	reservedInboundSats: number;
+	unresolvedSlots: number;
+}
+export interface OfflineReceiveStatus {
+	maxSats: number;
+	available: boolean | null;
+	reason: string | null;
+	probedAt: number | null;
+	concurrentVersion?: 1 | 2;
+	reservedChannelIds: string[];
+	requests: Array<{
+		id: string;
+		peer: string;
+		amountSats: number;
+		channelId?: string;
+		epochId?: string;
+		concurrent?: boolean;
+		concurrentVersion?: 1 | 2;
+		state?: string;
+		snapshotSeq?: string | null;
+		capabilityHold?: boolean;
+		reservedInboundSats?: number;
+		unresolvedSlots?: number;
+		done?: boolean;
+	}>;
+}
