@@ -98,20 +98,10 @@ function httpError(status, code, message) {
 }
 
 /** `pubkey@host:port` to its parts, or throws naming what is wrong. */
-function parseNodeUri(input) {
-	const uri = String(input || '').trim();
-	const m = uri.match(NODE_URI_RE);
-	if (!m) throw new Error('External node URI must be pubkey@host:port');
-	const port = parseInt(m[3], 10);
-	if (!(port >= 1 && port <= 65535))
-		throw new Error('External node port must be 1..65535');
-	return {
-		pubkey: m[1].toLowerCase(),
-		host: m[2],
-		port,
-		uri: `${m[1].toLowerCase()}@${m[2]}:${port}`
-	};
-}
+const {
+	parsePrimaryUri: parseNodeUri,
+	parsePrimaryFallback
+} = require('./primary-uri.cjs');
 
 function isLfbw(rec) {
 	return !!(rec && rec.lfbw && rec.lfbw.enabled);
@@ -187,8 +177,17 @@ function normalizeLfbw(
 		};
 	} else {
 		let parsed;
+		let fallback;
 		try {
 			parsed = parseNodeUri(input.primaryUri);
+			fallback = parsePrimaryFallback(
+				parsed,
+				input.primaryFallbackUri !== undefined
+					? input.primaryFallbackUri
+					: parsed.uri === existing?.primaryUri
+					? existing?.primaryFallbackUri
+					: undefined
+			);
 		} catch (err) {
 			throw httpError(400, 'BAD_LFBW_PEER', err.message);
 		}
@@ -197,6 +196,7 @@ function normalizeLfbw(
 			mode: 'external',
 			primaryWalletId: null,
 			primaryUri: parsed.uri,
+			primaryFallbackUri: fallback?.uri,
 			primaryPubkey: parsed.pubkey,
 			// The wallet's trust toward its primary is what lets the primary's
 			// zero-conf channel (a JIT open) be used the moment the payment
@@ -403,8 +403,8 @@ function directFundingConfig(
 ) {
 	const cfg = {
 		lspPubkey: primary.pubkey,
-		lspHost: primary.relayHost,
-		lspPort: primary.relayPort,
+		lspHost: primary.relayPort > 0 ? primary.relayHost : null,
+		lspPort: primary.relayPort > 0 ? primary.relayPort : null,
 		// Internal pairs buy no inbound alongside (JIT covers it for free);
 		// an external primary is asked to sell the default target.
 		targetInboundSat: lf.mode === 'external' ? DEFAULT_INBOUND_SATS : 0,
@@ -543,6 +543,7 @@ function channelizeOrder(
 		const open = {
 			pubkey: primary.pubkey,
 			host: primary.connectHost,
+			...(primary.transport ? { transport: primary.transport } : {}),
 			port: primary.connectPort,
 			amountSats: amount,
 			satsPerVbyte,

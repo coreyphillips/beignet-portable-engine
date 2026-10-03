@@ -578,6 +578,8 @@ export interface INodeConfig {
 	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
 	 */
 	webSocketImpl?: WebSocketConstructor;
+	/** Opt-in Iroh endpoint, supplied by Node or a native mobile bridge. */
+	iroh?: import('../transport/iroh').IIrohConfig;
 	/**
 	 * Watchtowers to ship encrypted justice data to at every revocation, as
 	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined
@@ -706,8 +708,8 @@ export interface IDirectFundingPolicy {
 	/** The peer every direct-funded channel is negotiated with. */
 	liquidityPeer?: string;
 	/** Where that peer is reachable, for the relay and onion descriptors. */
-	liquidityHost?: string;
-	liquidityPort?: number;
+	liquidityHost?: string | null;
+	liquidityPort?: number | null;
 	/** Smallest offer this receiver serves; the 5000 sat floor applies under it. */
 	minAmountSat?: number;
 	/** Largest offer this receiver serves. Unset means no ceiling. */
