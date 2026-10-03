@@ -49,6 +49,11 @@ export interface PortableRuntimeOptions {
 	databaseFactory(path: string): SQLiteCompatDatabase;
 	volume: DurableVolume;
 	socketFactory: SocketFactory;
+	iroh?: {
+		factory: IrohEndpointFactory;
+		relays?: string[];
+		discovery?: boolean;
+	};
 	electrum?: TransportTarget;
 }
 export interface PortableRuntime {
@@ -103,3 +108,67 @@ export interface OfflineReceiveStatus {
 		done?: boolean;
 	}>;
 }
+
+export interface IrohAddress {
+	endpointId: string;
+	relayUrl?: string;
+	directAddresses?: string[];
+}
+export interface IrohDiagnostics {
+	endpointId: string;
+	path: 'direct' | 'relay' | 'unknown';
+	rttMs?: number;
+}
+export interface IrohStream {
+	read(limit: number): Promise<Uint8Array>;
+	writeAll(data: Uint8Array): Promise<void>;
+	close(): void;
+	closed(): Promise<void>;
+	diagnostics(): IrohDiagnostics;
+}
+export declare class IrohTransport {
+	constructor(stream: IrohStream);
+	readonly transportType: 'iroh';
+	readonly writableLength: number;
+	on(event: string, listener: (...args: any[]) => void): this;
+	write(data: Uint8Array | string, callback?: (error?: Error) => void): boolean;
+	setTimeout(ms: number, callback?: () => void): this;
+	setKeepAlive(enabled?: boolean, delay?: number): this;
+	destroy(error?: Error): this;
+	getIrohDiagnostics(): IrohDiagnostics;
+}
+export interface IrohEndpoint {
+	address(): IrohAddress;
+	connect(address: IrohAddress, timeoutMs: number): Promise<IrohTransport>;
+	listen(
+		onConnection: (socket: IrohTransport) => void,
+		onError: (error: Error) => void
+	): void;
+	stopListening(): void;
+	close(): Promise<void>;
+}
+export type IrohEndpointFactory = (options: {
+	secretKey: Uint8Array;
+	relays?: string[];
+	discovery?: boolean;
+	maxPendingInbound?: number;
+	handshakeTimeoutMs?: number;
+}) => Promise<IrohEndpoint>;
+export declare const IROH_ALPN: string;
+export interface ParsedPrimary {
+	pubkey: string;
+	host: string;
+	port: number;
+	uri: string;
+	transport?: {
+		type: 'iroh';
+		endpointId: string;
+		relayUrl?: string;
+		fallbackOnion?: { host: string; port: number };
+	};
+}
+export declare function parsePrimaryUri(input: string): ParsedPrimary;
+export declare function parsePrimaryFallback(
+	primary: ParsedPrimary,
+	input?: string
+): ParsedPrimary | undefined;
