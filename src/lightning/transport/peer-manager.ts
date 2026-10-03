@@ -633,20 +633,44 @@ export class PeerManager extends EventEmitter {
 								)
 									throw new Error('Invalid Iroh fallback onion address');
 								// The phone adapter owns Tor, including its local SOCKS port.
-								const platformRoutes = (net as typeof net & { handlesDestinationRouting?: boolean }).handlesDestinationRouting;
-								const socket = platformRoutes ? await new Promise<net.Socket>((resolve, reject) => {
-									const socket = net.connect({ host: fallback.host, port: fallback.port });
-									const timer = setTimeout(() => fail(new Error('Tor fallback timed out')), timeoutMs ?? this.socks5TimeoutMs);
-									const clean = (): void => { clearTimeout(timer); socket.removeListener('error', fail); socket.removeListener('close', ended); };
-									const fail = (error: Error): void => { clean(); socket.destroy(); reject(error); };
-									const ended = (): void => fail(new Error('Tor fallback closed before connecting'));
-									socket.once('error', fail);
-									socket.once('close', ended);
-									socket.once('connect', () => { clean(); resolve(socket); });
-								}) : await socks5SocketFactory(
-									this.socks5Proxy ?? { host: '127.0.0.1', port: 9050 },
-									timeoutMs ?? this.socks5TimeoutMs
-								)(fallback.host, fallback.port);
+								const platformRoutes =
+									(net as typeof net & { handlesDestinationRouting?: boolean })
+										.handlesDestinationRouting === true;
+								const socket = platformRoutes
+									? await new Promise<net.Socket>((resolve, reject) => {
+											const socket = net.connect({
+												host: fallback.host,
+												port: fallback.port
+											});
+											const timer = setTimeout(
+												() => fail(new Error('Tor fallback timed out')),
+												timeoutMs ?? this.socks5TimeoutMs
+											);
+											const clean = (): void => {
+												clearTimeout(timer);
+												socket.removeListener('error', fail);
+												socket.removeListener('close', ended);
+											};
+											const fail = (error: Error): void => {
+												clean();
+												socket.destroy();
+												reject(error);
+											};
+											const ended = (): void =>
+												fail(
+													new Error('Tor fallback closed before connecting')
+												);
+											socket.once('error', fail);
+											socket.once('close', ended);
+											socket.once('connect', () => {
+												clean();
+												resolve(socket);
+											});
+									  })
+									: await socks5SocketFactory(
+											this.socks5Proxy ?? { host: '127.0.0.1', port: 9050 },
+											timeoutMs ?? this.socks5TimeoutMs
+									  )(fallback.host, fallback.port);
 								return Object.assign(socket, { transportType: 'tcp' as const });
 							},
 							1500,
@@ -670,9 +694,12 @@ export class PeerManager extends EventEmitter {
 			// Portable transports already resolve the requested destination (for
 			// example, Tor runs at the fixed byte relay). A second SOCKS handshake
 			// here would be sent to the Lightning peer rather than a SOCKS server.
-			const platformRoutes = (net as typeof net & {
-				handlesDestinationRouting?: boolean;
-			}).handlesDestinationRouting === true;
+			const platformRoutes =
+				(
+					net as typeof net & {
+						handlesDestinationRouting?: boolean;
+					}
+				).handlesDestinationRouting === true;
 			const proxy = platformRoutes
 				? undefined
 				: selectOutboundProxy(host, this.socks5Proxy, this.socks5ProxyScope);

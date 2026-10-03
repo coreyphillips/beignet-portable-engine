@@ -68,7 +68,7 @@ function parsePrimaryUri(input) {
 			}`
 		};
 	}
-	const tcp = /^(\[[0-9a-f:]+\]|[^\s:@/?#]+):(\d+)$/i.exec(address);
+	const tcp = /^(\[[0-9a-f:]+\]|[a-zA-Z0-9.-]+):(\d+)$/i.exec(address);
 	if (!tcp || Number(tcp[2]) < 1 || Number(tcp[2]) > 65535)
 		throw new Error('Enter a node host and port between 1 and 65535.');
 	return {
@@ -80,7 +80,7 @@ function parsePrimaryUri(input) {
 }
 
 function parsePrimaryFallback(primary, input) {
-	if (!input) return undefined;
+	if (!input || !String(input).trim()) return undefined;
 	const fallback = parsePrimaryUri(input);
 	if (
 		primary.transport?.type !== 'iroh' ||

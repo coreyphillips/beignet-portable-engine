@@ -2,7 +2,7 @@
 
 The fork tracks Beignet **0.26.0** at `026d202b96ada2d88f7cf0a206f36697fcf6b3fe`. The source resync retains the existing fork patches and adds host-injected Iroh endpoints, validated primary pairing URIs, same-key onion fallback, transport-aware channel opening, and destination routing for the fallback. See `PATCHES.md`.
 
-- `npm test`: 114 tests pass, including primary parsing, native-factory opt-in, fallback forwarding, refusal before wallet persistence on unsupported hosts, and bundle input checks.
+- `npm test`: 117 tests pass, including primary parsing, native-factory opt-in, fallback forwarding, clearing persisted funding addresses, avoiding unnecessary engine restarts, refusal before wallet persistence on unsupported hosts, and bundle input checks.
 - `npm run check:types`: passes for the public portable declarations.
 - The broader mirrored-source `tsc --noEmit` remains outside that check: 22 existing errors on the baseline and 27 after sync, with four additional errors from the intentionally uninstalled Node Iroh binding and one more instance of the existing Node socket callback variance mismatch in the fallback. The native and browser bundles exclude that binding.
 - The bundle reports `0.26.0-portable` and excludes the Node Iroh binding. Existing unreachable filesystem helper warnings remain.

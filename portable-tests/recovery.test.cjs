@@ -35,11 +35,21 @@ function memory() {
 		list: () => [...rows.keys()]
 	};
 }
-async function fixture(volume = memory(), storedChannels = [], runtimeOptions = {}) {
+async function fixture(
+	volume = memory(),
+	storedChannels = [],
+	runtimeOptions = {}
+) {
 	const connects = [];
-	const calls = [], intervals = new Set(), timers = new Set();
+	const calls = [],
+		intervals = new Set(),
+		timers = new Set();
 	const node = new EventEmitter();
-	let status = { state: 'running', autoApply: { enabled: true, phase: 'idle' }, node: { gate: 'unguarded', fenced: false } };
+	let status = {
+		state: 'running',
+		autoApply: { enabled: true, phase: 'idle' },
+		node: { gate: 'unguarded', fenced: false }
+	};
 	let connected = false;
 	Object.assign(node, {
 		getRecoverySurfaceStatus: () => status,
@@ -47,49 +57,105 @@ async function fixture(volume = memory(), storedChannels = [], runtimeOptions = 
 		getHealth: () => ({ electrumConnected: true }),
 		getInfo: () => ({ nodeId: PK, blockHeight: 100 }),
 		waitForInitialSync: async () => {},
-		listChannels: () => storedChannels.map(row => ({ channelId: row.channelId, ...row.state })),
-		listPeers: () => connected ? [{ pubkey: PK, state: 'connected' }] : [],
+		listChannels: () =>
+			storedChannels.map((row) => ({ channelId: row.channelId, ...row.state })),
+		listPeers: () => (connected ? [{ pubkey: PK, state: 'connected' }] : []),
 		getBalance: () => ({ onchain: 0, lightning: 0 }),
 		listUtxos: () => [],
 		addTrustedPeer: () => calls.push('trust'),
 		removeTrustedPeer: () => calls.push('untrust'),
 		configureDirectFunding: () => calls.push('configure-funding'),
-		connectPeer: async (...args) => { connects.push(args); calls.push('connect'); connected = true; },
-		disconnectPeer: () => { calls.push('disconnect'); connected = false; },
-		createInvoice: () => { calls.push('invoice'); throw Error('test must not create an invoice'); },
-		getFforReceiveService: () => ({ receipts: async () => calls.push('receipts') }),
+		connectPeer: async (...args) => {
+			connects.push(args);
+			calls.push('connect');
+			connected = true;
+		},
+		disconnectPeer: () => {
+			calls.push('disconnect');
+			connected = false;
+		},
+		createInvoice: () => {
+			calls.push('invoice');
+			throw Error('test must not create an invoice');
+		},
+		getFforReceiveService: () => ({
+			receipts: async () => calls.push('receipts')
+		}),
 		fforEpochs: () => [],
 		gracefulShutdown: async () => calls.push('shutdown'),
 		destroy: async () => calls.push('destroy')
 	});
 	const control = {
-		node, verified: 0, options: [],
-		create: async options => { control.options.push(options); return node; }
+		node,
+		verified: 0,
+		options: [],
+		create: async (options) => {
+			control.options.push(options);
+			return node;
+		}
 	};
 	const mod = { exports: {} };
-	new Function('module', 'exports', 'require', 'fixture', 'setInterval', 'setTimeout', 'clearInterval', 'clearTimeout', await compiled)(
-		mod, mod.exports, require, control,
-		(callback, ms) => { const timer = { callback, ms }; intervals.add(timer); return timer; },
-		(callback, ms) => { const timer = { callback, ms }; timers.add(timer); return timer; },
-		timer => intervals.delete(timer), timer => timers.delete(timer)
+	new Function(
+		'module',
+		'exports',
+		'require',
+		'fixture',
+		'setInterval',
+		'setTimeout',
+		'clearInterval',
+		'clearTimeout',
+		await compiled
+	)(
+		mod,
+		mod.exports,
+		require,
+		control,
+		(callback, ms) => {
+			const timer = { callback, ms };
+			intervals.add(timer);
+			return timer;
+		},
+		(callback, ms) => {
+			const timer = { callback, ms };
+			timers.add(timer);
+			return timer;
+		},
+		(timer) => intervals.delete(timer),
+		(timer) => timers.delete(timer)
 	);
 	const runtime = await mod.exports.createPortableRuntime({
-		volume, electrum, ...runtimeOptions,
-		databaseFactory: () => { throw Error('unexpected database'); },
-		socketFactory: () => { throw Error('unexpected network'); }
+		volume,
+		electrum,
+		...runtimeOptions,
+		databaseFactory: () => {
+			throw Error('unexpected database');
+		},
+		socketFactory: () => {
+			throw Error('unexpected network');
+		}
 	});
 	return {
-		runtime, node, calls, control, volume, connects,
-		set status(value) { status = value; },
-		get status() { return status; },
-		registry: () => JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString()),
+		runtime,
+		node,
+		calls,
+		control,
+		volume,
+		connects,
+		set status(value) {
+			status = value;
+		},
+		get status() {
+			return status;
+		},
+		registry: () =>
+			JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString()),
 		tick: async () => {
 			for (const timer of [...intervals, ...timers]) {
 				if (timer.ms === 15000) continue;
 				timers.delete(timer);
 				await timer.callback();
 			}
-			await new Promise(resolve => setImmediate(resolve));
+			await new Promise((resolve) => setImmediate(resolve));
 		}
 	};
 }
@@ -228,29 +294,88 @@ test('a crash after native install recovers import completion from durable chann
 
 
 test('an Iroh primary enables only the injected native endpoint and passes fallback settings on every dial', async () => {
- const factory = async () => { throw Error('fake node must not call native factory'); };
- const f = await fixture(memory(), [], { iroh: { factory } });
- const primaryUri = `${PK}@iroh:${'ab'.repeat(32)}?relay=https%3A%2F%2Frelay.example%2F`;
- const fallback = `${PK}@${'a'.repeat(56)}.onion:9735`;
- try {
-  await create(f, { lfbw: { primaryUri, primaryFallbackUri: fallback } });
-  assert.equal(f.control.options[0].iroh, true);
-  assert.equal(f.control.options[0].irohFactory, factory);
-  assert.deepEqual(f.connects[0][3], { type: 'iroh', endpointId: 'ab'.repeat(32), relayUrl: 'https://relay.example/', fallbackOnion: { host: 'a'.repeat(56) + '.onion', port: 9735 } });
-  assert.equal(f.registry().record.lfbw.primaryFallbackUri, fallback);
- } finally { await f.runtime.close(); }
+	const factory = async () => {
+		throw Error('fake node must not call native factory');
+	};
+	const f = await fixture(memory(), [], { iroh: { factory } });
+	const primaryUri = `${PK}@iroh:${'ab'.repeat(
+		32
+	)}?relay=https%3A%2F%2Frelay.example%2F`;
+	const fallback = `${PK}@${'a'.repeat(56)}.onion:9735`;
+	try {
+		await create(f, { lfbw: { primaryUri, primaryFallbackUri: fallback } });
+		assert.equal(f.control.options[0].iroh, true);
+		assert.equal(f.control.options[0].irohFactory, factory);
+		assert.deepEqual(f.connects[0][3], {
+			type: 'iroh',
+			endpointId: 'ab'.repeat(32),
+			relayUrl: 'https://relay.example/',
+			fallbackOnion: { host: 'a'.repeat(56) + '.onion', port: 9735 }
+		});
+		assert.equal(f.registry().record.lfbw.primaryFallbackUri, fallback);
+	} finally {
+		await f.runtime.close();
+	}
 });
 
 test('conventional primaries leave Iroh unbound even when the host offers its factory', async () => {
- const f = await fixture(memory(), [], { iroh: { factory: async () => { throw Error('must stay unused'); } } });
- try { await create(f); assert.equal(f.control.options[0].iroh, false); } finally { await f.runtime.close(); }
+	const f = await fixture(memory(), [], {
+		iroh: {
+			factory: async () => {
+				throw Error('must stay unused');
+			}
+		}
+	});
+	try {
+		await create(f);
+		assert.equal(f.control.options[0].iroh, false);
+	} finally {
+		await f.runtime.close();
+	}
 });
 
 test('an unsupported Iroh primary is refused before a wallet record or seed is saved', async () => {
- const f = await fixture();
- try {
-  await assert.rejects(create(f, { lfbw: { primaryUri: `${PK}@iroh:${'ab'.repeat(32)}` } }), { code: 'IROH_UNSUPPORTED' });
-  assert.equal(f.volume.read('/wallet/registry.json'), null);
-  assert.equal(f.control.options.length, 0);
- } finally { await f.runtime.close(); }
+	const f = await fixture();
+	try {
+		await assert.rejects(
+			create(f, { lfbw: { primaryUri: `${PK}@iroh:${'ab'.repeat(32)}` } }),
+			{ code: 'IROH_UNSUPPORTED' }
+		);
+		assert.equal(f.volume.read('/wallet/registry.json'), null);
+		assert.equal(f.control.options.length, 0);
+	} finally {
+		await f.runtime.close();
+	}
+});
+
+test('primary edits restart only when Iroh enablement changes', async () => {
+	const f = await fixture(memory(), [], { iroh: { factory: async () => {} } });
+	try {
+		const id = (await create(f)).record.id;
+		const patch = (lfbw) =>
+			f.runtime.request({
+				method: 'PATCH',
+				path: `/api/wallets/${id}`,
+				body: { lfbw: { enabled: true, ...lfbw } }
+			});
+		await patch({ primaryUri: `${PK}@other.example:9735` });
+		assert.equal(f.control.options.length, 1);
+		const primaryUri = `${PK}@iroh:${'ab'.repeat(32)}`;
+		await patch({ primaryUri });
+		assert.equal(f.control.options.length, 2);
+		await patch({
+			primaryUri,
+			primaryFallbackUri: `${PK}@${'a'.repeat(56)}.onion:9735`
+		});
+		assert.equal(f.control.options.length, 2);
+		assert.equal(f.connects.at(-1)[3].fallbackOnion.port, 9735);
+		await patch({ primaryUri, primaryFallbackUri: null });
+		assert.equal(f.control.options.length, 2);
+		assert.equal(f.connects.at(-1)[3].fallbackOnion, undefined);
+		await patch({ primaryUri: `${PK}@other.example:9735` });
+		assert.equal(f.control.options.length, 3);
+		assert.equal(f.control.options[2].iroh, false);
+	} finally {
+		await f.runtime.close();
+	}
 });

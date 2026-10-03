@@ -191,7 +191,14 @@ export async function createPortableRuntime(options: any) {
 			...p,
 			connectHost: p.host,
 			connectPort: p.port,
-			...(fallback ? { transport: { ...p.transport, fallbackOnion: { host: fallback.host, port: fallback.port } } } : {}),
+			...(fallback
+				? {
+						transport: {
+							...p.transport,
+							fallbackOnion: { host: fallback.host, port: fallback.port }
+						}
+				  }
+				: {}),
 			relayHost: fallback?.host ?? p.host,
 			relayPort: fallback?.port ?? p.port
 		};
@@ -1305,10 +1312,19 @@ export async function createPortableRuntime(options: any) {
 				body.lfbwPrimaryNode ??
 				(network === 'mainnet' ? DEFAULT_PRIMARY : null);
 			const lf = rules.normalizeLfbw(
-				{ enabled: true, primaryUri: uri, primaryFallbackUri: body.lfbw?.primaryFallbackUri, trusted: body.lfbw?.trusted ?? true },
+				{
+					enabled: true,
+					primaryUri: uri,
+					primaryFallbackUri: body.lfbw?.primaryFallbackUri,
+					trusted: body.lfbw?.trusted ?? true
+				},
 				{ network, available: true }
 			);
-			if (rules.parseNodeUri(lf.primaryUri).transport?.type === 'iroh' && !options.iroh) failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+			if (
+				rules.parseNodeUri(lf.primaryUri).transport?.type === 'iroh' &&
+				!options.iroh
+			)
+				failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
 			record = {
 				electrum,
 				id: randomBytes(16).toString('hex'),
@@ -1376,17 +1392,35 @@ export async function createPortableRuntime(options: any) {
 					enabled: true,
 					primaryUri: body.primaryNodeUri ?? body.primaryUri
 				};
-				const previousPrimary = JSON.stringify([record.lfbw.primaryUri, record.lfbw.primaryFallbackUri]);
+				const previousPrimary = rules.parseNodeUri(record.lfbw.primaryUri);
+				const previousFallback = record.lfbw.primaryFallbackUri;
 				const nextLfbw = rules.normalizeLfbw(input, {
 					network: record.network,
 					available: true,
 					existing: record.lfbw
 				});
-				if (rules.parseNodeUri(nextLfbw.primaryUri).transport?.type === 'iroh' && !options.iroh) failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+				if (
+					rules.parseNodeUri(nextLfbw.primaryUri).transport?.type === 'iroh' &&
+					!options.iroh
+				)
+					failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
 				record.lfbw = nextLfbw;
 				if (body.name) record.name = body.name;
 				persist();
-				if (previousPrimary !== JSON.stringify([record.lfbw.primaryUri, record.lfbw.primaryFallbackUri])) await stop();
+				const nextPrimary = rules.parseNodeUri(nextLfbw.primaryUri);
+				if (
+					(previousPrimary.transport?.type === 'iroh') !==
+					(nextPrimary.transport?.type === 'iroh')
+				) {
+					await stop();
+				} else if (
+					node &&
+					previousPrimary.pubkey === nextPrimary.pubkey &&
+					(previousPrimary.uri !== nextPrimary.uri ||
+						previousFallback !== nextLfbw.primaryFallbackUri)
+				) {
+					node.disconnectPeer(previousPrimary.pubkey);
+				}
 				if (!node) return start();
 				await setup();
 				return publicRecord();

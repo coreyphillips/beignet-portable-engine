@@ -98,7 +98,10 @@ function httpError(status, code, message) {
 }
 
 /** `pubkey@host:port` to its parts, or throws naming what is wrong. */
-const { parsePrimaryUri: parseNodeUri, parsePrimaryFallback } = require('./primary-uri.cjs');
+const {
+	parsePrimaryUri: parseNodeUri,
+	parsePrimaryFallback
+} = require('./primary-uri.cjs');
 
 function isLfbw(rec) {
 	return !!(rec && rec.lfbw && rec.lfbw.enabled);
@@ -174,8 +177,17 @@ function normalizeLfbw(
 		};
 	} else {
 		let parsed;
+		let fallback;
 		try {
 			parsed = parseNodeUri(input.primaryUri);
+			fallback = parsePrimaryFallback(
+				parsed,
+				input.primaryFallbackUri !== undefined
+					? input.primaryFallbackUri
+					: parsed.uri === existing?.primaryUri
+					? existing?.primaryFallbackUri
+					: undefined
+			);
 		} catch (err) {
 			throw httpError(400, 'BAD_LFBW_PEER', err.message);
 		}
@@ -184,7 +196,7 @@ function normalizeLfbw(
 			mode: 'external',
 			primaryWalletId: null,
 			primaryUri: parsed.uri,
-			primaryFallbackUri: parsePrimaryFallback(parsed, input.primaryFallbackUri !== undefined ? input.primaryFallbackUri : (input.primaryUri === existing?.primaryUri ? existing?.primaryFallbackUri : undefined))?.uri,
+			primaryFallbackUri: fallback?.uri,
 			primaryPubkey: parsed.pubkey,
 			// The wallet's trust toward its primary is what lets the primary's
 			// zero-conf channel (a JIT open) be used the moment the payment
@@ -391,7 +403,8 @@ function directFundingConfig(
 ) {
 	const cfg = {
 		lspPubkey: primary.pubkey,
-		...(primary.relayPort > 0 ? { lspHost: primary.relayHost, lspPort: primary.relayPort } : {}),
+		lspHost: primary.relayPort > 0 ? primary.relayHost : null,
+		lspPort: primary.relayPort > 0 ? primary.relayPort : null,
 		// Internal pairs buy no inbound alongside (JIT covers it for free);
 		// an external primary is asked to sell the default target.
 		targetInboundSat: lf.mode === 'external' ? DEFAULT_INBOUND_SATS : 0,

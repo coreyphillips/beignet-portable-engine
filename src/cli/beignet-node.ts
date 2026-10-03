@@ -9154,8 +9154,8 @@ export class BeignetNode extends EventEmitter {
 	 */
 	configureDirectFunding(update: {
 		lspPubkey?: string;
-		lspHost?: string;
-		lspPort?: number;
+		lspHost?: string | null;
+		lspPort?: number | null;
 		targetInboundSat?: number;
 		trusted?: boolean;
 		allowSplice?: boolean;
@@ -9198,7 +9198,7 @@ export class BeignetNode extends EventEmitter {
 				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
 			);
 		}
-		if (update.lspPort !== undefined) {
+		if (update.lspPort !== undefined && update.lspPort !== null) {
 			if (
 				!Number.isInteger(update.lspPort) ||
 				update.lspPort < 1 ||
@@ -9210,7 +9210,11 @@ export class BeignetNode extends EventEmitter {
 				);
 			}
 		}
-		if (update.lspHost !== undefined && update.lspHost.length === 0) {
+		if (
+			update.lspHost !== undefined &&
+			update.lspHost !== null &&
+			(typeof update.lspHost !== 'string' || update.lspHost.length === 0)
+		) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
 				'lspHost must not be empty'

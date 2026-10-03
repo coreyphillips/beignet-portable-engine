@@ -50,8 +50,8 @@ test('direct-funding descriptors never treat an Iroh endpoint as a TCP address',
 		{ mode: 'external', trusted: true },
 		{ ...parsed, relayHost: parsed.host, relayPort: parsed.port }
 	);
-	assert.equal(config.lspHost, undefined);
-	assert.equal(config.lspPort, undefined);
+	assert.equal(config.lspHost, null);
+	assert.equal(config.lspPort, null);
 	assert.equal(config.lspPubkey, key);
 });
 test('the portable bundle exposes the stream adapter without loading a Node binding', () => {
@@ -67,4 +67,34 @@ test('the portable bundle exposes the stream adapter without loading a Node bind
 			(p) => p.includes('@number0') || p.endsWith('transport/iroh-node.ts')
 		)
 	);
+});
+
+test('canonical primary edits preserve fallback and invalid fallback uses the API error contract', () => {
+	const primaryUri = `${key}@iroh:${'0'.repeat(64)}`;
+	const existing = rules.normalizeLfbw(
+		{ enabled: true, primaryUri, primaryFallbackUri: onion },
+		{ available: true }
+	);
+	for (const input of [` ${primaryUri} `, `${key}@iroh:${'a'.repeat(52)}`]) {
+		assert.equal(
+			rules.normalizeLfbw(
+				{ enabled: true, primaryUri: input },
+				{ available: true, existing }
+			).primaryFallbackUri,
+			onion
+		);
+	}
+	assert.throws(
+		() =>
+			rules.normalizeLfbw(
+				{ enabled: true, primaryUri, primaryFallbackUri: 'bad' },
+				{ available: true }
+			),
+		{ status: 400, code: 'BAD_LFBW_PEER' }
+	);
+	assert.equal(
+		parsePrimaryFallback(parsePrimaryUri(primaryUri), '   '),
+		undefined
+	);
+	assert.throws(() => parsePrimaryUri(`${key}@h%st\\x:9735`));
 });
