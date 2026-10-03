@@ -53,11 +53,12 @@ async function runChannelize({
 		const target = rules.channelizeTarget({
 			onchainSats: balance.onchain,
 			utxos: node.listUtxos(),
-			channels: node
-				.listChannels()
-				.filter((c) => !excludeChannelIds.has(c.channelId)),
+			// Reservations do not make an existing home disappear.
+			channels: node.listChannels(),
 			primaryPubkey: record.lfbw.primaryPubkey
 		});
+		if (target.action === 'splice-in' && excludeChannelIds.has(target.channelId))
+			return { last: decided(now, { action: 'wait', reason: 'offline-receive' }), retryAt };
 		if (target.action === 'wait') {
 			return { last: decided(now, target), retryAt };
 		}

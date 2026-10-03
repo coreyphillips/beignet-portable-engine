@@ -12,12 +12,16 @@ import {
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
+	isFforConcurrentVersion,
+	FforConcurrentVersion,
 	FforAbortReason,
 	FforRole,
 	FforSlotState,
 	FforState,
 	IFforEpochRecord
 } from '../ffor/types';
+import { fforTranscriptConcurrentVersion } from '../ffor/messages';
+import { validateFforSyncState } from '../ffor/sync-state';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -33,6 +37,12 @@ import {
 import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IGraphChannel, IGraphNode } from '../gossip/types';
+import {
+	ICompactHtlcHistory,
+	encodeHtlcHistory,
+	decodeHtlcHistory,
+	usesCompactHtlcHistory
+} from './htlc-history';
 
 // ─── Primitive helpers ───
 
@@ -393,6 +403,7 @@ export interface ISerializedChannelState {
 	 */
 	pendingFeerateSignable?: boolean;
 	pendingFeerateCommitted?: boolean;
+	awaitingLocalFeeCommitment?: boolean;
 	/**
 	 * The feerate baked into the current signed local commitment (the rate
 	 * remoteCommitmentSignature covers) — force-close rebuilds at this rate.
@@ -417,8 +428,15 @@ export interface ISerializedChannelState {
 	remoteNextPerCommitmentPoint: string | null;
 	localHtlcCounter: string;
 	htlcs: ISerializedHtlcEntry[];
+	/**
+	 * Received removals the signed local commitment still carries (see
+	 * IChannelState.signedLocalRemovals). Absent when there are none, so a row
+	 * outside that window is byte for byte what it was.
+	 */
+	signedLocalRemovals?: ISerializedHtlcEntry[];
 	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
+	compactHtlcHistory?: ICompactHtlcHistory;
 	/**
 	 * Unrevoked remote commitment txs kept for watchtower backups. A point
 	 * repeats once per funding output it was signed over.
@@ -856,7 +874,8 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 }
 
 export function serializeChannelState(
-	s: IChannelState
+	s: IChannelState,
+	options: { legacyHtlcHistory?: boolean } = {}
 ): ISerializedChannelState {
 	const htlcs: ISerializedHtlcEntry[] = [];
 	for (const [key, entry] of s.htlcs) {
@@ -864,7 +883,13 @@ export function serializeChannelState(
 	}
 
 	let revokedHtlcSnapshots: ISerializedHtlcSnapshot[] | undefined;
-	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.size > 0) {
+	const compactHistory =
+		!options.legacyHtlcHistory && usesCompactHtlcHistory(s);
+	if (
+		!compactHistory &&
+		s.revokedHtlcSnapshots &&
+		s.revokedHtlcSnapshots.size > 0
+	) {
 		revokedHtlcSnapshots = [];
 		for (const [commitmentNumber, entries] of s.revokedHtlcSnapshots) {
 			revokedHtlcSnapshots.push({
@@ -911,6 +936,7 @@ export function serializeChannelState(
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		awaitingLocalFeeCommitment: s.awaitingLocalFeeCommitment,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
 		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
@@ -926,7 +952,15 @@ export function serializeChannelState(
 		remoteNextPerCommitmentPoint: bufToHex(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
+		signedLocalRemovals: s.signedLocalRemovals?.length
+			? s.signedLocalRemovals.map((e) =>
+					serializeHtlcEntry(`received-${e.id}`, e)
+			  )
+			: undefined,
 		revokedHtlcSnapshots,
+		...(compactHistory
+			? { compactHtlcHistory: encodeHtlcHistory(s.revokedHtlcSnapshots) }
+			: {}),
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.size
 			? [...s.watchtowerRemoteCommitmentTxs].flatMap(([point, txs]) =>
 					txs.map((tx) => ({ point, tx: tx.toString('hex') }))
@@ -1097,6 +1131,8 @@ export interface ISerializedFforEpoch {
 		voucherAmountsMsat: string[];
 		witnessPeers?: string[];
 		hashChain?: boolean;
+		/** ff_init TLV 17 as requested; absent when the TLV was. */
+		concurrentVersion?: number;
 	};
 	remoteNodeId: string;
 	initWire: string;
@@ -1115,10 +1151,19 @@ export interface ISerializedFforEpoch {
 	activateAckWire: string | null;
 	closeWire: string | null;
 	closeAckWire: string | null;
+	syncRequestWire?: string;
+	syncSnapshotWire?: string;
+	syncConflictWire?: string;
+	slotRedeemed?: boolean[];
 	slotStates: string[];
 	slotUpstream: (string | null)[];
 	settledBitmap: string | null;
 	knownPreimages: (string | null)[];
+	voucherOutcomes?: ({
+		outcome: 'fulfilled' | 'cancelled';
+		localCommitmentNumber: string;
+		remoteCommitmentNumber: string;
+	} | null)[];
 	/** Absent on records written before the field existed: no slot exposed. */
 	exposedSlots?: boolean[];
 	/** Absent on records written before the field existed: no issuer. */
@@ -1140,6 +1185,18 @@ export interface ISerializedFforEpoch {
 	abortReason: number | null;
 	closeSent: boolean;
 	activationMismatch: boolean;
+	/**
+	 * The selected profile (see IFforEpochRecord.concurrentVersion). Written
+	 * only for a concurrent epoch, so a baseline record serializes to the
+	 * bytes it always did; absent reads as baseline.
+	 */
+	concurrentVersion?: number;
+	concurrentVersionMismatch?: boolean;
+	/**
+	 * The capability hold (see IFforEpochRecord.capabilityHold). Written
+	 * only while it stands, and only a concurrent epoch has one.
+	 */
+	capabilityHold?: boolean;
 }
 
 export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
@@ -1164,7 +1221,10 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 			...(f.params.witnessPeers
 				? { witnessPeers: f.params.witnessPeers.map((p) => p.toString('hex')) }
 				: {}),
-			...(f.params.hashChain ? { hashChain: true } : {})
+			...(f.params.hashChain ? { hashChain: true } : {}),
+			...(f.params.concurrentVersion !== undefined
+				? { concurrentVersion: f.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: f.remoteNodeId.toString('hex'),
 		initWire: f.initWire.toString('hex'),
@@ -1184,10 +1244,33 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		activateAckWire: bufToHex(f.activateAckWire),
 		closeWire: bufToHex(f.closeWire),
 		closeAckWire: bufToHex(f.closeAckWire),
+		...(f.syncRequestWire
+			? { syncRequestWire: f.syncRequestWire.toString('hex') }
+			: {}),
+		...(f.syncSnapshotWire
+			? { syncSnapshotWire: f.syncSnapshotWire.toString('hex') }
+			: {}),
+		...(f.syncConflictWire
+			? { syncConflictWire: f.syncConflictWire.toString('hex') }
+			: {}),
+		...(f.slotRedeemed ? { slotRedeemed: [...f.slotRedeemed] } : {}),
 		slotStates: [...f.slotStates],
 		slotUpstream: [...f.slotUpstream],
 		settledBitmap: bufToHex(f.settledBitmap),
 		knownPreimages: f.knownPreimages.map((p) => bufToHex(p)),
+		...(f.voucherOutcomes
+			? {
+					voucherOutcomes: f.voucherOutcomes.map((o) =>
+						o
+							? {
+									outcome: o.outcome,
+									localCommitmentNumber: bigintToStr(o.localCommitmentNumber),
+									remoteCommitmentNumber: bigintToStr(o.remoteCommitmentNumber)
+							  }
+							: null
+					)
+			  }
+			: {}),
 		exposedSlots: [...f.exposedSlots],
 		issuerProvisioned: f.issuerProvisioned,
 		witnesses: f.witnesses.map((w) => ({
@@ -1205,14 +1288,109 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 		unwindOwed: f.unwindOwed,
 		abortReason: f.abortReason,
 		closeSent: f.closeSent,
-		activationMismatch: f.activationMismatch
+		activationMismatch: f.activationMismatch,
+		...(f.concurrentVersionMismatch ? { concurrentVersionMismatch: true } : {}),
+		...(isFforConcurrentVersion(f.concurrentVersion)
+			? { concurrentVersion: f.concurrentVersion }
+			: {}),
+		...(isFforConcurrentVersion(f.concurrentVersion) &&
+		f.capabilityHold === true
+			? { capabilityHold: true }
+			: {})
 	};
+}
+
+/**
+ * The selected profile of a stored epoch, checked against the transcript
+ * it was persisted with (CONCURRENT-RECEIVE.md section 1.1: the version is
+ * never inferred from features, connection status or preferences, and
+ * section 8: it is compared with the persisted setup bytes).
+ *
+ * The stored field and the stored ff_init and ff_accept must tell one
+ * story: a request and its exact echo beside a selected version, or no
+ * TLV 17 in either beside none. When they do not (a row a build without
+ * the field rewrote, a damaged row), the record is never read as a
+ * baseline epoch: it is concurrent if either source says so, and
+ * `mismatch` is set so the caller raises activationMismatch, which stops
+ * new work on both sides and leaves the vouchers and every existing
+ * obligation in place. A record whose wires do not decode and whose field
+ * is absent is left alone; there is nothing to compare.
+ */
+function storedConcurrentVersion(
+	storedField: number | undefined,
+	requestedField: number | undefined,
+	initWire: Buffer,
+	acceptWire: Buffer | null
+): { selected: 0 | FforConcurrentVersion; mismatch: boolean } {
+	const stored = isFforConcurrentVersion(storedField) ? storedField : 0;
+	const transcript = fforTranscriptConcurrentVersion(initWire, acceptWire);
+	if (transcript === null) {
+		const hints = [storedField, requestedField].filter(
+			(version) => version !== undefined && version !== 0
+		);
+		return {
+			selected:
+				hints.some((version) => version !== 1) || requestedField === 0
+					? 2
+					: hints.length
+					? 1
+					: 0,
+			mismatch: !!storedField || requestedField !== undefined
+		};
+	}
+	const { requested, echoed } = transcript;
+	const accepted = acceptWire !== null;
+	const selectedOnWire =
+		accepted && isFforConcurrentVersion(requested) && echoed === requested
+			? requested
+			: 0;
+	const unsupported =
+		(storedField !== undefined &&
+			storedField !== 0 &&
+			!isFforConcurrentVersion(storedField)) ||
+		[requestedField, requested, echoed].some(
+			(version) => version !== undefined && !isFforConcurrentVersion(version)
+		);
+	const consistent =
+		!unsupported &&
+		selectedOnWire === stored &&
+		requested === requestedField &&
+		(!accepted || echoed === requested);
+	// Never reinterpret a contradictory or unknown selected version as baseline.
+	// Prefer the reservation-preserving profile while the mismatch quarantines it.
+	const selected =
+		unsupported ||
+		stored === 2 ||
+		selectedOnWire === 2 ||
+		(!consistent && [requestedField, requested, echoed].includes(2))
+			? 2
+			: stored || selectedOnWire;
+	return { selected, mismatch: !consistent };
 }
 
 export function deserializeFforEpoch(
 	s: ISerializedFforEpoch
 ): IFforEpochRecord {
-	return {
+	for (const wire of [
+		s.syncRequestWire,
+		s.syncSnapshotWire,
+		s.syncConflictWire
+	]) {
+		if (
+			wire !== undefined &&
+			(typeof wire !== 'string' || !/^(?:[0-9a-f]{2})+$/.test(wire))
+		)
+			throw new Error('Invalid persisted receipt wire encoding');
+	}
+	const initWire = Buffer.from(s.initWire, 'hex');
+	const acceptWire = hexToBuf(s.acceptWire);
+	const concurrent = storedConcurrentVersion(
+		s.concurrentVersion,
+		s.params.concurrentVersion,
+		initWire,
+		acceptWire
+	);
+	const record: IFforEpochRecord = {
 		role: s.role as FforRole,
 		state: s.state as FforState,
 		epochId: Buffer.from(s.epochId, 'hex'),
@@ -1237,11 +1415,14 @@ export function deserializeFforEpoch(
 						)
 				  }
 				: {}),
-			...(s.params.hashChain ? { hashChain: true } : {})
+			...(s.params.hashChain ? { hashChain: true } : {}),
+			...(s.params.concurrentVersion !== undefined
+				? { concurrentVersion: s.params.concurrentVersion }
+				: {})
 		},
 		remoteNodeId: Buffer.from(s.remoteNodeId, 'hex'),
-		initWire: Buffer.from(s.initWire, 'hex'),
-		acceptWire: hexToBuf(s.acceptWire),
+		initWire,
+		acceptWire,
 		sCommitmentNumber:
 			s.sCommitmentNumber === null ? null : strToBigint(s.sCommitmentNumber),
 		sHtlcIdBase: s.sHtlcIdBase === null ? null : strToBigint(s.sHtlcIdBase),
@@ -1257,10 +1438,38 @@ export function deserializeFforEpoch(
 		activateAckWire: hexToBuf(s.activateAckWire),
 		closeWire: hexToBuf(s.closeWire),
 		closeAckWire: hexToBuf(s.closeAckWire),
+		...(s.syncRequestWire
+			? { syncRequestWire: Buffer.from(s.syncRequestWire, 'hex') }
+			: {}),
+		...(s.syncSnapshotWire
+			? { syncSnapshotWire: Buffer.from(s.syncSnapshotWire, 'hex') }
+			: {}),
+		...(s.syncConflictWire
+			? { syncConflictWire: Buffer.from(s.syncConflictWire, 'hex') }
+			: {}),
+		...(s.slotRedeemed ? { slotRedeemed: [...s.slotRedeemed] } : {}),
 		slotStates: s.slotStates.map((x) => x as FforSlotState),
 		slotUpstream: [...s.slotUpstream],
 		settledBitmap: hexToBuf(s.settledBitmap),
 		knownPreimages: s.knownPreimages.map((p) => hexToBuf(p)),
+		...(s.voucherOutcomes
+			? {
+					voucherOutcomes: s.voucherOutcomes.map((o) => {
+						if (o === null) return null;
+						if (
+							(o.outcome !== 'fulfilled' && o.outcome !== 'cancelled') ||
+							!/^\d+$/.test(o.localCommitmentNumber) ||
+							!/^\d+$/.test(o.remoteCommitmentNumber)
+						)
+							throw new Error('Invalid FFOR voucher outcome');
+						return {
+							outcome: o.outcome,
+							localCommitmentNumber: strToBigint(o.localCommitmentNumber),
+							remoteCommitmentNumber: strToBigint(o.remoteCommitmentNumber)
+						};
+					})
+			  }
+			: {}),
 		exposedSlots: s.exposedSlots ?? s.knownPreimages.map(() => false),
 		issuerProvisioned: s.issuerProvisioned === true,
 		witnesses: (s.witnesses ?? []).map((w) => ({
@@ -1281,8 +1490,21 @@ export function deserializeFforEpoch(
 				? null
 				: (s.abortReason as FforAbortReason),
 		closeSent: s.closeSent === true,
-		activationMismatch: s.activationMismatch === true
+		activationMismatch: s.activationMismatch === true || concurrent.mismatch,
+		...(s.concurrentVersionMismatch ||
+		(concurrent.selected === 2 && concurrent.mismatch)
+			? { concurrentVersionMismatch: true }
+			: {}),
+		...(isFforConcurrentVersion(concurrent.selected)
+			? { concurrentVersion: concurrent.selected }
+			: {}),
+		...(isFforConcurrentVersion(concurrent.selected) &&
+		s.capabilityHold === true
+			? { capabilityHold: true }
+			: {})
 	};
+	validateFforSyncState(record);
+	return record;
 }
 
 export function deserializeChannelState(
@@ -1295,6 +1517,11 @@ export function deserializeChannelState(
 	}
 
 	let revokedHtlcSnapshots: Map<string, IHtlcSnapshotEntry[]> | undefined;
+	if (s.compactHtlcHistory !== undefined) {
+		if (s.revokedHtlcSnapshots !== undefined)
+			throw new Error('Conflicting HTLC history encodings');
+		revokedHtlcSnapshots = decodeHtlcHistory(s.compactHtlcHistory);
+	}
 	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.length > 0) {
 		revokedHtlcSnapshots = new Map();
 		for (const snap of s.revokedHtlcSnapshots) {
@@ -1346,6 +1573,7 @@ export function deserializeChannelState(
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
+		awaitingLocalFeeCommitment: s.awaitingLocalFeeCommitment,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
 		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
@@ -1361,7 +1589,14 @@ export function deserializeChannelState(
 		remoteNextPerCommitmentPoint: hexToBuf(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
+		signedLocalRemovals: s.signedLocalRemovals?.length
+			? s.signedLocalRemovals.map((h) => deserializeHtlcEntry(h).entry)
+			: undefined,
 		revokedHtlcSnapshots,
+		...(s.compactHtlcHistory !== undefined ||
+		isFforConcurrentVersion(s.ffor?.concurrentVersion)
+			? { compactHtlcHistory: true as const }
+			: {}),
 		watchtowerRemoteCommitmentTxs: s.watchtowerRemoteCommitmentTxs?.length
 			? s.watchtowerRemoteCommitmentTxs.reduce(
 					(cache, e) =>

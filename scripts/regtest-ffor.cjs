@@ -1,27 +1,209 @@
 'use strict';
-// Disposable regtest funds only. Exercise the same runtime and client used by
-// the phone and browser, including durable close/reopen and Activity mapping.
+// Disposable regtest funds. The receiver runs in a separate process that is
+// killed before payment, then cold-started twice against its durable volume.
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
-const { createPortableRuntime } = require('../dist/portable.cjs');
-const { createSqlJsDatabaseFactory } = require('../dist/sqljs.cjs');
+const { fork } = require('node:child_process');
+const { once } = require('node:events');
 const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 (async () => {
-	const h = await createHarness({ prefix: 'beignet-ffor-', ffor: true });
-	let payer;
-	let reopened;
+	const h = await createHarness({
+		prefix: 'beignet-concurrent-portable-',
+		ffor: true
+	});
+	const { EmbeddedWalletClient } = await import(
+		path.join(
+			process.env.BEIGNET_WALLET_CORE_DIR ||
+				path.resolve(__dirname, '../../shared'),
+			'src/index.js'
+		)
+	);
+	let child,
+		payer,
+		client,
+		walletId,
+		rpc,
+		adapter,
+		next = 0;
+	const evidence = {
+		engine: require('../package.json').upstreamVersion,
+		engineCommit: require('../package.json').upstreamCommit,
+		node: process.version,
+		processes: [],
+		balances: []
+	};
+	const pending = new Map();
+	function call(operation, body) {
+		const id = ++next;
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				pending.delete(id);
+				reject(Error(`${operation} timed out`));
+			}, 120000);
+			pending.set(id, {
+				resolve: (value) => {
+					clearTimeout(timer);
+					resolve(value);
+				},
+				reject: (error) => {
+					clearTimeout(timer);
+					reject(error);
+				}
+			});
+			child.send({ id, operation, body });
+		});
+	}
+	async function start() {
+		if (process.env.FFOR_RUNTIME_ADAPTER) {
+			adapter = await require(path.resolve(
+				process.env.FFOR_RUNTIME_ADAPTER
+			)).start({ h, directory: path.join(h.temp, 'receiver') });
+			evidence.processes.push(adapter.identity);
+			client =
+				adapter.client ||
+				new EmbeddedWalletClient({
+					runtime: { request: adapter.request },
+					...(walletId ? { walletId } : {})
+				});
+			if (walletId) await client.startWallet();
+			else
+				walletId = (
+					await client.createWallet({
+						name: 'Concurrent receiver',
+						network: 'regtest',
+						primaryUri: h.primaryUri,
+						electrum: h.electrum
+					})
+				).id;
+			rpc = (route, method = 'GET', body) =>
+				adapter.request({
+					method,
+					path: `/wallets/${walletId}/api${route}`,
+					body
+				});
+			return;
+		}
+		child = fork(path.join(__dirname, 'regtest-ffor-receiver.cjs'), [], {
+			stdio: ['ignore', 'inherit', 'inherit', 'ipc']
+		});
+		child.on('message', ({ id, value, error }) => {
+			const entry = pending.get(id);
+			if (!entry) return;
+			pending.delete(id);
+			error
+				? entry.reject(Object.assign(Error(error.message), error))
+				: entry.resolve(value);
+		});
+		child.on('exit', () => {
+			for (const p of pending.values()) p.reject(Error('receiver stopped'));
+			pending.clear();
+		});
+		const started = await call('start', {
+			directory: path.join(h.temp, 'receiver'),
+			electrum: h.electrum,
+			transport: {
+				electrumUrl: `ws://127.0.0.1:${h.relayPort}/electrum`,
+				peerUrl: `ws://127.0.0.1:${h.relayPort}/peer`,
+				token: h.token,
+				electrum: h.electrum
+			}
+		});
+		evidence.processes.push(started.pid);
+		client = new EmbeddedWalletClient({
+			runtime: {
+				request: (body) => call('request', body),
+				close: () => call('close')
+			},
+			...(walletId ? { walletId } : {})
+		});
+		if (walletId) await client.startWallet();
+		else
+			walletId = (
+				await client.createWallet({
+					name: 'Concurrent receiver',
+					network: 'regtest',
+					primaryUri: h.primaryUri,
+					electrum: h.electrum
+				})
+			).id;
+		rpc = (route, method = 'GET', body) =>
+			call('request', {
+				method,
+				path: `/wallets/${walletId}/api${route}`,
+				body
+			});
+	}
+	async function stop() {
+		if (adapter) {
+			await adapter.stop();
+			adapter = undefined;
+			return;
+		}
+		if (!child) return;
+		const old = child;
+		const exited = once(old, 'exit');
+		old.kill('SIGKILL');
+		await exited;
+		child = undefined;
+	}
+	async function balance(label) {
+		const snapshot = await client.snapshot();
+		evidence.balances.push({ label, ...snapshot.balance });
+		return snapshot;
+	}
+	async function ordinaryBothWays(label) {
+		const before = (await rpc('/channels'))[0].localBalanceSats;
+		const outgoing = h.primary.createInvoice(5000, label + ' outgoing');
+		const sent = await rpc('/invoice/pay-safe', 'POST', {
+			bolt11: outgoing.bolt11,
+			timeoutMs: 30000,
+			maxFeeSats: 100
+		});
+		assert.equal(sent.status, 'COMPLETED', JSON.stringify(sent));
+		const incoming = await rpc('/invoice/create', 'POST', {
+			amountSats: 6000,
+			description: label + ' incoming'
+		});
+		const paid = await payer.payInvoiceSafe(incoming.bolt11, 30000, 100);
+		assert.equal(paid.status, 'COMPLETED', JSON.stringify(paid));
+		await wait(
+			label + ' ordinary balances',
+			async () => (await rpc('/channels'))[0].localBalanceSats === before + 1000
+		);
+		assert.equal((await rpc('/channels')).length, 1);
+		await balance(label);
+	}
 	try {
-		const dev = await h.device('receiver');
-		const nodeId = (await dev.rpc('/info')).nodeId;
-		h.primary.addTrustedPeer(nodeId);
-		h.primary.openChannel(nodeId, 300000, 0, 2, false, true);
-		await wait('receiver channel ready', async () =>
-			(await dev.rpc('/channels')).some((c) => c.htlcUsable)
+		await start();
+		assert.equal(
+			(
+				await (adapter
+					? adapter.request({ path: '/api/config' })
+					: call('request', { path: '/api/config' }))
+			).engineVersion,
+			'0.25.0-portable'
+		);
+		const receiverId = (await rpc('/info')).nodeId;
+		h.primary.addTrustedPeer(receiverId);
+		h.primary.openChannel(receiverId, 500000, 0, 2, false, true);
+		await wait('receiver home ready', async () =>
+			(await rpc('/channels')).some((c) => c.htlcUsable)
+		);
+		const fundInvoice = await rpc('/invoice/create', 'POST', {
+			amountSats: 100000,
+			description: 'Fund receiver home'
+		});
+		assert.equal(
+			(await h.primary.payInvoiceSafe(fundInvoice.bolt11, 30000, 100)).status,
+			'COMPLETED'
+		);
+		await wait(
+			'funded receiver home',
+			async () => (await rpc('/channels'))[0].localBalanceSats === 100000
 		);
 		btc('-generate', '6');
 		await delay(2000);
-		await dev.client.refreshWallet();
-		const channel = (await dev.rpc('/channels')).find((c) => c.htlcUsable);
 		payer = await h.BeignetNode.create({
 			network: 'regtest',
 			dataDir: path.join(h.temp, 'payer'),
@@ -33,7 +215,12 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 			autoGossipSync: false,
 			logger: { debug() {}, info() {}, warn() {}, error() {} }
 		});
-		btc('sendtoaddress', await payer.getNewAddress(), '0.02000000');
+		let address;
+		await wait('payer wallet ready', async () => {
+			address = await payer.getNewAddress();
+			return !!address;
+		});
+		btc('sendtoaddress', address, '0.02000000');
 		btc('-generate', '1');
 		await wait('payer funded', async () => {
 			await payer.refreshWallet();
@@ -46,159 +233,164 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 		);
 		h.primary.addTrustedPeer(payer.getInfo().nodeId);
 		payer.addTrustedPeer(h.primary.getInfo().nodeId);
-		payer.openChannel(h.primary.getInfo().nodeId, 300000, 0, 2, false, true);
+		payer.openChannel(h.primary.getInfo().nodeId, 500000, 0, 2, false, true);
 		await wait('payer channel ready', () =>
 			payer.listChannels().some((c) => c.htlcUsable)
 		);
 		btc('-generate', '6');
 		await delay(2000);
-
-		const { EmbeddedWalletClient } = await import('../../shared/src/index.js');
-		let active = dev.runtime;
-		let client = dev.client;
-		const rpc = (route, method = 'GET', body) =>
-			active.request({ method, path: `/wallets/${dev.id}/api${route}`, body });
-		async function reopen() {
-			await active.close();
-			const databaseFactory = await createSqlJsDatabaseFactory({
-				load: dev.options.volume.read,
-				save: dev.options.volume.write
-			});
-			reopened = active = await createPortableRuntime({
-				...dev.options,
-				databaseFactory
-			});
-			client = new EmbeddedWalletClient({ runtime: active, walletId: dev.id });
-			await active.request({
-				method: 'POST',
-				path: `/api/wallets/${dev.id}/start`
-			});
-			await wait('receiver reconnected', async () =>
-				(await rpc('/channels')).some((c) => c.state === 'NORMAL')
-			);
-		}
-		const invoice = await client.receive(
+		await client.refreshWallet();
+		const request = await client.receive(
 			await client.quoteReceive({
 				amountSats: 20000,
-				description: 'Offline receipt'
+				description: 'Concurrent offline receipt',
+				mode: 'offline'
 			})
 		);
 		const reservation = (await rpc('/ffor/epochs')).find(
 			(e) => e.state === 'ACTIVE'
 		);
-		assert.ok(reservation);
-		assert.equal(reservation.slots[0].paymentHash, invoice.paymentHash);
-		console.log('PASS ordinary app receive creates an offline reservation');
-		await reopen();
-		await delay(5000);
+		assert.equal(reservation.concurrentVersion, 2);
+		evidence.channelId = reservation.channelId;
+		evidence.paymentHash = request.paymentHash;
+		await ordinaryBothWays('active offline book');
+		const before = (await rpc('/channels'))[0].localBalanceSats;
+		await stop();
 		assert.equal(
-			(await rpc('/ffor/epoch?channelId=' + reservation.channelId)).state,
-			'ACTIVE'
+			(await payer.payInvoiceSafe(request.bolt11, 30000, 100)).status,
+			'COMPLETED'
 		);
-		assert.notEqual(
-			(await rpc('/invoices')).find(
-				(i) => i.paymentHash === invoice.paymentHash
-			).status,
-			'PAID'
-		);
-		console.log('PASS reopening an unpaid invoice keeps it payable');
-		await active.close();
-		const paid = await payer.payInvoiceSafe(invoice.bolt11, 30000, 100);
-		assert.equal(paid.status, 'COMPLETED', JSON.stringify(paid));
-		console.log('PASS payment completes with the receiver stopped');
-		await reopen();
+		for (let run = 1; run <= 2; run++) {
+			await start();
+			await wait(`cold start ${run} credit`, async () => {
+				const snapshot = await client.snapshot();
+				const entries = snapshot.activity.filter(
+					(row) =>
+						row.paymentHash === request.paymentHash &&
+						row.status === 'completed'
+				);
+				return (
+					entries.length === 1 &&
+					(await rpc('/channels'))[0].localBalanceSats === before + 20000
+				);
+			});
+			const snapshot = await balance(`cold start ${run}`);
+			assert.equal(
+				snapshot.activity.filter(
+					(row) => row.paymentHash === request.paymentHash
+				).length,
+				1
+			);
+			if (run === 1) await stop();
+		}
 		await wait(
-			'automatic receipt reconciliation',
+			'automatic book retired after redemption',
 			async () =>
-				(await rpc('/invoices')).find(
-					(i) => i.paymentHash === invoice.paymentHash
-				).status === 'PAID'
+				(await rpc('/ffor/epoch?channelId=' + reservation.channelId)).state ===
+					'CLOSED' &&
+				(await rpc('/receive/offline')).requests.every((j) => j.done)
 		);
+		const height = (await rpc('/info')).blockHeight;
+		await rpc('/ffor/epoch/start', 'POST', {
+			channelId: reservation.channelId,
+			voucherAmountsMsat: ['12000000', '13000000'],
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0,
+			settlementDeadline: height + 144,
+			voucherExpiry: height + 1296,
+			concurrent: true,
+			concurrentVersion: 2
+		});
+		await wait(
+			'manual two-voucher book active',
+			async () =>
+				(await rpc('/ffor/epoch?channelId=' + reservation.channelId)).state ===
+				'ACTIVE'
+		);
+		const first = await rpc('/ffor/invoice', 'POST', {
+			channelId: reservation.channelId,
+			k: 1,
+			description: 'partial first',
+			expirySecs: 600
+		});
+		const second = await rpc('/ffor/invoice', 'POST', {
+			channelId: reservation.channelId,
+			k: 2,
+			description: 'partial second',
+			expirySecs: 600
+		});
 		assert.equal(
-			(await rpc('/channels')).find(
-				(c) => c.channelId === reservation.channelId
-			).localBalanceSats,
-			20000
+			(await payer.payInvoiceSafe(first.bolt11, 30000, 100)).status,
+			'COMPLETED'
 		);
-		const snapshot = await client.snapshot();
-		const rows = snapshot.activity.filter(
-			(r) => r.paymentHash === invoice.paymentHash
-		);
-		assert.equal(rows.length, 1);
-		assert.equal(rows[0].status, 'completed');
-		assert.equal(rows[0].amountSats, 20000);
-		console.log(
-			'PASS automatic recovery credits 20,000 sats and one Activity row'
-		);
-		await reopen();
-		const again = await client.snapshot();
+		await wait('first voucher redeemed without retiring second', async () => {
+			await rpc('/ffor/sync', 'POST', { channelId: reservation.channelId });
+			const epoch = await rpc('/ffor/epoch?channelId=' + reservation.channelId);
+			return (
+				epoch.state === 'ACTIVE' &&
+				epoch.slots[0].state === 'redeemed' &&
+				epoch.slots[1].state === 'exposed'
+			);
+		});
 		assert.equal(
-			again.activity.filter(
-				(r) => r.paymentHash === invoice.paymentHash && r.status === 'completed'
-			).length,
-			1
+			(await payer.payInvoiceSafe(second.bolt11, 30000, 100)).status,
+			'COMPLETED'
 		);
-		assert.equal(
-			(await rpc('/channels')).find(
-				(c) => c.channelId === reservation.channelId
-			).localBalanceSats,
-			20000
+		await wait('second voucher redeemed', async () => {
+			await rpc('/ffor/sync', 'POST', { channelId: reservation.channelId });
+			return (
+				await rpc('/ffor/epoch?channelId=' + reservation.channelId)
+			).slots.every((s) => s.state === 'redeemed');
+		});
+		await rpc('/ffor/epoch/close', 'POST', {
+			channelId: reservation.channelId
+		});
+		await wait(
+			'manual book closed',
+			async () =>
+				(await rpc('/ffor/epoch?channelId=' + reservation.channelId)).state ===
+				'CLOSED'
 		);
-		console.log(
-			'PASS a second restart preserves balance without duplicate receipts'
-		);
-		const second = await client.receive(
+		const unknown = await client.receive(
 			await client.quoteReceive({
-				amountSats: 15000,
-				description: 'Second offline receipt'
+				amountSats: 17000,
+				description: 'Retained unknown',
+				mode: 'offline'
 			})
 		);
-		const reservations = (await rpc('/ffor/epochs')).filter(
-			(e) => e.state === 'ACTIVE'
-		);
-		assert.equal(reservations.length, 1);
-		assert.notEqual(reservations[0].channelId, reservation.channelId);
-		assert.equal(
-			(await rpc('/channels')).find(
-				(c) => c.channelId === reservation.channelId
-			).htlcUsable,
-			true
-		);
+		assert.ok(unknown.offlineReceive);
+		await rpc('/ffor/epoch/close', 'POST', {
+			channelId: reservation.channelId
+		});
+		await wait('unknown reservation retained after early close', async () => {
+			const ch = (await rpc('/channels'))[0];
+			return (
+				ch.ffor.state === 'DRAINING' &&
+				ch.ffor.reservedInboundSats === 17000 &&
+				ch.ffor.unresolvedSlots === 1 &&
+				ch.htlcUsable
+			);
+		});
+		await ordinaryBothWays('draining unknown reservation');
+		assert.equal((await rpc('/receive/offline')).maxSats, 0);
+		evidence.result = 'passed';
+		if (process.env.BEIGNET_EVIDENCE_FILE)
+			fs.writeFileSync(
+				process.env.BEIGNET_EVIDENCE_FILE,
+				JSON.stringify(evidence, null, 2) + '\n'
+			);
 		console.log(
-			'PASS another invoice gets a dedicated channel while existing funds remain usable'
+			'PASS concurrent portable receive, partial redemption, retained unknown reservation and two process cold starts'
 		);
-        const outgoing = h.primary.createInvoice(5000, 'Send while receiving');
-        const sent = await client.send(await client.prepareSend({request:outgoing.bolt11}));
-        assert.equal(sent.status, 'completed', JSON.stringify(sent));
-        assert.equal((await rpc('/ffor/epoch?channelId='+reservations[0].channelId)).state,'ACTIVE');
-        console.log('PASS ordinary payment succeeds while another receive reservation is active');
-		await active.close();
-		const paidSecond = await payer.payInvoiceSafe(second.bolt11, 30000, 100);
-		assert.equal(paidSecond.status, 'COMPLETED', JSON.stringify(paidSecond));
-		await reopen();
-		await wait(
-			'second automatic recovery',
-			async () =>
-				(await rpc('/invoices')).find(
-					(i) => i.paymentHash === second.paymentHash
-				).status === 'PAID'
-		);
-		assert.equal(
-			(await client.snapshot()).activity.filter(
-				(r) => r.paymentHash === second.paymentHash && r.status === 'completed'
-			).length,
-			1
-		);
-		console.log('PASS provider-funded reservation also recovers automatically');
 	} finally {
-		if (reopened) await reopened.close().catch(() => {});
+		await stop();
 		if (payer) await payer.gracefulShutdown(5000).catch(() => {});
 		await h.close();
 	}
 })().then(
 	() => process.exit(0),
-	(e) => {
-		console.error(e);
+	(error) => {
+		console.error(error);
 		process.exit(1);
 	}
 );

@@ -35,7 +35,10 @@ import {
 	FF_ERROR_TYPE,
 	FF_INIT_TYPE,
 	FF_INVOICES_TYPE,
+	FF_MAX_K,
 	FF_REESTABLISH_TLV_TYPE,
+	FF_SYNC_TYPE,
+	FF_SYNC_REPLY_TYPE,
 	FforAbortReason,
 	FforState,
 	IFforAbortMessage,
@@ -47,7 +50,9 @@ import {
 	IFforErrorMessage,
 	IFforInitMessage,
 	IFforInvoicesMessage,
-	IFforReestablishTlv
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
 } from './types';
 
 const HEADER_LEN = 64;
@@ -75,6 +80,10 @@ export function fforMessageName(type: number): string {
 			return 'ff_close';
 		case FF_CLOSE_ACK_TYPE:
 			return 'ff_close_ack';
+		case FF_SYNC_TYPE:
+			return 'ff_sync';
+		case FF_SYNC_REPLY_TYPE:
+			return 'ff_sync_reply';
 		default:
 			return `ff_unknown(${type})`;
 	}
@@ -91,7 +100,9 @@ export function isFforMessageType(type: number): boolean {
 		type === FF_ACTIVATE_ACK_TYPE ||
 		type === FF_ABORT_TYPE ||
 		type === FF_CLOSE_TYPE ||
-		type === FF_CLOSE_ACK_TYPE
+		type === FF_CLOSE_ACK_TYPE ||
+		type === FF_SYNC_TYPE ||
+		type === FF_SYNC_REPLY_TYPE
 	);
 }
 
@@ -333,12 +344,44 @@ export function encodeFforInitUnsigned(
 	if (msg.hashChain) {
 		records.push({ type: 15n, value: u8(1) });
 	}
+	if (msg.concurrentVersion !== undefined) {
+		records.push({
+			type: 17n,
+			value: encodeConcurrentVersion(msg.concurrentVersion)
+		});
+	}
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
 		fixed,
 		encodeTlvStream(records)
 	]);
+}
+
+/**
+ * TLV 17 `concurrent_version` of ff_init and ff_accept (CONCURRENT-RECEIVE.md
+ * section 1.1): exactly two bytes, big-endian.
+ */
+function encodeConcurrentVersion(version: number): Buffer {
+	if (!Number.isInteger(version) || version < 0 || version > 0xffff) {
+		throw new Error('concurrent_version must fit two bytes');
+	}
+	return u16(version);
+}
+
+/**
+ * A length other than two is malformed. The value itself is not judged
+ * here: the handler refuses one it does not select.
+ */
+function decodeConcurrentVersion(
+	value: Buffer | undefined,
+	what: string
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (value.length !== 2) {
+		throw new Error(`${what} TLV 17 must be 2 bytes`);
+	}
+	return value.readUInt16BE(0);
 }
 
 function assertNodeId(id: Buffer, what: string): void {
@@ -384,6 +427,10 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 	const amounts = tlvList(tlvs, 9n);
 	const witnessPeers = tlvList(tlvs, 13n);
 	const hashChain = tlvList(tlvs, 15n);
+	const concurrentVersion = decodeConcurrentVersion(
+		tlvList(tlvs, 17n),
+		'ff_init'
+	);
 	if (tower !== undefined && tower.length !== 33) {
 		throw new Error('ff_init TLV 3 must be 33 bytes');
 	}
@@ -421,6 +468,7 @@ export function decodeFforInitMessage(body: Buffer): IFforInitMessage {
 			? { witnessPeers: decodeWitnessPeers(witnessPeers) }
 			: {}),
 		...(hashChain !== undefined ? { hashChain: true } : {}),
+		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
 		signature
 	};
 }
@@ -447,6 +495,12 @@ export function encodeFforAcceptUnsigned(
 		});
 	}
 	records.push({ type: 11n, value: msg.initHash });
+	if (msg.concurrentVersion !== undefined) {
+		records.push({
+			type: 17n,
+			value: encodeConcurrentVersion(msg.concurrentVersion)
+		});
+	}
 	return Buffer.concat([
 		msg.channelId,
 		msg.epochId,
@@ -472,6 +526,10 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 	if (initHash === undefined || initHash.length !== 32) {
 		throw new Error('ff_accept: TLV 11 (init_hash) required, 32 bytes');
 	}
+	const concurrentVersion = decodeConcurrentVersion(
+		tlvList(tlvs, 17n),
+		'ff_accept'
+	);
 	return {
 		channelId,
 		epochId,
@@ -485,8 +543,44 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 				  )
 				: [],
 		initHash,
+		...(concurrentVersion !== undefined ? { concurrentVersion } : {}),
 		signature
 	};
+}
+
+/**
+ * What a stored setup transcript says about the concurrent profile
+ * (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version ff_init
+ * requested and the one ff_accept echoed, read from the wire bytes the
+ * epoch record keeps (`[2: type] || body`). `acceptWire` is null before
+ * ff_accept. Returns null when a stored message does not decode, so the
+ * caller can tell "says baseline" from "cannot say".
+ */
+export function fforTranscriptConcurrentVersion(
+	initWire: Buffer,
+	acceptWire: Buffer | null
+): { requested: number | undefined; echoed: number | undefined } | null {
+	try {
+		if (initWire.length < 2 || initWire.readUInt16BE(0) !== FF_INIT_TYPE) {
+			return null;
+		}
+		const requested = decodeFforInitMessage(
+			initWire.subarray(2)
+		).concurrentVersion;
+		if (acceptWire === null) return { requested, echoed: undefined };
+		if (
+			acceptWire.length < 2 ||
+			acceptWire.readUInt16BE(0) !== FF_ACCEPT_TYPE
+		) {
+			return null;
+		}
+		return {
+			requested,
+			echoed: decodeFforAcceptMessage(acceptWire.subarray(2)).concurrentVersion
+		};
+	} catch {
+		return null;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +846,127 @@ export function decodeFforCloseAckMessage(body: Buffer): IFforCloseAckMessage {
 		preimages,
 		signature
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent receive: ff_sync (55075), ff_sync_reply (55077)
+// ---------------------------------------------------------------------------
+
+export function encodeFforSyncUnsigned(
+	msg: Omit<IFforSyncMessage, 'signature'>
+): Buffer {
+	assert32(msg.channelId, 'channel_id');
+	assert32(msg.epochId, 'epoch_id');
+	assert32(msg.activationHash, 'activation_hash');
+	assert32(msg.nonce, 'nonce');
+	return Buffer.concat([
+		msg.channelId,
+		msg.epochId,
+		msg.activationHash,
+		msg.nonce
+	]);
+}
+
+export function decodeFforSyncMessage(body: Buffer): IFforSyncMessage {
+	if (body.length + 2 > 0xffff) throw new Error('ff_sync: frame too long');
+	const r = new Reader(body, 'ff_sync');
+	const channelId = r.bytes(32);
+	const epochId = r.bytes(32);
+	const activationHash = r.bytes(32);
+	const nonce = r.bytes(32);
+	const { signature } = splitSigned(body, r.offset, [], 'ff_sync');
+	return { channelId, epochId, activationHash, nonce, signature };
+}
+
+type SyncSnapshot = Pick<
+	IFforSyncReplyMessage,
+	'numSlots' | 'settled' | 'preimages'
+>;
+
+/** Canonical content excludes nonce, signature, extensions and sequence. */
+export function fforSyncSnapshotContent(snapshot: SyncSnapshot): Buffer {
+	const { numSlots, settled, preimages } = snapshot;
+	if (!Number.isInteger(numSlots) || numSlots < 1 || numSlots > FF_MAX_K)
+		throw new Error('ff_sync_reply: invalid slot count');
+	if (settled.length !== bitmapLength(numSlots))
+		throw new Error('ff_sync_reply: bitmap length must be ceil(K/8)');
+	const usedBits = numSlots % 8;
+	if (usedBits && settled[settled.length - 1] >> usedBits !== 0)
+		throw new Error('ff_sync_reply: unused bitmap bits must be zero');
+	const expected: number[] = [];
+	for (let k = 1; k <= numSlots; k++) {
+		if (bitmapGet(settled, k)) expected.push(k);
+	}
+	if (preimages.length !== expected.length)
+		throw new Error('ff_sync_reply: preimage count must match bitmap');
+	const encoded: Buffer[] = [];
+	for (let i = 0; i < expected.length; i++) {
+		const p = preimages[i];
+		if (p.k !== expected[i])
+			throw new Error(
+				'ff_sync_reply: preimages must match ordered bitmap slots'
+			);
+		assert32(p.preimage, 'preimage');
+		encoded.push(u16(p.k), p.preimage);
+	}
+	return Buffer.concat([
+		u16(numSlots),
+		settled,
+		u16(preimages.length),
+		...encoded
+	]);
+}
+
+export function encodeFforSyncReplyUnsigned(
+	msg: Omit<IFforSyncReplyMessage, 'signature'>
+): Buffer {
+	if (msg.snapshotSeq === 0n && msg.preimages.length > 0)
+		throw new Error('ff_sync_reply: sequence zero must be empty');
+	return Buffer.concat([
+		encodeFforSyncUnsigned(msg),
+		u64(msg.snapshotSeq),
+		fforSyncSnapshotContent(msg)
+	]);
+}
+
+export function decodeFforSyncReplyMessage(
+	body: Buffer
+): IFforSyncReplyMessage {
+	if (body.length + 2 > 0xffff)
+		throw new Error('ff_sync_reply: frame too long');
+	const r = new Reader(body, 'ff_sync_reply');
+	const channelId = r.bytes(32);
+	const epochId = r.bytes(32);
+	const activationHash = r.bytes(32);
+	const nonce = r.bytes(32);
+	const snapshotSeq = r.u64();
+	const numSlots = r.u16();
+	if (numSlots < 1 || numSlots > FF_MAX_K)
+		throw new Error('ff_sync_reply: invalid slot count');
+	const settled = r.bytes(bitmapLength(numSlots));
+	const count = r.u16();
+	if (count > numSlots || r.remaining() < count * 34 + SIG_LEN)
+		throw new Error('ff_sync_reply: invalid preimage count');
+	const preimages: IFforSyncReplyMessage['preimages'] = [];
+	for (let i = 0; i < count; i++) {
+		preimages.push({ k: r.u16(), preimage: r.bytes(32) });
+	}
+	const { signature } = splitSigned(body, r.offset, [], 'ff_sync_reply');
+	const message = {
+		channelId,
+		epochId,
+		activationHash,
+		nonce,
+		snapshotSeq,
+		numSlots,
+		settled,
+		preimages,
+		signature
+	};
+	fforSyncSnapshotContent(message);
+	if (snapshotSeq === 0n && preimages.length > 0)
+		throw new Error('ff_sync_reply: sequence zero must be empty');
+	return message;
 }
 
 // ---------------------------------------------------------------------------

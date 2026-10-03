@@ -14,6 +14,10 @@
  * module keeps fixed, so hashing the encoded bytes is stable.
  */
 
+import {
+	IFforVoucherArchive,
+	validateFforVoucherArchive
+} from '../ffor/voucher-archive';
 import { createHash } from 'crypto';
 import {
 	serializeChannelState,
@@ -25,6 +29,7 @@ import {
 	ISerializedChannelState,
 	ISerializedPaymentInfo
 } from '../storage/serialization';
+import { usesCompactHtlcHistory } from '../storage/htlc-history';
 import {
 	IForwardingEvent,
 	IInvoiceInfo,
@@ -53,6 +58,7 @@ interface IEncodedOutboundMessage {
 }
 
 interface IEncodedSnapshot {
+	fforVouchers?: IFforVoucherArchive[];
 	/** Snapshot content schema, authenticated by the frame hash. Written
 	 *  first so its bytes sit at a stable position; conditional so frames
 	 *  captured before the field existed re-encode byte-identically. */
@@ -133,7 +139,7 @@ function decodeForwardingEvent(
 }
 
 interface IEncodedFrame {
-	version: 1;
+	version: 1 | 2;
 	writerEpoch: string;
 	sequence: string;
 	previousFrameHash: string;
@@ -152,13 +158,23 @@ const DURABILITY_VALUES: readonly RecoveryDurability[] = [
 	'quorum'
 ];
 
-function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
+function encodeMutation(
+	mutation: RecoveryMutation,
+	version: 1 | 2 = 2
+): IEncodedMutation {
 	switch (mutation.type) {
+		case 'ffor_voucher':
+			return {
+				type: mutation.type,
+				record: validateFforVoucherArchive(mutation.record)
+			};
 		case 'channel_state':
 			return {
 				type: mutation.type,
 				channelId: mutation.channelId,
-				state: serializeChannelState(mutation.state),
+				state: serializeChannelState(mutation.state, {
+					legacyHtlcHistory: version === 1
+				}),
 				peerPubkey: mutation.peerPubkey
 			};
 		case 'channel_key_index':
@@ -252,6 +268,11 @@ function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
 
 function decodeMutation(encoded: IEncodedMutation): RecoveryMutation {
 	switch (encoded.type) {
+		case 'ffor_voucher':
+			return {
+				type: encoded.type,
+				record: validateFforVoucherArchive(encoded.record)
+			};
 		case 'channel_state':
 			return {
 				type: encoded.type,
@@ -380,7 +401,10 @@ function decodeOutboundMessage(
 	};
 }
 
-function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
+function encodeSnapshot(
+	snapshot: RecoverySnapshot,
+	version: 1 | 2
+): IEncodedSnapshot {
 	return {
 		// Pure passthrough, no default: a decoded pre-field frame must
 		// re-encode to its stored hash byte for byte.
@@ -390,9 +414,14 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 		...(snapshot.pageFrames !== undefined
 			? { pageFrames: snapshot.pageFrames }
 			: {}),
+		...(snapshot.fforVouchers !== undefined
+			? { fforVouchers: snapshot.fforVouchers.map(validateFforVoucherArchive) }
+			: {}),
 		channels: snapshot.channels.map((c) => ({
 			channelId: c.channelId,
-			state: serializeChannelState(c.state),
+			state: serializeChannelState(c.state, {
+				legacyHtlcHistory: version === 1
+			}),
 			peerPubkey: c.peerPubkey
 		})),
 		keyIndices: snapshot.keyIndices,
@@ -451,6 +480,19 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			'Recovery snapshot schemaVersion, when present, must be a nonempty string'
 		);
 	}
+	const hasArchiveSchema =
+		encoded.schemaVersion === '2+ffor-vouchers' ||
+		encoded.schemaVersion === '2+ffor-vouchers+pages' ||
+		encoded.schemaVersion === '2+ffor-vouchers+htlc-history' ||
+		encoded.schemaVersion === '2+ffor-vouchers+htlc-history+pages';
+	if (
+		hasArchiveSchema !== (encoded.fforVouchers !== undefined) ||
+		(encoded.fforVouchers !== undefined && !Array.isArray(encoded.fforVouchers))
+	) {
+		throw new Error(
+			'Recovery snapshot FFOR custody does not match its declared schema'
+		);
+	}
 	// Restore trusts this count to say whether the snapshot is whole.
 	if (
 		'pageFrames' in encoded &&
@@ -466,6 +508,9 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			: {}),
 		...(encoded.pageFrames !== undefined
 			? { pageFrames: encoded.pageFrames }
+			: {}),
+		...(encoded.fforVouchers !== undefined
+			? { fforVouchers: encoded.fforVouchers.map(validateFforVoucherArchive) }
 			: {}),
 		channels: encoded.channels.map((c) => ({
 			channelId: c.channelId,
@@ -532,6 +577,20 @@ export function encodedMutationBytes(mutation: RecoveryMutation): number {
 	return Buffer.byteLength(JSON.stringify(encodeMutation(mutation)), 'utf8');
 }
 
+/** Select the format for newly written frames. Historical frames retain theirs. */
+export function frameVersionForContent(frame: RecoveryFrame): 1 | 2 {
+	return frame.mutations.some(
+		(mutation) =>
+			mutation.type === 'channel_state' &&
+			usesCompactHtlcHistory(mutation.state)
+	) ||
+		frame.snapshot?.channels.some((channel) =>
+			usesCompactHtlcHistory(channel.state)
+		)
+		? 2
+		: 1;
+}
+
 /** Encode a frame to the plaintext bytes the frame hash commits to. */
 export function encodeFrame(frame: RecoveryFrame): Buffer {
 	const encoded: IEncodedFrame = {
@@ -540,7 +599,9 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 		sequence: frame.sequence.toString(),
 		previousFrameHash: frame.previousFrameHash.toString('hex'),
 		timestamp: frame.timestamp,
-		mutations: frame.mutations.map(encodeMutation),
+		mutations: frame.mutations.map((mutation) =>
+			encodeMutation(mutation, frame.version)
+		),
 		outboundMessages: frame.outboundMessages.map(encodeOutboundMessage)
 	};
 	// Key insertion order IS the byte layout the frame hash commits to, so
@@ -559,7 +620,7 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 		}
 	}
 	if (frame.snapshot) {
-		encoded.snapshot = encodeSnapshot(frame.snapshot);
+		encoded.snapshot = encodeSnapshot(frame.snapshot, frame.version);
 	}
 	return Buffer.from(JSON.stringify(encoded), 'utf8');
 }
@@ -567,11 +628,24 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 /** Decode plaintext frame bytes. Throws on any malformed content. */
 export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 	const encoded = JSON.parse(plaintext.toString('utf8')) as IEncodedFrame;
-	if (encoded.version !== 1) {
+	if (encoded.version !== 1 && encoded.version !== 2) {
 		throw new Error(`Unsupported recovery frame version: ${encoded.version}`);
 	}
+	if (
+		encoded.version === 1 &&
+		(encoded.mutations.some(
+			(mutation) =>
+				mutation.type === 'channel_state' &&
+				(mutation.state as ISerializedChannelState).compactHtlcHistory !==
+					undefined
+		) ||
+			encoded.snapshot?.channels.some(
+				(channel) => channel.state.compactHtlcHistory !== undefined
+			))
+	)
+		throw new Error('Compact HTLC history requires recovery frame version 2');
 	const frame: RecoveryFrame = {
-		version: 1,
+		version: encoded.version,
 		writerEpoch: BigInt(encoded.writerEpoch),
 		sequence: BigInt(encoded.sequence),
 		previousFrameHash: Buffer.from(encoded.previousFrameHash, 'hex'),

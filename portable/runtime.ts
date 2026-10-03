@@ -744,7 +744,7 @@ export async function createPortableRuntime(options: any) {
 	/** Channels, each annotated with what is known about its funding on chain. */
 	const channelsWithFunding = (list: any[]) =>
 		list.map((channel) => {
-			if (offlineReceive?.reservedIds().has(channel.channelId))
+			if (offlineReceive?.reservedIds().has(channel.channelId) && channel.ffor?.concurrent !== true)
 				channel = { ...channel, htlcUsable: false };
 			if (typeof channel?.fundingTxid !== 'string') return channel;
 			const index = channel.fundingOutputIndex ?? 0;
@@ -894,6 +894,8 @@ export async function createPortableRuntime(options: any) {
 					...(offlineReceive?.capacity(record.lfbw.primaryPubkey) ?? {
 						maxSats: 0
 					}),
+					...offlineReceive?.status(),
+					...offlineReceive?.availability(record.lfbw.primaryPubkey),
 					available: probed.offlineReceiveAvailable,
 					reason: probed.offlineReceiveReason
 				};
@@ -901,7 +903,8 @@ export async function createPortableRuntime(options: any) {
 			case 'GET /receive/quote':
 				return offlineReceive!.quote(
 					record.lfbw.primaryPubkey,
-					Number(q.get('amountSats'))
+					Number(q.get('amountSats')),
+					q.get('requestId') ?? undefined
 				);
 			case 'POST /receive/invoice':
 				return durableInvoice(
@@ -915,6 +918,10 @@ export async function createPortableRuntime(options: any) {
 				return n.fforStartEpoch(b);
 			case 'POST /ffor/invoice':
 				return durableInvoice(n.fforCreateInvoice(b));
+			case 'POST /ffor/sync':
+				return n.fforSync(b.channelId);
+			case 'POST /ffor/epoch/close':
+				return n.fforCloseEpoch(b.channelId);
 			case 'POST /ffor/recover':
 				return n.fforRecover({ channelId: b.channelId });
 			case 'GET /liquidity':
@@ -1239,6 +1246,7 @@ export async function createPortableRuntime(options: any) {
 				// The engine implements offline receiving. Whether this wallet's
 				// primary serves it is the probed pair on the wallet record.
 				offlineReceiveAvailable: true,
+				concurrentOfflineReceiveAvailable: true,
 				recoveryAvailable: true,
 				recoveryAutoApplyAvailable: true,
 				engineVersion: ENGINE_VERSION,

@@ -1708,7 +1708,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/backup': {
 				post: {
 					summary:
-						'Create database backup, with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
+						'Create database backup at the canonical destPath (returned as path; a relative destPath resolves against the working directory of the daemon, not the caller), with its seed-derived MAC in <destPath>.hmac (returned as macPath; `beignet restore db` needs it). An existing destPath or MAC file needs overwrite: true; the live database, its sidecars, the instance lock, config.json and daemon.pid are always refused',
 					tags: ['Node'],
 					requestBody: bodyContent({
 						destPath: 'string',
@@ -1808,7 +1808,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), and a direct-funding request reserves no channel"
+								"available, reservedChannelIds and requests; each request carries its kind ('bolt11' or 'direct-funding'), concurrent requests also carry concurrentVersion, reservedInboundSats and unresolvedSlots, and a direct-funding request reserves no channel"
 						}
 					}
 				}
@@ -1816,9 +1816,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/quote': {
 				get: {
 					summary:
-						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
 					tags: ['FFOR'],
 					parameters: [
+						{
+							name: 'requestId',
+							in: 'query',
+							required: false,
+							schema: { type: 'string' },
+							description:
+								'Pass the existing requestId to refresh terms for an interrupted request and reuse its reserved channel.'
+						},
 						{
 							name: 'peer',
 							in: 'query',
@@ -1835,7 +1843,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode contacts no peer and adds minAmountSat, the configured direct-funding minimum (5000 by default)'
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default)'
 						},
 						'400': {
 							description:
@@ -1885,6 +1893,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						feeBaseMsat: 'number',
 						feeProportionalMillionths: 'number',
 						hashChain: 'boolean',
+						concurrent: 'boolean',
+						concurrentVersion: 'number',
 						witnessPeers: 'string[]'
 					}),
 					responses: {
@@ -1916,7 +1926,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/ffor/epoch/close': {
 				post: {
 					summary:
-						'R, back online: send ff_close; the ack carries the settled bitmap and preimages and the drain fulfils settled slots and fails the rest. The epoch reads CLOSED once no voucher remains',
+						'R, back online: request retirement with ff_close. Verified paid slots redeem. Concurrent version 2 retains unknown slots in DRAINING until safely resolved. The epoch reads CLOSED once no voucher remains',
 					tags: ['FFOR'],
 					requestBody: bodyContent({ channelId: 'string' }),
 					responses: {
@@ -2004,10 +2014,26 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/ffor/sync': {
+				post: {
+					summary:
+						'R: request the cumulative signed receipts for an ACTIVE concurrent book. Verified paid slots redeem while the remaining reservations stay live.',
+					tags: ['FFOR'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'Current epoch view. The sync reply may arrive after this response.'
+						},
+						'400': { description: 'Invalid channel id or FFOR_REFUSED' },
+						'404': { description: 'Channel not found' }
+					}
+				}
+			},
 			'/ffor/recover': {
 				post: {
 					summary:
-						'R, back online: fetch every provisioned witness, credit each record that verifies, then close the epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
+						'R, back online: fetch every provisioned witness, credit each record that verifies, then sync a connected concurrent book without retirement (action synced), or close a baseline epoch cooperatively when S is there and ACTIVE, or force-close with every known preimage when forceCloseIfUnreachable is true and S is not. Returns what was learned and what was done. On a channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret, forceCloseIfUnreachable also needs acceptStaleStateRisk: true, the acknowledgement POST /channel/forceclose asks for, since it publishes the same commitment (issue #908). So does any channel while the recovery gate is fenced or quarantined (issue #1013)',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
 						channelId: 'string',
@@ -2019,7 +2045,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'action (closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record'
+								'action (synced | closed | force-closed | nothing), preimagesKnown, per-witness results, the epoch record'
 						},
 						'400': {
 							description:
@@ -2209,12 +2235,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/guardian/status': {
 				get: {
 					summary:
-						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off; otherwise the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, namespaces per set, bytes per namespace, sets). Independent of this node's own recovery mode",
+						"The reference guardian this node serves to OTHER beignet nodes over bolt8 sessions (docs/RECOVERY-GUARDIAN-WIRE.md 2.7): serving false when hosting is off, and also while hosting is on but the Lightning listener guardians dial is not bound, when listenError (a ListenerProblem) says why (issue #861); whenever hosting is on, the guardian id, whether a bearer token is required, open sessions, requests retained in flight, every served set (id, members, namespaces, bytes stored and on disk, registeredAt), the bytes stored across sets, and the limits (per-record ciphertext, bytes per set, namespaces per set, bytes per namespace, sets). Independent of this node's own recovery mode",
 					tags: ['Node'],
 					responses: {
 						'200': {
 							description:
-								'{ serving } plus the host status when serving. Quotas refuse rather than delete, so a set at its byte limit still answers reads'
+								'{ serving } plus the host status whenever hosting is on, and listenError while the Lightning listener is not bound. Quotas refuse rather than delete, so a set at its byte limit still answers reads'
 						}
 					}
 				}
@@ -2238,11 +2264,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								'ROTATION_IN_PROGRESS or ROTATION_UNAVAILABLE (not a guardian mode, gate not confirmed, fenced, no lease)'
+								'ROTATION_IN_PROGRESS or ROTATION_UNAVAILABLE (not a guardian mode, gate not confirmed, fenced, no lease, or a wallet with no journal entries whose guardians hold records in the namespace: its journal was lost, so restore instead of rotating)'
 						},
 						'503': {
 							description:
-								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip; retry'
+								'ROTATION_NO_QUORUM or ROTATION_NOT_CATCHING_UP: the incoming set did not register or did not reach the tip, or, on a wallet with no journal entries, too few members of either set confirmed the namespace is empty or its first entry landed during that check; retry'
 						}
 					}
 				}
@@ -2540,7 +2566,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'SPENDING_LIMIT_EXCEEDED: maxFeeSats does not fit the remaining dailySpendLimitSats'
 						},
-						'409': { description: 'SERVICE_DRAINING' }
+						'409': {
+							description: 'SERVICE_DRAINING, or NODE_DESTROYED during shutdown'
+						}
 					}
 				}
 			},
@@ -2805,7 +2833,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect, node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:slot-resolved (terminal concurrent slot outcome: channelId, epochId, k, paymentHash, amountMsat as a decimal string, outcome fulfilled or cancelled), ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -3748,8 +3776,47 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED)'
 						},
 						peerCount: { type: 'integer' },
-						listening: { type: 'boolean' }
+						listening: {
+							type: 'boolean',
+							description:
+								'True while an inbound listener (TCP or WebSocket) is bound'
+						},
+						listenPort: {
+							type: 'integer',
+							description:
+								'The TCP listen port this node was asked for (BEIGNET_LISTEN_PORT), present whenever one was configured, bound or not; listening and listenError say which'
+						},
+						listenError: {
+							$ref: '#/components/schemas/ListenerProblem'
+						},
+						websocketPort: {
+							type: 'integer',
+							description:
+								'The WebSocket listener port, present only while it is bound'
+						},
+						websocketListenError: {
+							$ref: '#/components/schemas/ListenerProblem'
+						}
 					}
+				},
+				ListenerProblem: {
+					type: 'object',
+					description:
+						'Why a configured inbound listener is not bound; absent while it is. failed: the OS refused the bind (the port is taken or not permitted; errno names it), nothing retries it, and node:error LISTEN_FAILED was raised; restart once the port is free. held: a guardian recovery mode (async-remote, quorum) holds the bind under its startup quarantine until writer ownership is confirmed and any startup repair is receipted, and it binds then. fenced: another device owns this recovery namespace, so the listener stays down (the fence also closes one that was bound)',
+					properties: {
+						port: { type: 'integer', description: 'The port asked for' },
+						state: { type: 'string', enum: ['failed', 'held', 'fenced'] },
+						message: {
+							type: 'string',
+							description: 'The OS error, or why the bind is held'
+						},
+						errno: {
+							type: 'string',
+							description:
+								'The OS error code (EADDRINUSE, EACCES, ...) when the OS refused'
+						}
+					},
+					required: ['port', 'state', 'message']
 				},
 				BalanceInfo: {
 					type: 'object',
@@ -3921,6 +3988,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						shortChannelId: { type: 'string' },
 						feeratePerKw: { type: 'integer' },
 						htlcCount: { type: 'integer' },
+						ffor: {
+							type: 'object',
+							description:
+								'The retained offline receive book and its unresolved reservation. Ordinary payment availability is reported separately by htlcUsable.',
+							properties: {
+								state: { type: 'string' },
+								concurrent: { type: 'boolean' },
+								concurrentVersion: { type: 'integer', enum: [1, 2] },
+								reservedInboundSats: { type: 'integer' },
+								unresolvedSlots: { type: 'integer' }
+							}
+						},
 						pendingSpliceLocalBalanceSats: {
 							type: 'integer',
 							description:

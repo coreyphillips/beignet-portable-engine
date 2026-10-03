@@ -1,3 +1,23 @@
+# Concurrent receive qualification
+
+Target: published Beignet 0.25.0 at `db15cf581bf3f59a26280bdd955f1f08f2dbc182`.
+
+The coordinator regression suite covers funded capacity, baseline and opt-out refusal, durable profile selection, busy retries, expired quote refresh, signed live sync, terminal outcomes, and retained unknown reservations through two coordinator reloads. Coordinator fixtures do not qualify actual mobile process death or wallet credit.
+
+The funded runtime and encrypted worker passed the complete concurrent acceptance on Node 22.13.1. Wallet core was reviewed at commit `2a42a2c2a55195eb2e7854d5633f2ff6285d4552`. Portable tests: 108 passed. Public types passed.
+
+One 500,000-sat home channel started with 100,000 sats owned by the receiver. With a 20,000-sat offline reservation live, ordinary payments of 5,000 sats out and 6,000 sats in completed. The receiver process or worker was terminated before the offline invoice was paid. Both cold starts reported 121,000 sats total, 116,000 sats available, and exactly one Activity entry for the offline payment. Redeeming the first voucher of a separate two-voucher book left its second invoice payable. Explicit early closure retained 17,000 sats and one unknown slot in DRAINING; ordinary payments still completed, leaving 147,000 sats total and 142,000 sats available.
+
+The worker check bundles the production worker source from web commit `57449f6d7a148decab1d7f9a5d3a5cbc9336de10` against this engine. It uses the production encrypted vault and journal with durable OPFS handles in a browser-like realm that has no Node globals. Worker threads are terminated without graceful engine shutdown. This is storage and runtime qualification, not browser UI compatibility.
+
+Run `npm run test:regtest:ffor`, `npm run test:regtest:ffor:worker`, and `npm run test:regtest:ffor:native`. The harness accepts explicit source locations through `BEIGNET_SOURCE_DIR`, `BEIGNET_WALLET_CORE_DIR`, `BEIGNET_RELAY_DIR`, and `BEIGNET_WEB_DIR`. Set `BEIGNET_EVIDENCE_FILE` to record balances and restart identities. Native runs require the isolated app from Chicory's qualification entry and `FFOR_MOBILE_PLATFORM`, `FFOR_MOBILE_DEVICE`, and `FFOR_MOBILE_APP`.
+
+Packaged iOS and Android acceptance is still in progress. Mobile lifecycle support is not yet qualified.
+
+The historical evidence below covers an older release and must not be used as evidence for concurrent receive. Its ordinary-receive and dedicated-channel behavior is superseded by explicit offline mode on one funded channel.
+
+## Historical baseline evidence
+
 # Automatic offline receive validation
 
 Release baseline: Beignet 0.21.8, which includes the automatic-receive provider protocol. The published npm package was installed separately and passed the funded portable regression on September 18, 2026.

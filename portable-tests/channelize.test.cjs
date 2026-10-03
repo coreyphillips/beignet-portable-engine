@@ -223,3 +223,13 @@ test('a fee wait carries the figures the client needs to explain it', async () =
 	assert.equal(last.feeSats, 5000);
 	assert.equal(last.amountSats, 58000);
 });
+
+for (const state of ['ACTIVE', 'DRAINING']) {
+ test(`a ${state} concurrent home waits for funding changes without opening a replacement`, async () => {
+  const node = fakeNode({ channels: [{ ...home, ffor: { concurrent: true, state } }] });
+  const { last } = await runChannelize({ node, record, primary, rules, excludeChannelIds: new Set(['home']) });
+  assert.equal(last.action, 'wait');
+  assert.equal(last.reason, 'offline-receive');
+  assert.deepEqual(node.calls, []);
+ });
+}

@@ -12,6 +12,7 @@
  * unconditionally (spec 5.1, "backward compatibility requirement").
  */
 
+import { IFforVoucherArchive } from '../ffor/voucher-archive';
 import { IChannelState } from '../channel/channel-state';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IPaymentInfo } from '../node/types';
@@ -79,6 +80,7 @@ export type RecoveryDurability = 'local' | 'async-remote' | 'quorum';
  * record (`v2InFlight`).
  */
 export type RecoveryMutation =
+	| { type: 'ffor_voucher'; record: IFforVoucherArchive }
 	| {
 			type: 'channel_state';
 			channelId: string;
@@ -201,7 +203,7 @@ export interface IRecoveryCommitResult {
  * frame's mutations list is empty; the snapshot IS the state.
  */
 export interface RecoveryFrame {
-	version: 1;
+	version: 1 | 2;
 	/** Changes only when a restored device takes ownership (Phase 5). */
 	writerEpoch: bigint;
 	/** Globally monotonic across the node, starting at 1. */
@@ -302,6 +304,7 @@ export interface EncryptedRecoveryFrame {
  * (fitSnapshotUnderCeiling in journal.ts), so those two may be partial.
  */
 export interface RecoverySnapshot {
+	fforVouchers?: IFforVoucherArchive[];
 	/**
 	 * The snapshot content schema this frame was written under (see
 	 * META_SNAPSHOT_SCHEMA in journal.ts). Carried INSIDE the authenticated

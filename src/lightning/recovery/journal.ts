@@ -28,6 +28,7 @@ import { createCipheriv, createDecipheriv } from 'crypto';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
+import { usesCompactHtlcHistory } from '../storage/htlc-history';
 import {
 	CorruptRecoveryRowError,
 	IStorageBackend,
@@ -41,6 +42,7 @@ import {
 	decodeFrame,
 	encodeFrame,
 	encodedMutationBytes,
+	frameVersionForContent,
 	hashFrame
 } from './frame-codec';
 import { PaymentDirection, PaymentStatus } from '../node/types';
@@ -114,6 +116,18 @@ export const SNAPSHOT_SCHEMA_VERSION = '2';
  * so those releases must read it as a schema they cannot restore.
  */
 const PAGED_SNAPSHOT_SCHEMA_VERSION = '2+pages';
+export const FFOR_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers';
+const FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers+pages';
+export const COMPACT_SNAPSHOT_SCHEMA_VERSION = '2+ffor-vouchers+htlc-history';
+const COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION =
+	'2+ffor-vouchers+htlc-history+pages';
+function currentSnapshotSchema(marker: string | null | undefined): boolean {
+	return (
+		marker === SNAPSHOT_SCHEMA_VERSION ||
+		marker === FFOR_SNAPSHOT_SCHEMA_VERSION ||
+		marker === COMPACT_SNAPSHOT_SCHEMA_VERSION
+	);
+}
 /**
  * The EXACT marker strings this release knows how to migrate from. An
  * absent or empty marker (a journal written before versioning existed)
@@ -131,7 +145,7 @@ const MIGRATABLE_SNAPSHOT_SCHEMAS = new Set(['1']);
  */
 function snapshotSchemaKnown(marker: string | null | undefined): boolean {
 	if (marker == null || marker === '') return true;
-	if (marker === SNAPSHOT_SCHEMA_VERSION) return true;
+	if (currentSnapshotSchema(marker)) return true;
 	return MIGRATABLE_SNAPSHOT_SCHEMAS.has(marker);
 }
 /**
@@ -160,6 +174,19 @@ export const META_REPLICATED_THROUGH = 'guardian_replicated_through';
  * the retained frame store (see resolveWatermarkAnchor).
  */
 export const META_REPLICATED_THROUGH_HASH = 'guardian_replicated_through_hash';
+/** The guardian-set generation (wire 5.9); absent reads as 1. */
+const META_GUARDIAN_GENERATION = 'guardian_generation_v1';
+/**
+ * The rest of a guardian-set rotation's metadata (wire 5.9), named here
+ * only so the empty-store check below can admit it: the modules that write
+ * these keys (guardian-rotation.ts, guardian-replication.ts) import this
+ * one, so the names are repeated rather than imported, and the phase 2
+ * tests pin each copy to its writer's constant. Not exported: the recovery
+ * barrel already exports the writers' names.
+ */
+const META_ROTATION_PENDING = 'guardian_rotation_pending_v1';
+const META_RETIRE_PENDING = 'guardian_retire_pending_v1';
+const META_GUARDIAN_SET_ENTRIES = 'guardian_set_v1';
 
 /**
  * The frame hash a watermark at `sequence` must have been receipted at, from
@@ -223,9 +250,14 @@ const JOURNAL_META_RESIDUE_KEYS = [
  * lease acquisition and namespace registration run ahead of the first
  * commit, and the node's startup repair marker is written before restore,
  * but only as the bare 'owed' sentinel (a numeric receipt target implies
- * frames existed, so it can never precede frame 1). Everything else
- * present over an EMPTY frame store, and every allowed key holding a
- * value outside its legitimate shape, is residue of destroyed history.
+ * frames existed, so it can never precede frame 1). A guardian-set
+ * rotation can run before the first frame too (issue #862): its intent,
+ * and after the switch the generation, the configured set and the
+ * retirement owed to the outgoing set. Everything else present over an
+ * EMPTY frame store, and every allowed key holding a value outside its
+ * legitimate shape, is residue of destroyed history. That includes every
+ * replication watermark, main or a rotation's prefixed copy: nothing
+ * receipted is ABSENCE, so a watermark exists only because frames did.
  * The scan refuses BY PRESENCE: an explicitly stored empty string is
  * presence, not absence.
  */
@@ -233,6 +265,38 @@ const isJsonObject = (value: string): boolean => {
 	try {
 		const parsed: unknown = JSON.parse(value);
 		return parsed !== null && typeof parsed === 'object';
+	} catch {
+		return false;
+	}
+};
+/** A persisted rotation record: exactly what its loader accepts (version 1). */
+const isVersionOneRecord = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return (
+			parsed !== null &&
+			typeof parsed === 'object' &&
+			!Array.isArray(parsed) &&
+			(parsed as { version?: unknown }).version === 1
+		);
+	} catch {
+		return false;
+	}
+};
+/** A configured guardian set: a non-empty list of entries naming a guardian. */
+const isGuardianSetEntries = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return (
+			Array.isArray(parsed) &&
+			parsed.length > 0 &&
+			parsed.every(
+				(entry: unknown) =>
+					entry !== null &&
+					typeof entry === 'object' &&
+					typeof (entry as { guardianId?: unknown }).guardianId === 'string'
+			)
+		);
 	} catch {
 		return false;
 	}
@@ -248,7 +312,18 @@ const EMPTY_STORE_ALLOWED_META: ReadonlyMap<
 	['writer_lease_v1', isJsonObject],
 	['restore_pending_acquisition_v1', isJsonObject],
 	['guardian_pending_registration_v1', isJsonObject],
-	['startup_repair_tail', (value: string): boolean => value === 'owed']
+	['startup_repair_tail', (value: string): boolean => value === 'owed'],
+	// A rotation's intent survives an abort by design, so a restart resumes
+	// it (wire 5.9); the switch records the rest, and the boot follow loop
+	// records the generation and the set a rotation moved to. A generation
+	// is only ever written as g+1, so 1 is never a stored value.
+	[META_ROTATION_PENDING, isVersionOneRecord],
+	[META_RETIRE_PENDING, isVersionOneRecord],
+	[
+		META_GUARDIAN_GENERATION,
+		(value: string): boolean => /^(?:[2-9]|[1-9]\d+)$/.test(value)
+	],
+	[META_GUARDIAN_SET_ENTRIES, isGuardianSetEntries]
 ]);
 
 /**
@@ -265,7 +340,7 @@ export const JOURNAL_META_KEYS = {
 	durabilityFloor: META_DURABILITY_FLOOR,
 	backfillLost: META_BACKFILL_LOST,
 	/** The guardian-set generation (wire 5.9); absent reads as 1. */
-	generation: 'guardian_generation_v1'
+	generation: META_GUARDIAN_GENERATION
 } as const;
 
 /**
@@ -482,6 +557,18 @@ export function decryptFrame(
  */
 export function journalSupported(storage: IStorageBackend): boolean {
 	return (
+		// Older adapters with no archive support can still journal ordinary
+		// channels. Partial support can silently omit custody and is refused.
+		([
+			storage.saveFforVoucher,
+			storage.loadFforVoucher,
+			storage.loadAllFforVouchers
+		].every((m) => typeof m === 'function') ||
+			[
+				storage.saveFforVoucher,
+				storage.loadFforVoucher,
+				storage.loadAllFforVouchers
+			].every((m) => m === undefined)) &&
 		typeof storage.saveRecoveryFrame === 'function' &&
 		typeof storage.loadRecoveryFrames === 'function' &&
 		typeof storage.deleteRecoveryFramesBelow === 'function' &&
@@ -1016,7 +1103,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations: [],
 			outboundMessages: []
 		};
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		return ceiling - encodeFrame(frame).length - FRAME_CIPHERTEXT_OVERHEAD;
 	}
 
@@ -1204,6 +1291,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			const declared = frames[i].snapshot!.schemaVersion;
 			if (
 				declared !== PAGED_SNAPSHOT_SCHEMA_VERSION &&
+				declared !== FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION &&
+				declared !== COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION &&
 				!snapshotSchemaKnown(declared)
 			) {
 				throw new Error(
@@ -1479,7 +1568,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`verified chain's epoch ${this.epochFloor}; refusing to write`
 			);
 		}
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		const plaintext = encodeFrame(frame);
 		const ceiling = this.maxFrameCiphertextBytes?.();
 		if (
@@ -1551,13 +1640,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	}
 
 	/**
-	 * Stamped at write time rather than at each construction site so that
+	 * Format and durability are stamped on newly written frames, so that
 	 * deltas, bootstrap snapshots, per-run re-base snapshots and interval
 	 * snapshots all carry the same declaration; a snapshot that omitted it
 	 * would be a certified head that says nothing about what its writer
 	 * promised.
 	 */
-	private stampDurability(frame: RecoveryFrame): void {
+	private stampFramePolicy(frame: RecoveryFrame): void {
+		frame.version = frameVersionForContent(frame);
 		if (!this.durability) return;
 		frame.durability = this.durability;
 		// Only quorum frames carry a policy stamp, because only they make a
@@ -1584,7 +1674,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private fitSnapshotUnderCeiling(frame: RecoveryFrame): string[] {
 		const ceiling = this.maxFrameCiphertextBytes?.();
 		if (ceiling === undefined) return [];
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		const size = (): number =>
 			encodeFrame(frame).length + FRAME_CIPHERTEXT_OVERHEAD;
 		if (size() <= ceiling) return [];
@@ -1664,7 +1754,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 */
 	snapshotSchemaRepair(): bigint | null {
 		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
-		if (marker === SNAPSHOT_SCHEMA_VERSION) return null;
+		if (currentSnapshotSchema(marker)) return null;
 		this.assertSnapshotSchemaMigratable(marker);
 		const tip = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
@@ -1688,10 +1778,6 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				last = this.appendSnapshotFrame(
 					sequence,
 					decodeStoredHashHex(tipHash, 'journal tip hash')
-				);
-				this.storage.setRecoveryMeta!(
-					META_SNAPSHOT_SCHEMA,
-					SNAPSHOT_SCHEMA_VERSION
 				);
 			});
 		} catch (err) {
@@ -1718,7 +1804,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			// No frames yet: the bootstrap snapshot will be current-schema.
 			return false;
 		}
-		return marker !== SNAPSHOT_SCHEMA_VERSION;
+		return !currentSnapshotSchema(marker);
 	}
 
 	/**
@@ -1761,6 +1847,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const snapshot = frame.snapshot!;
 		// applySnapshot's order.
 		const rows: RecoveryMutation[] = [
+			...(snapshot.fforVouchers ?? []).map(
+				(record): RecoveryMutation => ({ type: 'ffor_voucher', record })
+			),
 			...snapshot.preimages.map(
 				(p): RecoveryMutation => ({
 					type: 'payment_preimage',
@@ -1821,7 +1910,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 
 		const paged: RecoverySnapshot = {
 			...snapshot,
-			schemaVersion: PAGED_SNAPSHOT_SCHEMA_VERSION,
+			schemaVersion:
+				snapshot.schemaVersion === COMPACT_SNAPSHOT_SCHEMA_VERSION
+					? COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
+					: snapshot.schemaVersion === FFOR_SNAPSHOT_SCHEMA_VERSION
+					? FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION
+					: PAGED_SNAPSHOT_SCHEMA_VERSION,
+			...(snapshot.fforVouchers !== undefined ? { fforVouchers: [] } : {}),
 			pageFrames: pages.length,
 			preimages: [],
 			payments: [],
@@ -1850,7 +1945,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			mutations,
 			outboundMessages: []
 		};
-		this.stampDurability(frame);
+		this.stampFramePolicy(frame);
 		return frame;
 	}
 
@@ -1911,7 +2006,11 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// means a fresh journal is never seen as needing the repair.
 		this.storage.setRecoveryMeta!(
 			META_SNAPSHOT_SCHEMA,
-			SNAPSHOT_SCHEMA_VERSION
+			frameVersionForContent(frame) === 2
+				? COMPACT_SNAPSHOT_SCHEMA_VERSION
+				: frame.snapshot?.fforVouchers !== undefined
+				? FFOR_SNAPSHOT_SCHEMA_VERSION
+				: SNAPSHOT_SCHEMA_VERSION
 		);
 		this.compactTo(sequence);
 		this.snapshotGroupEnd = sequence + BigInt(pages.length);
@@ -2054,11 +2153,20 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// counter around the loads and refuse the snapshot if it moved.
 		const corruptBefore = storage.corruptRowCount?.();
 		const channels = storage.loadAllChannels();
+		const fforVouchers = storage.loadAllFforVouchers?.() ?? [];
+		const compactHistory = channels.some((channel) =>
+			usesCompactHtlcHistory(channel.state)
+		);
 		const snapshot: RecoverySnapshot = {
 			// Authenticated by the frame: restoration re-derives the local
 			// schema marker from here, since recovery_meta does not ride
 			// frames and would otherwise be lost with the device.
-			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+			schemaVersion: compactHistory
+				? COMPACT_SNAPSHOT_SCHEMA_VERSION
+				: fforVouchers.length > 0
+				? FFOR_SNAPSHOT_SCHEMA_VERSION
+				: SNAPSHOT_SCHEMA_VERSION,
+			...(fforVouchers.length > 0 || compactHistory ? { fforVouchers } : {}),
 			channels: channels.map((c) => ({
 				channelId: c.channelId,
 				state: c.state,
@@ -2333,8 +2441,10 @@ export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
 	if (!snapshot) return;
 	const declared = snapshot.schemaVersion;
 	if (
-		declared === SNAPSHOT_SCHEMA_VERSION ||
-		declared === PAGED_SNAPSHOT_SCHEMA_VERSION
+		currentSnapshotSchema(declared) ||
+		declared === PAGED_SNAPSHOT_SCHEMA_VERSION ||
+		declared === FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION ||
+		declared === COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
 	) {
 		return;
 	}
@@ -2398,14 +2508,30 @@ export function reconstructFromFrames(
 	const declaredSchema = frames[snapshotIndex].snapshot!.schemaVersion;
 	// The local marker records content, and a paged snapshot's is schema 2.
 	const snapshotSchema =
-		declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
+		declaredSchema === COMPACT_PAGED_SNAPSHOT_SCHEMA_VERSION
+			? COMPACT_SNAPSHOT_SCHEMA_VERSION
+			: declaredSchema === PAGED_SNAPSHOT_SCHEMA_VERSION
 			? SNAPSHOT_SCHEMA_VERSION
+			: declaredSchema === FFOR_PAGED_SNAPSHOT_SCHEMA_VERSION
+			? FFOR_SNAPSHOT_SCHEMA_VERSION
 			: declaredSchema;
 	const replayEnd = lastAppliedFrameIndex(frames) + 1;
 	// Path_id preflight runs over the WHOLE restore set (snapshot AND replay
 	// deltas) before the first write: a refusal discovered mid-replay would
 	// leave the target partially populated and unretryable.
 	assertPathIdsRestorable(target, frames, snapshotIndex, replayEnd);
+	if (
+		!target.saveFforVoucher &&
+		frames
+			.slice(snapshotIndex, replayEnd)
+			.some(
+				(frame) =>
+					(frame.snapshot?.fforVouchers?.length ?? 0) > 0 ||
+					frame.mutations.some((m) => m.type === 'ffor_voucher')
+			)
+	) {
+		throw new Error('Recovery target cannot persist FFOR voucher custody');
+	}
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.
@@ -2504,6 +2630,8 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 
 /** Throw when the reconstruction target already holds journaled state. */
 export function assertEmptyTarget(target: IStorageBackend): void {
+	if (target.saveFforVoucher && !target.loadAllFforVouchers)
+		throw new Error('Restore target cannot enumerate FFOR voucher custody');
 	// A target that can write path_id rows but cannot enumerate them could
 	// hold rows this scan cannot see; refuse to vouch for its emptiness. A
 	// target lacking BOTH methods genuinely cannot hold rows, so the ?? []
@@ -2522,6 +2650,7 @@ export function assertEmptyTarget(target: IStorageBackend): void {
 	// and the restore would proceed over them (issue #317).
 	const corruptBefore = target.corruptRowCount?.();
 	const dirty =
+		(target.loadAllFforVouchers?.() ?? []).length > 0 ||
 		target.loadAllChannels().length > 0 ||
 		// Key indices are safety-critical residue too: an orphaned row
 		// surviving a restore shifts the next channel's derivation index.
@@ -2655,6 +2784,11 @@ function applySnapshot(
 	// Joins the caller's transaction when one is active (a capsule install
 	// wraps the whole restore in one); opens its own otherwise.
 	withStorageTransaction(target, () => {
+		for (const record of snapshot.fforVouchers ?? []) {
+			if (!target.saveFforVoucher)
+				throw new Error('Recovery target cannot persist FFOR voucher custody');
+			target.saveFforVoucher(record);
+		}
 		for (const c of snapshot.channels) {
 			target.saveChannel(c.channelId, c.state, c.peerPubkey);
 		}

@@ -153,7 +153,8 @@ export interface IWalletLike {
 	/**
 	 * unfreezeUtxo that leaves the coin frozen (Ok, { unfrozen: false }) once
 	 * an entry without tag stands on it, decided under the wallet's own write
-	 * lock.
+	 * lock. A coin with nothing frozen answers Ok too, so an Err always means
+	 * the tagged entry is still there.
 	 */
 	unfreezeUtxoIfTagged?(params: {
 		txid: string;
@@ -266,12 +267,19 @@ export class WalletFundingProvider implements IFundingProvider {
 			// A freeze queued ahead of ours in the wallet lands between any read
 			// taken from here and our own write, so only the wallet can say
 			// whether this call added the entry. An entry that was already there
-			// leaves ownership as it stood. So does a refusal of a coin frozen
-			// before the call, since the read below can catch an unfreeze queued
-			// behind ours whose storage write then rolls it back.
+			// leaves ownership as it stood.
+			//
+			// A refusal settles nothing about the entry on the coin: the read
+			// above and the one below can each catch an unfreeze, queued on
+			// either side of ours, whose storage write then rolls it back. Where
+			// release checks the tag under the wallet's lock, ownership of a
+			// freeze that is really gone lifts nothing, so a refusal leaves it as
+			// it stood. A plain unfreeze would lift whatever froze the coin
+			// since, so there only a coin frozen before the call stays owned.
 			res = await this.wallet.freezeUtxoIfUnfrozen(params);
 			owned = res.isErr()
-				? frozenBefore && this.ownedFreezes.has(key)
+				? this.ownedFreezes.has(key) &&
+				  (frozenBefore || this.wallet.unfreezeUtxoIfTagged !== undefined)
 				: (res as IResultOk<{ created: boolean }>).value.created === true ||
 				  this.ownedFreezes.has(key);
 		} else {
@@ -324,28 +332,36 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * Lift the freeze behind a pledge. Returns whether the coin ended up
 	 * released, so a caller only forgets the pledge once it no longer holds
 	 * anything: a wallet that refused the write still has the coin frozen, and
-	 * dropping the record would leave nothing able to try again. A wallet that
-	 * no longer lists the outpoint as frozen is released whatever it called the
-	 * refusal ("not frozen" is the answer to a double release). A pledge
+	 * dropping the record would leave nothing able to try again. A pledge
 	 * standing on a freeze this provider did not place has nothing to lift.
 	 *
 	 * A user freeze on a coin we froze clears our tag or replaces our entry
 	 * without telling us. Where the wallet offers it, the unfreeze checks the
 	 * tag under the wallet's lock. A read from here could see a takeover whose
-	 * write is still in flight and may yet roll back.
+	 * write is still in flight and may yet roll back, or a queued user
+	 * unfreeze whose failed write then restores our entry. So that wallet's
+	 * refusal always keeps the pledge: it answers a coin with nothing frozen
+	 * with Ok.
+	 *
+	 * A plain unfreezeUtxo calls a double release "not frozen", and reading
+	 * the coin back is the only way to tell that from a failed write.
 	 */
 	private async releasePledge(txid: string, vout: number): Promise<boolean> {
 		const key = `${txid}:${vout}`;
 		if (!this.ownedFreezes.has(key)) return true;
-		const res = this.wallet.unfreezeUtxoIfTagged
-			? await this.wallet.unfreezeUtxoIfTagged({
-					txid,
-					index: vout,
-					tag: WalletFundingProvider.PLEDGE_TAG
-			  })
-			: await this.wallet.unfreezeUtxo?.({ txid, index: vout });
-		const released =
-			!res?.isErr() || this.wallet.isUtxoFrozen?.(txid, vout) === false;
+		let released: boolean;
+		if (this.wallet.unfreezeUtxoIfTagged) {
+			const res = await this.wallet.unfreezeUtxoIfTagged({
+				txid,
+				index: vout,
+				tag: WalletFundingProvider.PLEDGE_TAG
+			});
+			released = !res.isErr();
+		} else {
+			const res = await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+			released =
+				!res?.isErr() || this.wallet.isUtxoFrozen?.(txid, vout) === false;
+		}
 		if (released) this.ownedFreezes.delete(key);
 		return released;
 	}
