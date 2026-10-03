@@ -12,7 +12,7 @@ The worker check bundles the production worker source from web commit `57449f6d7
 
 Run `npm run test:regtest:ffor`, `npm run test:regtest:ffor:worker`, and `npm run test:regtest:ffor:native`. The harness accepts explicit source locations through `BEIGNET_SOURCE_DIR`, `BEIGNET_WALLET_CORE_DIR`, `BEIGNET_RELAY_DIR`, and `BEIGNET_WEB_DIR`. Set `BEIGNET_EVIDENCE_FILE` to record balances and restart identities. Native runs require the isolated app from Chicory's qualification entry and `FFOR_MOBILE_PLATFORM`, `FFOR_MOBILE_DEVICE`, and `FFOR_MOBILE_APP`.
 
-Packaged iOS and Android acceptance is still in progress. Mobile lifecycle support is not yet qualified.
+Packaged iOS and Android acceptance passed with Hermes, Keychain/Keystore, SQLCipher and native TCP. iOS 26.2 used an iPhone 17 Pro simulator and three app processes (10264, 10677 and 10813). Android 17 (API 37) used an arm64 emulator and processes 9857, 9957, 10032. Both passed the same exact balance, Activity cardinality, partial-redemption and retained-reservation assertions. The native client used wallet-core `dcbb538f530e275b5b768512c683737de5f455e8`. These runs use Chicory's dedicated qualification entry with the production storage and client; they do not claim physical-device or app-store qualification.
 
 The historical evidence below covers an older release and must not be used as evidence for concurrent receive. Its ordinary-receive and dedicated-channel behavior is superseded by explicit offline mode on one funded channel.
 

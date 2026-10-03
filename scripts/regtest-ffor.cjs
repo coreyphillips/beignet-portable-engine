@@ -149,6 +149,18 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 	}
 	async function balance(label) {
 		const snapshot = await client.snapshot();
+		const expected =
+			label === 'active offline book'
+				? [101000, 96000]
+				: label.startsWith('cold start')
+				? [121000, 116000]
+				: [147000, 142000];
+		assert.equal(snapshot.balance.totalSats, expected[0], label + ' total');
+		assert.equal(
+			snapshot.balance.availableSats,
+			expected[1],
+			label + ' available'
+		);
 		evidence.balances.push({ label, ...snapshot.balance });
 		return snapshot;
 	}
@@ -182,7 +194,7 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 					? adapter.request({ path: '/api/config' })
 					: call('request', { path: '/api/config' }))
 			).engineVersion,
-			'0.25.0-portable'
+			adapter?.engineVersion || '0.25.0-portable'
 		);
 		const receiverId = (await rpc('/info')).nodeId;
 		h.primary.addTrustedPeer(receiverId);
@@ -288,7 +300,9 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 			async () =>
 				(await rpc('/ffor/epoch?channelId=' + reservation.channelId)).state ===
 					'CLOSED' &&
-				(await rpc('/receive/offline')).requests.every((j) => j.done)
+				(
+					await rpc(adapter?.offlineStatusPath || '/receive/offline')
+				).requests.every((j) => j.done)
 		);
 		const height = (await rpc('/info')).blockHeight;
 		await rpc('/ffor/epoch/start', 'POST', {
@@ -372,7 +386,12 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 			);
 		});
 		await ordinaryBothWays('draining unknown reservation');
-		assert.equal((await rpc('/receive/offline')).maxSats, 0);
+		const finalStatus = await rpc(
+			adapter?.offlineStatusPath || '/receive/offline'
+		);
+		if (finalStatus.maxSats !== undefined) assert.equal(finalStatus.maxSats, 0);
+		else
+			assert.ok(finalStatus.reservedChannelIds.includes(reservation.channelId));
 		evidence.result = 'passed';
 		if (process.env.BEIGNET_EVIDENCE_FILE)
 			fs.writeFileSync(

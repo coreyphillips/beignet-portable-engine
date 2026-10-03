@@ -97,18 +97,37 @@ exports.start = async ({ h }) => {
 			{ encoding: 'utf8' }
 		).trim();
 	}
-	const launch = execute('start');
-	const native = await Promise.race([
-		ready,
-		new Promise((_, reject) => {
-			const timer = setTimeout(
-				() => reject(Error('Native startup timed out')),
-				90000
-			);
-			timer.unref();
-		})
-	]);
-	if (!native.hermes) throw Error('Native qualification requires Hermes');
+	let launch, native;
+	try {
+		launch = execute('start');
+		native = await Promise.race([
+			ready,
+			new Promise((_, reject) => {
+				const timer = setTimeout(
+					() => reject(Error('Native startup timed out')),
+					90000
+				);
+				timer.unref();
+			})
+		]);
+		if (!native.hermes) throw Error('Native qualification requires Hermes');
+	} catch (error) {
+		try {
+			execute('stop');
+		} catch {}
+		if (waiting) waiting.end('{}');
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+		throw error;
+	}
+	const pid =
+		platform === 'android'
+			? Number(
+					execFileSync(adb, ['-s', device, 'shell', 'pidof', app], {
+						encoding: 'utf8'
+					}).trim()
+			  )
+			: Number(launch.split(':').pop().trim());
 	const call = (operation, body, args) =>
 		new Promise((resolve, reject) => {
 			const id = ++next;
@@ -143,7 +162,7 @@ exports.start = async ({ h }) => {
 						call(method, undefined, args)
 			}
 		),
-		identity: { platform, device, app, launch, run: ++run, ...native },
+		identity: { platform, device, app, pid, launch, run: ++run, ...native },
 		stop: async () => {
 			execute('stop');
 			if (waiting) waiting.end('{}');
