@@ -2,7 +2,7 @@
 
 This local fork runs the real Beignet Bitcoin and Lightning engine inside a browser worker or React Native Hermes. Keys, signatures, BOLT 8 transport encryption, channel state and payment state stay in the device runtime. The optional sibling `beignet-relay` forwards encrypted Lightning bytes and Electrum JSON; it is not a wallet daemon and never receives a seed or signing key.
 
-Source baseline: upstream Beignet `0.24.1`, commit `d71fa287` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.24.1-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
+Source baseline: upstream Beignet `0.26.0`, commit `026d202b` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.26.0-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
 
 ## Build and validation
 
@@ -119,3 +119,11 @@ See [FFOR validation](FFOR-VALIDATION.md) for simulator and funded regtest evide
 ## Continuous integration
 
 The portable fork builds and runs its own tests, checks public TypeScript declarations, checks JavaScript syntax, and audits dependencies. The upstream CLI and recovery suites remain in Beignet. `npm run test:relay:integration` additionally exercises the unpublished sibling `beignet-relay` checkout; the default tests use a local WebSocket server and need no sibling repositories.
+
+## Iroh primary connections
+
+A native host can supply `iroh: { factory }` to `createPortableRuntime`. The factory implements `IrohEndpointFactory` and returns transports backed by a single ordered bidirectional stream. `IrohTransport` and `IROH_ALPN` are exported for adapters. The bundle excludes the Node Iroh binding and starts an endpoint only for an Iroh primary. Browser hosts without a factory reject this option before wallet creation.
+
+`parsePrimaryUri` accepts `<lightning-pubkey>@iroh:<endpoint-id>?relay=<encoded-url>` as well as existing TCP and onion URIs. Endpoint IDs accept hex or canonical base32. `primaryFallbackUri` is optional and must identify the same Lightning key at a v3 onion address. The fallback uses the host's destination routing, so native Tor sockets are not wrapped in another SOCKS handshake. Changing either URI restarts the selected engine to apply the transport configuration. Clearing the fallback uses `null`.
+
+The endpoint identity is derived by Beignet from the wallet seed. BOLT 8 still authenticates the Lightning key. An Iroh direct path can reveal each peer's IP address; the relay is a connectivity service and does not provide Tor anonymity. An Iroh-only primary never supplies an endpoint ID as a TCP address in direct-funding descriptors.

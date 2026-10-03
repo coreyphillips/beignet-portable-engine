@@ -1,6 +1,12 @@
 # Portable fork patch map
 
-Baseline: `db15cf581bf3f59a26280bdd955f1f08f2dbc182` (published Beignet 0.25.0). npm's `gitHead` matches this commit. `package.json` records `upstreamVersion` and `upstreamCommit`, and the bundle reports that version through `GET /api/config`.
+Baseline: `026d202b96ada2d88f7cf0a206f36697fcf6b3fe` (published Beignet 0.26.0). `package.json` records `upstreamVersion` and `upstreamCommit`, and the bundle reports that version through `GET /api/config`.
+
+The 0.25.0 to 0.26.0 resync uses a per-file three-way merge against pristine `db15cf58` and `026d202b`. All existing fork changes merged without conflicts, and the fork-only reconstructable batch module remains in place. Upstream supplies Iroh transport, endpoint persistence, stable identity derivation, listener configuration and diagnostics.
+
+Two additional fork patches support native hosts: `BeignetNodeOptions.irohFactory` injects an endpoint factory instead of importing the Node binding at runtime; the Iroh Tor fallback in `peer-manager.ts` honors `net.handlesDestinationRouting`, with bounded connection setup and cleanup. The build redirects the Node factory module to `portable/iroh-node.ts`, which gives an explicit missing-host-factory error. The portable router and channelize flow retain transport options, validate same-key onion fallback, and restart on primary configuration changes.
+
+Previous baseline: `db15cf581bf3f59a26280bdd955f1f08f2dbc182` (Beignet 0.25.0).
 
 The 0.24.1 to 0.25.0 resync recaptured 52 hunks across 20 files against pristine `d71fa287`. Fifty hunks applied with fuzz disabled. The storage import hunk was reapplied beside upstream's new voucher archive imports. The remaining hunk only reformatted `acceptsNewHtlcs`; it was dropped because upstream changed the method signature. The other storage, transport, timer, diagnostic and reconstructable gossip batching patches are retained. Permanent voucher archives, recovery schema markers and compacted HTLC history come from the release source without modification.
 

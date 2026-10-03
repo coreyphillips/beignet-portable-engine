@@ -17,6 +17,9 @@ import { runChannelize } from './channelize.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
+export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
+export { parsePrimaryUri, parsePrimaryFallback } from './primary-uri.cjs';
+import { parsePrimaryFallback } from './primary-uri.cjs';
 export const DEFAULT_PRIMARY =
 	'025501f56b72e7b999443b836ae1bff4c6fff514943d3f6677302a9189949bd99c@ulyeemszaigzrvpjcjcby4ehibrvsuqi5sq4dmmew2urk2nse5f7spid.onion:9102';
 // The upstream Beignet release this bundle was cut from. esbuild substitutes it
@@ -183,12 +186,14 @@ export async function createPortableRuntime(options: any) {
 			: null;
 	const primary = () => {
 		const p = rules.parseNodeUri(record.lfbw.primaryUri);
+		const fallback = parsePrimaryFallback(p, record.lfbw.primaryFallbackUri);
 		return {
 			...p,
 			connectHost: p.host,
 			connectPort: p.port,
-			relayHost: p.host,
-			relayPort: p.port
+			...(fallback ? { transport: { ...p.transport, fallbackOnion: { host: fallback.host, port: fallback.port } } } : {}),
+			relayHost: fallback?.host ?? p.host,
+			relayPort: fallback?.port ?? p.port
 		};
 	};
 	/** Whether the primary is a connected peer right now. */
@@ -219,7 +224,7 @@ export async function createPortableRuntime(options: any) {
 			try {
 				node.disconnectPeer(p.pubkey);
 			} catch {}
-			await node.connectPeer(p.pubkey, p.host, p.port);
+			await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
 			options.onDiagnostic?.({
 				phase: 'primary-redial',
 				message: 'reconnected'
@@ -305,7 +310,7 @@ export async function createPortableRuntime(options: any) {
 			// until the next restart.
 			if (!held) node.configureDirectFunding(rules.directFundingConfig(record.lfbw, p));
 			try {
-				await node.connectPeer(p.pubkey, p.host, p.port);
+				await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
 			} catch (error) {
 				if (nodeUnavailable()) return;
 				if (
@@ -390,6 +395,10 @@ export async function createPortableRuntime(options: any) {
 				node = await BeignetNode.create({
 					...options.nodeOptions,
 					mnemonic,
+					iroh: !!options.iroh && primary().transport?.type === 'iroh',
+					irohFactory: options.iroh?.factory,
+					irohRelays: options.iroh?.relays,
+					irohDiscovery: options.iroh?.discovery,
 					network: record.network,
 					dataDir: '/wallet',
 					allowMultipleInstances: true,
@@ -1242,6 +1251,7 @@ export async function createPortableRuntime(options: any) {
 				supportedNetworks: [...SUPPORTED_NETWORKS],
 				electrumPresets: [],
 				torAvailable: false,
+				irohAvailable: !!options.iroh,
 				jitQuoteAvailable: true,
 				// The engine implements offline receiving. Whether this wallet's
 				// primary serves it is the probed pair on the wallet record.
@@ -1295,9 +1305,10 @@ export async function createPortableRuntime(options: any) {
 				body.lfbwPrimaryNode ??
 				(network === 'mainnet' ? DEFAULT_PRIMARY : null);
 			const lf = rules.normalizeLfbw(
-				{ enabled: true, primaryUri: uri, trusted: body.lfbw?.trusted ?? true },
+				{ enabled: true, primaryUri: uri, primaryFallbackUri: body.lfbw?.primaryFallbackUri, trusted: body.lfbw?.trusted ?? true },
 				{ network, available: true }
 			);
+			if (rules.parseNodeUri(lf.primaryUri).transport?.type === 'iroh' && !options.iroh) failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
 			record = {
 				electrum,
 				id: randomBytes(16).toString('hex'),
@@ -1365,13 +1376,17 @@ export async function createPortableRuntime(options: any) {
 					enabled: true,
 					primaryUri: body.primaryNodeUri ?? body.primaryUri
 				};
-				record.lfbw = rules.normalizeLfbw(input, {
+				const previousPrimary = JSON.stringify([record.lfbw.primaryUri, record.lfbw.primaryFallbackUri]);
+				const nextLfbw = rules.normalizeLfbw(input, {
 					network: record.network,
 					available: true,
 					existing: record.lfbw
 				});
+				if (rules.parseNodeUri(nextLfbw.primaryUri).transport?.type === 'iroh' && !options.iroh) failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+				record.lfbw = nextLfbw;
 				if (body.name) record.name = body.name;
 				persist();
+				if (previousPrimary !== JSON.stringify([record.lfbw.primaryUri, record.lfbw.primaryFallbackUri])) await stop();
 				if (!node) return start();
 				await setup();
 				return publicRecord();

@@ -1,3 +1,13 @@
+# Portable engine validation, 2026-10-03
+
+The fork tracks Beignet **0.26.0** at `026d202b96ada2d88f7cf0a206f36697fcf6b3fe`. The source resync retains the existing fork patches and adds host-injected Iroh endpoints, validated primary pairing URIs, same-key onion fallback, transport-aware channel opening, and destination routing for the fallback. See `PATCHES.md`.
+
+- `npm test`: 114 tests pass, including primary parsing, native-factory opt-in, fallback forwarding, refusal before wallet persistence on unsupported hosts, and bundle input checks.
+- `npm run check:types`: passes for the public portable declarations.
+- The broader mirrored-source `tsc --noEmit` remains outside that check: 22 existing errors on the baseline and 27 after sync, with four additional errors from the intentionally uninstalled Node Iroh binding and one more instance of the existing Node socket callback variance mismatch in the fallback. The native and browser bundles exclude that binding.
+- The bundle reports `0.26.0-portable` and excludes the Node Iroh binding. Existing unreachable filesystem helper warnings remain.
+- Consumer native integration results are recorded in Chicory's Iroh validation document. Physical-device network handover, battery, UDP-blocked and relay-outage checks remain release qualifications.
+
 # Portable engine validation, 2026-09-30 addendum
 
 The fork now tracks upstream Beignet **0.24.1** (`d71fa287`, npm's `gitHead` for the release; the bump to 0.24.1 was published without being committed, so the commit's `package.json` still reads 0.24.0 while its `src/` is the released source), resynced from 0.24.0 on 2026-09-30; this addendum supersedes the "now tracks" line of the one below, and `PATCHES.md` carries the method and what the release changes for this fork. A tarball of the 0.24.0 fork was written first (`beignet-engine-backup-0.24.0-2026-09-30.tar.gz` at the workspace root, `node_modules` excluded). Upstream had changed six of the nineteen patched files; all 52 hunks reapplied to pristine `d71fa287` with no rejection and no fuzz, 23 by an offset only (the largest 163 lines in `lightning-node.ts`), and all 52 hunk bodies are byte-identical to the recaptured patch's. Nothing was ported by hand. The reapplied tree's sorted added and removed lines are identical to the recaptured patch's, and the fork-only `reconstructable-batch.ts` is unchanged. The esbuild input graph grows from 551 to 552 inputs, `src/cli/backup-mac.ts`, which the bundle carries but never calls. Nothing in `portable/` had to change for the resync.

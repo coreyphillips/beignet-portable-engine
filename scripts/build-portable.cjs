@@ -27,6 +27,7 @@ const RGS_IMPORTER = path.resolve('src/lightning/gossip/rapid-sync.ts');
 const httpsPerImporter = {
 	name: 'https-per-importer',
 	setup(build) {
+		build.onResolve({ filter: /(?:^|\/)iroh-node$/ }, () => ({ path: path.resolve('portable/iroh-node.ts') }));
 		build.onResolve({ filter: /^https$/ }, (args) => ({
 			path: path.resolve(
 				'portable',

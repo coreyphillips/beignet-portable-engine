@@ -146,7 +146,10 @@ async function runChannelize({
 			}
 		}
 		const b = order.body;
-		await node.connectAndOpenChannel(
+		if (b.transport) {
+			await node.connectPeer(b.pubkey, b.host, b.port, b.transport);
+			await node.openChannel(b.pubkey, b.amountSats, undefined, b.satsPerVbyte, b.max, b.trusted);
+		} else await node.connectAndOpenChannel(
 			b.pubkey,
 			b.host,
 			b.port,
