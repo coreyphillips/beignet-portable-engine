@@ -14,6 +14,11 @@ import {
 import { verifyElectrumNetwork } from './network';
 import * as rules from './lfbw.cjs';
 import { runChannelize } from './channelize.cjs';
+import { sendRoutes } from './send-routes.cjs';
+import { channelizePause } from './channelize-pause.cjs';
+import { drainCoordinator } from './drain.cjs';
+import { drainFence } from './drain-fence.cjs';
+import { closeNotStarted } from './drain-close-state.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
@@ -104,6 +109,7 @@ export async function createPortableRuntime(options: any) {
 	let activity: any[] = load('/wallet/activity.json', []);
 	let startPromise: Promise<any> | undefined;
 	let stopPromise: Promise<any> | undefined;
+	let drainGeneration = 0;
 	// The home channel's last splice conflict or revert (beignet #760), and
 	// whether a payer this wallet has not paired with is growing the channel
 	// right now. Both narrate the wallet's notes and die with the runtime, as
@@ -127,9 +133,21 @@ export async function createPortableRuntime(options: any) {
 	// itself paying a direct funding, so the two never contend for one coin.
 	let channelizeRetryAt = 0;
 	let directFundingInFlight = 0;
-	configure(options);
 	const persist = () =>
 		save('/wallet/registry.json', { record, mnemonic: storedMnemonic, recoveryImport });
+	const channelizeHold = channelizePause({
+		read: () => record?.channelizePause,
+		write: (value) => {
+			const previous = record.channelizePause;
+			record.channelizePause = value;
+			try { persist(); } catch (error) {
+				record.channelizePause = previous;
+				throw error;
+			}
+		},
+		busy: () => busy,
+		failure
+	});
 	const recoveryHold = () => node ? recoveryRefusal(node, importPending()) : null;
 	const requireRecoveryReady = () => {
 		const held = recoveryHold();
@@ -139,6 +157,92 @@ export async function createPortableRuntime(options: any) {
 		node.resuming || node.restorePending || node.restartRequired
 	);
 	const healthy = () => !!node && !nodeUnavailable() && node.getHealth().electrumConnected;
+	const drain = drainCoordinator({
+		lifecycle: () => drainGeneration,
+		operational: () => !closed && !stopPromise,
+		read: () => load('/wallet/drains.json', null),
+		write: (value: any) => save('/wallet/drains.json', value),
+		node: () => node,
+		primary: () => record?.lfbw?.primaryPubkey,
+		ready: () => {
+			requireRecoveryReady();
+			if (closed || stopPromise || durabilityFailed || !healthy())
+				failure('DRAIN_UNAVAILABLE', 'Wait for the wallet to reconnect and finish syncing', 409);
+		},
+		busy: () => {
+			const engine = node?.getNode();
+			const requests = engine?.getDirectFundingRequests();
+			return busy || setupRunning || directFundingInFlight > 0 ||
+				mutations.pending() > 0 ||
+				(engine?.getDirectFundingReceiver()?.inflightCount() ?? 0) > 0 ||
+				(requests?.activeFundings().length ?? 0) > 0 ||
+				(requests?.lapsedFundings().length ?? 0) > 0;
+		},
+		activityPending: () => activity.some((row) => ['pending', 'uncertain'].includes(row.status)),
+		offline: () => offlineReceive?.status() ?? {},
+		pause: channelizeHold,
+		// The durable journal is the receive admission fence. Keeping policy
+		// intact lets existing offers and protocol obligations finish normally.
+		disableReceive: async () => {},
+		restoreReceive: async () => {},
+		closeNotStarted: (channelId: string) => {
+			try {
+				const id = Buffer.from(channelId, 'hex');
+				const manager = node?.getNode().getChannelManager();
+				return closeNotStarted({
+					channelId,
+					live: manager?.getChannel(id)?.getFullState(),
+					saved: node?.getStorage().loadChannel(channelId)?.state,
+					monitor: manager?.getMonitor(id)?.getFullState(),
+					held: durabilityFailed || !!recoveryHold()
+				});
+			} catch { return false; }
+		},
+		observe: async (payout: any, row: any) => {
+			const seen = await verifySubmission(
+				options.socketFactory, options.electrum ?? record.electrum,
+				{ address: row.address, amountSats: payout.valueSats,
+					previousFundingTxid: row.fundingTxid,
+					previousFundingOutputIndex: row.fundingOutputIndex },
+				payout.txid, record.network
+			);
+			const height = seen?.height ?? 0;
+			return { exists: seen?.matched === true, height,
+				depth: height > 0 ? Math.max(0, (node?.getNode().getCurrentBlockHeight() ?? 0) - height + 1) : 0 };
+		},
+		sweepDepth: (txid: string) => {
+			const tx = node?.getWallet().transactions[txid];
+			return tx?.height && tx.height > 0 && tx.exists !== false
+				? Math.max(0, (node?.getNode().getCurrentBlockHeight() ?? 0) - tx.height + 1) : 0;
+		},
+		failure
+	});
+	const mutations = drainFence({ active: () => drain.active(), failure });
+	// Validate saved intent before any network starts. Corrupt intent must not
+	// silently enable funding on a wallet that may still be draining.
+	drain.active();
+	configure(options);
+	let drainSync: Promise<any> | undefined;
+	const syncDrain = () => {
+		if (!node || closed || stopPromise || durabilityFailed || recoveryHold()) return Promise.resolve(null);
+		if (!drainSync) {
+			drainSync = drain.sync().finally(() => { drainSync = undefined; });
+		}
+		return drainSync;
+	};
+	const drainActivity = () => drain.list()
+		.filter((row: any) => row.phase !== 'review' && (row.phase !== 'cancelled' || row.startedAt !== undefined))
+		.map((row: any) => ({
+			id: `drain:${row.requestId}`, requestId: row.requestId, type: 'send', method: 'drain',
+			status: row.phase === 'completed' ? 'completed' : row.phase === 'cancelled' ? 'failed' : 'pending',
+			title: row.phase === 'completed' ? 'Wallet emptied' : row.phase === 'cancelled' ? 'Wallet drain cancelled' : 'Emptying wallet',
+			address: row.address, amountSats: row.amountSats, feeSats: row.feeSats,
+			debitSats: row.debitSats, reviewedDebitSats: row.reviewedDebitSats,
+			feeEstimated: row.feeEstimated, txids: row.txids,
+			txid: row.txids[0] ?? null, reference: row.requestId, drain: row,
+			timestamp: row.createdAt, description: row.error ?? 'Closing the home channel and sending the reviewed loose coins.',
+			residualSats: row.residualSats
+		}));
 	const completeRecoveryImport = () => {
 		if (!importPending()) return;
 		recoveryImport.complete = true;
@@ -349,6 +453,8 @@ export async function createPortableRuntime(options: any) {
 			durabilityFailed ||
 			!node ||
 			recoveryHold() ||
+			channelizeHold.status().paused ||
+			drain.active() ||
 			busy ||
 			directFundingInFlight > 0 ||
 			record.lfbw.setup !== 'ready'
@@ -364,7 +470,7 @@ export async function createPortableRuntime(options: any) {
 				rules,
 				force,
 				retryAt: channelizeRetryAt,
-				mayMutate: () => !closed && !durabilityFailed && !recoveryHold(),
+				mayMutate: () => !closed && !durabilityFailed && !recoveryHold() && !channelizeHold.status().paused && !drain.active(),
 				onDiagnostic: options.onDiagnostic
 			});
 			if (closed) return null;
@@ -419,6 +525,9 @@ export async function createPortableRuntime(options: any) {
 					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
 					forwardingEnabled: false,
+					newChannelsRefused: () => drain.active()
+						? 'New funding is paused while this wallet is being emptied'
+						: options.nodeOptions?.newChannelsRefused?.() ?? null,
 					// Silent by default; a caller that wants the engine's own log
 					// (a test harness, a debug build) supplies one.
 					logger: options.nodeOptions?.logger ?? {
@@ -578,7 +687,9 @@ export async function createPortableRuntime(options: any) {
 					probeOfflineReceive();
 				receiveTimer = setInterval(() => {
 					if (!closed && !durabilityFailed && !recoveryHold()) void offlineReceive?.sync().catch(() => {});
+					void syncDrain().catch(() => {});
 				}, 2000);
+				void syncDrain().catch(() => {});
 				if (!recoveryHold()) void offlineReceive.sync().catch(() => {});
 				if (record.lfbw.setup === 'failed') retrySetupSoon();
 				lastSplice = null;
@@ -676,6 +787,7 @@ export async function createPortableRuntime(options: any) {
 	};
 	const stop = async () => {
 		if (stopPromise) return stopPromise;
+		drainGeneration++;
 		stopPromise = (async () => {
 			const deadline = Date.now() + STOP_DEADLINE_MS;
 			// A start in flight may be waiting on a cold Tor bootstrap, which is
@@ -689,6 +801,7 @@ export async function createPortableRuntime(options: any) {
 				]);
 			clearInterval(timer);
 			clearInterval(receiveTimer);
+			if (drainSync) await Promise.race([drainSync.catch(() => {}), sleep(STOP_DEADLINE_MS)]);
 			offlineReceive?.stop();
 			for (const pending of pendingTimers) clearTimeout(pending);
 			pendingTimers.clear();
@@ -887,19 +1000,30 @@ export async function createPortableRuntime(options: any) {
 			};
 		const b = body ?? {};
 		const q = url.searchParams;
+		const sendRoute = sendRoutes({ node: n, channelsWithFunding, failure })[route];
+		if (sendRoute) return sendRoute(b, q);
 		switch (route) {
+			case 'POST /drain/quote':
+				return drain.quote(b);
+			case 'POST /drain/send':
+				return drain.send(b.requestId);
+			case 'POST /drain/cancel':
+				return drain.cancel(b.requestId);
+			case 'GET /drain':
+				await syncDrain();
+				return q.has('requestId') ? drain.get(q.get('requestId')) : drain.list();
+			case 'GET /channelize/status':
+				return channelizeHold.status();
+			case 'POST /channelize/pause':
+				return channelizeHold.set(b);
 			case 'GET /info':
 				return n.getInfo();
 			case 'GET /health':
 				return n.getHealth();
 			case 'GET /balance':
 				return n.getBalance();
-			case 'GET /channels':
-				return channelsWithFunding(n.listChannels());
 			case 'GET /peers':
 				return n.listPeers();
-			case 'GET /payments':
-				return n.listPayments();
 			case 'GET /invoices':
 				return n.listInvoices();
 			case 'GET /receive/offline': {
@@ -940,8 +1064,6 @@ export async function createPortableRuntime(options: any) {
 				return n.fforCloseEpoch(b.channelId);
 			case 'POST /ffor/recover':
 				return n.fforRecover({ channelId: b.channelId });
-			case 'GET /liquidity':
-				return n.getLiquiditySnapshot();
 			case 'GET /graph/info':
 				// The size of the network map routes are found on: the Rapid
 				// Gossip Sync snapshot plus what the primary gossips.
@@ -1055,8 +1177,6 @@ export async function createPortableRuntime(options: any) {
 					undefined,
 					b.maxFeeMsat
 				);
-			case 'POST /channel/splice-quote':
-				return n.spliceQuote(b.channelId, b.direction, b.feeratePerkw);
 			case 'POST /channel/splice-out': {
 				if (!/^[a-zA-Z0-9_-]{8,128}$/.test(b.requestId ?? ''))
 					failure(
@@ -1266,6 +1386,8 @@ export async function createPortableRuntime(options: any) {
 				concurrentOfflineReceiveAvailable: true,
 				recoveryAvailable: true,
 				recoveryAutoApplyAvailable: true,
+				drainAvailable: ['closeQuote', 'prepareOnchainSweep', 'submitOnchainSweep']
+					.every((name) => typeof (BeignetNode.prototype as any)?.[name] === 'function'),
 				engineVersion: ENGINE_VERSION,
 				embedded: true
 			};
@@ -1355,8 +1477,9 @@ export async function createPortableRuntime(options: any) {
 			if (!action && method === 'GET') return publicRecord();
 			if (action === '/activity' && method === 'GET') {
 				await reconcileActivity();
+				await syncDrain().catch(() => {});
 				return clone(
-					activity.map((row) => ({
+					[...drainActivity(), ...activity.map((row) => ({
 						...row,
 						title:
 							row.status === 'completed'
@@ -1371,7 +1494,7 @@ export async function createPortableRuntime(options: any) {
 											? 'Direct funding pending'
 											: 'Bitcoin payment pending',
 						description: row.description || row.statusNote
-					}))
+					}))]
 				);
 			}
 			if (action === '/start' && method === 'POST') return start();
@@ -1436,7 +1559,7 @@ export async function createPortableRuntime(options: any) {
 		failure('NOT_FOUND', 'Unknown embedded wallet operation', 404);
 	}
 	function request(input: any) {
-		const pending = execute(input);
+		const pending = mutations.run(input, execute);
 		inFlight.add(pending);
 		pending.then(
 			() => inFlight.delete(pending),
@@ -1450,6 +1573,7 @@ export async function createPortableRuntime(options: any) {
 			if (released) return;
 			if (closing) return closing;
 			closed = true;
+			drainGeneration++;
 			closing = (async () => {
 				try {
 					await Promise.allSettled(Array.from(inFlight));

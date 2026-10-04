@@ -239,6 +239,8 @@ export interface IDfSpliceTxSigsNeeded {
 }
 
 export interface IDfReceiverDeps {
+	/** Host fence for new offers; duplicate and resumed offers still complete. */
+	newFundingRefused?: () => string | null;
 	/** Sign with the node identity key; zbase32, i.e. LightningNode.signMessage. */
 	signMessage(message: string): string;
 	/** This node's identity key, the one its requests name. Proofs must name it. */

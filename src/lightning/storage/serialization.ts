@@ -538,6 +538,8 @@ export interface ISerializedChannelState {
 	 * authorizes the load-time repair to re-derive those (issue #381).
 	 */
 	channelReserveVersion?: number;
+	localReserveWaived?: boolean;
+	remoteReserveWaived?: boolean;
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
 	v2InFlight?: ISerializedV2InFlight | null;
@@ -554,6 +556,11 @@ export interface ISerializedChannelState {
 	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
 	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
 	lastCooperativeCloseTxHex?: string;
+	externalClose?: {
+		scriptHex: string;
+		timestamp: number;
+		transactions?: Array<{ txHex: string; localFeeSats: number }>;
+	};
 	// Data loss protection: MUST persist - a restart after detecting we fell
 	// behind would otherwise forget the flag and let a force-close broadcast
 	// our stale (revoked) commitment.
@@ -1078,6 +1085,8 @@ export function serializeChannelState(
 			: null,
 		fundingVersion: s.fundingVersion,
 		channelReserveVersion: s.channelReserveVersion,
+		localReserveWaived: s.localReserveWaived === true ? true : undefined,
+		remoteReserveWaived: s.remoteReserveWaived === true ? true : undefined,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
 		v2InFlight: s.v2InFlight ? serializeV2InFlight(s.v2InFlight) : null,
@@ -1088,6 +1097,7 @@ export function serializeChannelState(
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		externalClose: s.externalClose,
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
@@ -1727,6 +1737,8 @@ export function deserializeChannelState(
 			: null,
 		fundingVersion: (s.fundingVersion ?? 1) as 1 | 2,
 		channelReserveVersion: s.channelReserveVersion,
+		localReserveWaived: s.localReserveWaived === true,
+		remoteReserveWaived: s.remoteReserveWaived === true,
 		dualFundingSession: null,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
 		fundingLocktime: s.fundingLocktime ?? 0,
@@ -1738,6 +1750,7 @@ export function deserializeChannelState(
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		externalClose: s.externalClose,
 		dataLossDetected: s.dataLossDetected,
 		fundingConfirmedLate: s.fundingConfirmedLate,
 		stateUncertain: s.stateUncertain,
@@ -1763,6 +1776,13 @@ export function deserializeChannelState(
 // ─── IPaymentInfo ───
 
 export interface ISerializedPaymentInfo {
+	payAll?: {
+		debitMsat: string;
+		maxFeeMsat: string;
+		deliveredMsat: string;
+		feeMsat: string;
+		remainderMsat: string;
+	};
 	paymentHash: string;
 	preimage?: string;
 	amountMsat: string;
@@ -1783,6 +1803,17 @@ export interface ISerializedPaymentInfo {
 
 export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 	return {
+		...(p.payAll
+			? {
+					payAll: {
+						debitMsat: p.payAll.debitMsat.toString(),
+						maxFeeMsat: p.payAll.maxFeeMsat.toString(),
+						deliveredMsat: p.payAll.deliveredMsat.toString(),
+						feeMsat: p.payAll.feeMsat.toString(),
+						remainderMsat: p.payAll.remainderMsat.toString()
+					}
+			  }
+			: {}),
 		paymentHash: p.paymentHash.toString('hex'),
 		preimage: bufToHex(p.preimage) ?? undefined,
 		amountMsat: bigintToStr(p.amountMsat),
@@ -1827,6 +1858,17 @@ export function deserializePaymentInfo(
 	};
 
 	return {
+		...(s.payAll
+			? {
+					payAll: {
+						debitMsat: BigInt(s.payAll.debitMsat),
+						maxFeeMsat: BigInt(s.payAll.maxFeeMsat),
+						deliveredMsat: BigInt(s.payAll.deliveredMsat),
+						feeMsat: BigInt(s.payAll.feeMsat),
+						remainderMsat: BigInt(s.payAll.remainderMsat)
+					}
+			  }
+			: {}),
 		paymentHash: Buffer.from(s.paymentHash, 'hex'),
 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
 		amountMsat: strToBigint(s.amountMsat),

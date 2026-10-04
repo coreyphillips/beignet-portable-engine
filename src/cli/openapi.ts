@@ -14,7 +14,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			version: '1.0.0',
 			description:
 				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
-				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
+				'**Idempotency:** These endpoints support the `X-Idempotency-Key` header: `/invoice/pay`, `/invoice/pay-all`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. ' +
 				'When provided, the response is cached in memory for 24 hours (or until the daemon restarts), and repeated requests with the same key and body return the cached response. ' +
 				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned. ' +
 				'Any other POST that carries the header answers `400 INVALID_PARAMS` without running.\n\n' +
@@ -600,6 +600,46 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/invoice/pay-all/quote': {
+				post: {
+					summary:
+						'Quote a single-part pay-all to an amountless BOLT 11 invoice',
+					description:
+						'Read-only; holds no review or funds. All msat figures are decimal strings. The debit sums usable local balance ceilings; routeFound is false when it cannot fit one part or the exact fee gap cannot be placed. Blinded invoices and MPP are unsupported.',
+					tags: ['Payments'],
+					requestBody: bodyContent({ bolt11: 'string', maxFeeMsat: 'string' }),
+					responses: {
+						'200': {
+							description: 'Frozen budget to review',
+							content: jsonContent({ $ref: '#/components/schemas/PayAllQuote' })
+						}
+					}
+				}
+			},
+			'/invoice/pay-all': {
+				post: {
+					summary: 'Pay an amountless invoice using a frozen debit and fee cap',
+					description:
+						'Single-part only. Reserves the approved debit once. Retries retain the exact budget; later receipts are not swept. An unresolved timeout remains pending, including after restart. Restarts reconcile the existing attempt without automatic retries. Retry the same invoice only after a definitive failure, with its original budget. Exact figures are in payment.payAll; amountSats retains its historical total-debit meaning.',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						debitMsat: 'string',
+						maxFeeMsat: 'string',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Settled payment',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						},
+						'409': {
+							description:
+								'PAY_ALL_REVIEW_EXPIRED, PAY_ALL_REMAINDER, PAY_ALL_BUDGET_MISMATCH or DUPLICATE_PAYMENT. Nothing new was sent. A remainder refusal names remainderMsat in its message.'
+						}
+					}
+				}
+			},
 			'/invoice/pay': {
 				post: {
 					summary: 'Pay an invoice (blocks until settled or timeout)',
@@ -732,13 +772,49 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
-			'/channel/close': {
+			'/channel/close-quote': {
 				post: {
 					summary:
-						"Cooperatively close a channel. The payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
+						'Estimate our cooperative-close payout at the current chain feerate. Read-only; no review or balance is held. The peer chooses its script and negotiates the final fee, so the amount is an estimate.',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
+						address: 'string?',
+						acceptStaleStateRisk: 'boolean?'
+					}),
+					responses: {
+						'200': {
+							description: 'Expected payout',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									amountSats: { type: 'integer' },
+									feeSats: {
+										type: 'integer',
+										description: 'Fee charged to our balance'
+									},
+									networkFeeSats: { type: 'integer' },
+									feeratePerkw: { type: 'integer' },
+									feePayer: { type: 'string', enum: ['local', 'remote'] },
+									feeEstimated: { type: 'boolean', enum: [true] }
+								}
+							})
+						},
+						'409': {
+							description:
+								'CLOSE_UNAVAILABLE: channel not ready, pending HTLCs or updates, recency hold, or no spendable payout after fees'
+						}
+					}
+				}
+			},
+			'/channel/close': {
+				post: {
+					summary:
+						"Cooperatively close a channel. Optional address sends our payout directly to that address on the configured network and records a durable on-chain send with its actual output and our fee. External closes refuse pending HTLCs, updates and splices. Without address, the payout goes to a wallet-scanned address on the wallet's internal change chain, never to a receive address that POST /address/new or a receive request handed out, so a close can never read as a payer paying a request (issue #1064): the next unused change address when the wallet can produce one (consecutive closes may get the same address until it sees use), else the startup sweep address (also a change address), else the funding-key address, so the closed balance is tracked and spendable without a rescue sweep. A channel held for unproven recency after a capsule restore, a peer reestablish claim or a missing local per-commitment secret needs acceptStaleStateRisk: true, because a mutual close pays out the balances that row carries and a stale allocation is peer-favourable by construction: any payment received after the capsule was written is missing from it. Letting the peer close unilaterally is the safe outcome; the flag is the labelled way to accept the risk anyway",
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						address: 'string?',
 						// Conditionally required, and only for a capsule-restored
 						// channel, so the schema cannot say "required" without
 						// misdescribing every other close.
@@ -2335,6 +2411,127 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/onchain/sweep/prepare': {
+				post: {
+					summary:
+						'Prepare and persist one reviewed sweep without broadcasting',
+					tags: ['Node'],
+					requestBody: {
+						content: jsonContent({
+							type: 'object',
+							required: [
+								'requestId',
+								'address',
+								'satsPerVbyte',
+								'inputOutpoints',
+								'debitSats',
+								'maxFeeSats'
+							],
+							properties: {
+								requestId: {
+									type: 'string',
+									pattern: '^[a-zA-Z0-9_-]{8,128}$'
+								},
+								address: { type: 'string' },
+								satsPerVbyte: {
+									type: 'number',
+									minimum: 0,
+									exclusiveMinimum: true
+								},
+								debitSats: { type: 'integer', minimum: 1 },
+								maxFeeSats: { type: 'integer', minimum: 0 },
+								inputOutpoints: {
+									type: 'array',
+									minItems: 1,
+									items: {
+										type: 'object',
+										required: ['txid', 'vout'],
+										properties: {
+											txid: { type: 'string' },
+											vout: { type: 'integer', minimum: 0 }
+										}
+									}
+								}
+							}
+						})
+					},
+					responses: {
+						'200': {
+							description:
+								'Durable preparation, also returned for an identical requestId',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': {
+							description:
+								'Conflicting request, unavailable inputs or expired review'
+						},
+						'503': {
+							description: 'Sweep journal or reservation could not be persisted'
+						}
+					}
+				}
+			},
+			'/onchain/sweep/submit': {
+				post: {
+					summary: 'Submit or rebroadcast exactly the saved sweep transaction',
+					tags: ['Node'],
+					requestBody: bodyContent({ requestId: 'string' }),
+					responses: {
+						'200': {
+							description:
+								'Durable sweep status. Submitted does not imply confirmation or broadcast acceptance.',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': {
+							description: 'Sweep is not prepared or its inputs are unavailable'
+						},
+						'403': { description: 'Spend limit refused the first submission' }
+					}
+				}
+			},
+			'/onchain/sweep/cancel': {
+				post: {
+					summary: 'Cancel a sweep only before any broadcast attempt',
+					tags: ['Node'],
+					requestBody: bodyContent({ requestId: 'string' }),
+					responses: {
+						'200': {
+							description: 'Cancelled sweep and released owned reservations',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'409': { description: 'A submitted sweep cannot be cancelled' }
+					}
+				}
+			},
+			'/onchain/sweep': {
+				get: {
+					summary: 'Read a durable sweep without signed hex',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'requestId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Sweep status',
+							content: jsonContent({
+								$ref: '#/components/schemas/OnchainSweepInfo'
+							})
+						},
+						'404': { description: 'Unknown requestId' }
+					}
+				}
+			},
 			'/tx/bump-fee': {
 				post: {
 					summary:
@@ -3289,12 +3486,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/channel/splice-quote': {
 				post: {
 					summary:
-						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve)',
+						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve). Pass address to price the intended splice-out destination; omitted uses the wallet destination',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
 						direction: 'string',
-						feeratePerkw: 'number'
+						feeratePerkw: 'number',
+						address: 'string?'
 					}),
 					responses: {
 						'200': {
@@ -3310,6 +3508,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 										type: 'number',
 										description: 'splice-out only'
 									},
+									commitmentCostSats: {
+										type: 'number',
+										description:
+											'splice-out only: commitment fee and anchors retained by the channel opener'
+									},
 									inputCount: {
 										type: 'number',
 										description: 'splice-in only'
@@ -3323,7 +3526,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'400': {
 							description:
-								'INVALID_PARAMS: malformed channelId, non-integer amount, or a feeratePerkw outside 1..4294967295'
+								'INVALID_PARAMS: malformed channelId, invalid or wrong-network address, or a feeratePerkw outside 1..100000'
 						},
 						'404': { description: 'CHANNEL_NOT_FOUND' }
 					}
@@ -4001,10 +4204,28 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							]
 						},
 						localBalanceSats: { type: 'integer' },
+						maxSendableSats: {
+							type: 'integer',
+							description:
+								'Balance-based debit ceiling for one new outbound HTLC, floored to sats, before routing fees and route HTLC limits; zero when unavailable'
+						},
 						remoteBalanceSats: { type: 'integer' },
 						capacitySats: { type: 'integer' },
 						isAnchor: { type: 'boolean' },
 						isPrivate: { type: 'boolean' },
+						isOpener: { type: 'boolean' },
+						localReserveWaived: {
+							type: 'boolean',
+							description:
+								'The peer waived our reserve when this channel opened.'
+						},
+						remoteReserveWaived: {
+							type: 'boolean',
+							description:
+								'We waived the peer reserve when this channel opened.'
+						},
+						localReserveSats: { type: 'integer' },
+						remoteReserveSats: { type: 'integer' },
 						fundingTxid: { type: 'string' },
 						shortChannelId: { type: 'string' },
 						feeratePerKw: { type: 'integer' },
@@ -4168,9 +4389,33 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						source: { type: 'string', enum: ['override', 'default'] }
 					}
 				},
+				PayAllQuote: {
+					type: 'object',
+					properties: {
+						debitMsat: { type: 'string' },
+						minRecipientMsat: { type: 'string' },
+						maxFeeMsat: { type: 'string' },
+						routeFound: { type: 'boolean' },
+						remainderMsat: { type: 'string' },
+						searchExhausted: { type: 'boolean' }
+					}
+				},
+				PayAllPayment: {
+					type: 'object',
+					description:
+						'Exact msat strings. Planned figures while PENDING, settled figures when COMPLETED. FAILED records describe the failed attempt. Remainder excludes reserves and funds received after review.',
+					properties: {
+						debitMsat: { type: 'string' },
+						maxFeeMsat: { type: 'string' },
+						deliveredMsat: { type: 'string' },
+						feeMsat: { type: 'string' },
+						remainderMsat: { type: 'string' }
+					}
+				},
 				PaymentInfo: {
 					type: 'object',
 					properties: {
+						payAll: { $ref: '#/components/schemas/PayAllPayment' },
 						paymentHash: { type: 'string' },
 						preimage: { type: 'string' },
 						amountSats: { type: 'integer' },
@@ -4584,6 +4829,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				PaymentProof: {
 					type: 'object',
 					properties: {
+						payAll: { $ref: '#/components/schemas/PayAllPayment' },
 						paymentHash: { type: 'string' },
 						preimage: { type: 'string' },
 						amountSats: { type: 'number' },
@@ -4753,6 +4999,39 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						finalCltvExpiry: { type: 'integer' }
 					}
 				},
+				OnchainSweepInfo: {
+					type: 'object',
+					required: [
+						'requestId',
+						'address',
+						'status',
+						'debitSats',
+						'createdAt'
+					],
+					properties: {
+						requestId: { type: 'string' },
+						address: { type: 'string' },
+						status: {
+							type: 'string',
+							enum: [
+								'preparing',
+								'prepared',
+								'submitted',
+								'confirmed',
+								'cancelling',
+								'cancelled'
+							]
+						},
+						debitSats: { type: 'integer' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						satsPerVbyte: { type: 'number' },
+						txid: { type: 'string' },
+						createdAt: { type: 'integer' },
+						broadcastAccepted: { type: 'boolean' },
+						error: { type: 'string' }
+					}
+				},
 				TxInfo: {
 					type: 'object',
 					properties: {
@@ -4861,7 +5140,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						sendableSats: {
 							type: 'integer',
 							description:
-								'Local balance above the reserve, i.e. what can actually be sent (sats); zero while below the reserve'
+								'Legacy local balance above the reserve (sats), excluding commitment costs and other send buffers; zero while below the reserve'
+						},
+						maxSendableSats: {
+							type: 'integer',
+							description:
+								'Sum of available channel outbound debit ceilings, floored to sats after summing msat, before routing fees and route HTLC limits; may require multiple parts'
 						},
 						recommendations: {
 							type: 'array',

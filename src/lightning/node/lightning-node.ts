@@ -110,6 +110,8 @@ import {
 	TPolicyOverrides,
 	policyOverrideKey
 } from '../gossip/pathfinding';
+import { findPayAllRoute, IPayAllRouteResult } from '../gossip/pay-all';
+import { IPayAllBudget, IPayAllQuote } from './types';
 import {
 	applyRapidGossipSnapshot,
 	IRapidGossipResult
@@ -147,7 +149,7 @@ import {
 	decodeQueryShortChannelIdsMessage,
 	decodeGossipTimestampFilterMessage
 } from '../gossip/gossip-queries';
-import { GossipSyncManager } from '../gossip/gossip-sync';
+import { GossipSyncManager, IGossipSyncMessage } from '../gossip/gossip-sync';
 import {
 	verifyChannelAnnouncement,
 	verifyNodeAnnouncement,
@@ -940,6 +942,7 @@ export class LightningNode extends EventEmitter {
 	private graph: NetworkGraph;
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
+	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
 	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
 	private readonly fforVoucherIndex = new FforVoucherIndex();
 	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
@@ -1868,6 +1871,23 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
+		const zeroReserveRole =
+			config.zeroReserve?.role ??
+			(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
+				? 'primary'
+				: 'wallet');
+		// Qualified wallets accept waivers by default. Primaries still need
+		// the operator setting, and an explicit advertisement opt-out wins.
+		const advertiseZeroReserve =
+			config.zeroReserve?.advertise ??
+			(zeroReserveRole === 'wallet' ||
+				config.zeroReserve?.waiveClientReserve === true);
+		if (advertiseZeroReserve) {
+			localFeatures.setOptional(Feature.OPTION_ZERO_RESERVE);
+		} else {
+			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
+			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1876,6 +1896,10 @@ export class LightningNode extends EventEmitter {
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
+			zeroReserve: {
+				...config.zeroReserve,
+				role: zeroReserveRole
+			},
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
 			localPerCommitmentSeed: config.perCommitmentSeed,
@@ -2315,7 +2339,7 @@ export class LightningNode extends EventEmitter {
 			// to 'custom-message' before the first peer message arrives, and a
 			// listener attached later would miss an offer sent to a request this
 			// node minted in a previous run.
-			this.wireDirectFunding(config.directFunding);
+			this.wireDirectFunding(config.directFunding, config.newChannelsRefused);
 		}
 		if (config.swaps?.enabled) {
 			this.wireSwapProvider(config.swaps);
@@ -5878,6 +5902,7 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		this.channelManager.handlePeerDisconnected(peerPubkey);
+		this.dropGossipSync(peerPubkey);
 		this.notifyPeerDisconnectRequestObservers(peerPubkey);
 	}
 
@@ -7016,10 +7041,7 @@ export class LightningNode extends EventEmitter {
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
 			this.guardianHost?.sessionClosed(pubkey);
 			this.channelManager.handlePeerDisconnected(pubkey);
-			if (this.gossipSyncManagers.get(pubkey)?.repairPending) {
-				this.gossipRepairPending = true;
-			}
-			this.gossipSyncManagers.delete(pubkey);
+			this.dropGossipSync(pubkey);
 			this.rateLimiter.removePeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
 		});
@@ -11028,12 +11050,14 @@ export class LightningNode extends EventEmitter {
 		this.prunedKeysendHashes.clear();
 		this.prunedOutgoingHashes.clear();
 		this.prunedCompletedOutgoingHashes.clear();
+		this.prunedPayAllBudgets.clear();
 		this.paymentSecrets.clear();
 		this.invoices.clear();
 		this.scidToChannelId.clear();
 		this.htlcPaymentMap.clear();
 		this.forwardedHtlcs.clear();
 		this.retriesAwaitingRemoval.clear();
+		for (const syncMgr of this.gossipSyncManagers.values()) syncMgr.stop();
 		this.gossipSyncManagers.clear();
 		this.pendingMppPayments.clear();
 		this.pendingFundingTxs.clear();
@@ -11141,6 +11165,12 @@ export class LightningNode extends EventEmitter {
 				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
+			if (payment.payAll && !this.storage) {
+				this.prunedPayAllBudgets.set(hash, {
+					debitMsat: payment.payAll.debitMsat,
+					maxFeeMsat: payment.payAll.maxFeeMsat
+				});
+			}
 			this.payments.delete(hash);
 			this.preimages.delete(hash);
 			if (
@@ -11783,6 +11813,93 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/** Estimate the cooperative payout at the current chain feerate. */
+	closeQuote(
+		channelId: Buffer,
+		scriptPubkey: Buffer,
+		acceptStaleStateRisk = false
+	): import('../chain/closing').ICooperativeCloseQuote {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		if (
+			!Buffer.isBuffer(scriptPubkey) ||
+			!isValidShutdownScript(scriptPubkey, true)
+		) {
+			throw new Error('Invalid local shutdown scriptPubkey');
+		}
+		return this.channelManager.quoteCooperativeClose(
+			channelId,
+			scriptPubkey,
+			acceptStaleStateRisk
+		);
+	}
+
+	/** Payout history derived from durable intent and the actual signed close. */
+	listExternalClosePayments(): Array<{
+		channelId: string;
+		txid: string;
+		scriptHex: string;
+		amountSats: number;
+		feeSats: number;
+		networkFeeSats: number;
+		satsPerVbyte: number;
+		timestamp: number;
+		confirmationHeight: number;
+	}> {
+		const payments: ReturnType<LightningNode['listExternalClosePayments']> = [];
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.externalClose || !state.channelId) continue;
+			const status = this._buildCloseStatus(state, state.channelId);
+			if (status?.closer !== 'cooperative') continue;
+			const recorded = state.externalClose.transactions?.find(
+				(entry) =>
+					bitcoin.Transaction.fromHex(entry.txHex).getId() ===
+					status.closingTxid
+			);
+			// Only the funding spend selected by the chain monitor is final.
+			// Before observation, closeStatus selects the last signed candidate.
+			if (!recorded) continue;
+			const observed = this.channelManager
+				.getMonitor(state.channelId)
+				?.getFullState().commitmentBroadcast?.cooperativeTxHex;
+			const signed = state.lastCooperativeCloseTxHex
+				? bitcoin.Transaction.fromHex(state.lastCooperativeCloseTxHex)
+				: undefined;
+			const tx = observed
+				? bitcoin.Transaction.fromHex(observed)
+				: signed && signed.getId() === status.closingTxid
+				? signed
+				: bitcoin.Transaction.fromHex(recorded.txHex);
+			const script = Buffer.from(state.externalClose.scriptHex, 'hex');
+			const expected =
+				Number(state.localBalanceMsat / 1000n) - recorded.localFeeSats;
+			const output = tx.outs.find(
+				(out) => out.script.equals(script) && out.value === expected
+			);
+			if (!output) continue;
+			const amountSats = output.value;
+			const networkFeeSats =
+				Number(state.fundingSatoshis) -
+				tx.outs.reduce((sum, out) => sum + out.value, 0);
+			payments.push({
+				channelId: state.channelId.toString('hex'),
+				txid: tx.getId(),
+				scriptHex: state.externalClose.scriptHex,
+				amountSats,
+				feeSats: Math.max(
+					0,
+					Number(state.localBalanceMsat / 1000n) - amountSats
+				),
+				networkFeeSats,
+				satsPerVbyte: networkFeeSats / tx.virtualSize(),
+				timestamp: state.externalClose.timestamp,
+				confirmationHeight: status.confirmationHeight
+			});
+		}
+		return payments;
+	}
+
 	closeChannel(
 		channelId: Buffer,
 		scriptPubkey: Buffer,
@@ -11792,7 +11909,9 @@ export class LightningNode extends EventEmitter {
 		 * pays out the balances that row carries, and a stale allocation can
 		 * only be the peer-favourable one (issue #469).
 		 */
-		acceptStaleStateRisk = false
+		acceptStaleStateRisk = false,
+		/** Record a payment to this destination instead of a wallet payout. */
+		externalDestination = false
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
@@ -11815,7 +11934,8 @@ export class LightningNode extends EventEmitter {
 		const result = this.channelManager.initiateShutdown(
 			channelId,
 			scriptPubkey,
-			acceptStaleStateRisk
+			acceptStaleStateRisk,
+			externalDestination
 		);
 		if (!result.ok) {
 			if (stamped) {
@@ -13669,17 +13789,20 @@ export class LightningNode extends EventEmitter {
 	 * splice-out prices from the channel's own spendable balance net of the
 	 * reserve the peer actually set. Exists so a UI never has to reconstruct
 	 * this arithmetic and offer an amount the daemon then rejects.
+	 * Pass the intended splice-out destination to price its exact output size.
 	 */
 	spliceQuote(
 		channelId: Buffer,
 		direction: 'in' | 'out',
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		destinationScript?: Buffer
 	): {
 		direction: 'in' | 'out';
 		feeSats: number;
 		spendableSats: number;
 		maxAmountSats: number;
 		reserveSats?: number;
+		commitmentCostSats?: number;
 		inputCount?: number;
 	} {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
@@ -13698,7 +13821,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		if (direction === 'out') {
-			const destination = this.getSweepDestinationScript();
+			const destination = this._spliceOutDestination(destinationScript);
 			const feeSats = spliceFeeSats(
 				estimateSpliceTxWeight({
 					walletInputCount: 0,
@@ -13709,6 +13832,7 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
 			const local = channel.getBalances().localMsat / 1000n;
+			const commitmentCost = channel.spliceOutCommitmentCostSats();
 			// spliceOut prices the kept reserve at the POST-splice capacity, so
 			// the advertised maximum must be solved against that same predicate:
 			// pricing at the current capacity understates it whenever the stored
@@ -13721,7 +13845,10 @@ export class LightningNode extends EventEmitter {
 					state.fundingSatoshis - amountSats - feeSats
 				);
 				const reserve = derived > stored ? derived : stored;
-				return amountSats + feeSats <= local - reserve;
+				return (
+					amountSats + feeSats <= local - reserve - commitmentCost &&
+					channel.spliceOutCommitmentRefusal(amountSats + feeSats) === null
+				);
 			};
 			let lo = 0n;
 			let hi = local > feeSats ? local - feeSats : 0n;
@@ -13736,13 +13863,15 @@ export class LightningNode extends EventEmitter {
 				state.fundingSatoshis - max - feeSats
 			);
 			const reserve = derivedAtMax > stored ? derivedAtMax : stored;
-			const spendable = local > reserve ? local - reserve : 0n;
+			const kept = reserve + commitmentCost;
+			const spendable = local > kept ? local - kept : 0n;
 			return {
 				direction,
 				feeSats: Number(feeSats),
 				spendableSats: Number(spendable),
 				maxAmountSats: Number(max),
-				reserveSats: Number(reserve)
+				reserveSats: Number(reserve),
+				commitmentCostSats: Number(commitmentCost)
 			};
 		}
 
@@ -13762,24 +13891,7 @@ export class LightningNode extends EventEmitter {
 		};
 	}
 
-	spliceOut(
-		channelId: Buffer,
-		amountSats: bigint,
-		fundingFeeratePerkw = 253,
-		destinationScript?: Buffer
-	): ISpliceRequestResult {
-		const cidErr = validateBuffer(channelId, 32, 'channelId');
-		if (cidErr) throw new InvalidSpliceError(cidErr);
-		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
-		if (satsErr) throw new InvalidSpliceError(satsErr);
-		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
-		// here: encoding happens AFTER the channel has moved to SPLICING and
-		// persisted, so a throw there leaves the channel wedged until restart.
-		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
-			min: 1,
-			max: MAX_SPLICE_FEERATE_PERKW
-		});
-		if (feeErr) throw new InvalidSpliceError(feeErr);
+	private _spliceOutDestination(destinationScript?: Buffer): Buffer {
 		if (
 			destinationScript !== undefined &&
 			(!Buffer.isBuffer(destinationScript) || destinationScript.length === 0)
@@ -13800,6 +13912,28 @@ export class LightningNode extends EventEmitter {
 				'destinationScript is not a standard output script (would burn the withdrawn funds)'
 			);
 		}
+		return destinationScript ?? this.getSweepDestinationScript();
+	}
+
+	spliceOut(
+		channelId: Buffer,
+		amountSats: bigint,
+		fundingFeeratePerkw = 253,
+		destinationScript?: Buffer
+	): ISpliceRequestResult {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new InvalidSpliceError(cidErr);
+		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
+		if (satsErr) throw new InvalidSpliceError(satsErr);
+		// splice_init carries funding_feerate_perkw as a u32. Refuse a bad one
+		// here: encoding happens AFTER the channel has moved to SPLICING and
+		// persisted, so a throw there leaves the channel wedged until restart.
+		const feeErr = validateU32(fundingFeeratePerkw, 'fundingFeeratePerkw', {
+			min: 1,
+			max: MAX_SPLICE_FEERATE_PERKW
+		});
+		if (feeErr) throw new InvalidSpliceError(feeErr);
+		const destination = this._spliceOutDestination(destinationScript);
 
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) {
@@ -13809,8 +13943,6 @@ export class LightningNode extends EventEmitter {
 				code: SpliceRefusalCode.CHANNEL_NOT_FOUND
 			};
 		}
-
-		const destination = destinationScript ?? this.getSweepDestinationScript();
 
 		// Sanity checks before any protocol message goes out: dust amount, peer
 		// support, and spendable channel balance.
@@ -13857,15 +13989,22 @@ export class LightningNode extends EventEmitter {
 			const stored = state.remoteConfig?.channelReserveSatoshis ?? 0n;
 			const derived = channel.spliceReserveWeKeepSats(postCapacity);
 			const reserve = derived > stored ? derived : stored;
-			const spendableSats = channel.getBalances().localMsat / 1000n - reserve;
+			const commitmentCost = channel.spliceOutCommitmentCostSats();
+			const spendableSats =
+				channel.getBalances().localMsat / 1000n - reserve - commitmentCost;
 			if (amountSats + fee > spendableSats) {
 				refusal = {
 					error: `insufficient channel balance for splice-out: need ${
 						amountSats + fee
-					} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve at the post-splice capacity`,
+					} sats (amount + ${fee}-sat fee at ${fundingFeeratePerkw} sat/kw), spendable ${spendableSats} sats after the ${reserve}-sat reserve and ${commitmentCost}-sat commitment cost at the post-splice capacity`,
 					code: SpliceRefusalCode.INSUFFICIENT_BALANCE
 				};
 			}
+		}
+		if (!refusal) {
+			const error = channel.spliceOutCommitmentRefusal(amountSats + fee);
+			if (error)
+				refusal = { error, code: SpliceRefusalCode.INSUFFICIENT_BALANCE };
 		}
 		if (refusal) {
 			this.emit('node:error', {
@@ -14720,6 +14859,12 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 		info.htlcUsable = channel.acceptsNewHtlcs();
+		// The initial splice handshake is still NORMAL, but its quiescence
+		// gate already refuses outbound adds.
+		info.spendableOutboundMsat =
+			info.htlcUsable && !channel.isQuiescing()
+				? channel.getSpendableOutboundMsat()
+				: 0n;
 		// The reason a NORMAL channel can still answer false, so a consumer can
 		// tell "mid-splice and parked" from "restored and held" (issue #469) and
 		// from "funding unaccounted for" (issue #593).
@@ -14777,6 +14922,9 @@ export class LightningNode extends EventEmitter {
 		}
 		info.htlcCount = htlcCount;
 		info.localReserveMsat = state.remoteConfig.channelReserveSatoshis * 1000n;
+		info.localReserveWaived = state.localReserveWaived === true;
+		info.remoteReserveWaived = state.remoteReserveWaived === true;
+		info.isOpener = state.role === ChannelRole.OPENER;
 		info.remoteReserveMsat = state.localConfig.channelReserveSatoshis * 1000n;
 		info.isPrivate = !state.announceChannel;
 		// Effective routing policy (per-channel override or node defaults)
@@ -15726,22 +15874,11 @@ export class LightningNode extends EventEmitter {
 				const syncMgr = this.gossipSyncManagers.get(pubkey);
 				if (syncMgr) {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
-					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
-					// The batch this marker closes may still be queued. A fast
-					// peer's next reply would land behind it and overflow the
-					// intake, so the next query waits for the intake to drain.
-					if (responses.length > 0) {
-						void this.flushGossip().then(() => {
-							if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
-							try {
-								for (const resp of responses) {
-									this.emitOutbound(pubkey, resp.type, resp.payload);
-								}
-							} catch {
-								// Peer disconnected while the intake drained.
-							}
-						});
-					}
+					this.sendGossipQueriesAfterIntake(
+						pubkey,
+						syncMgr,
+						syncMgr.handleReplyShortChannelIdsEnd(msg)
+					);
 				}
 				break;
 			}
@@ -15939,12 +16076,49 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
-		let mgr = this.gossipSyncManagers.get(pubkey);
-		if (!mgr) {
-			mgr = new GossipSyncManager(this.graph, this.chainHash());
-			this.gossipSyncManagers.set(pubkey, mgr);
-		}
+		const existing = this.gossipSyncManagers.get(pubkey);
+		if (existing) return existing;
+		const mgr = new GossipSyncManager(this.graph, this.chainHash());
+		const send = (queries: IGossipSyncMessage[]): void => {
+			this.sendGossipQueriesAfterIntake(pubkey, mgr, queries);
+		};
+		mgr.on('timeout', send);
+		mgr.on('retry', send);
+		this.gossipSyncManagers.set(pubkey, mgr);
 		return mgr;
+	}
+
+	/** End a peer's sync with its connection, keeping any repair it owed. */
+	private dropGossipSync(pubkey: string): void {
+		const syncMgr = this.gossipSyncManagers.get(pubkey);
+		if (syncMgr?.repairPending) {
+			this.gossipRepairPending = true;
+		}
+		syncMgr?.stop();
+		this.gossipSyncManagers.delete(pubkey);
+	}
+
+	/**
+	 * The batch before a query may still be queued. A fast peer's next reply
+	 * would land behind it and overflow the intake, so the query waits for
+	 * the intake to drain.
+	 */
+	private sendGossipQueriesAfterIntake(
+		pubkey: string,
+		syncMgr: GossipSyncManager,
+		queries: IGossipSyncMessage[]
+	): void {
+		if (queries.length === 0) return;
+		void this.flushGossip().then(() => {
+			if (this.gossipSyncManagers.get(pubkey) !== syncMgr) return;
+			try {
+				for (const query of queries) {
+					this.emitOutbound(pubkey, query.type, query.payload);
+				}
+			} catch {
+				// Peer disconnected while the intake drained.
+			}
+		});
 	}
 
 	/**
@@ -16516,6 +16690,218 @@ export class LightningNode extends EventEmitter {
 		return edges;
 	}
 
+	private decodePayAllInvoice(
+		invoiceStr: string
+	): ReturnType<typeof decodeInvoice> {
+		let invoice: ReturnType<typeof decodeInvoice>;
+		try {
+			invoice = decodeInvoice(invoiceStr);
+		} catch {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'Invalid BOLT 11 invoice'
+			);
+		}
+		if (
+			invoice.network !== this.network ||
+			invoice.amountMsat !== undefined ||
+			!invoice.paymentSecret ||
+			!(invoice.payeeNodeKey || invoice.recoveredPubkey) ||
+			(invoice.blindedPaths?.length ?? 0) > 0
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'Pay-all requires an amountless BOLT 11 invoice with a payment secret on this network and an unblinded route'
+			);
+		}
+		for (const bit of invoice.featureBits?.listSetBits() ?? []) {
+			if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
+				throw new LightningPaymentError(
+					LightningErrorCode.INVALID_INVOICE,
+					`Invoice requires unknown feature bit ${bit}`
+				);
+			}
+		}
+		if (
+			Math.floor(Date.now() / 1000) >
+			invoice.timestamp + (invoice.expiry ?? DEFAULT_EXPIRY)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVOICE_EXPIRED,
+				'Invoice has expired'
+			);
+		}
+		return invoice;
+	}
+
+	private persistedPayAllBudget(hash: string): IPayAllBudget | undefined {
+		// Pruning drops the cache, not the approval contract. Read failures
+		// propagate so an unavailable durable record cannot authorize a new debit.
+		return (
+			this.payments.get(hash)?.payAll ??
+			this.prunedPayAllBudgets.get(hash) ??
+			this.storage?.loadPayment(hash)?.payAll
+		);
+	}
+
+	private validatePayAllBudget(budget: IPayAllBudget): void {
+		if (
+			budget.debitMsat <= 0n ||
+			budget.debitMsat > 0xffffffffffffffffn ||
+			budget.maxFeeMsat < 0n ||
+			budget.maxFeeMsat >= budget.debitMsat
+		) {
+			throw new InvalidRequestError(
+				'Pay-all requires a positive u64 debitMsat and 0 <= maxFeeMsat < debitMsat'
+			);
+		}
+	}
+
+	private payAllLocalEdges(): ILocalChannelEdge[] {
+		return this.getLocalChannelEdges().filter((edge) => {
+			const channel = this.findLocalChannelByScid(
+				edge.shortChannelId,
+				edge.peer.toString('hex')
+			);
+			return channel && !channel.isQuiescing();
+		});
+	}
+
+	private payAllRoute(
+		invoice: ReturnType<typeof decodeInvoice>,
+		budget: IPayAllBudget,
+		context?: IPaymentRetryContext
+	): IPayAllRouteResult {
+		const baseHeight = this.cltvBaseHeight(invoice.paymentHash);
+		return findPayAllRoute({
+			graph: this.graph,
+			source: getPublicKey(this.nodePrivkey),
+			destination: (invoice.payeeNodeKey || invoice.recoveredPubkey)!,
+			...budget,
+			finalCltvExpiry: this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
+			localChannels: this.payAllLocalEdges(),
+			routingHints: invoice.routingHints,
+			excludedChannels: context?.excludedChannels,
+			policyOverrides: context?.policyOverrides,
+			maxCltvExpiry: this.cltvBudgetFor(
+				invoice.paymentHash,
+				context?.maxCltvExpiryHeight
+			),
+			canSend: (route) => {
+				const hop = route.hops[0];
+				const channel = this.findLocalChannelByScid(
+					hop.shortChannelId,
+					hop.pubkey.toString('hex')
+				);
+				return (
+					!!channel &&
+					channel.validateOutgoingHtlc(
+						budget.debitMsat,
+						hop.outgoingCltvValue + baseHeight
+					).length === 0
+				);
+			}
+		});
+	}
+
+	/** Read-only quote. Multiple local channels may require unsupported MPP. */
+	quotePayAll(invoiceStr: string, maxFeeMsat: bigint): IPayAllQuote {
+		const invoice = this.decodePayAllInvoice(invoiceStr);
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
+		const prior = this.persistedPayAllBudget(
+			invoice.paymentHash.toString('hex')
+		);
+		if (prior && prior.maxFeeMsat !== maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'A retry must retain the persisted pay-all debit and fee cap'
+			);
+		}
+		const debitMsat =
+			prior?.debitMsat ??
+			this.payAllLocalEdges().reduce(
+				(sum, edge) => sum + edge.outboundMsat,
+				0n
+			);
+		const budget = { debitMsat, maxFeeMsat };
+		this.validatePayAllBudget(budget);
+		const found = this.payAllRoute(invoice, budget);
+		return {
+			...budget,
+			minRecipientMsat: debitMsat - maxFeeMsat,
+			routeFound: found.route !== null,
+			remainderMsat: found.remainderMsat,
+			searchExhausted: found.searchExhausted
+		};
+	}
+
+	/** Single-part pay-all. Every retry uses the same reviewed debit and cap. */
+	sendPayAll(
+		invoiceStr: string,
+		debitMsat: bigint,
+		maxFeeMsat: bigint,
+		metadata?: Record<string, string>
+	): IPaymentInfo {
+		const redispatching = this.redispatchingRetryContext;
+		this.redispatchingRetryContext = undefined;
+		const invoice = this.decodePayAllInvoice(invoiceStr);
+		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
+		const hash = invoice.paymentHash.toString('hex');
+		const prior = this.persistedPayAllBudget(hash);
+		const budget = { debitMsat, maxFeeMsat };
+		this.validatePayAllBudget(budget);
+		if (
+			prior &&
+			(prior.debitMsat !== debitMsat || prior.maxFeeMsat !== maxFeeMsat)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'A retry must retain the persisted pay-all debit and fee cap'
+			);
+		}
+		const oldContext = this.paymentRetryContexts.get(hash);
+		if (oldContext && oldContext !== redispatching)
+			this.paymentRetryContexts.delete(hash);
+		const available = this.payAllLocalEdges().reduce(
+			(sum, edge) => sum + edge.outboundMsat,
+			0n
+		);
+		if (available < debitMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_REVIEW_EXPIRED,
+				'The reviewed debit is no longer spendable; prepare a new review'
+			);
+		}
+		const context: IPaymentRetryContext = redispatching ?? {
+			invoiceStr,
+			payAll: budget,
+			maxFeeMsat,
+			excludedChannels: new Set(),
+			retryCount: 0,
+			maxRetries: this.maxPaymentRetries,
+			metadata
+		};
+		const found = this.payAllRoute(invoice, budget, context);
+		if (!found.route) {
+			throw new LightningPaymentError(
+				found.remainderMsat > 0n
+					? LightningErrorCode.PAY_ALL_REMAINDER
+					: LightningErrorCode.NO_ROUTE,
+				`No exact single-part pay-all route within the approved cap; remainderMsat=${found.remainderMsat}` +
+					(found.searchExhausted ? '; route search limit reached' : '')
+			);
+		}
+		return this.dispatchInvoiceRoute(
+			found.route,
+			invoice.paymentHash,
+			this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
+			invoice.paymentSecret!,
+			found.route.hops[found.route.hops.length - 1].amountToForwardMsat,
+			context,
+			metadata
+		);
+	}
+
 	sendPayment(
 		invoiceStr: string,
 		excludedChannels?: Set<string>,
@@ -16546,6 +16932,12 @@ export class LightningNode extends EventEmitter {
 		// the guarantee on the route, and MPP dispatch runs only after this.
 		this.assertHashUnpaid(invoice.paymentHash, 'any-pending');
 		const dedupHashHex = invoice.paymentHash.toString('hex');
+		if (this.persistedPayAllBudget(dedupHashHex)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'Retry this payment through pay-all with its persisted budget'
+			);
+		}
 		// Past that check nothing is out for the hash, so a context other than
 		// the retry being re-dispatched was left by a send that ended. This
 		// call's amount, fee cap, ceiling and exclusions replace it (issue #1041).
@@ -16882,7 +17274,8 @@ export class LightningNode extends EventEmitter {
 				finalCltvExpiry,
 				paymentSecret,
 				paymentAmountMsat,
-				metadata
+				metadata,
+				context.payAll
 			);
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
@@ -16932,7 +17325,8 @@ export class LightningNode extends EventEmitter {
 		finalCltvExpiry: number,
 		paymentSecret?: Buffer,
 		totalMsat?: bigint,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		payAll?: IPayAllBudget
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
@@ -16950,6 +17344,32 @@ export class LightningNode extends EventEmitter {
 		// part all the same.
 		const finalAmountMsat =
 			route.hops[route.hops.length - 1].amountToForwardMsat;
+		const priorPayAll = this.persistedPayAllBudget(paymentHash.toString('hex'));
+		if (
+			priorPayAll &&
+			(!payAll ||
+				priorPayAll.debitMsat !== payAll.debitMsat ||
+				priorPayAll.maxFeeMsat !== payAll.maxFeeMsat)
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_BUDGET_MISMATCH,
+				'Retry this payment through pay-all with its persisted budget'
+			);
+		}
+		if (payAll) {
+			this.validatePayAllBudget(payAll);
+			if (
+				route.hops[0].amountToForwardMsat !== payAll.debitMsat ||
+				finalAmountMsat <= 0n ||
+				finalAmountMsat > payAll.debitMsat ||
+				payAll.debitMsat - finalAmountMsat > payAll.maxFeeMsat ||
+				(totalMsat !== undefined && totalMsat !== finalAmountMsat)
+			) {
+				throw new InvalidRequestError(
+					'Route does not match the frozen single-part pay-all budget'
+				);
+			}
+		}
 		this.assertHashUnpaid(
 			paymentHash,
 			totalMsat !== undefined && totalMsat > finalAmountMsat
@@ -17053,7 +17473,9 @@ export class LightningNode extends EventEmitter {
 		const outChannel =
 			selfIntro?.outChannel ??
 			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
-			this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat);
+			(payAll
+				? undefined
+				: this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat));
 		if (!outChannel) {
 			throw new LightningPaymentError(
 				LightningErrorCode.NO_CHANNEL_TO_HOP,
@@ -17065,6 +17487,15 @@ export class LightningNode extends EventEmitter {
 		const cltvExpiry =
 			(selfIntro?.wireCltvRel ?? hops[0].outgoingCltvValue) + baseHeight;
 		const amount = selfIntro?.wireAmountMsat ?? hops[0].amountToForwardMsat;
+		if (
+			payAll &&
+			outChannel.validateOutgoingHtlc(amount, cltvExpiry).length > 0
+		) {
+			throw new LightningPaymentError(
+				LightningErrorCode.PAY_ALL_REVIEW_EXPIRED,
+				'The reviewed debit can no longer be admitted; prepare a new review'
+			);
+		}
 		// Fail closed BEFORE any record, mapping or HTLC exists: the router
 		// bound above is advisory, this is the guarantee (issue #737).
 		this.assertWithinCltvCeiling(paymentHash, cltvExpiry);
@@ -17072,6 +17503,16 @@ export class LightningNode extends EventEmitter {
 		// Create payment info BEFORE addHtlc because in synchronous loopback
 		// the entire fulfill chain runs during addHtlc
 		const payment: IPaymentInfo = {
+			...(payAll
+				? {
+						payAll: {
+							...payAll,
+							deliveredMsat: finalAmountMsat,
+							feeMsat: amount - finalAmountMsat,
+							remainderMsat: payAll.debitMsat - amount
+						}
+				  }
+				: {}),
 			paymentHash,
 			amountMsat: amount,
 			status: PaymentStatus.PENDING,
@@ -17130,6 +17571,7 @@ export class LightningNode extends EventEmitter {
 				'payment metadata is too large for the recovery guardians to accept'
 			);
 		}
+		const priorPayment = this.payments.get(paymentHash.toString('hex'));
 		this.payments.set(paymentHash.toString('hex'), payment);
 
 		// Track offered HTLC → payment mapping
@@ -17144,11 +17586,22 @@ export class LightningNode extends EventEmitter {
 			];
 			const paymentMutation = this.paymentMutation(paymentHash);
 			if (paymentMutation) mutations.unshift(paymentMutation);
-			this.commitMutations(
+			const committed = this.commitMutations(
 				'persist payment + HTLC mapping',
 				mutations,
 				RecoveryCriticality.SafetyCritical
 			);
+			if (payAll && !committed) {
+				// No HTLC may leave without the frozen contract. The failed
+				// transition is atomic; undo its provisional memory entries too.
+				this.htlcPaymentMap.delete(htlcKey);
+				if (priorPayment)
+					this.payments.set(paymentHash.toString('hex'), priorPayment);
+				else this.payments.delete(paymentHash.toString('hex'));
+				throw new Error(
+					'Could not persist pay-all budget and HTLC mapping; nothing was sent'
+				);
+			}
 		}
 
 		// Add HTLC to channel (may trigger synchronous fulfillment via loopback)
@@ -25327,15 +25780,22 @@ export class LightningNode extends EventEmitter {
 					const outerRedispatch = this.redispatchingRetryContext;
 					this.redispatchingRetryContext = retryCtx;
 					try {
-						retried = this.sendPayment(
-							retryCtx.invoiceStr!,
-							retryCtx.excludedChannels,
-							retryCtx.maxFeeMsat,
-							retryCtx.amountMsat,
-							retryCtx.maxCltvExpiryHeight,
-							retryCtx.policyOverrides,
-							retryCtx.metadata
-						);
+						retried = retryCtx.payAll
+							? this.sendPayAll(
+									retryCtx.invoiceStr!,
+									retryCtx.payAll.debitMsat,
+									retryCtx.payAll.maxFeeMsat,
+									retryCtx.metadata
+							  )
+							: this.sendPayment(
+									retryCtx.invoiceStr!,
+									retryCtx.excludedChannels,
+									retryCtx.maxFeeMsat,
+									retryCtx.amountMsat,
+									retryCtx.maxCltvExpiryHeight,
+									retryCtx.policyOverrides,
+									retryCtx.metadata
+							  );
 					} finally {
 						this.redispatchingRetryContext = outerRedispatch;
 					}
@@ -26918,7 +27378,10 @@ export class LightningNode extends EventEmitter {
 	 * What this does at construction is make sure a request minted later can be
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */
-	private wireDirectFunding(config: IDirectFundingNodeConfig): void {
+	private wireDirectFunding(
+		config: IDirectFundingNodeConfig,
+		newFundingRefused?: () => string | null
+	): void {
 		const log = (action: string, data: Record<string, unknown>): void => {
 			this.emitStructuredLog('channel', action, data);
 		};
@@ -27027,6 +27490,7 @@ export class LightningNode extends EventEmitter {
 						this.directFundingChain().getScriptHashHistory(scriptHash)
 				},
 				liquidityPeer: () => policy.liquidityPeer ?? null,
+				newFundingRefused,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
 				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
@@ -28968,6 +29432,7 @@ export class LightningNode extends EventEmitter {
 			storage?: IStorageBackend;
 			enableNetworking?: boolean;
 			localFeatures?: FeatureFlags;
+			zeroReserve?: INodeConfig['zeroReserve'];
 			chainHashes?: Buffer[];
 			alias?: string;
 			announcedAddresses?: INodeAddress[];
@@ -29069,6 +29534,7 @@ export class LightningNode extends EventEmitter {
 			leaseRates: options?.leaseRates,
 			eagerGossipVerify: options?.eagerGossipVerify,
 			localFeatures: options?.localFeatures,
+			zeroReserve: options?.zeroReserve,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,
 			announcedAddresses: options?.announcedAddresses,
@@ -31192,10 +31658,7 @@ export class LightningNode extends EventEmitter {
 					channel.getPendingSpliceLocalBalanceMsat() ?? state.localBalanceMsat;
 				localBalanceMsat +=
 					pending < state.localBalanceMsat ? pending : state.localBalanceMsat;
-			} else if (
-				state.state !== ChannelState.NORMAL &&
-				state.state !== ChannelState.AWAITING_REESTABLISH
-			) {
+			} else if (effState !== ChannelState.NORMAL) {
 				continue;
 			} else {
 				localBalanceMsat += state.localBalanceMsat;

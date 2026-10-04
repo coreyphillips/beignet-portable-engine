@@ -11,9 +11,12 @@ const compiled = build({
 	bundle: true, platform: 'node', format: 'cjs', write: false,
 	plugins: [{ name: 'recovery-fixture', setup(builder) {
 		builder.onResolve({ filter: /beignet-node$/ }, () => ({ path: 'node', namespace: 'fixture' }));
+		builder.onResolve({ filter: /^\.\/proof$/ }, () => ({ path: 'proof', namespace: 'fixture' }));
 		builder.onResolve({ filter: /^\.\/network$/ }, () => ({ path: 'network', namespace: 'fixture' }));
 		builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path: name }) => ({
-			contents: name === 'node'
+			contents: name === 'proof'
+				? 'export const verifySubmission = (...args) => fixture.verify(...args); export const fundingConfirmed = async () => false; export const queryElectrum = async () => null;'
+				: name === 'node'
 				? 'export const BeignetNode = { create: (options) => fixture.create(options) };'
 				: 'export const verifyElectrumNetwork = async () => { fixture.verified++; };',
 			loader: 'js'
@@ -88,6 +91,7 @@ async function fixture(
 	const control = {
 		node,
 		verified: 0,
+		verify: async () => null,
 		options: [],
 		create: async (options) => {
 			control.options.push(options);
@@ -141,6 +145,7 @@ async function fixture(
 		control,
 		volume,
 		connects,
+		expireStop: () => { for (const timer of timers) if (timer.ms === 15000) { timers.delete(timer); timer.callback(); } },
 		set status(value) {
 			status = value;
 		},
@@ -378,4 +383,66 @@ test('primary edits restart only when Iroh enablement changes', async () => {
 	} finally {
 		await f.runtime.close();
 	}
+});
+
+
+test('drain observation settling after runtime teardown cannot write to the released volume', async () => {
+  const f = await fixture();
+  const id = (await create(f)).record.id;
+  const requestId = 'runtime-drain-001';
+  const address = 'external-address';
+  const row = {
+    requestId, address, primary: PK, phase: 'pending',
+    channelId: 'ab'.repeat(32), fundingTxid: 'cd'.repeat(32), fundingOutputIndex: 0,
+    coins: [], close: { amountSats: 9500, feeSats: 500, txid: 'ef'.repeat(32) },
+    sweep: null, amountSats: 9500, feeSats: 500, debitSats: 10000,
+    reviewedDebitSats: 10000, createdAt: 1, expiresAt: 120001
+  };
+  f.volume.write('/wallet/drains.json', Buffer.from(JSON.stringify({version: 1, records: [row]})));
+  Object.assign(f.node, {
+    getNode: () => ({getCurrentBlockHeight: () => 100}),
+    listOnchainTransactions: () => [{source: 'cooperative-close', channelId: row.channelId,
+      address, valueSats: 9500, feeSats: 500, txid: row.close.txid}]
+  });
+  let release;
+  f.control.verify = () => new Promise(resolve => { release = resolve; });
+  await f.tick();
+  assert.equal(typeof release, 'function');
+  const closing = f.runtime.close();
+  await new Promise(resolve => setImmediate(resolve));
+  f.expireStop();
+  await closing;
+  const saved = Buffer.from(f.volume.read('/wallet/drains.json')).toString();
+  release({matched: true, height: 90});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(Buffer.from(f.volume.read('/wallet/drains.json')).toString(), saved);
+  const next = await fixture(f.volume);
+  await next.runtime.close();
+});
+
+
+test('drain retries and cancellation are refused when requested after stop begins', async () => {
+  const f = await fixture();
+  const id = (await create(f)).record.id;
+  const requestId = 'stopping-drain-001';
+  const row = {requestId, address: 'external-address', primary: PK, phase: 'pending',
+    channelId: null, coins: [{txid: 'ab'.repeat(32), vout: 0, valueSats: 2000}],
+    close: null, sweep: {amountSats: 1700, feeSats: 300, txid: 'cd'.repeat(32)},
+    amountSats: 1700, feeSats: 300, debitSats: 2000, reviewedDebitSats: 2000,
+    createdAt: 1, expiresAt: 120001};
+  f.volume.write('/wallet/drains.json', Buffer.from(JSON.stringify({version: 1, records: [row]})));
+  let finish, submits = 0, cancellations = 0;
+  f.node.gracefulShutdown = () => new Promise(resolve => { finish = resolve; });
+  f.node.submitOnchainSweep = async () => { submits++; return {...row.sweep, status: 'submitted'}; };
+  f.node.cancelOnchainSweep = async () => { cancellations++; };
+  const stopping = f.runtime.request({method: 'POST', path: `/api/wallets/${id}/stop`});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof finish, 'function');
+  for (const action of ['send', 'cancel'])
+    await assert.rejects(f.runtime.request({method: 'POST', path: `/wallets/${id}/api/drain/${action}`, body: {requestId}}), {code: 'WALLET_CLOSED'});
+  assert.equal(submits, 0);
+  assert.equal(cancellations, 0);
+  finish();
+  await stopping;
+  await f.runtime.close();
 });
