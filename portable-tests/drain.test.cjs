@@ -346,6 +346,71 @@ test('busy, offline, foreign-channel, splice, recovery and offline-reservation s
 	}
 });
 
+test('unpaid receive invoices do not block a drain, including after restart', async () => {
+	const h = harness();
+	h.state.payments = [
+		{ direction: 'INCOMING', status: 'PENDING' },
+		{ direction: 'incoming', status: 'pending' }
+	];
+	await h.create().quote(request);
+	assert.equal((await h.create().send(request.requestId)).phase, 'closing');
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+});
+
+test('live or unidentified payments block review and dispatch before any drain mutation', async () => {
+	for (const payment of [
+		{ direction: 'OUTGOING', status: 'PENDING' },
+		{ direction: 'outgoing', status: 'pending' },
+		{ direction: 'incoming', status: 'in_flight' },
+		{ direction: 'incoming', status: 'INFLIGHT' },
+		{ status: 'pending' },
+		{ direction: 'unknown', status: 'pending' }
+	]) {
+		for (const afterReview of [false, true]) {
+			const h = harness();
+			if (afterReview) await h.create().quote(request);
+			h.state.payments = [payment];
+			await assert.rejects(
+				afterReview
+					? h.create().send(request.requestId)
+					: h.create().quote(request),
+				{
+					code: 'DRAIN_BUSY',
+					message: 'Wait for the pending payment to finish'
+				}
+			);
+			assert.deepEqual(h.calls, []);
+		}
+	}
+});
+
+test('incoming HTLCs and commitment updates still block a drain with pending receive invoices', async () => {
+	for (const afterReview of [false, true]) {
+		for (const blocker of afterReview ? ['htlc'] : ['htlc', 'commitment']) {
+			const h = harness();
+			h.state.payments = [{ direction: 'INCOMING', status: 'PENDING' }];
+			if (afterReview) await h.create().quote(request);
+			if (blocker === 'htlc') h.state.channels[0].htlcCount = 1;
+			else
+				h.engine.closeQuote = async () => {
+					throw new Error('Cannot close cooperatively: pending updates');
+				};
+			await assert.rejects(
+				afterReview
+					? h.create().send(request.requestId)
+					: h.create().quote(request),
+				blocker === 'htlc'
+					? {
+							code: 'DRAIN_BUSY',
+							message: 'The home channel is not ready for a cooperative close'
+					  }
+					: /Cannot close cooperatively: pending updates/
+			);
+			assert.deepEqual(h.calls, []);
+		}
+	}
+});
+
 test('a failed intent write cannot sign or close and a second request cannot take an active hold', async () => {
 	const h = harness(),
 		drain = h.create();

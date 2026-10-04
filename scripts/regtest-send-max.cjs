@@ -167,6 +167,16 @@ async function exactPayment(dev, primary, laterReceive) {
 	return { review, record, sent };
 }
 async function drain(dev) {
+	const receiveQuote = await dev.client.quoteReceive({
+		amountSats: 1000,
+		description: 'Unpaid invoice must not block empty wallet'
+	});
+	const unpaid = await dev.client.receive(receiveQuote);
+	await dev.restart();
+	await settledHome(dev, 'home restored with an unpaid invoice');
+	const pending = await dev.rpc('/payment?paymentHash=' + unpaid.paymentHash);
+	assert.equal(pending.direction, 'INCOMING');
+	assert.equal(pending.status, 'PENDING');
 	const coinAddress = (await dev.rpc('/address/new', 'POST', {})).address;
 	const deposit = btc('sendtoaddress', coinAddress, '0.00020000');
 	btc('-generate', '1');
@@ -186,6 +196,7 @@ async function drain(dev) {
 		['pending', 'completed'].includes(sent.status),
 		JSON.stringify(sent)
 	);
+	pass('an unpaid receive invoice survives restart without blocking drain');
 	assert.equal((await dev.rpc('/channelize/status')).paused, true);
 	const later = btc('sendtoaddress', coinAddress, '0.00001000');
 	await dev.restart();
