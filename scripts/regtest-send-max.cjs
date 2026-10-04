@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { spawn, execFileSync } = require('node:child_process');
 const bitcoin = require('bitcoinjs-lib');
+bitcoin.initEccLib(require('@bitcoinerlab/secp256k1'));
 const {
 	btc,
 	wait,
@@ -40,7 +41,11 @@ function destination(kind = 'bech32m') {
 		  }).address
 		: btc('getnewaddress', '', kind);
 }
-async function settledHome(dev, label = 'home channel ready', previousFundingTxid) {
+async function settledHome(
+	dev,
+	label = 'home channel ready',
+	previousFundingTxid
+) {
 	const mine = miner();
 	return wait(
 		label,
@@ -48,7 +53,8 @@ async function settledHome(dev, label = 'home channel ready', previousFundingTxi
 			mine();
 			await dev.client.refreshWallet();
 			const channel = await home(dev);
-			return channel?.state === 'NORMAL' && channel.fundingConfirmed &&
+			return channel?.state === 'NORMAL' &&
+				channel.fundingConfirmed &&
 				(!previousFundingTxid || channel.fundingTxid !== previousFundingTxid)
 				? channel
 				: false;
@@ -60,11 +66,17 @@ function verifySplicePayout(before, after, address, amountSats) {
 	assert.notEqual(after.fundingTxid, before.fundingTxid);
 	const tx = JSON.parse(btc('getrawtransaction', after.fundingTxid, 'true'));
 	assert.ok(tx.confirmations > 0, 'splice transaction is confirmed');
-	const script = bitcoin.address.toOutputScript(address, bitcoin.networks.regtest).toString('hex');
+	const script = bitcoin.address
+		.toOutputScript(address, bitcoin.networks.regtest)
+		.toString('hex');
 	const paidSats = tx.vout
 		.filter((output) => output.scriptPubKey.hex === script)
 		.reduce((total, output) => total + Math.round(output.value * 1e8), 0);
-	assert.equal(paidSats, amountSats, 'exact reviewed payout reaches the requested script');
+	assert.equal(
+		paidSats,
+		amountSats,
+		'exact reviewed payout reaches the requested script'
+	);
 }
 async function payer(h) {
 	const node = await h.BeignetNode.create({
@@ -262,6 +274,8 @@ async function runCase(name) {
 			btc('-generate', '1');
 			const channel = await settledHome(dev, 'phone-funded channel ready');
 			assert.equal(channel.isOpener, true);
+			assert.equal(channel.isPrivate, true);
+			assert.equal(channel.fundingConfirmed, true);
 			assert.equal(channel.localReserveWaived, name !== 'cln');
 			assert.equal(channel.remoteReserveWaived, false);
 			const target = destination('bech32');
@@ -280,7 +294,11 @@ async function runCase(name) {
 					['pending', 'completed'].includes(sent.status),
 					JSON.stringify(sent)
 				);
-				const after = await settledHome(dev, 'phone-funded max splice locked', channel.fundingTxid);
+				const after = await settledHome(
+					dev,
+					'phone-funded max splice locked',
+					channel.fundingTxid
+				);
 				verifySplicePayout(channel, after, target, review.amountSats);
 				assert.equal(after.localBalanceSats, review.keptSats);
 			}
@@ -343,7 +361,11 @@ async function runCase(name) {
 					['pending', 'completed'].includes(sent.status),
 					JSON.stringify(sent)
 				);
-				const after = await settledHome(dev, name + ' max splice locked', before.fundingTxid);
+				const after = await settledHome(
+					dev,
+					name + ' max splice locked',
+					before.fundingTxid
+				);
 				verifySplicePayout(before, after, target, review.amountSats);
 				assert.equal(after.localBalanceSats, 0);
 				assert.equal(after.localReserveWaived, true);
@@ -387,11 +409,14 @@ async function main() {
 			});
 			let timedOut = false;
 			let killTimer;
-			const deadline = setTimeout(() => {
-				timedOut = true;
-				child.kill('SIGTERM');
-				killTimer = setTimeout(() => child.kill('SIGKILL'), 10000);
-			}, 15 * 60 * 1000);
+			const deadline = setTimeout(
+				() => {
+					timedOut = true;
+					child.kill('SIGTERM');
+					killTimer = setTimeout(() => child.kill('SIGKILL'), 10000);
+				},
+				15 * 60 * 1000
+			);
 			const clearDeadline = () => {
 				clearTimeout(deadline);
 				clearTimeout(killTimer);
@@ -402,7 +427,8 @@ async function main() {
 			});
 			child.once('exit', (code) => {
 				clearDeadline();
-				if (timedOut) reject(new Error(name + ' exceeded its 15 minute deadline'));
+				if (timedOut)
+					reject(new Error(name + ' exceeded its 15 minute deadline'));
 				else if (code === 0) resolve();
 				else reject(new Error(name + ' exited ' + code));
 			});

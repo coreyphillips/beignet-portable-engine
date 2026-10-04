@@ -1360,6 +1360,11 @@ export class ChannelManager extends EventEmitter {
 			state.trustedPeer = true;
 			state.minimumDepth = 0;
 		}
+		// Portable wallets open private home channels, including confirmed opens.
+		// Privacy does not grant zero-conf trust or depend on a reserve waiver.
+		if (this.config.zeroReserve?.role === 'wallet') {
+			state.announceChannel = false;
+		}
 
 		const signer = this.makeSigner(
 			chKeys.channelIndex,
@@ -7300,6 +7305,10 @@ export class ChannelManager extends EventEmitter {
 		// dependencies), and BOLT 2 forbids announcing a channel whose type
 		// carries option_scid_alias, so the open goes out private.
 		let channelFlags = params.channelFlags;
+		// Keep every new outgoing wallet channel private without changing trust.
+		if (this.config.zeroReserve?.role === 'wallet') {
+			channelFlags = (channelFlags ?? 0x01) & ~0x01;
+		}
 		if (opts?.trusted) {
 			const typeFlags = FeatureFlags.fromBuffer(channelType);
 			typeFlags.setCompulsory(Feature.SCID_ALIAS);

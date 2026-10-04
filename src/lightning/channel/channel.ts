@@ -1782,7 +1782,10 @@ export class Channel {
 			// channel"), so force the private flag for taproot. Same for zero-conf:
 			// BOLT 2 forbids a channel_type containing option_scid_alias when
 			// announce_channel is set.
-			channelFlags: preferTaproot || zeroConf ? 0x00 : 0x01,
+			channelFlags:
+				preferTaproot || zeroConf || this._state.announceChannel === false
+					? 0x00
+					: 0x01,
 			channelType
 		};
 
