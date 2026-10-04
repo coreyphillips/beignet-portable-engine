@@ -823,6 +823,10 @@ export interface IChannelState {
 	 * with rows carrying the older number. Today every marked row is left alone.
 	 */
 	channelReserveVersion?: number;
+	/** The peer waived the reserve we keep, fixed at open. Old rows are false. */
+	localReserveWaived?: boolean;
+	/** We waived the peer's reserve, fixed at open. Old rows are false. */
+	remoteReserveWaived?: boolean;
 	/** Dual-funding: session state (only set for v2 channels) */
 	dualFundingSession: import('./dual-funding').DualFundingSession | null;
 	/**
@@ -918,6 +922,12 @@ export interface IChannelState {
 	 * must be able to detect and punish. Undefined for channels never coop-closed.
 	 */
 	lastCooperativeCloseTxHex?: string;
+	/** External payout intent, persisted before sending shutdown. */
+	externalClose?: {
+		scriptHex: string;
+		timestamp: number;
+		transactions?: Array<{ txHex: string; localFeeSats: number }>;
+	};
 	/**
 	 * option_taproot: OUR current MuSig2 verification nonce for our local
 	 * commitment (the peer co-signs our commitment against it; we consume it only

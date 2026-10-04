@@ -146,10 +146,20 @@ export interface CloseStatus {
 }
 
 export interface ChannelInfo {
+	/** Per-channel waiver directions fixed at open, false for legacy channels. */
+	localReserveWaived?: boolean;
+	remoteReserveWaived?: boolean;
+	isOpener?: boolean;
+	localReserveSats?: number;
+	remoteReserveSats?: number;
 	channelId: string;
 	peerPubkey: string;
 	state: ChannelStateString;
 	localBalanceSats: number;
+	/** Balance-based debit ceiling for one new outbound HTLC, floored to
+	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
+	 * Present on channel list/query snapshots. */
+	maxSendableSats?: number;
 	remoteBalanceSats: number;
 	capacitySats: number;
 	isAnchor: boolean;
@@ -286,7 +296,25 @@ export interface PaymentRoute {
 	hopCount: number;
 }
 
+export interface PayAllQuote {
+	debitMsat: string;
+	minRecipientMsat: string;
+	maxFeeMsat: string;
+	routeFound: boolean;
+	remainderMsat: string;
+	searchExhausted: boolean;
+}
+
+export interface PayAllPayment {
+	debitMsat: string;
+	maxFeeMsat: string;
+	deliveredMsat: string;
+	feeMsat: string;
+	remainderMsat: string;
+}
+
 export interface PaymentInfo {
+	payAll?: PayAllPayment;
 	paymentHash: string;
 	preimage?: string;
 	amountSats: number;
@@ -302,6 +330,7 @@ export interface PaymentInfo {
 }
 
 export interface PaymentProof {
+	payAll?: PayAllPayment;
 	paymentHash: string;
 	preimage: string;
 	amountSats: number;
@@ -598,6 +627,9 @@ export type TChannelFundingQuote = {
 };
 
 export interface OnchainTxInfo {
+	/** External cooperative payouts are retained with their channel record. */
+	source?: 'cooperative-close' | 'onchain-sweep';
+	channelId?: string;
 	txid: string;
 	type: 'sent' | 'received';
 	valueSats: number;
@@ -752,6 +784,8 @@ export interface Bolt12InvoiceInfo {
 }
 
 export interface BeignetConfig extends IrohDaemonConfig {
+	/** Primary-only switch for new private client channels. Default false. */
+	waiveClientReserve?: boolean;
 	mnemonic?: string;
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
@@ -1183,9 +1217,13 @@ export interface LiquiditySnapshot {
 	inboundLiquidityPct: number;
 	/** Total local balance held back as channel reserve, unspendable (sats). */
 	reserveSats: number;
-	/** Local balance above the reserve, i.e. what can actually be sent (sats).
-	 *  Zero while a channel's balance is still below its reserve. */
+	/** Legacy local balance above the reserve (sats), excluding commitment
+	 * costs and other send buffers. Zero while below the reserve. */
 	sendableSats: number;
+	/** Sum of the available channels' outbound debit ceilings, floored to
+	 * sats after summing msat. Before routing fees and route HTLC limits.
+	 * May require multiple parts when more than one channel contributes. */
+	maxSendableSats: number;
 	recommendations: LiquidityRecommendation[];
 }
 

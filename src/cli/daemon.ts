@@ -116,6 +116,7 @@ const CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Idempotency-Key';
 
 const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay',
+	'POST /invoice/pay-all',
 	'POST /invoice/pay-safe',
 	'POST /invoice/pay-async',
 	'POST /invoice/pay-retry',
@@ -487,6 +488,19 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	AMOUNT_TOO_SMALL: 400,
 	INVALID_REVIEW: 400,
 	QUOTE_EXPIRED: 409,
+	CLOSE_UNAVAILABLE: 409,
+	SWEEP_INPUT_UNAVAILABLE: 409,
+	SWEEP_QUOTE_EXPIRED: 409,
+	SWEEP_NOT_PREPARED: 409,
+	SWEEP_ALREADY_SUBMITTED: 409,
+	SWEEP_PENDING: 409,
+	SWEEP_INPUT_RESERVED: 409,
+	REQUEST_ID_CONFLICT: 409,
+	SWEEP_UNAVAILABLE: 409,
+	SWEEP_NOT_PERSISTED: 503,
+	SWEEP_JOURNAL_INVALID: 503,
+	SWEEP_JOURNAL_CONFLICT: 503,
+	SWEEP_JOURNAL_FULL: 503,
 	FEE_CHANGED: 409,
 	RECEIVE_UNAVAILABLE: 409,
 	RECEIVE_PENDING: 409,
@@ -502,6 +516,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// The caller's own fee ceiling, a recovery answer that needs a reachable
 	// quorum, and a resource with nothing recorded yet: none is a node fault.
 	FEE_EXCEEDS_MAX: 409,
+	PAY_ALL_REVIEW_EXPIRED: 409,
+	PAY_ALL_REMAINDER: 409,
+	PAY_ALL_BUDGET_MISMATCH: 409,
 	CLTV_EXCEEDS_MAX: 409,
 	CHAIN_NOT_SYNCED: 503,
 	RECOVERY_UNAVAILABLE: 503,
@@ -1703,6 +1720,24 @@ async function bootDaemon(
 			if (!address) return failure('INVALID_PARAMS', 'address required');
 			return success(await node.sendMaxOnchain(address, satsPerVbyte));
 		},
+		'POST /onchain/sweep/prepare': async (body) =>
+			success(
+				await node.prepareOnchainSweep(
+					body as unknown as import('./onchain-sweep').OnchainSweepRequest
+				)
+			),
+		'POST /onchain/sweep/submit': async (body) =>
+			success(
+				await node.submitOnchainSweep((body as { requestId: string }).requestId)
+			),
+		'POST /onchain/sweep/cancel': async (body) =>
+			success(
+				await node.cancelOnchainSweep((body as { requestId: string }).requestId)
+			),
+		'GET /onchain/sweep': (_body, query) => {
+			const sweep = node.getOnchainSweep(query.get('requestId') ?? '');
+			return sweep ? success(sweep) : failure('NOT_FOUND', 'Sweep not found');
+		},
 		'POST /tx/bump-fee': async (body) => {
 			const { txid, satsPerVbyte } = body as {
 				txid: string;
@@ -1873,10 +1908,22 @@ async function bootDaemon(
 				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte, max)
 			);
 		},
+		'POST /channel/close-quote': async (body) => {
+			const { channelId, address, acceptStaleStateRisk } = body as {
+				channelId: string;
+				address?: string;
+				acceptStaleStateRisk?: boolean;
+			};
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			return success(
+				await node.closeQuote(channelId, address, acceptStaleStateRisk === true)
+			);
+		},
 		'POST /channel/close': async (body) => {
-			const { channelId, acceptStaleStateRisk } = body as {
+			const { channelId, acceptStaleStateRisk, address } = body as {
 				channelId: string;
 				acceptStaleStateRisk?: boolean;
+				address?: string;
 			};
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			// Strict boolean, the same rule the force close uses: the
@@ -1886,7 +1933,8 @@ async function bootDaemon(
 			// receive address a payer may have been given).
 			const result = await node.closeChannel(
 				channelId,
-				acceptStaleStateRisk === true
+				acceptStaleStateRisk === true,
+				address
 			);
 			if (!result.ok)
 				return failure('CLOSE_FAILED', result.error || 'Close failed');
@@ -2332,6 +2380,36 @@ async function bootDaemon(
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
 			return success(node.decodeInvoice(bolt11));
 		},
+		'POST /invoice/pay-all/quote': (body) => {
+			const { bolt11, maxFeeMsat } = body as {
+				bolt11: string;
+				maxFeeMsat: number | string;
+			};
+			if (typeof bolt11 !== 'string' || !bolt11 || maxFeeMsat === undefined)
+				return failure('INVALID_PARAMS', 'bolt11 and maxFeeMsat required');
+			return success(node.quotePayAll(bolt11, maxFeeMsat));
+		},
+		'POST /invoice/pay-all': async (body) => {
+			const { bolt11, debitMsat, maxFeeMsat, timeoutMs } = body as {
+				bolt11: string;
+				debitMsat: number | string;
+				maxFeeMsat: number | string;
+				timeoutMs?: number;
+			};
+			if (
+				typeof bolt11 !== 'string' ||
+				!bolt11 ||
+				debitMsat === undefined ||
+				maxFeeMsat === undefined
+			)
+				return failure(
+					'INVALID_PARAMS',
+					'bolt11, debitMsat and maxFeeMsat required'
+				);
+			return success(
+				await node.payInvoiceAll(bolt11, debitMsat, maxFeeMsat, timeoutMs)
+			);
+		},
 		'POST /invoice/pay': async (body) => {
 			const {
 				bolt11,
@@ -2753,10 +2831,11 @@ async function bootDaemon(
 
 		// ── Splicing ──
 		'POST /channel/splice-quote': (body) => {
-			const { channelId, direction, feeratePerkw } = body as {
+			const { channelId, direction, feeratePerkw, address } = body as {
 				channelId: string;
 				direction: 'in' | 'out';
 				feeratePerkw: number;
+				address?: string;
 			};
 			if (
 				!channelId ||
@@ -2767,7 +2846,9 @@ async function bootDaemon(
 					'INVALID_PARAMS',
 					"channelId, direction ('in' or 'out') and feeratePerkw required"
 				);
-			return success(node.spliceQuote(channelId, direction, feeratePerkw));
+			return success(
+				node.spliceQuote(channelId, direction, feeratePerkw, address)
+			);
 		},
 		'POST /channel/splice-in': (body) => {
 			const { channelId, amountSats, feeratePerkw } = body as {

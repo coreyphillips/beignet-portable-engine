@@ -14,8 +14,43 @@ export class Socket extends EventEmitter {
 	private encoding?: string;
 	private timeoutMs = 0;
 	private timeout: any;
+	private pendingData: Buffer[] = [];
+	private pendingBytes = 0;
+	private pendingEnd = false;
+	private paused = false;
+	private draining = false;
 	constructor(..._args: any[]) {
 		super();
+		// Handshake reads replace their listener after an awaited continuation.
+		// A host can deliver several chunks before that continuation runs.
+		this.on('newListener', (event) => {
+			if (event === 'data') queueMicrotask(() => this.flushData());
+		});
+	}
+	private flushData() {
+		if (this.draining || this.paused || this.destroyed) return;
+		this.draining = true;
+		try {
+			while (
+				this.pendingData.length &&
+				this.listenerCount('data') > 0 &&
+				!this.paused &&
+				!this.destroyed
+			) {
+				const bytes = this.pendingData.shift()!;
+				this.pendingBytes -= bytes.length;
+				this.emit(
+					'data',
+					this.encoding ? bytes.toString(this.encoding as any) : bytes
+				);
+			}
+			if (!this.pendingData.length && this.pendingEnd && !this.destroyed) {
+				this.pendingEnd = false;
+				this.emit('end');
+			}
+		} finally {
+			this.draining = false;
+		}
 	}
 	connect(...args: any[]) {
 		const opts =
@@ -46,13 +81,27 @@ export class Socket extends EventEmitter {
 					}
 					if (event === 'close') {
 						this.destroyed = true;
+						this.pendingData = [];
+						this.pendingBytes = 0;
 						clearTimeout(this.timeout);
 					}
 					if (event === 'data') {
+						if (this.destroyed) return;
 						this.arm();
-						values[0] = this.encoding
-							? Buffer.from(values[0]).toString(this.encoding as any)
-							: Buffer.from(values[0]);
+						const bytes = Buffer.from(values[0]);
+						if (this.pendingBytes + bytes.length > 2 * 1024 * 1024) {
+							this.destroy(new Error('Portable socket read buffer exceeded'));
+							return;
+						}
+						this.pendingData.push(bytes);
+						this.pendingBytes += bytes.length;
+						this.flushData();
+						return;
+					}
+					if (event === 'end') {
+						this.pendingEnd = true;
+						this.flushData();
+						return;
 					}
 					this.emit(event, ...values);
 				});
@@ -86,6 +135,9 @@ export class Socket extends EventEmitter {
 	destroy(error?: any) {
 		clearTimeout(this.timeout);
 		this.destroyed = true;
+		this.pendingData = [];
+		this.pendingBytes = 0;
+		this.pendingEnd = false;
 		this.inner?.destroy(error);
 		return this;
 	}
@@ -112,11 +164,14 @@ export class Socket extends EventEmitter {
 		return this;
 	}
 	pause() {
+		this.paused = true;
 		this.inner?.pause?.();
 		return this;
 	}
 	resume() {
+		this.paused = false;
 		this.inner?.resume?.();
+		this.flushData();
 		return this;
 	}
 }
@@ -130,4 +185,11 @@ export function createServer() {
 export function isIP(host: string) {
 	return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? 4 : host.includes(':') ? 6 : 0;
 }
-export default { Socket, connect, createConnection, createServer, isIP, handlesDestinationRouting };
+export default {
+	Socket,
+	connect,
+	createConnection,
+	createServer,
+	isIP,
+	handlesDestinationRouting
+};

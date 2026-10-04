@@ -2,7 +2,7 @@
 
 This local fork runs the real Beignet Bitcoin and Lightning engine inside a browser worker or React Native Hermes. Keys, signatures, BOLT 8 transport encryption, channel state and payment state stay in the device runtime. The optional sibling `beignet-relay` forwards encrypted Lightning bytes and Electrum JSON; it is not a wallet daemon and never receives a seed or signing key.
 
-Source baseline: upstream Beignet `0.26.0`, commit `026d202b` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.26.0-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
+Source baseline: upstream Beignet `0.27.0`, commit `1c59fa65` (full source commit recorded in `package.json`). The baseline is recorded in `package.json` (`upstreamVersion`, `upstreamCommit`) and substituted into the bundle at build time, so `GET /api/config` reports `0.27.0-portable` rather than a hand-maintained string. Upstream documentation is preserved in [README.upstream.md](README.upstream.md); the original CLI/package exports described there are **not** this package's exports. MIT license retained.
 
 ## Build and validation
 
@@ -66,6 +66,26 @@ The relay handshake sends protocols `beignet.v1` and `auth.<raw-base64url-token>
 `runtime.request({method,path,body})` returns raw manager/daemon-shaped results, with `Error.code` and `Error.status` failures. It implements the shared LFBW client's lifecycle, balance, activity, send/receive, primary settings, and explicit recovery-phrase routes. It does not run an HTTP server. One wallet lives in each vault. Recovery phrase retrieval is explicit; record/config/activity queries never include it.
 
 Address sends durably record a request ID before dispatch. Retrying the same ID does not resubmit. Accepted splices remain pending until chain evidence proves the transaction spends the recorded prior funding outpoint and pays the requested destination and amount. A positive matching Electrum history height marks completion. Missing evidence remains pending/uncertain; a channel balance change alone never proves a payment.
+
+## Send max and reserve waivers
+
+The embedded wallet advertises and accepts the optional zero-reserve feature. It never waives the primary's reserve. A supporting primary must explicitly grant a waiver when a new private channel opens; existing channels retain their original terms. `GET /channels` exposes both waiver directions and reserve amounts. `GET /liquidity` and each channel report `maxSendableSats` separately from the unchanged balance figures.
+
+Address max quotes forward the destination through `POST /channel/splice-quote`, including its output cost. A primary-opened, waived channel can send its whole available balance while keeping the channel open when the resulting commitments remain valid. A wallet opener retains its commitment cost, and a channel without a waiver retains its reserve.
+
+Amountless BOLT11 payments use `POST /invoice/pay-all/quote` with `bolt11` and `maxFeeMsat`, followed by `POST /invoice/pay-all` with the reviewed `debitMsat` and `maxFeeMsat`. These amounts remain exact decimal strings in millisatoshis. The engine freezes that debit and fee cap across retries and restart, so later receipts are excluded. `GET /payment?paymentHash=...` and `GET /payments` expose the durable debit, delivered amount, fee and remainder under `payAll`. A locally timed-out payment can remain pending until its HTLC outcome is known.
+
+## Empty-wallet drain
+
+`GET /api/config` reports `drainAvailable`. The wallet API exposes `POST /drain/quote` with `{requestId, address}`, `POST /drain/send` and `/drain/cancel` with `{requestId}`, and `GET /drain?requestId=...` for progress. A quote covers the current home channel and exact loose-coin set, expires after two minutes, and does not pause channelize until send starts. Pending payments, splices, swaps, offline reservations and recovery holds prevent admission.
+
+The durable coordinator pauses channelize, prepares a fixed-input sweep, cooperatively closes to the destination, and submits the sweep after verifying the close's actual funding spend and payout. Exact inputs, signed sweep, fee cap and request identity survive restart. On-chain coins received after review remain in the wallet. A Lightning payment crossing shutdown can change the actual closing payout, which progress and Activity reconcile from chain evidence. Ambiguous or partial outcomes retain the hold and remain visible; cancellation releases it only after the engine establishes that no close or broadcast started. Public progress contains no signing material and carries a monotonic `revision` for callers handling responses out of order.
+
+Activity combines the close and sweep into one send with both transaction IDs. Reconciliation checks chain evidence again after completion, so a reorg can return the send to pending and rebroadcast the same sweep. Raw close and sweep routes are also exposed, but clients implementing the combined flow should use the coordinator so its durable hold and mutation checks remain in force.
+
+`npm run test:regtest:send-max` runs disposable wallets sequentially, one child process per case. Point `BEIGNET_SOURCE_DIR` at an unpacked published npm release; `BEIGNET_WALLET_CORE_DIR` and `BEIGNET_RELAY_DIR` can select sibling checkouts. It requires the local Bitcoin and Electrum services and CLN on port 19846. Cases cover JIT pay-all, later receipts, restart, a two-leg drain, P2WPKH/P2TR/P2WSH max splices, wallet-opener cost and an unwaived CLN contrast. Set `HARNESS_ENGINE_LOG=1` for engine logs or `SEND_MAX_CASES=jit` to select one case. The script verifies regtest before funding and bounds each case to fifteen minutes.
+
+Published-package qualification passed on October 4, 2026 against beignet 0.27.0. JIT pay-all reached zero with exact durable millisatoshi accounting, later Lightning receipts stayed outside the frozen review, and a two-leg drain completed after restart with later loose coins excluded and one Activity containing both transaction IDs. P2WPKH, Taproot and P2WSH max splices paid the exact reviewed output. A confirmed private phone-funded channel retained only the live commitment cost; the CLN contrast retained its ordinary reserve. New outgoing wallet channels are private even without waiver support, and still wait for funding confirmation.
 
 ## Fork changes and limits
 

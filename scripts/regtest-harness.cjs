@@ -71,7 +71,8 @@ async function freePort() {
 /** A durable volume in a fresh directory, fsynced and renamed like the apps do. */
 function makeVolume(dir) {
 	fs.mkdirSync(dir, { recursive: true });
-	const file = (p) => path.join(dir, 'device-' + Buffer.from(p).toString('hex'));
+	const file = (p) =>
+		path.join(dir, 'device-' + Buffer.from(p).toString('hex'));
 	return {
 		read: (p) => (fs.existsSync(file(p)) ? fs.readFileSync(file(p)) : null),
 		write(p, bytes) {
@@ -95,7 +96,11 @@ function makeVolume(dir) {
  * factory settings, and `device(name)` which creates a portable runtime and
  * embedded client on its own volume. `close()` tears everything down.
  */
-async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}) {
+async function createHarness({
+	prefix = 'beignet-portable-',
+	ffor = false,
+	waiveClientReserve = false
+} = {}) {
 	if (JSON.parse(btc('getblockchaininfo')).chain !== 'regtest')
 		throw new Error('the bitcoin container is not on regtest');
 	const { BeignetNode } = require(path.join(
@@ -103,8 +108,20 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 			'/Users/coreyphillips/Documents/synonym/beignet',
 		'dist/cli/beignet-node.js'
 	));
-	const { EmbeddedWalletClient } = await import(path.join(process.env.BEIGNET_WALLET_CORE_DIR || path.resolve(__dirname, '../../shared'), 'src/index.js'));
-	const { createRelay } = await import(path.join(process.env.BEIGNET_RELAY_DIR || path.resolve(__dirname, '../../beignet-relay'), 'relay.js'));
+	const { EmbeddedWalletClient } = await import(
+		path.join(
+			process.env.BEIGNET_WALLET_CORE_DIR ||
+				path.resolve(__dirname, '../../shared'),
+			'src/index.js'
+		)
+	);
+	const { createRelay } = await import(
+		path.join(
+			process.env.BEIGNET_RELAY_DIR ||
+				path.resolve(__dirname, '../../beignet-relay'),
+			'relay.js'
+		)
+	);
 	const WebSocket = require('ws');
 	const temp = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	const peerPort = await freePort();
@@ -120,10 +137,30 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 		autoGossipSync: false,
 		forwardingEnabled: true,
 		jitReceive: { enabled: true, flatFeeSat: 0, feePpm: 0 },
+		waiveClientReserve,
 		dfRelay: true,
 		fforSettle: { enabled: ffor },
-        fforReceiveFunding: {enabled: ffor, maxChannels: 10, maxChannelsPerPeer: 5, maxChannelSats: 500000, maxTotalSats: 2000000},
-		logger: { debug() {}, info() {}, warn() {}, error() {} }
+		fforReceiveFunding: {
+			enabled: ffor,
+			maxChannels: 10,
+			maxChannelsPerPeer: 5,
+			maxChannelSats: 500000,
+			maxTotalSats: 2000000
+		},
+		logger: {
+			debug: (...args) =>
+				process.env.HARNESS_ENGINE_LOG === '2' &&
+				console.log('[primary debug]', ...args),
+			info: (...args) =>
+				process.env.HARNESS_ENGINE_LOG === '2' &&
+				console.log('[primary info]', ...args),
+			warn: (...args) =>
+				process.env.HARNESS_ENGINE_LOG &&
+				console.log('[primary warn]', ...args),
+			error: (...args) =>
+				process.env.HARNESS_ENGINE_LOG &&
+				console.log('[primary error]', ...args)
+		}
 	});
 	await primary.refreshWallet();
 	btc('sendtoaddress', await primary.getNewAddress(), '0.05000000');
@@ -152,13 +189,15 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 		electrum
 	});
 	/** A second relay and socket factory, for tests that must rule the relay in or out. */
-	const freshTransport = async () => {
+	const freshTransport = async (
+		peer = { host: '127.0.0.1', port: peerPort }
+	) => {
 		const other = createRelay({
 			token,
 			origins: ['http://127.0.0.1'],
 			allowNoOrigin: true,
 			electrum: { host: '127.0.0.1', port: 60001, tls: false },
-			peer: { host: '127.0.0.1', port: peerPort }
+			peer
 		});
 		const address = await other.listen(0);
 		extraRelays.push(other);
@@ -174,7 +213,10 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 	const primaryUri = `${primary.getInfo().nodeId}@127.0.0.1:${peerPort}`;
 	const devices = [];
 	/** A portable runtime on its own volume, with a wallet created on the primary. */
-	const device = async (name, { onDiagnostic, socketFactory: factory } = {}) => {
+	const device = async (
+		name,
+		{ onDiagnostic, socketFactory: factory, primaryUri: uri = primaryUri } = {}
+	) => {
 		const volume = makeVolume(path.join(temp, name));
 		const databaseFactory = await createSqlJsDatabaseFactory({
 			load: volume.read,
@@ -190,10 +232,44 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 				? {
 						nodeOptions: {
 							logger: {
-								debug: (...a) => process.env.HARNESS_ENGINE_LOG === '2' && console.log(`[${name} debug]`, ...a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).slice(0, 4)),
-								info: (...a) => process.env.HARNESS_ENGINE_LOG === '2' && console.log(`[${name} info]`, ...a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).slice(0, 4)),
-								warn: (...a) => console.log(`[${name} warn]`, ...a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).slice(0, 4)),
-								error: (...a) => console.log(`[${name} error]`, ...a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).slice(0, 4))
+								debug: (...a) =>
+									process.env.HARNESS_ENGINE_LOG === '2' &&
+									console.log(
+										`[${name} debug]`,
+										...a
+											.map((x) =>
+												typeof x === 'string' ? x : JSON.stringify(x)
+											)
+											.slice(0, 4)
+									),
+								info: (...a) =>
+									process.env.HARNESS_ENGINE_LOG === '2' &&
+									console.log(
+										`[${name} info]`,
+										...a
+											.map((x) =>
+												typeof x === 'string' ? x : JSON.stringify(x)
+											)
+											.slice(0, 4)
+									),
+								warn: (...a) =>
+									console.log(
+										`[${name} warn]`,
+										...a
+											.map((x) =>
+												typeof x === 'string' ? x : JSON.stringify(x)
+											)
+											.slice(0, 4)
+									),
+								error: (...a) =>
+									console.log(
+										`[${name} error]`,
+										...a
+											.map((x) =>
+												typeof x === 'string' ? x : JSON.stringify(x)
+											)
+											.slice(0, 4)
+									)
 							}
 						}
 				  }
@@ -204,14 +280,26 @@ async function createHarness({ prefix = 'beignet-portable-', ffor = false } = {}
 		const created = await client.createWallet({
 			name,
 			network: 'regtest',
-			primaryUri,
+			primaryUri: uri,
 			electrum
 		});
 		const id = created.id;
 		const rpc = (route, method = 'GET', body) =>
-			runtime.request({ method, path: `/wallets/${id}/api${route}`, body });
-		const record = () => runtime.request({ path: `/api/wallets/${id}` });
+			dev.runtime.request({ method, path: `/wallets/${id}/api${route}`, body });
+		const record = () => dev.runtime.request({ path: `/api/wallets/${id}` });
 		const dev = { name, id, runtime, client, rpc, record, options };
+		dev.restart = async () => {
+			await dev.runtime.close();
+			dev.runtime = await createPortableRuntime(options);
+			await dev.runtime.request({
+				method: 'POST',
+				path: `/api/wallets/${id}/start`
+			});
+			dev.client = new EmbeddedWalletClient({
+				runtime: dev.runtime,
+				walletId: id
+			});
+		};
 		devices.push(dev);
 		return dev;
 	};

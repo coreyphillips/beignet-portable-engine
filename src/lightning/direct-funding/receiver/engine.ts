@@ -1014,6 +1014,11 @@ export class DirectFundingReceiver extends EventEmitter {
 	): Promise<void> {
 		const decline = (reason: string): void =>
 			this.declineUnrecorded(frame, keys, record, offer, reason);
+		const initialRefusal = this.deps.newFundingRefused?.();
+		if (initialRefusal) {
+			decline(initialRefusal);
+			return;
+		}
 
 		// 3. Concurrency cap. This offer already counts (it holds an admission
 		// guard), so `> max` admits exactly `max` sessions: the fork tested the
@@ -1160,6 +1165,11 @@ export class DirectFundingReceiver extends EventEmitter {
 
 		// Re-read what a concurrent admission could have changed while this one
 		// was awaiting the chain.
+		const currentRefusal = this.deps.newFundingRefused?.();
+		if (currentRefusal) {
+			decline(currentRefusal);
+			return;
+		}
 		//
 		// Expiry first, and it is not a courtesy: an expired record answers every
 		// question below as if the request were untouched (not tombstoned, no

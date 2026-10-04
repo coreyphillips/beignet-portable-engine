@@ -174,6 +174,9 @@ export async function verifySubmission(
 	);
 	return {
 		matched: true,
+		height: Array.isArray(history)
+			? history.find((row) => row.tx_hash === txid)?.height ?? 0
+			: 0,
 		confirmed:
 			Array.isArray(history) &&
 			history.some((row) => row.tx_hash === txid && row.height > 0)

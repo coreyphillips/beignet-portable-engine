@@ -2,8 +2,8 @@
   "name": "@beignet/portable-engine",
   "version": "0.1.0",
   "description": "Portable Beignet Bitcoin and Lightning engine for browser workers and React Native",
-  "upstreamVersion": "0.26.0",
-  "upstreamCommit": "026d202b96ada2d88f7cf0a206f36697fcf6b3fe",
+  "upstreamVersion": "0.27.0",
+  "upstreamCommit": "1c59fa65e43d706fef2f0d8de21cc76b7cd27a22",
   "main": "dist/portable.cjs",
   "scripts": {
     "build": "node scripts/build-portable.cjs",
@@ -16,7 +16,8 @@
     "test:regtest:ffor:worker": "node scripts/regtest-ffor-worker.cjs",
     "test:regtest:ffor:native": "node scripts/regtest-ffor-native.cjs",
     "test:relay:integration": "npm run build && node --test scripts/relay-integration.test.cjs",
-    "check:types": "tsc --noEmit --strict --skipLibCheck false --target es2020 --moduleResolution node portable/types.d.ts portable/sqljs.d.ts"
+    "check:types": "tsc --noEmit --strict --skipLibCheck false --target es2020 --moduleResolution node portable/types.d.ts portable/sqljs.d.ts",
+    "test:regtest:send-max": "npm run build && node scripts/regtest-send-max.cjs"
   },
   "repository": {
     "type": "git",

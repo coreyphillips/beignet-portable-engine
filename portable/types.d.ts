@@ -65,6 +65,42 @@ export interface PortableRuntime {
 	}): Promise<any>;
 	close(): Promise<void>;
 }
+/** Durable channelize hold, read at GET /wallets/:id/api/channelize/status. */
+export type ChannelizePauseStatus =
+	| { paused: false }
+	| { paused: true; requestId: string; since: number };
+/** POST /wallets/:id/api/channelize/pause. Only the owner can release a hold. */
+export interface ChannelizePauseRequest {
+	paused: boolean;
+	requestId: string;
+}
+/** Review and durable progress from /wallets/:id/api/drain. No signing data. */
+export interface DrainInfo {
+	revision: number;
+	requestId: string;
+	address: string;
+	phase: 'review' | 'preparing' | 'closing' | 'sweeping' | 'pending' | 'cancelling' | 'cancelled' | 'completed';
+	amountSats: number;
+	feeSats: number;
+	debitSats: number;
+	reviewedDebitSats: number;
+	feeEstimated: boolean;
+	closeAmountSats: number;
+	closeFeeSats: number;
+	sweepAmountSats: number;
+	sweepFeeSats: number;
+	txids: string[];
+	createdAt: number;
+	expiresAt: number;
+	startedAt?: number;
+	error?: string;
+	residualSats?: number;
+}
+/** POST /drain/quote; POST /drain/send and /drain/cancel use requestId only. */
+export interface DrainQuoteRequest {
+	requestId: string;
+	address: string;
+}
 export declare const DEFAULT_PRIMARY: string;
 export declare function createPortableRuntime(
 	options: PortableRuntimeOptions
