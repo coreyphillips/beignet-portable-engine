@@ -240,7 +240,9 @@ export async function createPortableRuntime(options: any) {
 			debitSats: row.debitSats, reviewedDebitSats: row.reviewedDebitSats,
 			feeEstimated: row.feeEstimated, txids: row.txids,
 			txid: row.txids[0] ?? null, reference: row.requestId, drain: row,
-			timestamp: row.createdAt, description: row.error ?? 'Closing the home channel and sending the reviewed loose coins.',
+			timestamp: row.createdAt, description: row.phase === 'completed'
+				? 'Reviewed funds sent to the destination.'
+				: row.error ?? 'Closing the home channel and sending the reviewed loose coins.',
 			residualSats: row.residualSats
 		}));
 	const completeRecoveryImport = () => {

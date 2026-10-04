@@ -445,6 +445,8 @@ function drainCoordinator({
 			(!row.coins.length || row.sweep?.confirmed)
 		) {
 			row.phase = 'completed';
+			// Confirmed payouts supersede earlier transport or rebroadcast warnings.
+			delete row.error;
 			row.finalized =
 				(!row.channelId || row.close.depth >= 100) &&
 				(!row.coins.length || sweepDepth(row.sweep.txid) >= 100);

@@ -577,3 +577,49 @@ test('cancelling the current owner preserves the hold for an older pending drain
 	assert.equal(h.create().active().requestId, older.requestId);
 	assert.equal(h.calls.includes('close'), false);
 });
+
+test('confirmed payouts clear stale broadcast warnings across restart and reorg', async () => {
+	const h = harness();
+	await h.create().quote(request);
+	h.state.closeSeen = true;
+	h.state.sweepFailure = true;
+	assert.equal((await h.create().send(request.requestId)).phase, 'pending');
+	assert.equal(h.create().get(request.requestId).error, 'broadcast reply lost');
+	h.state.sweepConfirmed = true;
+	// A confirmed sweep alone does not resolve an unconfirmed closing output.
+	assert.equal((await h.create().sync()).phase, 'pending');
+	assert.equal(h.create().get(request.requestId).error, 'broadcast reply lost');
+	h.state.closeHeight = 50;
+	const completed = await h.create().sync();
+	assert.equal(completed.phase, 'completed');
+	assert.equal(completed.error, undefined);
+	assert.equal(h.create().get(request.requestId).error, undefined);
+	assert.equal(h.journal().records[0].error, undefined);
+	assert.equal(await h.create().sync(), null);
+	assert.equal(h.create().get(request.requestId).error, undefined);
+	assert.deepEqual(completed.txids, ['close-tx', 'sweep-tx']);
+	h.state.sweepConfirmed = false;
+	const pending = await h.create().sync();
+	assert.equal(pending.phase, 'pending');
+	assert.equal(pending.error, 'broadcast reply lost');
+	assert.equal(h.paused(), true);
+	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+});
+
+test('a confirmed close clears its earlier transport warning without a sweep', async () => {
+	const h = harness({ coins: false });
+	await h.create().quote(request);
+	h.state.closeFailure = true;
+	await assert.rejects(
+		h.create().send(request.requestId),
+		/lost close response/
+	);
+	assert.equal(h.create().get(request.requestId).error, 'lost close response');
+	h.state.closeSeen = true;
+	h.state.closeHeight = 50;
+	const completed = await h.create().sync();
+	assert.equal(completed.phase, 'completed');
+	assert.equal(completed.error, undefined);
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+});
