@@ -237,13 +237,18 @@ function drainCoordinator({
 				409
 			);
 		if (
-			engine
-				.listPayments()
-				.some((entry) =>
-					['pending', 'in_flight', 'inflight'].includes(
-						String(entry.status).toLowerCase()
-					)
+			engine.listPayments().some((entry) => {
+				const status = String(entry.status).toLowerCase();
+				// Creating an unpaid invoice already records a pending incoming
+				// payment. Actual incoming HTLCs and unsettled commitments are
+				// guarded by the channel checks and closeQuote below.
+				if (
+					status === 'pending' &&
+					String(entry.direction).toLowerCase() === 'incoming'
 				)
+					return false;
+				return ['pending', 'in_flight', 'inflight'].includes(status);
+			})
 		)
 			failure('DRAIN_BUSY', 'Wait for the pending payment to finish', 409);
 		const held = offline();
