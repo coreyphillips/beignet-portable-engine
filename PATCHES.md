@@ -1,6 +1,6 @@
 # Portable fork patch map
 
-Baseline: `1c59fa65e43d706fef2f0d8de21cc76b7cd27a22` (merged Beignet 0.27.0 release). `package.json` records `upstreamVersion` and `upstreamCommit`, and the bundle reports that version through `GET /api/config`. Published-tarball qualification is pending.
+Baseline: `1c59fa65e43d706fef2f0d8de21cc76b7cd27a22` (merged Beignet 0.27.0 release). `package.json` records `upstreamVersion` and `upstreamCommit`, and the bundle reports that version through `GET /api/config`. The published npm tarball records this same git head; its integrity verifies and all 933 built files match the reviewed release byte for byte. Live published-tarball qualification is pending.
 
 The 0.26.0 to 0.27.0 resync uses a per-file three-way merge against pristine `026d202b`. The workspace-root backup is `pre-send-max-20261004.tgz`. Across the source tree, 270 paths were unchanged, 23 took upstream changes, 15 retained an unchanged fork patch, and seven merged changes from both trees. The only adjacent conflict was in `BeignetNodeOptions`; the final declaration retains both the injected `irohFactory` and upstream `waiveClientReserve` setting. All 22 previously patched paths remain present, including the fork-only reconstructable batch module. Timer compatibility, SQLite batching, injected transport, Iroh fallback, direct-funding null handling and diagnostics are retained. The merged release has the same `src/` tree as the reviewed integration commit `dedac49c8a8538d8320b84b54ecf078db3d96437`.
 
@@ -10,7 +10,7 @@ Portable additions expose the new routes and implement a durable drain coordinat
 
 `portable/net.ts` now buffers inbound chunks when a consumer is between data listeners or paused, with a 2 MiB bound and ordered delivery after listener registration. This prevents the synchronous relay from discarding the tail of a 65,535-byte peer-storage frame during the real peer's init handoff. Adapter regressions cover listener gaps, pause/end ordering and overflow; a real Peer encrypted-framing regression covers the large frame followed by a later message.
 
-Validation before publication: 167 portable tests pass, public types and build pass, and dependency audit reports zero findings. The new `regtest-send-max.cjs` runs sequential disposable cases for JIT max, frozen later receipts, restart, drain, three address scripts, opener cost and CLN reserve contrast. Live qualification against the published tarball remains required. See README for its environment variables.
+Validation: 167 portable tests pass, public types and build pass, and dependency audit reports zero findings. The new `regtest-send-max.cjs` runs sequential disposable cases for JIT max, frozen later receipts, restart, drain, three address scripts, opener cost and CLN reserve contrast. Live qualification against the published tarball remains required. See README for its environment variables.
 
 Previous baseline: `026d202b96ada2d88f7cf0a206f36697fcf6b3fe` (published Beignet 0.26.0).
 
