@@ -194,7 +194,7 @@ const { btc, wait, delay, createHarness } = require('./regtest-harness.cjs');
 					? adapter.request({ path: '/api/config' })
 					: call('request', { path: '/api/config' }))
 			).engineVersion,
-			adapter?.engineVersion || '0.25.0-portable'
+			adapter?.engineVersion || `${evidence.engine}-portable`
 		);
 		const receiverId = (await rpc('/info')).nodeId;
 		h.primary.addTrustedPeer(receiverId);

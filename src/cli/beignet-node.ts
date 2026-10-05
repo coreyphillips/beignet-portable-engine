@@ -91,7 +91,8 @@ import {
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
-	DEFAULT_RGS_URL
+	DEFAULT_RGS_URL,
+	RapidGossipCancelledError
 } from '../lightning/gossip/rapid-sync';
 import { parseAnnouncedAddress } from '../lightning/gossip/messages';
 import {
@@ -110,7 +111,7 @@ import {
 } from '../lightning/invoice/types';
 import {
 	LnCoinType,
-	deriveLightningKeysFromMnemonic
+	deriveLightningKeysFromSeed
 } from '../lightning/keys/wallet-keys';
 import {
 	GuardianBootDecision,
@@ -2136,6 +2137,15 @@ export class BeignetNode extends EventEmitter {
 	 */
 	private _releaseBootRgs: (() => void) | null = null;
 	/**
+	 * The Rapid Gossip Sync in flight, download and import together, so a
+	 * second syncRapidGossip call (POST /gossip/sync-rapid during boot) joins
+	 * it instead of applying the same graph twice. Null when none runs.
+	 */
+	private _rapidGossipSync: Promise<{
+		channelsAdded: number;
+		updatesApplied: number;
+	} | null> | null = null;
+	/**
 	 * Pubkeys with a deferred gossip sync already queued on the latch. A
 	 * connect/disconnect/reconnect churn during the RGS window must produce
 	 * one sync per peer, not one per connect: a duplicate initiateGossipSync
@@ -2257,6 +2267,8 @@ export class BeignetNode extends EventEmitter {
 	/** A non-empty SCB went out to storage peers this run. */
 	private _pushedChannelBackup = false;
 	private _nodeSecret?: Buffer;
+	/** The mnemonic's BIP39 seed once derived; read through walletSeed(). */
+	private _walletSeed?: Buffer;
 	private _storageEncryptionKey?: Buffer;
 	/**
 	 * A Tier 2 capsule restore replaced the database underneath this daemon;
@@ -2538,7 +2550,7 @@ export class BeignetNode extends EventEmitter {
 		// without the mnemonic. Pre-existing plaintext rows migrate on open().
 		let encryptionKey: Buffer | undefined;
 		if (opts.storageEncryption ?? true) {
-			encryptionKey = deriveStorageKey(bip39.mnemonicToSeedSync(this.mnemonic));
+			encryptionKey = deriveStorageKey(this.walletSeed());
 		}
 
 		this._storageEncryptionKey = encryptionKey;
@@ -2646,6 +2658,7 @@ export class BeignetNode extends EventEmitter {
 		};
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
+			seed: this.walletSeed(),
 			network: beignetNetwork,
 			// BeignetNode owns the ONE startup refresh (init step 15) so
 			// waitForInitialSync can hold its promise; without this flag
@@ -2837,6 +2850,7 @@ export class BeignetNode extends EventEmitter {
 		this._nodeStorageView = nodeStorageView(this.storage);
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
+			seed: this.walletSeed(),
 			network: lnNetwork,
 			storage: this._nodeStorageView,
 			// Issue #906: fence fresh indices during active auto-apply or a
@@ -3841,12 +3855,18 @@ export class BeignetNode extends EventEmitter {
 
 		// Default graph source: download the full network graph via Rapid Gossip
 		// Sync (mainnet). Runs in the background so it never blocks startup; the
-		// graph fills in within a few seconds, enabling multi-hop routing.
+		// graph fills in within a few seconds, enabling multi-hop routing, and
+		// is applied in slices that leave the event loop free in between.
 		// Connect-time p2p gossip sync defers behind the latch (installed
 		// earlier, before the node existed) until this first attempt settles,
-		// success or not (issue #441).
+		// download and import both, success or not (issue #441).
 		if (this.rapidGossipSync && this.networkName === 'mainnet') {
 			const rgs = this.syncRapidGossip().catch((err) => {
+				// A shutdown during boot cancels the sync; that is no failure.
+				if (err instanceof RapidGossipCancelledError && this.destroyed) {
+					this.log('debug', 'Rapid gossip sync cancelled by shutdown', {});
+					return;
+				}
 				this.log('warn', 'Rapid gossip sync failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
@@ -6017,13 +6037,35 @@ export class BeignetNode extends EventEmitter {
 
 	private nodeSecret(): Buffer {
 		if (!this._nodeSecret) {
-			this._nodeSecret = deriveLightningKeysFromMnemonic(
-				this.mnemonic,
-				undefined,
+			// Keeps the refusal deriveLightningKeysFromMnemonic made here: a
+			// guardian boot asks for this secret before the wallet or the node
+			// has checked the mnemonic.
+			if (!bip39.validateMnemonic(this.mnemonic)) {
+				throw new Error('Invalid BIP39 mnemonic');
+			}
+			this._nodeSecret = deriveLightningKeysFromSeed(
+				this.walletSeed(),
 				this.toCoinType(this.networkName)
 			).nodePrivateKey;
 		}
 		return this._nodeSecret;
+	}
+
+	/**
+	 * The mnemonic's BIP39 seed (no passphrase), derived once: its PBKDF2
+	 * pass is the slow step behind every key this node derives, and a phone
+	 * runs it on the JS thread. No new secret and no longer lifetime: this
+	 * instance holds the mnemonic for its whole life and already memoizes
+	 * nodeSecret(), and the wallet keeps the same seed. Callers get a copy,
+	 * so none can alter the cache. Not zeroed on destroy(), which does not
+	 * wait for a backup in flight: that backup still derives its MAC key
+	 * from the seed.
+	 */
+	private walletSeed(): Buffer {
+		if (!this._walletSeed) {
+			this._walletSeed = bip39.mnemonicToSeedSync(this.mnemonic);
+		}
+		return Buffer.from(this._walletSeed);
 	}
 
 	/**
@@ -7755,8 +7797,26 @@ export class BeignetNode extends EventEmitter {
 	 * Download and apply a Rapid Gossip Sync snapshot, populating the network
 	 * graph for multi-hop routing (a few MB over HTTPS). RGS snapshots are
 	 * mainnet-only; on other networks this is a no-op. Returns ingestion counts.
+	 * Single-flight: a call while a sync is in flight (the boot sync, say)
+	 * joins it instead of downloading and applying the graph again. The
+	 * snapshot is applied cooperatively, so the event loop keeps turning
+	 * while it lands.
 	 */
-	async syncRapidGossip(): Promise<{
+	syncRapidGossip(): Promise<{
+		channelsAdded: number;
+		updatesApplied: number;
+	} | null> {
+		if (this._rapidGossipSync) return this._rapidGossipSync;
+		const run = this.runRapidGossipSync();
+		this._rapidGossipSync = run;
+		const clear = (): void => {
+			if (this._rapidGossipSync === run) this._rapidGossipSync = null;
+		};
+		void run.then(clear, clear);
+		return run;
+	}
+
+	private async runRapidGossipSync(): Promise<{
 		channelsAdded: number;
 		updatesApplied: number;
 	} | null> {
@@ -7766,17 +7826,41 @@ export class BeignetNode extends EventEmitter {
 		}
 		const url = this.rapidGossipSyncUrl ?? DEFAULT_RGS_URL;
 		this.log('info', 'Rapid gossip sync: downloading snapshot', { url });
+		const downloadStart = Date.now();
 		const data = await fetchRapidGossipSnapshot(url);
-		const result = this.node.loadRapidGossipSnapshot(data);
+		const downloadMs = Date.now() - downloadStart;
+		// Shut down mid-download: applying the graph would only hold up teardown.
+		if (this.destroyed) throw new RapidGossipCancelledError();
+		let slices = 0;
+		let busyMs = 0;
+		const applyStart = Date.now();
+		const result = await this.node.loadRapidGossipSnapshotAsync(data, {
+			cancelled: () => this.destroyed,
+			onSlice: (ms) => {
+				slices++;
+				busyMs += ms;
+			}
+		});
+		const applyMs = Date.now() - applyStart;
 		this._lastGraphSyncAt = Date.now();
 		this.log('info', 'Rapid gossip sync complete', {
 			channelsAdded: result.channelsAdded,
 			updatesApplied: result.updatesApplied,
-			nodes: result.nodeCount
+			nodes: result.nodeCount,
+			downloadMs,
+			applyMs,
+			busyMs,
+			slices
 		});
+		// applyMs is wall time from start to finish; busyMs is the part spent
+		// applying, in `slices` turns of the event loop.
 		this.emit('gossip:synced', {
 			channelsAdded: result.channelsAdded,
-			updatesApplied: result.updatesApplied
+			updatesApplied: result.updatesApplied,
+			downloadMs,
+			applyMs,
+			busyMs,
+			slices
 		});
 		return {
 			channelsAdded: result.channelsAdded,
@@ -14404,10 +14488,7 @@ export class BeignetNode extends EventEmitter {
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
 		await this.storage.backup(destPath);
-		await writeBackupMac(
-			deriveBackupMacKey(bip39.mnemonicToSeedSync(this.mnemonic)),
-			destPath
-		);
+		await writeBackupMac(deriveBackupMacKey(this.walletSeed()), destPath);
 	}
 
 	/** The live database, its sidecars and the instance lock. */
@@ -14477,7 +14558,7 @@ export class BeignetNode extends EventEmitter {
 			createdAt: Date.now(),
 			channels: data.channels
 		};
-		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const seed = this.walletSeed();
 		const encoded = encodeScb(backup, seed);
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
@@ -14501,7 +14582,7 @@ export class BeignetNode extends EventEmitter {
 		skipped: Array<{ channelId: string; reason: string }>;
 		channelCount: number;
 	}> {
-		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const seed = this.walletSeed();
 		const backup = decodeScb(encoded.trim(), seed);
 		const expectedNetwork = this.toLnNetwork(this.networkName);
 		if (backup.network !== expectedNetwork) {
@@ -14699,7 +14780,7 @@ export class BeignetNode extends EventEmitter {
 			}
 			// Surface the Tier 1 material under the wallet seed, the key
 			// restoreFromScb (POST /restore/scb) decodes with.
-			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			const seed = this.walletSeed();
 			this.offerRetrievedScb(
 				encodeScb(embedded, seed),
 				embedded,
@@ -14711,7 +14792,7 @@ export class BeignetNode extends EventEmitter {
 		let backup: IStaticChannelBackup;
 		const encoded = blob.toString('utf8');
 		try {
-			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			const seed = this.walletSeed();
 			backup = decodeScb(encoded, seed);
 		} catch {
 			this.log('debug', 'Ignoring peer storage blob that is not our SCB', {

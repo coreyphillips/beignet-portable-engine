@@ -20,6 +20,7 @@ import { drainCoordinator } from './drain.cjs';
 import { drainFence } from './drain-fence.cjs';
 import { closeNotStarted } from './drain-close-state.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
+import { engineDiagnostics } from './engine-diagnostics.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
@@ -133,6 +134,9 @@ export async function createPortableRuntime(options: any) {
 	// itself paying a direct funding, so the two never contend for one coin.
 	let channelizeRetryAt = 0;
 	let directFundingInFlight = 0;
+	// Boot timings (phase engine-perf) for the client's diagnostic hook;
+	// nothing is timed or listened to without one.
+	const enginePerf = engineDiagnostics({ onDiagnostic: options.onDiagnostic });
 	const persist = () =>
 		save('/wallet/registry.json', { record, mnemonic: storedMnemonic, recoveryImport });
 	const channelizeHold = channelizePause({
@@ -507,7 +511,7 @@ export async function createPortableRuntime(options: any) {
 				if (closed) failure('WALLET_CLOSED', 'Wallet runtime closed', 409);
 				record.electrum = e;
 				persist();
-				node = await BeignetNode.create({
+				node = await enginePerf.time('create', () => BeignetNode.create({
 					...options.nodeOptions,
 					mnemonic,
 					iroh: !!options.iroh && primary().transport?.type === 'iroh',
@@ -541,7 +545,10 @@ export async function createPortableRuntime(options: any) {
 					onError(error) {
 						if (error.code === 'PERSISTENCE_ERROR') durabilityFailed = true;
 					}
-				});
+				}));
+				// On mainnet create() starts the boot Rapid Gossip Sync in the
+				// background; it reports when its download and import are done.
+				enginePerf.watchGossip(node);
 				// Native restore flags are durable before the swap finishes. They
 				// cover a crash between installing channels and our completion event.
 				if (importPending() && hasInstalledRecovery(node)) completeRecoveryImport();
@@ -667,7 +674,7 @@ export async function createPortableRuntime(options: any) {
 					}, 2000);
 					pendingTimers.add(pending);
 				});
-				await node.waitForInitialSync();
+				await enginePerf.time('initial-sync', () => node!.waitForInitialSync());
 				if (!node.getHealth().electrumConnected)
 					failure(
 						'ELECTRUM_UNAVAILABLE',
