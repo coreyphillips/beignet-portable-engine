@@ -271,6 +271,7 @@ async function exactPayment(dev, primary, laterReceive) {
 	return { review, record, sent };
 }
 async function drain(dev, sender) {
+	const firstHomeId = (await home(dev)).channelId;
 	const receiveQuote = await dev.client.quoteReceive({
 		amountSats: 1000,
 		description: 'Unpaid invoice must not block empty wallet'
@@ -383,6 +384,84 @@ async function drain(dev, sender) {
 	pass(
 		'drain releases channelize at submission, survives restart and retains both payout identities',
 		progress
+	);
+	await dev.restart();
+	await wait('new home restored before a repeated drain', async () => {
+		await dev.client.refreshWallet();
+		return (await home(dev))?.localBalanceSats === 10000;
+	});
+	const old = (await dev.rpc('/channels')).find(
+		(channel) => channel.channelId === firstHomeId
+	);
+	assert.equal(old.state, 'CLOSED');
+	assert.equal(old.closeStatus.closer, 'cooperative');
+	assert.equal(old.closeStatus.broadcast, true);
+	assert.notEqual(old.closeStatus.resolution, 'resolved');
+	const secondAddress = destination();
+	const second = await dev.client.prepareDrain({ address: secondAddress });
+	assert.equal(second.totalSats, 11000, 'only the new channel and later coin');
+	await dev.client.send(second);
+	const secondPending = await wait(
+		'second drain payouts submitted',
+		async () => {
+			const state = await dev.client.getDrain(second.id);
+			return state.phase === 'pending' && state.txids.length === 2
+				? state
+				: false;
+		}
+	);
+	for (const txid of secondPending.txids) {
+		assert.ok(!progress.txids.includes(txid));
+		const tx = JSON.parse(btc('getrawtransaction', txid, 'true'));
+		assert.equal(tx.confirmations ?? 0, 0);
+		assert.ok(
+			tx.vout.some((out) => out.scriptPubKey.address === secondAddress)
+		);
+	}
+	btc('-generate', '1');
+	await wait('second drain confirmed once', async () => {
+		await dev.client.refreshWallet();
+		return (await dev.client.getDrain(second.id)).phase === 'completed';
+	});
+	await dev.restart();
+	await receive(dev, sender, 10000, false);
+	await wait('third home committed', async () => {
+		await dev.client.refreshWallet();
+		return (await home(dev))?.localBalanceSats === 10000;
+	});
+	const history = (await dev.rpc('/channels')).filter(
+		(channel) => channel.state === 'CLOSED'
+	);
+	assert.equal(history.length, 2);
+	assert.ok(
+		history.every((channel) => channel.closeStatus.resolution !== 'resolved')
+	);
+	const third = await dev.client.prepareDrain({ address: destination() });
+	assert.equal(third.totalSats, 10000);
+	await dev.client.cancelDrain(third.id);
+	const repeatedSnapshot = await dev.client.snapshot();
+	for (const id of [review.id, second.id]) {
+		const entries = repeatedSnapshot.activity.filter(
+			(row) => row.drain?.requestId === id
+		);
+		assert.equal(entries.length, 1);
+		assert.equal(entries[0].status, 'completed');
+	}
+	assert.deepEqual(
+		(await dev.client.getDrain(review.id)).txids,
+		progress.txids
+	);
+	pass(
+		'repeated drains ignore two closed home channels before anti-reorg depth',
+		{
+			first: progress.txids,
+			second: secondPending.txids,
+			historicalChannels: history.map((channel) => ({
+				channelId: channel.channelId,
+				closeStatus: channel.closeStatus
+			})),
+			thirdDebitSats: third.totalSats
+		}
 	);
 }
 async function runCase(name) {

@@ -361,6 +361,112 @@ test('busy, offline, foreign-channel, splice, recovery and offline-reservation s
 	}
 });
 
+const closedHistory = (confirmationHeight = 0) => ({
+	channelId: 'old-home',
+	peerPubkey: 'primary',
+	state: 'CLOSED',
+	htlcUsable: false,
+	localBalanceSats: 50000,
+	closeStatus: {
+		closer: 'cooperative',
+		closingTxid: 'ef'.repeat(32),
+		broadcast: true,
+		confirmationHeight,
+		resolution: confirmationHeight ? 'sweeping' : 'pending'
+	}
+});
+
+test('broadcast cooperative close history does not count as another home channel', async () => {
+	for (const height of [0, 100]) {
+		const h = harness();
+		h.state.channels.unshift(closedHistory(height));
+		h.state.channels.push({
+			...closedHistory(height),
+			channelId: 'older-home'
+		});
+		const before = copy(h.state.channels);
+		const review = await h.create().quote(request);
+		assert.equal(review.debitSats, 12000, 'old balances are not drained again');
+		assert.equal(review.closeAmountSats, 9500);
+		assert.deepEqual(
+			h.state.channels,
+			before,
+			'all channel history is retained'
+		);
+		const sent = await h.create().send(request.requestId);
+		assert.equal(sent.phase, 'closing');
+		assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+		assert.equal(h.journal().records[0].channelId, 'home');
+	}
+});
+
+test('closed cooperative history also permits a loose-coin-only drain', async () => {
+	const h = harness({ home: false });
+	h.state.channels.push(closedHistory());
+	const review = await h.create().quote(request);
+	assert.equal(review.debitSats, 2000);
+	assert.equal(review.closeAmountSats, 0);
+	await h.create().send(request.requestId);
+	assert.equal(h.calls.includes('close'), false);
+});
+
+test('unproven or force close history and extra live channels still block a drain', async () => {
+	for (const change of [
+		(old) => {
+			delete old.closeStatus;
+		},
+		(old) => {
+			old.closeStatus.broadcast = false;
+		},
+		(old) => {
+			delete old.closeStatus.closingTxid;
+		},
+		(old) => {
+			old.closeStatus.closingTxid = 'invalid';
+		},
+		(old) => {
+			old.closeStatus.closer = 'unknown';
+		},
+		(old) => {
+			old.closeStatus.closer = 'local';
+		},
+		(old) => {
+			old.closeStatus.closer = 'remote';
+		},
+		(old) => {
+			old.state = 'FORCE_CLOSED';
+		},
+		(old) => {
+			old.state = 'SHUTTING_DOWN';
+		},
+		(old) => {
+			old.state = 'NORMAL';
+		}
+	]) {
+		const h = harness();
+		const old = closedHistory();
+		change(old);
+		h.state.channels.push(old);
+		await assert.rejects(h.create().quote(request), {
+			code: 'DRAIN_UNAVAILABLE'
+		});
+		assert.deepEqual(h.calls, []);
+		assert.equal(h.journal(), null);
+	}
+});
+
+test('closed channel classification is checked again before dispatch', async () => {
+	const h = harness();
+	const old = closedHistory();
+	h.state.channels.push(old);
+	await h.create().quote(request);
+	old.closeStatus.closer = 'remote';
+	await assert.rejects(h.create().send(request.requestId), {
+		code: 'DRAIN_UNAVAILABLE'
+	});
+	assert.deepEqual(h.calls, []);
+});
+
 test('unpaid receive invoices do not block a drain, including after restart', async () => {
 	const h = harness();
 	h.state.payments = [
