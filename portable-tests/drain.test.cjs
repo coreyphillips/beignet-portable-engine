@@ -155,8 +155,12 @@ function harness({ home = true, coins = true } = {}) {
 				disabled = false;
 				calls.push('restore');
 			},
-			observe: async () => {
-				if (state.observationFailure)
+			observe: async (payout) => {
+				if (
+					typeof state.observationFailure === 'function'
+						? state.observationFailure(payout)
+						: state.observationFailure
+				)
 					throw new Error('observation unavailable');
 				return { exists: state.closeSeen, height: state.closeHeight };
 			},
@@ -817,7 +821,7 @@ test('restart releases a committed owner before a failing network observation', 
 	assert.equal(h.paused(), true);
 	h.state.restoreFailure = false;
 	h.state.observationFailure = true;
-	await assert.rejects(h.create().sync(), /observation unavailable/);
+	assert.match((await h.create().sync()).error, /observation unavailable/);
 	assert.equal(h.paused(), false);
 	assert.equal(h.create().blocksWallet(), false);
 });
@@ -849,4 +853,40 @@ test('an older committed drain cannot starve a newer submitting drain without a 
 		h.journal().records[0].revision > revision,
 		'older payout is still tracked'
 	);
+});
+
+test('one unavailable payout does not prevent another from confirming, but persistence failures halt tracking', async () => {
+	for (const writeFailure of [false, true]) {
+		const h = harness({ coins: false });
+		await h.create().quote(request);
+		h.state.closeSeen = true;
+		await h.create().send(request.requestId);
+		const later = {
+			...copy(h.journal().records[0]),
+			requestId: 'later-drain-001',
+			channelId: 'later-home',
+			close: { txid: 'later-close', amountSats: 9500, feeSats: 500 }
+		};
+		h.journal().records.push(later);
+		h.state.transactions.push({
+			...h.state.transactions[0],
+			channelId: 'later-home',
+			txid: 'later-close'
+		});
+		h.state.closeHeight = 50;
+		h.state.observationFailure = (payout) => payout.channelId === 'home';
+		if (writeFailure) h.failWrites((journal) => !!journal.records[0].error);
+		if (writeFailure) {
+			await assert.rejects(h.create().sync(), /storage unavailable/);
+			assert.equal(h.create().get(later.requestId).phase, 'pending');
+		} else {
+			for (let i = 0; i < 2; i++) {
+				const unavailable = await h.create().sync();
+				assert.equal(unavailable.phase, 'pending');
+				assert.match(unavailable.error, /observation unavailable/);
+				assert.equal(h.create().get(later.requestId).phase, 'completed');
+				assert.equal(h.create().blocksWallet(), false);
+			}
+		}
+	}
 });

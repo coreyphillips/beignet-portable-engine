@@ -422,7 +422,19 @@ function drainCoordinator({
 						entry.channelId === row.channelId &&
 						entry.address === row.address
 				);
-			const seen = payout ? await observe(payout, row) : null;
+			let seen;
+			try {
+				seen = payout ? await observe(payout, row) : null;
+			} catch (error) {
+				checkLifecycle();
+				failure(
+					'DRAIN_OBSERVATION_UNAVAILABLE',
+					`Could not check the drain payout: ${String(
+						error.message ?? error
+					).slice(0, 200)}`,
+					503
+				);
+			}
 			checkLifecycle();
 			if (!seen?.exists) {
 				if (row.close?.txid) {
@@ -701,10 +713,21 @@ function drainCoordinator({
 		cancel: (id) => locked(() => cancel(find(id))),
 		sync: () =>
 			locked(async () => {
+				const follow = async (entry) => {
+					try {
+						return await (entry.phase === 'cancelling'
+							? cancel(entry)
+							: resume(entry));
+					} catch (error) {
+						// resume persisted this read-only observation error on its row.
+						// Other payouts can still progress. Storage, journal and runtime
+						// failures must stop the pass instead of being treated as network errors.
+						if (error.code !== 'DRAIN_OBSERVATION_UNAVAILABLE') throw error;
+						return publicInfo(find(entry.requestId));
+					}
+				};
 				const row = active();
-				const result = row
-					? await (row.phase === 'cancelling' ? cancel(row) : resume(row))
-					: null;
+				const result = row ? await follow(row) : null;
 				// Prioritize a drain still submitting, but keep tracking every older
 				// payout if a reorg has returned several completed drains to pending.
 				for (const tracked of records().filter(
@@ -713,7 +736,7 @@ function drainCoordinator({
 						((entry.phase === 'completed' && !entry.finalized) ||
 							(ACTIVE.has(entry.phase) && entry.fundsCommitted === true))
 				))
-					await resume(tracked);
+					await follow(tracked);
 				// A crash after the terminal record but before releasing the hold
 				// leaves the owner visible in the persisted pause.
 				const held = pause.status();
