@@ -21,6 +21,7 @@ const cases = [
 	'address-bech32',
 	'address-bech32m',
 	'address-p2wsh',
+	'unconfirmed-address',
 	'phone',
 	'cln'
 ];
@@ -116,7 +117,7 @@ async function payer(h) {
 		throw error;
 	}
 }
-async function receive(dev, sender, amountSats) {
+async function receive(dev, sender, amountSats, confirmFunding = true) {
 	const quote = await dev.client.quoteReceive({
 		amountSats,
 		description: 'Send max qualification'
@@ -130,8 +131,111 @@ async function receive(dev, sender, amountSats) {
 		);
 		return invoice?.status === 'PAID';
 	});
-	await settledHome(dev);
+	if (confirmFunding) await settledHome(dev);
 	return request;
+}
+async function unconfirmedAddressPayment(dev) {
+	const before = await wait(
+		'unconfirmed receive balance and funding status ready',
+		async () => {
+			await dev.client.refreshWallet();
+			const channel = await home(dev);
+			return channel?.fundingConfirmed === false &&
+				channel.localBalanceSats === 100000
+				? channel
+				: false;
+		}
+	);
+	assert.equal(before.localReserveWaived, true);
+	const height = Number(btc('getblockcount'));
+	const confirmations = (txid) =>
+		JSON.parse(btc('getrawtransaction', txid, 'true')).confirmations ?? 0;
+	assert.equal(confirmations(before.fundingTxid), 0);
+	const target = destination();
+	const maximum = await dev.client.quoteMax({ request: target });
+	const review = await dev.client.prepareSend({ request: target, max: true });
+	assert.equal(review.amountSats, maximum.amountSats);
+	assert.equal(review.keptSats, 0);
+	assert.ok(
+		review.warnings.some((note) => note.includes('funding is unconfirmed'))
+	);
+	assert.equal((await dev.client.send(review)).status, 'pending');
+	const after = await wait(
+		'unconfirmed max splice adopted without mining',
+		async () => {
+			const channel = await home(dev);
+			return channel?.state === 'NORMAL' &&
+				channel.fundingTxid !== before.fundingTxid
+				? channel
+				: false;
+		}
+	);
+	assert.equal(after.localBalanceSats, 0);
+	const payout = JSON.parse(
+		btc('getrawtransaction', after.fundingTxid, 'true')
+	);
+	assert.ok(
+		payout.vin.some(
+			(input) =>
+				input.txid === before.fundingTxid &&
+				input.vout === before.fundingOutputIndex
+		)
+	);
+	const script = bitcoin.address
+		.toOutputScript(target, bitcoin.networks.regtest)
+		.toString('hex');
+	assert.equal(
+		payout.vout
+			.filter((output) => output.scriptPubKey.hex === script)
+			.reduce((total, output) => total + Math.round(output.value * 1e8), 0),
+		review.amountSats
+	);
+	const payment = async () =>
+		(await dev.client.snapshot()).activity.filter(
+			(row) => row.kind === 'sent' && row.amountSats === review.amountSats
+		);
+	await wait('unconfirmed payout has one pending Activity row', async () => {
+		const rows = await payment();
+		return (
+			rows.length === 1 &&
+			rows[0].txid === after.fundingTxid &&
+			rows[0].status === 'pending'
+		);
+	});
+	await dev.restart();
+	await wait('unconfirmed max payout restored after restart', async () => {
+		const channel = await home(dev);
+		const rows = await payment();
+		return (
+			channel?.fundingTxid === after.fundingTxid &&
+			channel.localBalanceSats === 0 &&
+			rows.length === 1 &&
+			rows[0].txid === after.fundingTxid &&
+			rows[0].status === 'pending'
+		);
+	});
+	assert.equal(
+		Number(btc('getblockcount')),
+		height,
+		'no blocks mined between receive, send and restart'
+	);
+	assert.equal(confirmations(before.fundingTxid), 0);
+	assert.equal(confirmations(after.fundingTxid), 0);
+	btc('-generate', '1');
+	await wait('funding and max payout confirm in the same block', async () => {
+		await dev.client.refreshWallet();
+		const rows = await payment();
+		return rows.length === 1 && rows[0].status === 'completed';
+	});
+	assert.equal(confirmations(before.fundingTxid), 1);
+	assert.equal(confirmations(after.fundingTxid), 1);
+	verifySplicePayout(before, after, target, review.amountSats);
+	pass('max to an address before funding confirms survives restart', {
+		fundingTxid: before.fundingTxid,
+		payoutTxid: after.fundingTxid,
+		amountSats: review.amountSats,
+		feeSats: review.feeSats
+	});
 }
 async function exactPayment(dev, primary, laterReceive) {
 	const invoice = primary.createInvoice(undefined, 'Exact reviewed debit');
@@ -362,12 +466,14 @@ async function runCase(name) {
 				0,
 				'receive begins without a channel'
 			);
-			await receive(dev, sender, 100000);
+			await receive(dev, sender, 100000, name !== 'unconfirmed-address');
 			const channel = await home(dev);
 			assert.equal(channel.isOpener, false);
 			assert.equal(channel.localReserveWaived, true);
 			assert.equal(channel.remoteReserveWaived, false);
-			if (name === 'jit') {
+			if (name === 'unconfirmed-address') {
+				await unconfirmedAddressPayment(dev);
+			} else if (name === 'jit') {
 				const first = await exactPayment(dev, h.primary);
 				assert.equal(first.review.keptSats, 0);
 				assert.equal((await home(dev)).localBalanceSats, 0);

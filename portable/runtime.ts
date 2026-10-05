@@ -852,9 +852,8 @@ export async function createPortableRuntime(options: any) {
 	 */
 	const fundingSeen = new Map<string, boolean>();
 	const fundingAsked = new Map<string, number>();
-	// A confirmed funding is cached for good. An unconfirmed one is rechecked
-	// often, because that answer gates sending to a Bitcoin address and a stale
-	// "not yet" would hold up a payment that has become perfectly safe.
+	// A confirmed funding is cached for good. Recheck an unconfirmed one often
+	// so the wallet's funding status follows the chain as confirmations arrive.
 	const FUNDING_RECHECK_MS = 5000;
 	const refreshFunding = (txid: string, outputIndex: number) => {
 		if (fundingSeen.get(txid)) return;
