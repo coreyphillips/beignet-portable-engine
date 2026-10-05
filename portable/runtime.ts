@@ -217,10 +217,10 @@ export async function createPortableRuntime(options: any) {
 		},
 		failure
 	});
-	const mutations = drainFence({ active: () => drain.active(), failure });
+	const mutations = drainFence({ active: () => drain.blocksWallet(), failure });
 	// Validate saved intent before any network starts. Corrupt intent must not
 	// silently enable funding on a wallet that may still be draining.
-	drain.active();
+	drain.blocksWallet();
 	configure(options);
 	let drainSync: Promise<any> | undefined;
 	const syncDrain = () => {
@@ -456,7 +456,7 @@ export async function createPortableRuntime(options: any) {
 			!node ||
 			recoveryHold() ||
 			channelizeHold.status().paused ||
-			drain.active() ||
+			drain.blocksWallet() ||
 			busy ||
 			directFundingInFlight > 0 ||
 			record.lfbw.setup !== 'ready'
@@ -472,7 +472,7 @@ export async function createPortableRuntime(options: any) {
 				rules,
 				force,
 				retryAt: channelizeRetryAt,
-				mayMutate: () => !closed && !durabilityFailed && !recoveryHold() && !channelizeHold.status().paused && !drain.active(),
+				mayMutate: () => !closed && !durabilityFailed && !recoveryHold() && !channelizeHold.status().paused && !drain.blocksWallet(),
 				onDiagnostic: options.onDiagnostic
 			});
 			if (closed) return null;
@@ -527,7 +527,7 @@ export async function createPortableRuntime(options: any) {
 					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
 					forwardingEnabled: false,
-					newChannelsRefused: () => drain.active()
+					newChannelsRefused: () => drain.blocksWallet()
 						? 'New funding is paused while this wallet is being emptied'
 						: options.nodeOptions?.newChannelsRefused?.() ?? null,
 					// Silent by default; a caller that wants the engine's own log

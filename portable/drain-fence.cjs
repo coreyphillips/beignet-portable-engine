@@ -12,7 +12,7 @@ function drainFence({ active, failure }) {
 				/^\/api\/wallets\/[^/]+\/(start|stop)$/.test(path);
 			// Offline receive quoting can reserve capacity, despite using GET.
 			const mutation = !control && (method !== 'GET' || /^\/wallets\/[^/]+\/api\/receive\/quote$/.test(path));
-			if (mutation && active()) failure('DRAIN_IN_PROGRESS', 'Finish or cancel the wallet drain before changing this wallet', 409);
+			if (mutation && active()) failure('DRAIN_IN_PROGRESS', 'Wait for the wallet drain transactions to be sent before changing this wallet', 409);
 			if (mutation) pending++;
 			try {
 				return await execute(input);

@@ -17,6 +17,7 @@ const ACTIVE = new Set([
 	'pending',
 	'cancelling'
 ]);
+const needsHold = (row) => ACTIVE.has(row.phase) && row.fundsCommitted !== true;
 const idValid = (id) =>
 	typeof id === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(id);
 const sats = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -114,6 +115,12 @@ function drainCoordinator({
 				!sats(row.amountSats) ||
 				!sats(row.feeSats) ||
 				!sats(row.debitSats) ||
+				(row.fundsCommitted !== undefined &&
+					(typeof row.fundsCommitted !== 'boolean' ||
+						(row.fundsCommitted &&
+							(!['sweeping', 'pending', 'completed'].includes(row.phase) ||
+								(row.channelId && !row.close?.txid) ||
+								(row.coins?.length && !row.sweep?.txid))))) ||
 				!Array.isArray(row.coins) ||
 				row.coins.some(
 					(coin) =>
@@ -153,8 +160,10 @@ function drainCoordinator({
 	};
 	const active = () => {
 		const rows = records().filter((row) => ACTIVE.has(row.phase));
+		const held = rows.filter(needsHold);
 		return (
-			rows.find((row) => row.requestId === pause.status().requestId) ??
+			held.find((row) => row.requestId === pause.status().requestId) ??
+			held[0] ??
 			rows[0] ??
 			null
 		);
@@ -367,7 +376,7 @@ function drainCoordinator({
 	};
 	const finishHold = async (row) => {
 		checkLifecycle();
-		if (records().some((entry) => ACTIVE.has(entry.phase))) return;
+		if (records().some(needsHold)) return;
 		const held = pause.status();
 		if (held.paused && held.requestId !== row.requestId) return;
 		await restoreReceive();
@@ -376,12 +385,16 @@ function drainCoordinator({
 	};
 	const acquireHold = async (row) => {
 		checkLifecycle();
+		if (!needsHold(row)) {
+			await finishHold(row);
+			return true;
+		}
 		const held = pause.status();
 		if (held.paused && held.requestId !== row.requestId) {
 			const owner = records().find(
 				(entry) => entry.requestId === held.requestId
 			);
-			if (!owner || ACTIVE.has(owner.phase)) return false;
+			if (!owner || needsHold(owner)) return false;
 			await pause.set({ paused: false, requestId: held.requestId });
 			checkLifecycle();
 		}
@@ -399,6 +412,7 @@ function drainCoordinator({
 		)
 			return row;
 		const engine = node();
+		let sweepSubmitted = !row.coins.length;
 		if (row.channelId) {
 			const payout = engine
 				.listOnchainTransactions()
@@ -408,7 +422,19 @@ function drainCoordinator({
 						entry.channelId === row.channelId &&
 						entry.address === row.address
 				);
-			const seen = payout ? await observe(payout, row) : null;
+			let seen;
+			try {
+				seen = payout ? await observe(payout, row) : null;
+			} catch (error) {
+				checkLifecycle();
+				failure(
+					'DRAIN_OBSERVATION_UNAVAILABLE',
+					`Could not check the drain payout: ${String(
+						error.message ?? error
+					).slice(0, 200)}`,
+					503
+				);
+			}
 			checkLifecycle();
 			if (!seen?.exists) {
 				if (row.close?.txid) {
@@ -434,6 +460,17 @@ function drainCoordinator({
 			row.phase = 'sweeping';
 			save(row);
 			const sweep = await engine.submitOnchainSweep(row.requestId);
+			if (
+				sweep.requestId !== row.requestId ||
+				!row.sweep?.txid ||
+				sweep.txid !== row.sweep.txid
+			)
+				failure(
+					'DRAIN_SWEEP_MISMATCH',
+					'The saved sweep does not match this wallet drain',
+					503
+				);
+			sweepSubmitted = ['submitted', 'confirmed'].includes(sweep.status);
 			row.sweep = {
 				txid: sweep.txid,
 				amountSats: sweep.amountSats,
@@ -444,6 +481,12 @@ function drainCoordinator({
 			else delete row.error;
 		}
 		row.phase = 'pending';
+		// The close has been verified at its destination and the sweep now owns
+		// durable signed bytes and permanently reserved inputs. New funds cannot
+		// enter either payout. Keep tracking confirmations without holding the
+		// whole wallet, including after a restart or a payout reorg.
+		if ((!row.channelId || row.close?.txid) && sweepSubmitted)
+			row.fundsCommitted = true;
 		recalculate(row);
 		if (
 			(!row.channelId || row.close?.confirmed) &&
@@ -461,7 +504,7 @@ function drainCoordinator({
 				.reduce((sum, coin) => sum + coin.valueSats, 0);
 		}
 		save(row);
-		if (row.phase === 'completed') await finishHold(row);
+		if (!needsHold(row)) await finishHold(row);
 		else await acquireHold(row);
 		return row;
 	};
@@ -541,6 +584,7 @@ function drainCoordinator({
 
 	return {
 		available,
+		blocksWallet: () => records().some(needsHold),
 		active: () => {
 			const row = active();
 			return row ? publicInfo(row) : null;
@@ -669,12 +713,30 @@ function drainCoordinator({
 		cancel: (id) => locked(() => cancel(find(id))),
 		sync: () =>
 			locked(async () => {
-				for (const done of records().filter(
-					(entry) => entry.phase === 'completed' && !entry.finalized
-				))
-					await reconcile(done);
+				const follow = async (entry) => {
+					try {
+						return await (entry.phase === 'cancelling'
+							? cancel(entry)
+							: resume(entry));
+					} catch (error) {
+						// resume persisted this read-only observation error on its row.
+						// Other payouts can still progress. Storage, journal and runtime
+						// failures must stop the pass instead of being treated as network errors.
+						if (error.code !== 'DRAIN_OBSERVATION_UNAVAILABLE') throw error;
+						return publicInfo(find(entry.requestId));
+					}
+				};
 				const row = active();
-				if (row) return row.phase === 'cancelling' ? cancel(row) : resume(row);
+				const result = row ? await follow(row) : null;
+				// Prioritize a drain still submitting, but keep tracking every older
+				// payout if a reorg has returned several completed drains to pending.
+				for (const tracked of records().filter(
+					(entry) =>
+						entry.requestId !== row?.requestId &&
+						((entry.phase === 'completed' && !entry.finalized) ||
+							(ACTIVE.has(entry.phase) && entry.fundsCommitted === true))
+				))
+					await follow(tracked);
 				// A crash after the terminal record but before releasing the hold
 				// leaves the owner visible in the persisted pause.
 				const held = pause.status();
@@ -686,7 +748,8 @@ function drainCoordinator({
 							['completed', 'cancelled'].includes(entry.phase)
 					);
 				if (terminal) await finishHold(terminal);
-				return null;
+				const pending = active();
+				return result ?? (pending ? publicInfo(pending) : null);
 			})
 	};
 }
