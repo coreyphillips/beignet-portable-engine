@@ -37,6 +37,20 @@ const channelIdentity = (channel) =>
 		  ].join(':')
 		: null;
 
+const isHistoricalClose = (channel) => {
+	if (channel.state !== 'CLOSED') return false;
+	const close = channel.closeStatus;
+	// Cooperative closes stay in history while the monitor waits out its
+	// anti-reorg depth. Their old balances are no longer in an open channel.
+	// Keep monitoring them, but do not count them as another channel to drain.
+	return (
+		close?.resolution === 'resolved' ||
+		(close?.closer === 'cooperative' &&
+			close.broadcast === true &&
+			/^[a-f0-9]{64}$/.test(close.closingTxid))
+	);
+};
+
 /**
  * Durable orchestration only. Signing, input ownership and broadcast retries
  * belong to the engine. The private journal never enters activity or API output.
@@ -276,13 +290,7 @@ function drainCoordinator({
 			);
 		const channels = engine
 			.listChannels()
-			.filter(
-				(entry) =>
-					!(
-						entry.state === 'CLOSED' &&
-						entry.closeStatus?.resolution === 'resolved'
-					)
-			);
+			.filter((entry) => !isHistoricalClose(entry));
 		if (
 			channels.length > 1 ||
 			channels.some((entry) => entry.peerPubkey !== peer)
