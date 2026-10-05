@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { drainCoordinator } = require('../portable/drain.cjs');
 const { channelizePause } = require('../portable/channelize-pause.cjs');
+const { drainFence } = require('../portable/drain-fence.cjs');
 
 const copy = (value) =>
 	value == null ? value : JSON.parse(JSON.stringify(value));
@@ -79,6 +80,7 @@ function harness({ home = true, coins = true } = {}) {
 			]);
 			state.coins[0].frozen = true;
 			state.sweep ??= {
+				requestId: input.requestId,
 				status: 'prepared',
 				amountSats: 1700,
 				feeSats: 300,
@@ -90,7 +92,11 @@ function harness({ home = true, coins = true } = {}) {
 		closeChannel: async (id, ack, address) => {
 			calls.push('close');
 			assert.deepEqual([id, ack, address], ['home', false, request.address]);
-			assert.equal(journal.records[0].phase, 'closing');
+			assert.equal(
+				journal.records.find((row) => row.requestId === request.requestId)
+					.phase,
+				'closing'
+			);
 			assert.equal(disabled, true);
 			channel.state = 'CLOSED';
 			state.transactions = [
@@ -144,13 +150,16 @@ function harness({ home = true, coins = true } = {}) {
 				calls.push('disable');
 			},
 			restoreReceive: async () => {
+				if (state.restoreFailure)
+					throw new Error('restore receive interrupted');
 				disabled = false;
 				calls.push('restore');
 			},
-			observe: async () => ({
-				exists: state.closeSeen,
-				height: state.closeHeight
-			}),
+			observe: async () => {
+				if (state.observationFailure)
+					throw new Error('observation unavailable');
+				return { exists: state.closeSeen, height: state.closeHeight };
+			},
 			closeNotStarted: () => channel.state === 'NORMAL',
 			failure,
 			now: () => time,
@@ -200,7 +209,7 @@ test('review holds nothing and returns only display amounts and an opaque identi
 	});
 });
 
-test('only an observed close permits the frozen sweep, and both confirmations release the hold', async () => {
+test('an observed close and submitted frozen sweep release the hold before confirmations', async () => {
 	const h = harness(),
 		drain = h.create();
 	await drain.quote(request);
@@ -218,7 +227,9 @@ test('only an observed close permits the frozen sweep, and both confirmations re
 	assert.equal(pending.amountSats, 11300);
 	assert.equal(pending.feeSats, 700);
 	assert.deepEqual(pending.txids, ['close-tx', 'sweep-tx']);
-	assert.equal(h.paused(), true);
+	assert.equal(h.paused(), false);
+	assert.equal(h.disabled(), false);
+	assert.equal(h.create().blocksWallet(), false);
 	h.state.closeHeight = 50;
 	h.state.sweepConfirmed = true;
 	const completed = await h.create().sync();
@@ -552,7 +563,8 @@ test('a shallow close reorg reopens pending state and keeps the same sweep and c
 	h.state.closeSeen = false;
 	const reorg = await h.create().sync();
 	assert.equal(reorg.phase, 'pending');
-	assert.equal(h.paused(), true);
+	assert.equal(h.paused(), false);
+	assert.equal(h.create().blocksWallet(), false);
 	assert.equal(h.journal().records[0].close.confirmed, false);
 	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
 	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
@@ -573,7 +585,8 @@ test('a shallow sweep reorg resumes only the original signed sweep after restart
 	h.state.sweepConfirmed = false;
 	h.state.coins.push({ ...coin, txid: 'ef'.repeat(32), valueSats: 900 });
 	assert.equal((await h.create().sync()).phase, 'pending');
-	assert.equal(h.paused(), true);
+	assert.equal(h.paused(), false);
+	assert.equal(h.create().blocksWallet(), false);
 	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
 	assert.equal(h.state.coins[0].valueSats, 900);
 	h.state.sweepConfirmed = true;
@@ -667,7 +680,7 @@ test('confirmed payouts clear stale broadcast warnings across restart and reorg'
 	const pending = await h.create().sync();
 	assert.equal(pending.phase, 'pending');
 	assert.equal(pending.error, 'broadcast reply lost');
-	assert.equal(h.paused(), true);
+	assert.equal(h.paused(), false);
 	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
 	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
 });
@@ -687,4 +700,153 @@ test('a confirmed close clears its earlier transport warning without a sweep', a
 	assert.equal(completed.phase, 'completed');
 	assert.equal(completed.error, undefined);
 	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+});
+
+test('receive requests resume after submission and restart while the drain stays pending', async () => {
+	for (const options of [{}, { home: false }, { coins: false }]) {
+		const h = harness(options);
+		const fence = drainFence({
+			active: () => h.create().blocksWallet(),
+			failure
+		});
+		const receive = () =>
+			fence.run(
+				{ method: 'POST', path: '/wallets/w/api/jit/invoice' },
+				() => 'new invoice'
+			);
+		await h.create().quote(request);
+		if (options.home !== false) {
+			await h.create().send(request.requestId);
+			await assert.rejects(receive(), { code: 'DRAIN_IN_PROGRESS' });
+		}
+		h.state.closeSeen = true;
+		const submitted =
+			options.home === false
+				? await h.create().send(request.requestId)
+				: await h.create().sync();
+		assert.equal(submitted.phase, 'pending');
+		assert.equal(h.journal().records[0].fundsCommitted, true);
+		assert.equal(h.create().blocksWallet(), false);
+		assert.equal(await receive(), 'new invoice');
+		assert.equal(h.paused(), false);
+		assert.equal((await h.create().sync()).phase, 'pending');
+		assert.equal(await receive(), 'new invoice');
+		await assert.rejects(
+			h.create().quote({ ...request, requestId: 'second-drain-001' }),
+			{ code: 'DRAIN_IN_PROGRESS' }
+		);
+	}
+});
+
+test('an unsubmitted or mismatched sweep never releases the wallet hold', async () => {
+	for (const change of [
+		(sweep) => ({ ...sweep, status: 'prepared' }),
+		(sweep) => ({ ...sweep, requestId: 'another-drain-001' }),
+		(sweep) => ({ ...sweep, txid: 'different-transaction' })
+	]) {
+		const h = harness();
+		await h.create().quote(request);
+		h.state.closeSeen = true;
+		const submit = h.engine.submitOnchainSweep;
+		h.engine.submitOnchainSweep = async (id) => change(await submit(id));
+		await h
+			.create()
+			.send(request.requestId)
+			.catch((error) => {
+				assert.equal(error.code, 'DRAIN_SWEEP_MISMATCH');
+			});
+		assert.equal(h.create().blocksWallet(), true);
+		assert.equal(h.paused(), true);
+		assert.notEqual(h.journal().records[0].fundsCommitted, true);
+	}
+});
+
+test('submission must be durably recorded before receiving is unlocked', async () => {
+	const h = harness();
+	await h.create().quote(request);
+	h.state.closeSeen = true;
+	h.failWrites((journal) => journal.records[0].fundsCommitted === true);
+	await assert.rejects(
+		h.create().send(request.requestId),
+		/storage unavailable/
+	);
+	assert.equal(h.create().blocksWallet(), true);
+	assert.equal(h.paused(), true);
+	h.failWrites(() => false);
+	assert.equal((await h.create().sync()).phase, 'pending');
+	assert.equal(h.create().blocksWallet(), false);
+	assert.equal(h.paused(), false);
+	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+});
+
+test('a pending drain saved by the previous version releases after verifying its existing payouts', async () => {
+	const h = harness();
+	await h.create().quote(request);
+	h.state.closeSeen = true;
+	await h.create().send(request.requestId);
+	delete h.journal().records[0].fundsCommitted;
+	assert.equal(h.create().blocksWallet(), true);
+	assert.equal((await h.create().sync()).phase, 'pending');
+	assert.equal(h.create().blocksWallet(), false);
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
+});
+
+test('invalid saved submission markers fail closed before receive admission', async () => {
+	for (const marker of ['true', 1, null, true]) {
+		const h = harness();
+		await h.create().quote(request);
+		h.journal().records[0].fundsCommitted = marker;
+		assert.throws(() => h.create().blocksWallet(), {
+			code: 'DRAIN_JOURNAL_INVALID'
+		});
+	}
+});
+
+test('restart releases a committed owner before a failing network observation', async () => {
+	const h = harness();
+	await h.create().quote(request);
+	h.state.closeSeen = true;
+	h.state.restoreFailure = true;
+	await assert.rejects(
+		h.create().send(request.requestId),
+		/restore receive interrupted/
+	);
+	assert.equal(h.journal().records[0].fundsCommitted, true);
+	assert.equal(h.paused(), true);
+	h.state.restoreFailure = false;
+	h.state.observationFailure = true;
+	await assert.rejects(h.create().sync(), /observation unavailable/);
+	assert.equal(h.paused(), false);
+	assert.equal(h.create().blocksWallet(), false);
+});
+
+test('an older committed drain cannot starve a newer submitting drain without a saved pause', async () => {
+	const h = harness();
+	await h.create().quote(request);
+	const current = h.journal().records[0];
+	current.phase = 'preparing';
+	const older = {
+		...copy(current),
+		requestId: 'older-drain-001',
+		phase: 'pending',
+		fundsCommitted: true,
+		channelId: 'older-home',
+		coins: [],
+		close: { txid: 'older-close', amountSats: 9500, feeSats: 500 },
+		sweep: null
+	};
+	h.journal().records.unshift(older);
+	assert.equal(h.paused(), false);
+	assert.equal(h.create().active().requestId, request.requestId);
+	const revision = older.revision;
+	assert.equal((await h.create().sync()).phase, 'closing');
+	assert.equal(h.calls.filter((call) => call === 'prepare').length, 1);
+	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
+	assert.equal(h.paused(), true);
+	assert.ok(
+		h.journal().records[0].revision > revision,
+		'older payout is still tracked'
+	);
 });

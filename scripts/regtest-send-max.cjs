@@ -166,7 +166,7 @@ async function exactPayment(dev, primary, laterReceive) {
 	);
 	return { review, record, sent };
 }
-async function drain(dev) {
+async function drain(dev, sender) {
 	const receiveQuote = await dev.client.quoteReceive({
 		amountSats: 1000,
 		description: 'Unpaid invoice must not block empty wallet'
@@ -197,10 +197,49 @@ async function drain(dev) {
 		JSON.stringify(sent)
 	);
 	pass('an unpaid receive invoice survives restart without blocking drain');
-	assert.equal((await dev.rpc('/channelize/status')).paused, true);
+	const submitted = await wait(
+		'drain payouts submitted before any confirmation',
+		async () => {
+			const progress = await dev.client.getDrain(review.id);
+			return progress.phase === 'pending' && progress.txids.length === 2
+				? progress
+				: false;
+		}
+	);
+	assert.equal((await dev.rpc('/channelize/status')).paused, false);
 	const later = btc('sendtoaddress', coinAddress, '0.00001000');
 	await dev.restart();
-	assert.equal((await dev.rpc('/channelize/status')).paused, true);
+	await dev.client.getDrain(review.id);
+	assert.equal((await dev.rpc('/channelize/status')).paused, false);
+	const nextQuote = await dev.client.quoteReceive({
+		amountSats: 10000,
+		description: 'Receive while drain confirmations are pending'
+	});
+	const nextInvoice = await dev.client.receive(nextQuote);
+	const paid = await sender.payInvoiceSafe(nextInvoice.bolt11, 120000, 1000);
+	assert.equal(paid.status, 'COMPLETED', JSON.stringify(paid));
+	await wait(
+		'new JIT channel received after pending drain and restart',
+		async () => {
+			const invoice = (await dev.rpc('/invoices')).find(
+				(i) => i.paymentHash === nextInvoice.paymentHash
+			);
+			return (
+				invoice?.status === 'PAID' &&
+				(await home(dev))?.localBalanceSats === 10000
+			);
+		}
+	);
+	assert.equal((await dev.client.getDrain(review.id)).phase, 'pending');
+	for (const txid of submitted.txids) {
+		assert.equal(
+			JSON.parse(btc('getrawtransaction', txid, 'true')).confirmations || 0,
+			0
+		);
+	}
+	pass(
+		'new Lightning sats arrive on a fresh channel before drain confirmations'
+	);
 	const mine = miner();
 	const progress = await wait(
 		'both drain legs complete after restart',
@@ -238,7 +277,7 @@ async function drain(dev) {
 		assert.ok(!tx.vin.some((input) => input.txid === later));
 	}
 	pass(
-		'drain holds channelize, survives restart and retains one Activity with both txids',
+		'drain releases channelize at submission, survives restart and retains both payout identities',
 		progress
 	);
 }
@@ -356,7 +395,7 @@ async function runCase(name) {
 				pass(
 					'pay-all empties a JIT balance and freezes later receipts across restart'
 				);
-				await drain(dev);
+				await drain(dev, sender);
 			} else {
 				const target = destination(name.slice('address-'.length));
 				const before = await home(dev);
