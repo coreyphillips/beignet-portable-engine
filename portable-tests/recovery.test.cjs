@@ -210,7 +210,7 @@ function restoringMap(node) {
 	let restoring = true;
 	node.isGraphRestoring = () => restoring;
 	node.whenGraphRestored = () => restored;
-	return () => { restoring = false; finish(true); };
+	return (restoredWhole = true) => { restoring = false; finish(restoredWhole); };
 }
 const settles = (promise) => {
 	const state = { settled: false, error: undefined };
@@ -262,6 +262,61 @@ test('closing or stopping the wallet ends a wait for the network map, and the re
 			assert.ok(f.calls.includes('shutdown') || f.calls.includes('destroy'));
 		} finally { await f.runtime.close(); }
 	}
+});
+
+test('a start that fails ends a wait for the network map before it tears the node down', async () => {
+	const f = await fixture();
+	try {
+		const finish = restoringMap(f.control.node);
+		let failSync;
+		f.control.node.waitForInitialSync = () => new Promise((_, reject) => { failSync = reject; });
+		// As the engine's does, destroy ends the restore before it finishes.
+		const destroy = f.control.node.destroy;
+		f.control.node.destroy = async () => {
+			finish(false);
+			await turns();
+			return destroy();
+		};
+		const created = settles(create(f));
+		await turns();
+		const [{ id }] = await f.runtime.request({ path: '/api/wallets' });
+		const estimate = settles(f.runtime.request({
+			method: 'POST',
+			path: `/wallets/${id}/api/payment/estimate`,
+			body: { bolt11: 'lnbcrt1x' }
+		}));
+		await turns();
+		assert.equal(estimate.settled, false);
+		failSync(Error('sync failed'));
+		await created.done;
+		await estimate.done;
+		assert.ok(f.calls.includes('destroy'));
+		assert.equal(estimate.error?.code, 'WALLET_STOPPED');
+	} finally { await f.runtime.close(); }
+});
+
+test('a route-finding request made while a stop is under way fails at once', async () => {
+	const f = await fixture();
+	try {
+		const { record } = await create(f);
+		restoringMap(f.control.node);
+		let release;
+		f.control.node.gracefulShutdown = () => new Promise((resolve) => { release = resolve; });
+		const stopped = settles(f.runtime.request({ method: 'POST', path: `/api/wallets/${record.id}/stop` }));
+		await turns();
+		assert.equal(stopped.settled, false);
+		const estimate = settles(f.runtime.request({
+			method: 'POST',
+			path: `/wallets/${record.id}/api/payment/estimate`,
+			body: { bolt11: 'lnbcrt1x' }
+		}));
+		await turns();
+		assert.equal(estimate.settled, true);
+		assert.equal(estimate.error?.code, 'WALLET_STOPPED');
+		release();
+		await stopped.done;
+		assert.equal(stopped.error, undefined);
+	} finally { await f.runtime.close(); }
 });
 
 test('opted-in import persists across restart, keeps status readable and blocks mutations plus background work', async () => {

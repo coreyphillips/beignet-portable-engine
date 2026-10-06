@@ -803,8 +803,12 @@ export async function createPortableRuntime(options: any) {
 			} catch (error) {
 				if (receiveTimer) clearInterval(receiveTimer);
 				offlineReceive?.stop();
-				if (node) await node.destroy().catch(() => {});
+				// Cleared before the destroy, so no request waiting for the
+				// network map resumes onto the node being torn down.
+				const old = node;
 				node = undefined;
+				endGraphWaits();
+				if (old) await old.destroy().catch(() => {});
 				throw error;
 			}
 		})();
@@ -1016,6 +1020,8 @@ export async function createPortableRuntime(options: any) {
 		// restore of it runs, these wait for it instead of having the engine
 		// finish it at once on the app's only thread.
 		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.()) {
+			// A stop already under way has ended the waits it found.
+			if (stopPromise) failure('WALLET_STOPPED', 'Start your wallet first', 409);
 			let end!: () => void;
 			const ended = new Promise<void>((resolve) => {
 				end = resolve;

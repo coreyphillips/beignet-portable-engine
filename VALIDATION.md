@@ -4,7 +4,7 @@ The fork now tracks upstream Beignet **0.29.0** (`45f8ff9d`, npm's `gitHead` for
 
 Checks, all on 2026-10-06:
 
-- `npm test`: 209 of 209 unit tests pass, including the new deferred restore report (`portable-tests/engine-diagnostics.test.cjs`) and the runtime's `deferGraphRestore`, its waits, and a close or stop ending them (`portable-tests/recovery.test.cjs`).
+- `npm test`: 211 of 211 unit tests pass, including the new deferred restore report (`portable-tests/engine-diagnostics.test.cjs`) and the runtime's `deferGraphRestore`, its waits, and a close, a stop or a failed start ending them (`portable-tests/recovery.test.cjs`).
 - `npm run check:types` passes, and the built `dist/portable.mjs` and `dist/portable.cjs` report `0.29.0-portable`; `dist/meta.json` builds `lightning-node.ts` and the new `graph-restore.ts` with the injected `portable/globals.ts`, whose `setImmediate` is a `setTimeout` of 0, as the restore's slices need.
 - `node --check` passes over the JavaScript files in `portable/`, `portable-tests/` and `scripts/`.
 - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS against the Docker `bitcoin` and `electrum` containers, the disposable primary and the stranger a `git archive` of `193c43b2` built with `npm run build` in a scratch directory and named through `BEIGNET_SOURCE_DIR`. Its teardown logs three `Error: close connect` lines; a run from the 0.28.0 fork's checkout logs the same three.
