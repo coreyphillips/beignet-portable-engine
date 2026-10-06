@@ -36,6 +36,14 @@ const ENGINE_VERSION =
 	typeof __BEIGNET_ENGINE_VERSION__ === 'string'
 		? __BEIGNET_ENGINE_VERSION__
 		: 'unknown-portable';
+// Requests that find a route, and so wait for the stored network map
+// (deferGraphRestore) before they run.
+const ROUTE_FINDING: ReadonlySet<string> = new Set([
+	'POST /payment/estimate',
+	'POST /invoice/pay-safe',
+	'POST /invoice/pay-all/quote',
+	'POST /invoice/pay-all'
+]);
 // The networks a wallet can be created on. GET /api/config advertises this
 // same list, so a client that trusts the config can create every wallet the
 // engine accepts and no other (fork issue #4).
@@ -110,6 +118,12 @@ export async function createPortableRuntime(options: any) {
 	let activity: any[] = load('/wallet/activity.json', []);
 	let startPromise: Promise<any> | undefined;
 	let stopPromise: Promise<any> | undefined;
+	// Requests waiting for the network map; a close or stop ends their wait.
+	const graphWaits = new Set<() => void>();
+	const endGraphWaits = () => {
+		for (const end of graphWaits) end();
+		graphWaits.clear();
+	};
 	let drainGeneration = 0;
 	// The home channel's last splice conflict or revert (beignet #760), and
 	// whether a payer this wallet has not paired with is growing the channel
@@ -527,6 +541,10 @@ export async function createPortableRuntime(options: any) {
 					feeEstimationSource: 'electrum',
 					autoBootstrap: false,
 					autoGossipSync: true,
+					// The stored network map comes back in slices after create,
+					// so the app's only JavaScript thread is not held for seconds
+					// as the wallet opens; route finding finishes it first.
+					deferGraphRestore: true,
 					recoveryMode: 'peer-storage',
 					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
@@ -785,8 +803,12 @@ export async function createPortableRuntime(options: any) {
 			} catch (error) {
 				if (receiveTimer) clearInterval(receiveTimer);
 				offlineReceive?.stop();
-				if (node) await node.destroy().catch(() => {});
+				// Cleared before the destroy, so no request waiting for the
+				// network map resumes onto the node being torn down.
+				const old = node;
 				node = undefined;
+				endGraphWaits();
+				if (old) await old.destroy().catch(() => {});
 				throw error;
 			}
 		})();
@@ -799,6 +821,7 @@ export async function createPortableRuntime(options: any) {
 	const stop = async () => {
 		if (stopPromise) return stopPromise;
 		drainGeneration++;
+		endGraphWaits();
 		stopPromise = (async () => {
 			const deadline = Date.now() + STOP_DEADLINE_MS;
 			// A start in flight may be waiting on a cold Tor bootstrap, which is
@@ -993,6 +1016,29 @@ export async function createPortableRuntime(options: any) {
 				importComplete: recoveryImport.complete
 			};
 		if (method !== 'GET' || nodeUnavailable()) requireRecoveryReady();
+		// Finding a route needs the whole network map: while the deferred
+		// restore of it runs, these wait for it instead of having the engine
+		// finish it at once on the app's only thread.
+		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.()) {
+			// A stop already under way has ended the waits it found.
+			if (stopPromise) failure('WALLET_STOPPED', 'Start your wallet first', 409);
+			let end!: () => void;
+			const ended = new Promise<void>((resolve) => {
+				end = resolve;
+			});
+			graphWaits.add(end);
+			try {
+				await Promise.race([n.whenGraphRestored(), ended]);
+			} finally {
+				graphWaits.delete(end);
+			}
+			// The wallet may have closed, stopped or been held for recovery
+			// while this waited, and its node with it.
+			if (closed) failure('WALLET_CLOSED', 'Wallet runtime closed', 409);
+			if (stopPromise || node !== n)
+				failure('WALLET_STOPPED', 'Start your wallet first', 409);
+			requireRecoveryReady();
+		}
 		if (route === 'POST /receive/requests')
 			return {
 				request: await receiveRequests().register(
@@ -1584,6 +1630,7 @@ export async function createPortableRuntime(options: any) {
 			if (closing) return closing;
 			closed = true;
 			drainGeneration++;
+			endGraphWaits();
 			closing = (async () => {
 				try {
 					await Promise.allSettled(Array.from(inFlight));

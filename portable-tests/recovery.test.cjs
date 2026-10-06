@@ -202,6 +202,123 @@ test('ordinary creation and seed import never imply automatic peer recovery', as
 	}
 });
 
+// A node whose stored network map is still being restored, until the
+// returned finish is called.
+function restoringMap(node) {
+	let finish;
+	const restored = new Promise((resolve) => { finish = resolve; });
+	let restoring = true;
+	node.isGraphRestoring = () => restoring;
+	node.whenGraphRestored = () => restored;
+	return (restoredWhole = true) => { restoring = false; finish(restoredWhole); };
+}
+const settles = (promise) => {
+	const state = { settled: false, error: undefined };
+	state.done = promise.then(() => {}, (error) => { state.error = error; }).finally(() => { state.settled = true; });
+	return state;
+};
+const turns = async () => { for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve)); };
+
+test('the engine restores its stored network map after create, and route finding waits for it', async () => {
+	const f = await fixture();
+	try {
+		const { record } = await create(f);
+		assert.equal(f.control.options[0].deferGraphRestore, true);
+		const finish = restoringMap(f.control.node);
+		const api = (method, path, body) => f.runtime.request({ method, path: `/wallets/${record.id}/api${path}`, body });
+		const estimate = settles(api('POST', '/payment/estimate', { bolt11: 'lnbcrt1x' }));
+		const quote = settles(api('POST', '/invoice/pay-all/quote', { bolt11: 'lnbcrt1x' }));
+		// A request that finds no route does not wait.
+		assert.deepEqual(await api('GET', '/balance'), await api('GET', '/balance'));
+		await turns();
+		assert.equal(estimate.settled, false);
+		assert.equal(quote.settled, false);
+		finish();
+		await estimate.done;
+		await quote.done;
+		assert.equal(estimate.settled, true);
+		assert.equal(quote.settled, true);
+	} finally { await f.runtime.close(); }
+});
+
+test('closing or stopping the wallet ends a wait for the network map, and the request does not run', async () => {
+	for (const end of ['close', 'stop']) {
+		const f = await fixture();
+		try {
+			const { record } = await create(f);
+			restoringMap(f.control.node);
+			const estimate = settles(f.runtime.request({
+				method: 'POST',
+				path: `/wallets/${record.id}/api/payment/estimate`,
+				body: { bolt11: 'lnbcrt1x' }
+			}));
+			await turns();
+			assert.equal(estimate.settled, false);
+			// The map is never restored here: the close or stop must not wait for it.
+			if (end === 'close') await f.runtime.close();
+			else await f.runtime.request({ method: 'POST', path: `/api/wallets/${record.id}/stop` });
+			await estimate.done;
+			assert.equal(estimate.error?.code, end === 'close' ? 'WALLET_CLOSED' : 'WALLET_STOPPED');
+			assert.ok(f.calls.includes('shutdown') || f.calls.includes('destroy'));
+		} finally { await f.runtime.close(); }
+	}
+});
+
+test('a start that fails ends a wait for the network map before it tears the node down', async () => {
+	const f = await fixture();
+	try {
+		const finish = restoringMap(f.control.node);
+		let failSync;
+		f.control.node.waitForInitialSync = () => new Promise((_, reject) => { failSync = reject; });
+		// As the engine's does, destroy ends the restore before it finishes.
+		const destroy = f.control.node.destroy;
+		f.control.node.destroy = async () => {
+			finish(false);
+			await turns();
+			return destroy();
+		};
+		const created = settles(create(f));
+		await turns();
+		const [{ id }] = await f.runtime.request({ path: '/api/wallets' });
+		const estimate = settles(f.runtime.request({
+			method: 'POST',
+			path: `/wallets/${id}/api/payment/estimate`,
+			body: { bolt11: 'lnbcrt1x' }
+		}));
+		await turns();
+		assert.equal(estimate.settled, false);
+		failSync(Error('sync failed'));
+		await created.done;
+		await estimate.done;
+		assert.ok(f.calls.includes('destroy'));
+		assert.equal(estimate.error?.code, 'WALLET_STOPPED');
+	} finally { await f.runtime.close(); }
+});
+
+test('a route-finding request made while a stop is under way fails at once', async () => {
+	const f = await fixture();
+	try {
+		const { record } = await create(f);
+		restoringMap(f.control.node);
+		let release;
+		f.control.node.gracefulShutdown = () => new Promise((resolve) => { release = resolve; });
+		const stopped = settles(f.runtime.request({ method: 'POST', path: `/api/wallets/${record.id}/stop` }));
+		await turns();
+		assert.equal(stopped.settled, false);
+		const estimate = settles(f.runtime.request({
+			method: 'POST',
+			path: `/wallets/${record.id}/api/payment/estimate`,
+			body: { bolt11: 'lnbcrt1x' }
+		}));
+		await turns();
+		assert.equal(estimate.settled, true);
+		assert.equal(estimate.error?.code, 'WALLET_STOPPED');
+		release();
+		await stopped.done;
+		assert.equal(stopped.error, undefined);
+	} finally { await f.runtime.close(); }
+});
+
 test('opted-in import persists across restart, keeps status readable and blocks mutations plus background work', async () => {
 	const volume = memory();
 	let id;
