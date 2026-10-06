@@ -99,9 +99,10 @@ function gossipSynced(data) {
  * it took, then the rows it read, how long reading and parsing them took
  * (`load`) and adding them to the graph (`add`), channels then nodes, then
  * the restore inside create (the map's included only when it was not
- * deferred) and the whole node build. It is kept short so the client's boot report keeps the marks after
- * it; the stale and orphan counts and the smaller steps are in the engine's
- * own `peer:graph_restored` log. A figure the stats lack is left out.
+ * deferred) and the whole node build. It is kept short so the client's boot
+ * report keeps the marks after it; the stale and orphan counts and the
+ * smaller steps are in the engine's own `peer:graph_restored` log. A figure
+ * the stats lack is left out.
  */
 function restoreGraph(stats) {
 	const pair = (a, b) =>
@@ -115,8 +116,7 @@ function restoreGraph(stats) {
 		['load', pair(stats?.loadChannelsMs, stats?.loadNodesMs), 'ms'],
 		['add', pair(stats?.restoreChannelsMs, stats?.restoreNodesMs), 'ms'],
 		['restore', stats?.restoreMs, 'ms'],
-		['construct', stats?.constructMs, 'ms'],
-		['steps', stats?.steps, '']
+		['construct', stats?.constructMs, 'ms']
 	];
 	const head = Number.isFinite(stats?.graphMs)
 		? `restore-graph ${stats.graphMs}ms`

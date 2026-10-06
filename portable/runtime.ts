@@ -42,9 +42,7 @@ const ROUTE_FINDING: ReadonlySet<string> = new Set([
 	'POST /payment/estimate',
 	'POST /invoice/pay-safe',
 	'POST /invoice/pay-all/quote',
-	'POST /invoice/pay-all',
-	'POST /drain/quote',
-	'POST /drain/send'
+	'POST /invoice/pay-all'
 ]);
 // The networks a wallet can be created on. GET /api/config advertises this
 // same list, so a client that trusts the config can create every wallet the
@@ -120,6 +118,12 @@ export async function createPortableRuntime(options: any) {
 	let activity: any[] = load('/wallet/activity.json', []);
 	let startPromise: Promise<any> | undefined;
 	let stopPromise: Promise<any> | undefined;
+	// Requests waiting for the network map; a close or stop ends their wait.
+	const graphWaits = new Set<() => void>();
+	const endGraphWaits = () => {
+		for (const end of graphWaits) end();
+		graphWaits.clear();
+	};
 	let drainGeneration = 0;
 	// The home channel's last splice conflict or revert (beignet #760), and
 	// whether a payer this wallet has not paired with is growing the channel
@@ -813,6 +817,7 @@ export async function createPortableRuntime(options: any) {
 	const stop = async () => {
 		if (stopPromise) return stopPromise;
 		drainGeneration++;
+		endGraphWaits();
 		stopPromise = (async () => {
 			const deadline = Date.now() + STOP_DEADLINE_MS;
 			// A start in flight may be waiting on a cold Tor bootstrap, which is
@@ -1010,8 +1015,24 @@ export async function createPortableRuntime(options: any) {
 		// Finding a route needs the whole network map: while the deferred
 		// restore of it runs, these wait for it instead of having the engine
 		// finish it at once on the app's only thread.
-		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.())
-			await n.whenGraphRestored();
+		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.()) {
+			let end!: () => void;
+			const ended = new Promise<void>((resolve) => {
+				end = resolve;
+			});
+			graphWaits.add(end);
+			try {
+				await Promise.race([n.whenGraphRestored(), ended]);
+			} finally {
+				graphWaits.delete(end);
+			}
+			// The wallet may have closed, stopped or been held for recovery
+			// while this waited, and its node with it.
+			if (closed) failure('WALLET_CLOSED', 'Wallet runtime closed', 409);
+			if (stopPromise || node !== n)
+				failure('WALLET_STOPPED', 'Start your wallet first', 409);
+			requireRecoveryReady();
+		}
 		if (route === 'POST /receive/requests')
 			return {
 				request: await receiveRequests().register(
@@ -1603,6 +1624,7 @@ export async function createPortableRuntime(options: any) {
 			if (closing) return closing;
 			closed = true;
 			drainGeneration++;
+			endGraphWaits();
 			closing = (async () => {
 				try {
 					await Promise.allSettled(Array.from(inFlight));
