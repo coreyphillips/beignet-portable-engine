@@ -75,6 +75,68 @@ test('gossip:synced reports the import timings and the channels it added', () =>
 	assert.equal(next.listenerCount('gossip:synced'), 1);
 });
 
+test('the stored network map restore is reported once per node, with its steps', () => {
+	const { seen, onDiagnostic } = recorder();
+	const perf = engineDiagnostics({ onDiagnostic });
+	let reads = 0;
+	const node = {
+		getGraphRestoreStats: () => {
+			reads++;
+			return {
+				graphMs: 3900,
+				restoreMs: 4100,
+				channelRows: 14670,
+				staleChannels: 3,
+				nodeRows: 12721,
+				orphanNodes: 1,
+				graphChannels: 14667,
+				graphNodes: 12700,
+				loadChannelsMs: 3000,
+				restoreChannelsMs: 300,
+				loadNodesMs: 500,
+				restoreNodesMs: 60,
+				deleteMs: 10,
+				pruneMs: 20,
+				reannounceMs: 10,
+				constructMs: 4500
+			};
+		}
+	};
+	perf.graphRestored(node);
+	perf.graphRestored(node);
+	assert.equal(reads, 1);
+	assert.deepEqual(seen, [
+		{
+			phase: 'engine-perf',
+			message:
+				'restore-graph 3900ms channels 14670 stale 3 nodes 12721 orphans 1 ' +
+				'graph-channels 14667 graph-nodes 12700 load-channels 3000ms ' +
+				'restore-channels 300ms load-nodes 500ms restore-nodes 60ms ' +
+				'delete 10ms prune 20ms reannounce 10ms restore 4100ms construct 4500ms'
+		}
+	]);
+});
+
+test('an engine without the restore stats, or with none to give, reports nothing', () => {
+	const { seen, onDiagnostic } = recorder();
+	const perf = engineDiagnostics({ onDiagnostic });
+	perf.graphRestored(new EventEmitter());
+	perf.graphRestored({ getGraphRestoreStats: () => null });
+	perf.graphRestored({
+		getGraphRestoreStats: () => {
+			throw new Error('no node yet');
+		}
+	});
+	perf.graphRestored(undefined);
+	assert.deepEqual(seen, []);
+	// A field the stats lack is left out.
+	perf.graphRestored({ getGraphRestoreStats: () => ({ graphMs: 12, channelRows: 2 }) });
+	assert.deepEqual(
+		seen.map((entry) => entry.message),
+		['restore-graph 12ms channels 2']
+	);
+});
+
 test('without a hook nothing is timed or listened to', async () => {
 	const perf = engineDiagnostics({
 		now: () => assert.fail('the clock is not read without a hook')
@@ -83,6 +145,9 @@ test('without a hook nothing is timed or listened to', async () => {
 	const node = new EventEmitter();
 	perf.watchGossip(node);
 	assert.equal(node.listenerCount('gossip:synced'), 0);
+	perf.graphRestored({
+		getGraphRestoreStats: () => assert.fail('the stats are not read without a hook')
+	});
 });
 
 test('a hook that throws fails neither the step nor the engine event', async () => {
