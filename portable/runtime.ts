@@ -36,6 +36,16 @@ const ENGINE_VERSION =
 	typeof __BEIGNET_ENGINE_VERSION__ === 'string'
 		? __BEIGNET_ENGINE_VERSION__
 		: 'unknown-portable';
+// Requests that find a route, and so wait for the stored network map
+// (deferGraphRestore) before they run.
+const ROUTE_FINDING: ReadonlySet<string> = new Set([
+	'POST /payment/estimate',
+	'POST /invoice/pay-safe',
+	'POST /invoice/pay-all/quote',
+	'POST /invoice/pay-all',
+	'POST /drain/quote',
+	'POST /drain/send'
+]);
 // The networks a wallet can be created on. GET /api/config advertises this
 // same list, so a client that trusts the config can create every wallet the
 // engine accepts and no other (fork issue #4).
@@ -527,6 +537,10 @@ export async function createPortableRuntime(options: any) {
 					feeEstimationSource: 'electrum',
 					autoBootstrap: false,
 					autoGossipSync: true,
+					// The stored network map comes back in slices after create,
+					// so the app's only JavaScript thread is not held for seconds
+					// as the wallet opens; route finding finishes it first.
+					deferGraphRestore: true,
 					recoveryMode: 'peer-storage',
 					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
@@ -993,6 +1007,11 @@ export async function createPortableRuntime(options: any) {
 				importComplete: recoveryImport.complete
 			};
 		if (method !== 'GET' || nodeUnavailable()) requireRecoveryReady();
+		// Finding a route needs the whole network map: while the deferred
+		// restore of it runs, these wait for it instead of having the engine
+		// finish it at once on the app's only thread.
+		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.())
+			await n.whenGraphRestored();
 		if (route === 'POST /receive/requests')
 			return {
 				request: await receiveRequests().register(

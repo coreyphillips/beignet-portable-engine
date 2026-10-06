@@ -141,6 +141,39 @@ test('an engine without the restore stats, or with none to give, reports nothing
 	);
 });
 
+test('a deferred restore is reported when it ends, with its busy time and slices', () => {
+	const { seen, onDiagnostic } = recorder();
+	const perf = engineDiagnostics({ onDiagnostic });
+	const node = new EventEmitter();
+	node.getGraphRestoreStats = () => null;
+	perf.graphRestored(node);
+	perf.graphRestored(node);
+	assert.deepEqual(seen, []);
+	assert.equal(node.listenerCount('graph:restored'), 1);
+	node.emit('graph:restored', {
+		cooperative: true,
+		graphMs: 6100,
+		busyMs: 3900,
+		slices: 480,
+		restoreMs: 950,
+		channelRows: 20328,
+		nodeRows: 7934,
+		loadChannelsMs: 3006,
+		loadNodesMs: 489,
+		restoreChannelsMs: 265,
+		restoreNodesMs: 39,
+		constructMs: 1100
+	});
+	node.emit('graph:restored', { cooperative: true, graphMs: 1 });
+	assert.deepEqual(
+		seen.map((entry) => entry.message),
+		[
+			'restore-graph 6100ms busy 3900ms slices 480 channels 20328 nodes 7934 ' +
+				'load 3006+489ms add 265+39ms restore 950ms construct 1100ms'
+		]
+	);
+});
+
 test('without a hook nothing is timed or listened to', async () => {
 	const perf = engineDiagnostics({
 		now: () => assert.fail('the clock is not read without a hook')

@@ -202,6 +202,31 @@ test('ordinary creation and seed import never imply automatic peer recovery', as
 	}
 });
 
+test('the engine restores its stored network map after create, and route finding waits for it', async () => {
+	const f = await fixture();
+	try {
+		const { record } = await create(f);
+		assert.equal(f.control.options[0].deferGraphRestore, true);
+		let finish;
+		const restored = new Promise((resolve) => { finish = resolve; });
+		let restoring = true;
+		f.control.node.isGraphRestoring = () => restoring;
+		f.control.node.whenGraphRestored = () => restored;
+		let settled = false;
+		const estimate = f.runtime.request({
+			method: 'POST',
+			path: `/wallets/${record.id}/api/payment/estimate`,
+			body: { bolt11: 'lnbcrt1x' }
+		}).then(() => {}, () => {}).finally(() => { settled = true; });
+		for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(settled, false);
+		restoring = false;
+		finish(true);
+		await estimate;
+		assert.equal(settled, true);
+	} finally { await f.runtime.close(); }
+});
+
 test('opted-in import persists across restart, keeps status readable and blocks mutations plus background work', async () => {
 	const volume = memory();
 	let id;
