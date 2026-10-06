@@ -109,10 +109,8 @@ test('the stored network map restore is reported once per node, with its steps',
 		{
 			phase: 'engine-perf',
 			message:
-				'restore-graph 3900ms channels 14670 stale 3 nodes 12721 orphans 1 ' +
-				'graph-channels 14667 graph-nodes 12700 load-channels 3000ms ' +
-				'restore-channels 300ms load-nodes 500ms restore-nodes 60ms ' +
-				'delete 10ms prune 20ms reannounce 10ms restore 4100ms construct 4500ms'
+				'restore-graph 3900ms channels 14670 nodes 12721 load 3000+500ms ' +
+				'add 300+60ms restore 4100ms construct 4500ms'
 		}
 	]);
 });
@@ -129,8 +127,14 @@ test('an engine without the restore stats, or with none to give, reports nothing
 	});
 	perf.graphRestored(undefined);
 	assert.deepEqual(seen, []);
-	// A field the stats lack is left out.
-	perf.graphRestored({ getGraphRestoreStats: () => ({ graphMs: 12, channelRows: 2 }) });
+	// A figure the stats lack is left out, a step's pair with it.
+	perf.graphRestored({
+		getGraphRestoreStats: () => ({
+			graphMs: 12,
+			channelRows: 2,
+			loadChannelsMs: 9
+		})
+	});
 	assert.deepEqual(
 		seen.map((entry) => entry.message),
 		['restore-graph 12ms channels 2']
@@ -145,9 +149,14 @@ test('without a hook nothing is timed or listened to', async () => {
 	const node = new EventEmitter();
 	perf.watchGossip(node);
 	assert.equal(node.listenerCount('gossip:synced'), 0);
+	let reads = 0;
 	perf.graphRestored({
-		getGraphRestoreStats: () => assert.fail('the stats are not read without a hook')
+		getGraphRestoreStats: () => {
+			reads++;
+			return { graphMs: 1 };
+		}
 	});
+	assert.equal(reads, 0);
 });
 
 test('a hook that throws fails neither the step nor the engine event', async () => {
