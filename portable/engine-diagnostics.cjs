@@ -6,6 +6,7 @@
  * timing under the message's first word and keeps the rest as its detail.
  *
  *   create 812ms
+ *   restore-graph 3812ms channels 20328 nodes 7934 load 3006+489ms add 265+39ms restore 4761ms construct 4866ms
  *   initial-sync 2140ms
  *   gossip-synced download 950ms apply 3100ms busy 2400ms slices 310 channels 28000
  *
@@ -20,6 +21,7 @@ function engineDiagnostics({ onDiagnostic, now = Date.now }) {
 		} catch {}
 	};
 	const watched = new WeakSet();
+	const restored = new WeakSet();
 	return {
 		/**
 		 * Await one boot step and report how long it took once it succeeds.
@@ -34,6 +36,24 @@ function engineDiagnostics({ onDiagnostic, now = Date.now }) {
 			const value = await run();
 			report(`${mark} ${now() - started}ms`);
 			return value;
+		},
+		/**
+		 * Report how the node brought back its stored network map as it was
+		 * built, once per node. An engine without getGraphRestoreStats
+		 * (coreyphillips/beignet#1343) reports nothing.
+		 */
+		graphRestored(node) {
+			if (!enabled || restored.has(node)) return;
+			if (typeof node?.getGraphRestoreStats !== 'function') return;
+			let stats;
+			try {
+				stats = node.getGraphRestoreStats();
+			} catch {
+				return;
+			}
+			if (!stats) return;
+			restored.add(node);
+			report(restoreGraph(stats));
 		},
 		/** Report every Rapid Gossip Sync import the node finishes, one listener per node. */
 		watchGossip(node) {
@@ -65,4 +85,37 @@ function gossipSynced(data) {
 		.join(' ');
 }
 
-module.exports = { engineDiagnostics, gossipSynced };
+/**
+ * The network map's part of the restore first, then the rows it read, how
+ * long reading and parsing them took (`load`) and adding them to the graph
+ * (`add`), channels then nodes, then the whole restore and the whole node
+ * build. It is kept short so the client's boot report keeps the marks after
+ * it; the stale and orphan counts and the smaller steps are in the engine's
+ * own `peer:graph_restored` log. A figure the stats lack is left out.
+ */
+function restoreGraph(stats) {
+	const pair = (a, b) =>
+		Number.isFinite(a) && Number.isFinite(b) ? `${a}+${b}` : undefined;
+	const fields = [
+		['channels', stats?.channelRows, ''],
+		['nodes', stats?.nodeRows, ''],
+		['load', pair(stats?.loadChannelsMs, stats?.loadNodesMs), 'ms'],
+		['add', pair(stats?.restoreChannelsMs, stats?.restoreNodesMs), 'ms'],
+		['restore', stats?.restoreMs, 'ms'],
+		['construct', stats?.constructMs, 'ms']
+	];
+	const head = Number.isFinite(stats?.graphMs)
+		? `restore-graph ${stats.graphMs}ms`
+		: 'restore-graph';
+	return [head]
+		.concat(
+			fields
+				.filter(
+					([, value]) => Number.isFinite(value) || typeof value === 'string'
+				)
+				.map(([name, value, unit]) => `${name} ${value}${unit}`)
+		)
+		.join(' ');
+}
+
+module.exports = { engineDiagnostics, gossipSynced, restoreGraph };

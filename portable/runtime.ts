@@ -546,6 +546,8 @@ export async function createPortableRuntime(options: any) {
 						if (error.code === 'PERSISTENCE_ERROR') durabilityFailed = true;
 					}
 				}));
+				// How the stored network map came back inside create().
+				enginePerf.graphRestored(node);
 				// On mainnet create() starts the boot Rapid Gossip Sync in the
 				// background; it reports when its download and import are done.
 				enginePerf.watchGossip(node);
