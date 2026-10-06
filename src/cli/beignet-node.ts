@@ -186,6 +186,7 @@ import {
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
+	IGraphRestoreStats,
 	IRebalanceExecutionSummary,
 	IRebalanceResult,
 	PaymentDirection,
@@ -452,6 +453,20 @@ export interface BeignetNodeOptions extends IrohDaemonConfig {
 	 * signatureless RGS-primed entries are re-fetched signed from peers.
 	 */
 	eagerGossipVerify?: boolean;
+	/**
+	 * Bring back the stored network map in time slices after create()
+	 * returns, rather than inside it (default false). For a node that runs
+	 * on an app's only JavaScript thread, as a phone wallet's does: a large
+	 * map otherwise holds that thread for seconds as the wallet opens. Until
+	 * it is back, payments, rebalances and channel suggestions wait for it,
+	 * a synchronous route query (estimateRouteFee, probeRoute, queryRoute,
+	 * quotePayAll) finishes it first, gossip that would write the graph and
+	 * the boot RGS import wait for it, and getGraphInfo() says `restoring`.
+	 * The waits are skipped while no restore runs, so a node that restores
+	 * inline sees no change. getGraphRestoreStats() is null until then, and
+	 * `graph:restored` reports it.
+	 */
+	deferGraphRestore?: boolean;
 	/** Optional error callback — receives all node:error events instead of silently absorbing them */
 	onError?: (error: {
 		code: string;
@@ -2237,6 +2252,8 @@ export class BeignetNode extends EventEmitter {
 	private peerStorageEnabled = true;
 	/** Epoch ms of the last gossip/RGS sync completed this session. */
 	private _lastGraphSyncAt?: number;
+	/** How long building the last LightningNode took (getGraphRestoreStats). */
+	private _nodeConstructMs?: number;
 	/** Newest VALID SCB a peer returned via peer storage (never auto-restored). */
 	private _peerRetrievedScb: {
 		encoded: string;
@@ -2848,6 +2865,7 @@ export class BeignetNode extends EventEmitter {
 		// node comes through here, so each gets a fresh view of the database
 		// it runs on.
 		this._nodeStorageView = nodeStorageView(this.storage);
+		const constructStarted = Date.now();
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			seed: this.walletSeed(),
@@ -3052,6 +3070,7 @@ export class BeignetNode extends EventEmitter {
 						: {}
 			},
 			eagerGossipVerify: opts.eagerGossipVerify ?? false,
+			cooperativeGraphRestore: opts.deferGraphRestore === true,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,
@@ -3101,6 +3120,12 @@ export class BeignetNode extends EventEmitter {
 			autoTuneFees: opts.autoTuneFees,
 			watchtowers: opts.watchtowers,
 			recovery: this.recoveryNodeConfig
+		});
+		this._nodeConstructMs = Date.now() - constructStarted;
+		// A deferred restore of the stored network map reports when it ends.
+		this.node.on('graph:restored', () => {
+			const stats = this.getGraphRestoreStats();
+			if (stats) this.emit('graph:restored', stats);
 		});
 
 		this.fforReceiveService = new FforReceiveService(
@@ -7831,6 +7856,11 @@ export class BeignetNode extends EventEmitter {
 		const downloadMs = Date.now() - downloadStart;
 		// Shut down mid-download: applying the graph would only hold up teardown.
 		if (this.destroyed) throw new RapidGossipCancelledError();
+		// A deferred restore of the stored map lands first, as an inline one
+		// did inside create(); the import would wait for it anyway, and its
+		// time is not the import's.
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
+		if (this.destroyed) throw new RapidGossipCancelledError();
 		let slices = 0;
 		let busyMs = 0;
 		const applyStart = Date.now();
@@ -7955,6 +7985,8 @@ export class BeignetNode extends EventEmitter {
 		satsPerChannel: number,
 		_opts?: { timeoutMs?: number }
 	): Promise<ChannelInfo[]> {
+		// The peers suggested come from the graph, so all of it first.
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Check existing ready channels
 		const existing = this.getReadyChannels();
 		if (existing.length >= count) return existing;
@@ -11323,6 +11355,7 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
 		this._checkDraining();
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		const decoded = decodeInvoiceInput(bolt11);
 		const debit = requireMsatValue(debitMsat, 'debitMsat');
 		const feeCap = requireMsatValue(maxFeeMsat, 'maxFeeMsat');
@@ -11368,6 +11401,7 @@ export class BeignetNode extends EventEmitter {
 		maxFeeMsatCap?: number | string
 	): Promise<PaymentInfo> {
 		this._checkDraining();
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Decode to get paymentHash for event matching
 		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
@@ -11789,6 +11823,7 @@ export class BeignetNode extends EventEmitter {
 		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Guarded before the accounting for the same reason payInvoice is: the
 		// decrements all live in the callbacks below, so a RangeError here used
 		// to leave _pendingSpendSats permanently raised (issue #474).
@@ -12887,6 +12922,7 @@ export class BeignetNode extends EventEmitter {
 		maxFeeMsatCap?: number | string,
 		onPaymentHash?: (paymentHash: string) => void
 	): Promise<PaymentInfo> {
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
 		// so it runs the same admission: drain mode, both spending limits, a
 		// reservation for the in-flight window and the daily accounting on
@@ -13489,6 +13525,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		maxFeeSats: number
 	): Promise<RebalanceResult> {
+		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		if (!/^[0-9a-fA-F]{64}$/.test(fromChannelId))
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -13693,6 +13730,37 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Graph Queries ───────────────
 
+	/**
+	 * Whether a deferred restore of the stored network map
+	 * (deferGraphRestore) is still running.
+	 */
+	isGraphRestoring(): boolean {
+		return this.node?.isGraphRestoring?.() ?? false;
+	}
+
+	/**
+	 * Settles once the stored network map is back: at once when it came back
+	 * inside create(), or when a deferred restore ends. False when a storage
+	 * failure or the node's destruction cut it short. It never rejects.
+	 */
+	whenGraphRestored(): Promise<boolean> {
+		return this.node?.whenGraphRestored?.() ?? Promise.resolve(true);
+	}
+
+	/**
+	 * How the stored network map came back as the node was built, with how
+	 * long building the node took in all (`constructMs`), or null before
+	 * there is a node or for one without storage. A phone's boot report reads
+	 * it as soon as create() returns.
+	 */
+	getGraphRestoreStats(): IGraphRestoreStats | null {
+		const stats = this.node?.getGraphRestoreStats() ?? null;
+		if (!stats) return null;
+		return this._nodeConstructMs === undefined
+			? stats
+			: { ...stats, constructMs: this._nodeConstructMs };
+	}
+
 	getGraphInfo(): GraphInfo {
 		const graph = this.node.getGraph();
 		const info: GraphInfo = {
@@ -13702,6 +13770,7 @@ export class BeignetNode extends EventEmitter {
 		if (this._lastGraphSyncAt !== undefined) {
 			info.lastSyncAt = this._lastGraphSyncAt;
 		}
+		if (this.isGraphRestoring()) info.restoring = true;
 		return info;
 	}
 

@@ -500,6 +500,14 @@ export interface INodeConfig {
 	 */
 	eagerGossipVerify?: boolean;
 	/**
+	 * Bring back the stored network map a time slice at a time after the
+	 * constructor returns, rather than inside it (default false). A phone's
+	 * JavaScript thread is otherwise held for seconds as its wallet opens.
+	 * Until the restore ends, gossip that would write the graph waits for it,
+	 * and route finding finishes it first (whenGraphRestored).
+	 */
+	cooperativeGraphRestore?: boolean;
+	/**
 	 * JIT channel receive, LSP role (issue #594): hold HTLCs addressed to
 	 * intercept SCIDs this node minted for wallet peers, fund a zero-conf
 	 * channel to the client (or splice its existing one bigger), then forward.
@@ -1856,6 +1864,61 @@ export interface IStructuredLog {
 	action: string;
 	timestamp: number;
 	data: Record<string, unknown>;
+}
+
+/**
+ * How the stored network map came back (LightningNode.getGraphRestoreStats).
+ * Counts are rows read from storage and what the graph held afterwards; times
+ * are milliseconds. Inline, the restore runs inside the constructor; with
+ * cooperativeGraphRestore it runs in slices after it.
+ */
+export interface IGraphRestoreStats {
+	/** Whether the map came back in slices after the constructor. */
+	cooperative: boolean;
+	/**
+	 * The network map's part, from its start to its end: reads, restores,
+	 * deletes, prune, reannounce, and in slices the turns of the event loop
+	 * between them.
+	 */
+	graphMs: number;
+	/** Of graphMs, the time spent restoring: all of it inline. */
+	busyMs: number;
+	/** How many slices it took: 1 inline. */
+	slices: number;
+	/**
+	 * The restore from storage inside the constructor, which includes the
+	 * network map only when that is restored inline.
+	 */
+	restoreMs: number;
+	channelRows: number;
+	/**
+	 * Channel rows past the freshness cutoff: not restored, and deleted when
+	 * the storage can delete gossip rows.
+	 */
+	staleChannels: number;
+	nodeRows: number;
+	/**
+	 * Node rows with no channel row behind them on disk: not restored, and
+	 * deleted when the storage can delete gossip rows.
+	 */
+	orphanNodes: number;
+	/** The graph once the restore and its prune are done. */
+	graphChannels: number;
+	graphNodes: number;
+	/** Reading the channel rows and parsing them. */
+	loadChannelsMs: number;
+	restoreChannelsMs: number;
+	/** Reading the node rows and parsing them. */
+	loadNodesMs: number;
+	restoreNodesMs: number;
+	deleteMs: number;
+	pruneMs: number;
+	reannounceMs: number;
+	/**
+	 * Building the LightningNode, the restore included. Only BeignetNode,
+	 * which builds it, can time that.
+	 */
+	constructMs?: number;
 }
 
 // ─── Payment Proof ───
