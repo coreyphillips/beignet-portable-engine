@@ -79,3 +79,30 @@ test('base64url encodes and decodes exactly as Node does, so the direct-funding 
 	assert.equal(Portable.from([0xfb, 0xff]).toString('base64'), '+/8=');
 	assert.equal(Portable.from('hi').toString(), 'hi');
 });
+
+test('hex reads through the digit table exactly as buffer@6 reads it', () => {
+	const context = vm.createContext({ setTimeout, clearTimeout, queueMicrotask });
+	vm.runInContext('var module = { exports: {} }; var exports = module.exports;', context);
+	vm.runInContext(compiled, context);
+	const Portable = vm.runInContext('module.exports.Buffer', context);
+	// The npm package the portable build bundles, not Node's own Buffer.
+	const { Buffer: Six } = require('buffer/');
+	const crypto = require('node:crypto');
+	const samples = ['', 'ab', 'AB', 'aBcD', '0123456789abcdefABCDEF', 'abc', 'abcde'];
+	for (let i = 0; i < 200; i++) samples.push(crypto.randomBytes(i % 70).toString('hex'));
+	// Malformed: buffer@6 stops at the first pair parseInt cannot read, and
+	// parseInt reads a leading digit of a pair such as "0g" or " 1".
+	samples.push('zz', 'abzz', 'ab0g', 'ab g1', 'aé', 'éa', 'ab😀', '0x12', ' 1ab');
+	for (const text of samples) {
+		const got = Portable.from(text, 'hex');
+		assert.equal(Portable.isBuffer(got), true, text);
+		assert.equal(
+			Buffer.from(got).toString('hex'),
+			Buffer.from(Six.from(text, 'hex')).toString('hex'),
+			JSON.stringify(text)
+		);
+	}
+	// Other encodings and forms are untouched.
+	assert.equal(Portable.from('hi', 'utf8').toString(), 'hi');
+	assert.equal(Portable.from([1, 2]).toString('hex'), '0102');
+});
