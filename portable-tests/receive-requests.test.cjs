@@ -20,6 +20,28 @@ function request(tag=3){
 function fixture(){let disk=null,fail=false,writes=0;const options={walletId:'wallet-one',network:'regtest',load:()=>disk&&JSON.parse(disk),save:data=>{if(fail)throw Error('disk failure');disk=JSON.stringify(data);writes++;}};
  return {open:()=>new ReceiveRequestStore(options), options, get disk(){return disk},set disk(v){disk=v},set fail(v){fail=v},get writes(){return writes}};}
 const checks=row=>({getInvoice:hash=>hash===row.paymentHash?{paymentHash:hash,bolt11:row.bolt11}:null,ownsAddress:addr=>addr===address});
+test('saved requests skip signer recovery while new registrations still require it',async()=>{
+ const f=fixture(),row=request(72);
+ await f.open().register(row,checks(row));
+ const {bech32}=require('bech32');
+ const decoded=bech32.decode(row.bolt11,20000);
+ decoded.words.fill(0,decoded.words.length-104);
+ const unsigned=bech32.encode(decoded.prefix,decoded.words,20000);
+ const altered={...row,bolt11:unsigned,uri:row.uri.replace(row.bolt11,unsigned)};
+ const saved=JSON.parse(f.disk);
+ saved.requests[0]={...saved.requests[0],...altered};
+ f.disk=JSON.stringify(saved);
+ // Stored metadata already passed registration and comes from the wallet's
+ // protected volume. A nonrecoverable signature proves reload skips recovery.
+ assert.equal(f.open().list()[0].bolt11,unsigned);
+ const fresh=fixture();
+ await assert.rejects(fresh.open().register(altered,checks(altered)),{code:'INVALID_RECEIVE_REQUEST'});
+ assert.equal(fresh.writes,0);
+ // Parsing and binding checks still run for stored rows.
+ saved.requests[0].amountSats=5000;
+ f.disk=JSON.stringify(saved);
+ assert.throws(()=>f.open().list(),{code:'RECEIVE_REQUESTS_UNAVAILABLE'});
+});
 test('original unified request survives a new store without seed fields and replay returns canonical ID after invoice pruning',async()=>{
  const f=fixture(),row=request(),store=f.open();
  const saved=await store.register({...row,preimage:'SECRET',mnemonic:'SECRET'},checks(row));

@@ -1,3 +1,14 @@
+# Portable engine validation, 2026-10-07 addendum
+
+The fork tracks Beignet **0.30.0** at `966a7e1099b2ac04db05d4359a1a453f493a5e1b`. This addendum supersedes the prior baseline statements below. The existing portable patch reapplies to pristine upstream source without rejection, and the resulting source matches the combined candidate used for the device and funded-regtest checks.
+
+- The 0.30.0 portable build passes all 213 unit tests, the public type checks, its build, and syntax checks over 57 JavaScript files. Its CommonJS and ESM bundles differ from the phone-tested candidate only in the reported version string.
+- The same source passes all 13 funded regtest steps against the local Bitcoin and Electrum containers. The CLN smoke checks pass, including the onion handshake and restored invoice and identity. The regtest teardown retains the three known `close connect` messages.
+- The matching upstream source passes 9,443 Lightning tests and its source type check.
+- Eleven release-build cold starts on a Pixel 10 Pro XL, with the Chicory startup fixes, paint the wallet in 2.62 to 2.91 seconds and restore the network map in 15.58 to 18.51 seconds. The longest task after paint is 440 to 483 ms. No task of at least 250 ms occurs after eight seconds, no entrance stalls, and no tap is refused. Tap wait median and maximum are 19 and 221 ms. The 200 ms maximum target was narrowly missed, so this is not a claim of zero remaining latency.
+
+These device checks use the reviewed source with local timing instrumentation. They perform navigation only and do not make a mainnet payment. A full final app artifact and its engine pin are recorded in Chicory's release validation.
+
 # Portable engine validation, 2026-10-06 addendum
 
 The fork now tracks upstream Beignet **0.29.0** (`45f8ff9d`, npm's `gitHead` for the release and the merge of the version bump #1347, whose `src/` is the same as `193c43b2`), resynced from 0.28.0 on 2026-10-06; this addendum supersedes the "tracks" line of the 2026-10-05 section below, and `PATCHES.md` carries the method and what the release changes for this fork. A tarball of the 0.28.0 fork was written first (`beignet-engine-backup-0.28.0-2026-10-06.tar.gz` at the workspace root: the tracked tree at `19a2f4a`, by `git archive`). Upstream had changed five of the twenty-two patched files; all 69 hunks reapplied to pristine `193c43b2` with no rejection, the resynced tree's change from the 0.28.0 fork is upstream's own 0.28.0 to 0.29.0 change (1,101 added and 104 removed lines, compared sorted) plus two added lines for the new paged gossip reads (see `PATCHES.md`). Nothing was ported by hand. The same branch passes `deferGraphRestore` to the engine, makes the route-finding requests wait for the stored network map, and reports a deferred restore through the diagnostic hook.

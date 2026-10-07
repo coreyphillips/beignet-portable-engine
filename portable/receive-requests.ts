@@ -16,7 +16,14 @@ export function receiveAddressScriptHash(address: string, network: string) {
 		return createHash('sha256').update(script).digest().reverse().toString('hex');
 	} catch { fail(); }
 }
-function normalize(input: any, network: string) {
+/**
+ * A request as the store keeps it, checked against its own bolt11. `stored`
+ * is a request this wallet registered and saved itself, read back: its
+ * invoice is the node's own, so its signer is not recovered again, which
+ * on a phone is tens of milliseconds of pure-JS secp256k1 for every saved
+ * request on every start. Every field is still checked against the invoice.
+ */
+function normalize(input: any, network: string, stored = false) {
 	if (!input || typeof input !== 'object' || Array.isArray(input) || input.demo === true) fail();
 	if (typeof input.id !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(input.id)) fail();
 	if (typeof input.uri !== 'string' || input.uri.length > 16384 || /[\s\u0000-\u001f]/.test(input.uri)) fail();
@@ -59,7 +66,7 @@ function normalize(input: any, network: string) {
 			}
 			if (uriAmount !== (amount === null ? null : BigInt(amount))) fail();
 		}
-		parsed = decode(input.bolt11);
+		parsed = decode(input.bolt11, stored ? { recoverSigner: false } : undefined);
 		const chain = ({mainnet:'bc', testnet:'tb', regtest:'bcrt', signet:'tbs'} as any)[network];
 		if (parsed.network !== chain || parsed.paymentHash.toString('hex') !== input.paymentHash
 			|| (parsed.amountMsat ?? null) !== (amount === null ? null : BigInt(amount) * 1000n)) fail();
@@ -91,7 +98,7 @@ export class ReceiveRequestStore {
 			const hashes = new Set(), ids = new Set();
 			const requests:any[]=[];
 			for (const row of data.requests) {
-				const normalized = normalize(row, this.options.network).request;
+				const normalized = normalize(row, this.options.network, true).request;
 				if (row.network !== this.options.network || row.createdAt !== normalized.createdAt || hashes.has(row.paymentHash) || ids.has(row.id)) fail();
 				hashes.add(row.paymentHash); ids.add(row.id); requests.push(normalized);
 			}
