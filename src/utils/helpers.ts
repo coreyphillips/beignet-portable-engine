@@ -13,11 +13,13 @@ import { availableNetworks, isValidBech32mEncodedString } from './wallet';
 import { err, ok, Result } from './result';
 import { addressTypes, getAddressTypes } from '../shapes';
 import { getKeyDerivationPathObject } from './derivation-path';
-import { ECPairFactory, ECPairInterface } from 'ecpair';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ECPairInterface } from 'ecpair';
+import { ecc } from './ecc';
+import { getECPair } from './ecc-apis';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
-const ECPair = ECPairFactory(ecc);
+
+bitcoin.initEccLib(ecc);
 
 /**
  * PSBT signature validator for Psbt.validateSignaturesOfInput. A 32-byte
@@ -35,7 +37,7 @@ export const validatePsbtSignature = (
 	if (pubkey.length === 32) {
 		return Boolean(ecc.verifySchnorr(msghash, pubkey, signature));
 	}
-	return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
+	return getECPair().fromPublicKey(pubkey).verify(msghash, signature);
 };
 
 /**
@@ -292,9 +294,8 @@ export const getAddressFromKeyPair = ({
 				publicKey: keyPair.publicKey,
 				network
 			});
-			if (res.isOk()) {
-				address = res.value.address;
-			}
+			if (res.isErr()) return err(res.error);
+			address = res.value.address;
 			break;
 		case EAddressType.p2wsh:
 			// A sorted-multisig P2WSH address needs every cosigner's key, not a
@@ -353,14 +354,14 @@ export const getAddressesFromPrivateKey = ({
 }): Result<IGetAddressesFromPrivateKey> => {
 	try {
 		if (!privateKey) return err('No private key provided.');
-		const keyPair = ECPair.fromWIF(privateKey, network);
+		const keyPair = getECPair().fromWIF(privateKey, network);
 		const response = addrTypes.map((addressType) => {
 			const addressInfo = getAddressFromKeyPair({
 				keyPair,
 				addressType,
 				network
 			});
-			if (addressInfo.isErr()) throw new Error(addressInfo.error.message);
+			if (addressInfo.isErr()) throw addressInfo.error;
 			return addressInfo.value;
 		});
 		if (!response) return err('Unable to get addresses from private key.');

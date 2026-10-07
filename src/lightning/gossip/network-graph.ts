@@ -33,6 +33,32 @@ import {
 const ZERO_SIG = Buffer.alloc(64);
 
 /**
+ * The block height a short channel id names: its first three bytes, big
+ * endian (BOLT 7), the figure decodeShortChannelId gives. A range reply reads
+ * it for every channel in the graph, so it is read here without a BigInt. An
+ * id that is not 8 bytes long is refused as decodeShortChannelId refuses it.
+ */
+function scidBlock(scid: Buffer): number {
+	if (scid.length !== 8) return decodeShortChannelId(scid).block;
+	return (scid[0] << 16) | (scid[1] << 8) | scid[2];
+}
+
+/**
+ * The byte order of two short channel ids, which for 8-byte ids is their
+ * numeric order, as Buffer.compare gives it. A range reply sorts every
+ * channel the range holds, and the buffer package a portable build runs on
+ * copies both arguments on each Buffer.compare: about 280,000 copies to sort
+ * a phone's 20,000 channels, held on its only thread.
+ */
+function compareScids(a: Buffer, b: Buffer): number {
+	const length = Math.min(a.length, b.length);
+	for (let i = 0; i < length; i++) {
+		if (a[i] !== b[i]) return a[i] - b[i];
+	}
+	return a.length - b.length;
+}
+
+/**
  * A stored message with an all-zero signature can never be verified or served
  * (Rapid Gossip Sync strips signatures). Such slots also carry synthetic
  * timestamps, which is why some freshness rules treat them specially.
@@ -1096,13 +1122,13 @@ export class NetworkGraph {
 			) {
 				continue;
 			}
-			const scid = decodeShortChannelId(channel.shortChannelId);
-			if (scid.block >= firstBlock && scid.block < endBlock) {
+			const block = scidBlock(channel.shortChannelId);
+			if (block >= firstBlock && block < endBlock) {
 				result.push(Buffer.from(channel.shortChannelId));
 			}
 		}
 		// Sort by SCID value (lexicographic on 8 bytes = numeric order)
-		result.sort((a, b) => Buffer.compare(a, b));
+		result.sort(compareScids);
 		return result;
 	}
 
@@ -1174,16 +1200,17 @@ export class NetworkGraph {
 			// (an announcement without its updates) would make the requester
 			// record the SCID as synced and never ask for the omitted pieces
 			// again.
-			const nodesNeedingResolution = [channel.nodeId1, channel.nodeId2]
-				.map((id) => id.toString('hex'))
-				.filter((hex) => {
-					if (seenNodes.has(hex)) return false;
-					const n = this._nodes.get(hex);
-					return (
-						n?.announcement !== undefined &&
-						n.announcementVerifyDeferred === true
-					);
-				});
+			const endpoints = [
+				channel.nodeId1.toString('hex'),
+				channel.nodeId2.toString('hex')
+			];
+			const nodesNeedingResolution = endpoints.filter((hex) => {
+				if (seenNodes.has(hex)) return false;
+				const n = this._nodes.get(hex);
+				return (
+					n?.announcement !== undefined && n.announcementVerifyDeferred === true
+				);
+			});
 			const needsResolution =
 				channel.announcementVerifyDeferred === true ||
 				(channel.update1 !== undefined &&
@@ -1192,55 +1219,16 @@ export class NetworkGraph {
 					channel.update2VerifyDeferred === true) ||
 				nodesNeedingResolution.length > 0;
 
-			if (needsResolution) {
-				if (this._serveVerifySpentMs >= NetworkGraph.SERVE_VERIFY_BUDGET_MS) {
-					// Budget exhausted: omit the whole channel from this reply.
-					// It stays deferred, resolvable in a later window, and the
-					// end marker reports the omission.
-					complete = false;
-					continue;
-				}
-				// Once started, a channel's slots settle as a group; the budget
-				// overrun is bounded by one channel (at most 8 signature
-				// checks: 4 announcement, 2 updates, 2 node announcements).
-				const t0 = Date.now();
-				if (channel.announcementVerifyDeferred === true) {
-					this._resolveDeferredAnnouncement(scidHex, channel);
-				}
-				// The updates and node announcements of a non-servable channel
-				// are never verified: its endpoint keys are unauthenticated.
-				if (channel.announcementVerified === true) {
-					if (
-						channel.update1 !== undefined &&
-						channel.update1VerifyDeferred === true
-					) {
-						channel.update1Verified = verifyChannelUpdateMessage(
-							channel.update1,
-							channel.nodeId1,
-							channel.nodeId2
-						);
-						channel.update1VerifyDeferred = undefined;
-					}
-					if (
-						channel.update2 !== undefined &&
-						channel.update2VerifyDeferred === true
-					) {
-						channel.update2Verified = verifyChannelUpdateMessage(
-							channel.update2,
-							channel.nodeId1,
-							channel.nodeId2
-						);
-						channel.update2VerifyDeferred = undefined;
-					}
-					for (const hex of nodesNeedingResolution) {
-						const n = this._nodes.get(hex)!;
-						n.announcementVerified = verifyNodeAnnouncementMessage(
-							n.announcement!
-						);
-						n.announcementVerifyDeferred = undefined;
-					}
-				}
-				this._serveVerifySpentMs += Date.now() - t0;
+			if (
+				needsResolution &&
+				!this._settleForServing(scidHex, channel, nodesNeedingResolution)
+			) {
+				// Budget exhausted before every slot settled: omit the whole
+				// channel from this reply. Slots already checked keep their
+				// result, the rest stay deferred for a later window, and the
+				// end marker reports the omission.
+				complete = false;
+				continue;
 			}
 
 			// BOLT 7: never relay announcements we have not validated (#340).
@@ -1258,8 +1246,7 @@ export class NetworkGraph {
 			}
 
 			// Collect node announcements for endpoint nodes (deduplicated)
-			for (const nodeId of [channel.nodeId1, channel.nodeId2]) {
-				const nodeHex = nodeId.toString('hex');
+			for (const nodeHex of endpoints) {
 				if (seenNodes.has(nodeHex)) continue;
 				seenNodes.add(nodeHex);
 				const node = this._nodes.get(nodeHex);
@@ -1270,5 +1257,88 @@ export class NetworkGraph {
 		}
 
 		return { announcements, updates, nodeAnnouncements, complete };
+	}
+
+	/**
+	 * Settle a channel's deferred slots for serving, drawing on the shared
+	 * serve budget before each check instead of once per channel. A channel
+	 * can carry eight signatures (four on its announcement, one per update,
+	 * one per endpoint's node announcement), so a check per channel let a
+	 * reply overrun the budget by all of them: on a phone, pure-JS
+	 * secp256k1 put about 0.1 s of overrun on each of the requester's
+	 * retries. Now the overrun is one message verification, which still
+	 * checks four signatures together for a channel announcement. Returns
+	 * false when the budget ran out first; what was checked keeps its sticky result, and the
+	 * rest stays deferred for a later window.
+	 */
+	private _settleForServing(
+		scidHex: string,
+		channel: IGraphChannel,
+		nodesNeedingResolution: string[]
+	): boolean {
+		const spend = (check: () => void): boolean => {
+			if (this._serveVerifySpentMs >= NetworkGraph.SERVE_VERIFY_BUDGET_MS) {
+				return false;
+			}
+			const t0 = Date.now();
+			check();
+			this._serveVerifySpentMs += Date.now() - t0;
+			return true;
+		};
+		if (
+			channel.announcementVerifyDeferred === true &&
+			!spend(() => this._resolveDeferredAnnouncement(scidHex, channel))
+		) {
+			return false;
+		}
+		// The updates and node announcements of a non-servable channel are
+		// never verified: its endpoint keys are unauthenticated. The caller
+		// skips it, and a settled failure is not an omission.
+		if (channel.announcementVerified !== true) return true;
+		const update1 = channel.update1;
+		if (
+			update1 !== undefined &&
+			channel.update1VerifyDeferred === true &&
+			!spend(() => {
+				channel.update1Verified = verifyChannelUpdateMessage(
+					update1,
+					channel.nodeId1,
+					channel.nodeId2
+				);
+				channel.update1VerifyDeferred = undefined;
+			})
+		) {
+			return false;
+		}
+		const update2 = channel.update2;
+		if (
+			update2 !== undefined &&
+			channel.update2VerifyDeferred === true &&
+			!spend(() => {
+				channel.update2Verified = verifyChannelUpdateMessage(
+					update2,
+					channel.nodeId1,
+					channel.nodeId2
+				);
+				channel.update2VerifyDeferred = undefined;
+			})
+		) {
+			return false;
+		}
+		for (const hex of nodesNeedingResolution) {
+			const node = this._nodes.get(hex)!;
+			if (node.announcementVerifyDeferred !== true) continue;
+			if (
+				!spend(() => {
+					node.announcementVerified = verifyNodeAnnouncementMessage(
+						node.announcement!
+					);
+					node.announcementVerifyDeferred = undefined;
+				})
+			) {
+				return false;
+			}
+		}
+		return true;
 	}
 }

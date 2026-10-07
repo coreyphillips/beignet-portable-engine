@@ -370,7 +370,7 @@ import {
 	MAX_SCRIPT_SIZE
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
-import * as ecc from '@bitcoinerlab/secp256k1';
+import { ecc } from '../../utils/ecc';
 import {
 	IStorageBackend,
 	IPersistedChannelPolicy,
@@ -961,6 +961,13 @@ interface IGraphRestoreRun {
 
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
+	/**
+	 * Our node's public key, derived from nodePrivkey once. Deriving it is a
+	 * point multiplication, which on a phone's JavaScript engine takes tens of
+	 * milliseconds, and every channel_update a peer sends asked for it.
+	 * Read it through ownNodeId(), which hands out a copy.
+	 */
+	private readonly ownNodeIdBytes: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
 	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
@@ -1629,7 +1636,8 @@ export class LightningNode extends EventEmitter {
 		this.setMaxListeners(50);
 
 		this.nodePrivkey = config.nodePrivateKey;
-		this.nodeId = getPublicKey(config.nodePrivateKey).toString('hex');
+		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
+		this.nodeId = this.ownNodeIdBytes.toString('hex');
 		this.network = config.network || Network.REGTEST;
 		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
@@ -1685,7 +1693,7 @@ export class LightningNode extends EventEmitter {
 				? new RecoveryJournal(
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
-						getPublicKey(config.nodePrivateKey),
+						this.ownNodeId(),
 						// The guardian namespace keys the deterministic frame IV
 						// (wire spec 1.1, 3.2); never the public node id.
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
@@ -1761,7 +1769,7 @@ export class LightningNode extends EventEmitter {
 			chainPromisedQuorum(
 				this.storage,
 				deriveRecoveryMasterKey(config.nodePrivateKey),
-				getPublicKey(config.nodePrivateKey)
+				this.ownNodeId()
 			)
 		) {
 			throw new Error(
@@ -2263,7 +2271,7 @@ export class LightningNode extends EventEmitter {
 			this.fforWitness = new FforWitnessService(witnessConfig, {
 				ledger,
 				nodePrivkey: this.nodePrivkey,
-				nodeId: getPublicKey(this.nodePrivkey),
+				nodeId: this.ownNodeId(),
 				currentHeight: () => this.currentBlockHeight,
 				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 				log: (action, data) => this.emitStructuredLog('htlc', action, data),
@@ -2292,7 +2300,7 @@ export class LightningNode extends EventEmitter {
 					ledger: issuerLedger,
 					witnessLedger: ledger,
 					nodePrivkey: this.nodePrivkey,
-					nodeId: getPublicKey(this.nodePrivkey),
+					nodeId: this.ownNodeId(),
 					currentHeight: () => this.currentBlockHeight,
 					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 					log: (action, data) => this.emitStructuredLog('htlc', action, data),
@@ -2319,7 +2327,7 @@ export class LightningNode extends EventEmitter {
 			this.heldForwardLedger,
 			{
 				nodePrivkey: this.nodePrivkey,
-				nodeId: getPublicKey(this.nodePrivkey),
+				nodeId: this.ownNodeId(),
 				chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 				currentHeight: () => this.currentBlockHeight,
 				channelForScid: (scidHex) => {
@@ -2337,7 +2345,7 @@ export class LightningNode extends EventEmitter {
 		this.loadAsyncReceiveGrants();
 		this.asyncPaymentManager = new AsyncPaymentManager(this.heldForwardLedger, {
 			nodePrivkey: this.nodePrivkey,
-			nodeId: getPublicKey(this.nodePrivkey),
+			nodeId: this.ownNodeId(),
 			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			currentHeight: () => this.currentBlockHeight,
 			hasOutgoingLeg: (record) =>
@@ -2576,7 +2584,7 @@ export class LightningNode extends EventEmitter {
 					chainPromisedQuorum(
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
-						getPublicKey(config.nodePrivateKey)
+						this.ownNodeId()
 					)
 				);
 			}
@@ -2831,8 +2839,9 @@ export class LightningNode extends EventEmitter {
 
 		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
 		// before the first journaled transition still receive a current blob
-		// via sendPeerStorageOnConnect.
-		this.scheduleRecoveryCapsuleRefresh();
+		// via sendPeerStorageOnConnect. It runs in its own task, just after
+		// this constructor returns (scheduleInitialCapsule).
+		this.scheduleInitialCapsule();
 
 		this.startCleanupTimer();
 
@@ -4532,6 +4541,11 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return false;
 		}
+	}
+
+	/** Our node's public key, as getPublicKey(nodePrivkey) gives it: a copy. */
+	private ownNodeId(): Buffer {
+		return Buffer.from(this.ownNodeIdBytes);
 	}
 
 	/**
@@ -6247,7 +6261,7 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		const localNodeId = getPublicKey(this.nodePrivkey);
+		const localNodeId = this.ownNodeId();
 		this.channelManager.triggerAnnouncementDepth(
 			channelId,
 			blockHeight,
@@ -6616,6 +6630,30 @@ export class LightningNode extends EventEmitter {
 			this.refreshRecoveryCapsule();
 		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS - elapsed);
 		if (typeof timer.unref === 'function') timer.unref?.();
+		this.capsuleRefreshTimer = timer;
+	}
+
+	/**
+	 * The run's first capsule, composed in a task of its own just after the
+	 * constructor returns instead of inside it. Composing re-bases the
+	 * journal and verifies the stored chain (prepareForReplication, then
+	 * composeRecoveryCapsule); on a phone that was about 0.33 s of a 0.8 s
+	 * constructor, all of it in one block on the thread that draws the
+	 * wallet. Nothing waits on it in between: the capsule stays dirty until
+	 * it is composed, so a provider that connects first gets a freshly
+	 * composed one (sendPeerStorageOnConnect), and a journaled commit
+	 * composes through the throttle as before.
+	 */
+	private scheduleInitialCapsule(): void {
+		if (!this.recoveryCapsuleActive || !this.peerStorageEnabled) return;
+		this.capsuleDirty = true;
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			if (this._destroyed || !this.capsuleDirty) return;
+			this.scheduleRecoveryCapsuleRefresh();
+		}, 0);
+		if (typeof timer.unref === 'function') timer.unref();
 		this.capsuleRefreshTimer = timer;
 	}
 
@@ -9831,7 +9869,7 @@ export class LightningNode extends EventEmitter {
 		this.chainWatcher.on(
 			'announcement:depth',
 			(channelId: Buffer, blockHeight: number, txIndex: number) => {
-				const localNodeId = getPublicKey(this.nodePrivkey);
+				const localNodeId = this.ownNodeId();
 				this.channelManager.triggerAnnouncementDepth(
 					channelId,
 					blockHeight,
@@ -13045,7 +13083,7 @@ export class LightningNode extends EventEmitter {
 		const policy = this.getChannelPolicy(channelId);
 		if (!policy) return null;
 		try {
-			const ourNodeId = getPublicKey(this.nodePrivkey);
+			const ourNodeId = this.ownNodeId();
 			const peerNodeId = Buffer.from(peerHex, 'hex');
 			// BOLT 7: htlc_maximum_msat MUST NOT exceed the channel capacity.
 			const capacityMsat = state.fundingSatoshis * 1000n;
@@ -14766,7 +14804,7 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const ourNodeId = this.ownNodeId();
 		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		// The toChannel peer charges its forwarding fee on the amount it relays
 		// to us, and needs its CLTV delta of headroom above our final expiry.
@@ -15575,7 +15613,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private buildNodeAnnouncement(timestamp: number): Buffer | null {
 		try {
-			const nodeId = getPublicKey(this.nodePrivkey);
+			const nodeId = this.ownNodeId();
 			const aliasBuffer = Buffer.alloc(32);
 			if (this.alias) {
 				// BOLT 7: alias is a 32-byte field that MUST be valid UTF-8. A raw
@@ -15913,7 +15951,7 @@ export class LightningNode extends EventEmitter {
 		feeProportionalMillionths: number;
 	} | null {
 		this.requireGraph('findBlindedIntroExtension');
-		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const ourNodeId = this.ownNodeId();
 		for (const edge of this.graph.getNodeChannels(peerPubkey)) {
 			const introIsNode1 = edge.nodeId2.equals(peerPubkey);
 			const introPubkey = introIsNode1 ? edge.nodeId1 : edge.nodeId2;
@@ -15952,7 +15990,7 @@ export class LightningNode extends EventEmitter {
 		pathId?: Buffer
 	): IBlindedPaymentPath[] {
 		const paths: IBlindedPaymentPath[] = [];
-		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const ourNodeId = this.ownNodeId();
 		// Absolute CLTV bound for the path's payment constraints. Before the
 		// first block arrives the height is 0 and "0 + 2016" is an absolute
 		// bound the chain passed years ago: every relay would refuse the
@@ -16167,7 +16205,7 @@ export class LightningNode extends EventEmitter {
 		pathId?: Buffer
 	): IBlindedPath[] {
 		const paths: IBlindedPath[] = [];
-		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const ourNodeId = this.ownNodeId();
 		for (const channel of this.channelManager.listChannels()) {
 			if (!channel.acceptsNewHtlcs(true)) continue;
 			const channelId = channel.getChannelId();
@@ -16890,7 +16928,7 @@ export class LightningNode extends EventEmitter {
 		) {
 			return;
 		}
-		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const ourNodeId = this.ownNodeId();
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			const scids = [
@@ -17068,7 +17106,7 @@ export class LightningNode extends EventEmitter {
 			minFinalCltvExpiry:
 				options.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 			privateKey: this.nodePrivkey,
-			payeeNodeKey: getPublicKey(this.nodePrivkey),
+			payeeNodeKey: this.ownNodeId(),
 			// Cleartext hints are suppressed under blinding (they would leak the
 			// node id blinding hides) UNLESS the caller opts into including them
 			// so non-blinded-aware payers can still route (S-4 LOW).
@@ -17270,7 +17308,7 @@ export class LightningNode extends EventEmitter {
 		const baseHeight = this.cltvBaseHeight(invoice.paymentHash);
 		return findPayAllRoute({
 			graph: this.graph,
-			source: getPublicKey(this.nodePrivkey),
+			source: this.ownNodeId(),
 			destination: (invoice.payeeNodeKey || invoice.recoveredPubkey)!,
 			...budget,
 			finalCltvExpiry: this.paddedFinalCltvExpiry(invoice.minFinalCltvExpiry),
@@ -17547,7 +17585,7 @@ export class LightningNode extends EventEmitter {
 		const finalCltvExpiry = this.paddedFinalCltvExpiry(
 			invoice.minFinalCltvExpiry
 		);
-		const sourceNodeId = getPublicKey(this.nodePrivkey);
+		const sourceNodeId = this.ownNodeId();
 		// The router bound is an optimisation; the dispatch gate in
 		// sendPaymentToRoute / sendPaymentMpp is the guarantee.
 		const cltvBudget = this.cltvBudgetFor(invoice.paymentHash, cltvCeiling);
@@ -18589,7 +18627,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const finalCltvExpiry = this.paddedFinalCltvExpiry();
-		const sourceNodeId = getPublicKey(this.nodePrivkey);
+		const sourceNodeId = this.ownNodeId();
 
 		const route = findRoute(
 			this.graph,
@@ -22550,7 +22588,7 @@ export class LightningNode extends EventEmitter {
 			signRegistrationRequest(
 				{
 					chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
-					receiverNodeId: getPublicKey(this.nodePrivkey),
+					receiverNodeId: this.ownNodeId(),
 					lspNodeId: Buffer.from(lspNodeIdHex, 'hex'),
 					scid,
 					requestedHoldBlocks: options.requestedHoldBlocks ?? 0,
@@ -22650,7 +22688,7 @@ export class LightningNode extends EventEmitter {
 		if (expect.lspNodeIdHex && lspHex !== expect.lspNodeIdHex) {
 			return 'wrong_lsp';
 		}
-		if (!grant.receiverNodeId.equals(getPublicKey(this.nodePrivkey))) {
+		if (!grant.receiverNodeId.equals(this.ownNodeId())) {
 			return 'not_for_us';
 		}
 		const chain = this.acceptableChainHashes[0] ?? this.chainHash();
@@ -22858,10 +22896,7 @@ export class LightningNode extends EventEmitter {
 			)
 		);
 		ours.add(
-			deriveHoldRegistrationId(
-				getPublicKey(this.nodePrivkey),
-				lspNodeId
-			).toString('hex')
+			deriveHoldRegistrationId(this.ownNodeId(), lspNodeId).toString('hex')
 		);
 		const byHash = new Map<string, IHeldForwardNotice['entries']>();
 		for (const entry of notice.entries) {
@@ -30693,7 +30728,7 @@ export class LightningNode extends EventEmitter {
 		const destination = invoice.nodeId;
 		const amountMsat = invoice.amount;
 		const finalCltvExpiry = this.paddedFinalCltvExpiry();
-		const sourceNodeId = getPublicKey(this.nodePrivkey);
+		const sourceNodeId = this.ownNodeId();
 
 		// Route blinding: BOLT 12 invoices natively carry blinded payment paths.
 		// Route through one (shared blinded sender with the BOLT 11 path). Try
@@ -32659,7 +32694,7 @@ export class LightningNode extends EventEmitter {
 			hops.length < 2 ||
 			!hops[0].blindingPoint ||
 			!hops[0].encryptedRecipientData ||
-			!hops[0].pubkey.equals(getPublicKey(this.nodePrivkey))
+			!hops[0].pubkey.equals(this.ownNodeId())
 		) {
 			return null;
 		}
