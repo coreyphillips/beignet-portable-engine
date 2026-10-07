@@ -44,9 +44,44 @@ Buffer.prototype.write = function (value: string, ...rest: any[]) {
 	return (bufferWrite as any).call(this, value, ...rest);
 } as any;
 const bufferFrom = Buffer.from;
+
+// Hex digit values by character code, and -1 for anything else.
+const HEX_DIGIT = new Int8Array(128).fill(-1);
+for (let i = 0; i < 10; i++) HEX_DIGIT[48 + i] = i;
+for (let i = 0; i < 6; i++) HEX_DIGIT[65 + i] = HEX_DIGIT[97 + i] = 10 + i;
+
+/**
+ * Buffer.from(text, 'hex'), read through a digit table. buffer@6 decodes
+ * each byte with parseInt over a two-character substring, which on Hermes
+ * made hex the larger part of bringing back a phone's stored network map:
+ * every key, id and signature of every channel row is stored as hex. A
+ * string with anything but hex digits in its byte pairs goes to buffer@6,
+ * so its exact reading of malformed input is kept; a last, unpaired
+ * character is dropped, as buffer@6 drops it.
+ */
+const hexBuffer = (text: string): Buffer => {
+	const size = text.length >>> 1;
+	const out = Buffer.allocUnsafe(size);
+	for (let i = 0, at = 0; i < size; i++, at += 2) {
+		const high = text.charCodeAt(at);
+		const low = text.charCodeAt(at + 1);
+		const byte =
+			high < 128 && low < 128
+				? (HEX_DIGIT[high] << 4) | HEX_DIGIT[low]
+				: -1;
+		if (byte < 0 || HEX_DIGIT[high] < 0 || HEX_DIGIT[low] < 0)
+			return (bufferFrom as any).call(Buffer, text, 'hex');
+		out[i] = byte;
+	}
+	return out;
+};
+
 Buffer.from = function (value: any, encodingOrOffset?: any, length?: any) {
-	if (typeof value === 'string' && isBase64Url(encodingOrOffset))
-		return bufferFrom.call(Buffer, toStandardBase64(value), 'base64');
+	if (typeof value === 'string') {
+		if (encodingOrOffset === 'hex') return hexBuffer(value);
+		if (isBase64Url(encodingOrOffset))
+			return bufferFrom.call(Buffer, toStandardBase64(value), 'base64');
+	}
 	return (bufferFrom as any).call(Buffer, value, encodingOrOffset, length);
 } as any;
 const bufferByteLength = Buffer.byteLength;
