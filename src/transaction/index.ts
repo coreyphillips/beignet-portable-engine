@@ -440,9 +440,18 @@ export class Transaction {
 		coinSelectPreference?: ECoinSelectPreference;
 	} = {}): Result<TGetTotalFeeObj> => {
 		try {
+			// With no inputs, price the transaction against every spendable UTXO, as
+			// setupTransaction would gather them, but in memory. Staging them here
+			// would replace the caller's staged outputs and write that to storage.
 			if (!transaction.inputs?.length) {
-				void this.setupTransaction({});
-				transaction = this.data;
+				transaction = {
+					...transaction,
+					inputs: this.removeBlackListedUtxos(this._wallet.data.utxos),
+					changeAddress:
+						transaction.changeAddress ||
+						this._wallet.data.changeAddressIndex[this._wallet.addressType]
+							?.address
+				};
 			}
 			const changeAddress = transaction.changeAddress;
 
@@ -755,6 +764,15 @@ export class Transaction {
 		const outputValue = this.getTransactionOutputValue({
 			outputs
 		});
+
+		// The built transaction pays whatever the outputs leave over, so a staged
+		// fee the inputs cannot cover would be silently cut, possibly below the
+		// relay floor. addOutput and removeTxInput do not reprice the fee.
+		if (outputValue + fee > balance) {
+			return err(
+				`Inputs of ${balance} sats cannot cover outputs of ${outputValue} sats plus the staged fee of ${fee} sats.`
+			);
+		}
 
 		const network = getBitcoinJsNetwork(this._wallet.network);
 
@@ -1199,7 +1217,7 @@ export class Transaction {
 				return err('No input provided.');
 			}
 
-			if (input.value < TRANSACTION_DEFAULTS.dustLimit) {
+			if (input.value < getDustThreshold(input.address)) {
 				return err('Input value is below dust limit.');
 			}
 
@@ -1658,7 +1676,12 @@ export class Transaction {
 			}
 
 			const currentWallet = this._wallet.data;
-			const onchainBalance = currentWallet.balance;
+			// The coins sendMax spends. The stored balance is not: it also counts
+			// frozen coins.
+			const spendableUtxos = this.removeBlackListedUtxos(currentWallet.utxos);
+			const onchainBalance = this.getTransactionInputValue({
+				inputs: spendableUtxos
+			});
 
 			const inputValue = this.getTransactionInputValue({
 				inputs: transaction.inputs
@@ -1667,10 +1690,10 @@ export class Transaction {
 
 			let utxos: IUtxo[] = [];
 			//Ensure we add the larger utxo set for a more accurate fee.
-			if (transaction.inputs.length > currentWallet?.utxos.length) {
+			if (transaction.inputs.length > spendableUtxos.length) {
 				utxos = transaction.inputs;
 			} else {
-				utxos = currentWallet?.utxos ?? [];
+				utxos = spendableUtxos;
 			}
 			const fees = this._wallet.feeEstimates;
 			const selectedFeeId = this._wallet.selectedFeeId;
@@ -1887,17 +1910,21 @@ export class Transaction {
 			}
 			const transaction = response.value;
 
-			const satsPerByte = this._wallet.feeEstimates.fast;
-			const newFee = this.getTotalFee({
-				transaction,
-				satsPerByte,
-				message: transaction.message
-			});
-
 			// filter out change address, otherwise getTransactionOutputValue will include it
 			const outputs = transaction.outputs
 				.filter((output) => output.address !== transaction.changeAddress)
 				.map((output, index) => ({ ...output, index }));
+
+			// getTotalFee prices the change output from changeAddress, so it is
+			// given the outputs without it. The replacement spends every input of
+			// the original, so coin selection must not price a subset of them.
+			const satsPerByte = this._wallet.feeEstimates.fast;
+			const newFee = this.getTotalFee({
+				transaction: { ...transaction, outputs },
+				satsPerByte,
+				message: transaction.message,
+				coinSelectPreference: ECoinSelectPreference.consolidate
+			});
 
 			const inputTotal = this.getTransactionInputValue({
 				inputs: transaction.inputs

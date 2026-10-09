@@ -99,6 +99,7 @@ import {
 	getDataFallback,
 	getDefaultWalletData,
 	getDefaultWalletDataKeys,
+	getDustThreshold,
 	getBitcoinJsNetwork,
 	getElectrumNetwork,
 	getHighestUsedIndexFromTxHashes,
@@ -2721,7 +2722,13 @@ export class Wallet {
 			spendMark
 		);
 		const utxos = removeDustUtxos(scanned.utxos);
-		const balance = (getUtxosRes.value?.balance ?? 0) - scanned.spentValue;
+		// No send path can select a coin the set leaves out, so the balance does
+		// not count it either.
+		const droppedValue =
+			scanned.utxos.reduce((sum, utxo) => sum + utxo.value, 0) -
+			utxos.reduce((sum, utxo) => sum + utxo.value, 0);
+		const balance =
+			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		// A refused write is logged and left to the next scan, which writes both
@@ -4939,6 +4946,21 @@ export class Wallet {
 	}
 
 	/**
+	 * Serializes send, sendMany and sendMax. They share one staged
+	 * transaction, and the coins a broadcast spends leave the UTXO set only
+	 * when it returns. Two overlapping calls would stage the same coins, and
+	 * under RBF the later broadcast replaces the earlier one after both have
+	 * reported a txid.
+	 */
+	private sendLock: Promise<unknown> = Promise.resolve();
+
+	private runSend<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.sendLock.then(fn, fn);
+		this.sendLock = run.catch(() => undefined);
+		return run;
+	}
+
+	/**
 	 * Sets up and creates a transaction to multiple outputs.
 	 * @param {ISendTx[]} txs
 	 * @param {number} [satsPerByte]
@@ -4947,19 +4969,26 @@ export class Wallet {
 	 * @param {boolean} [shuffleOutputs]
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async sendMany({
-		txs = [],
-		satsPerByte = this.feeEstimates.normal,
-		rbf,
-		broadcast = true,
-		shuffleOutputs = true
-	}: {
+	public async sendMany(params: {
 		txs: ISendTx[];
 		satsPerByte?: number;
 		rbf?: boolean;
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
+		// Copied now so a caller reusing the options object cannot retarget a
+		// send that is still queued.
+		const options = { ...params };
+		return this.runSend(() => this.sendManyLocked(options));
+	}
+
+	private async sendManyLocked({
+		txs = [],
+		satsPerByte = this.feeEstimates.normal,
+		rbf,
+		broadcast = true,
+		shuffleOutputs = true
+	}: Parameters<Wallet['sendMany']>[0]): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
@@ -5012,8 +5041,12 @@ export class Wallet {
 				return err(updateFeeRes.error.message);
 			}
 
+			// updateFee priced only the coins the wallet's coinSelectPreference
+			// selects, so build from those coins. Every staged UTXO would pay that
+			// smaller transaction's fee at a fraction of the requested rate.
 			const createRes = await this.transaction.createTransaction({
-				shuffleOutputs
+				shuffleOutputs,
+				runCoinSelect: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
 			const { hex } = createRes.value;
@@ -5038,17 +5071,24 @@ export class Wallet {
 	 * @param {boolean} [broadcast]
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async sendMax({
+	public async sendMax(
+		params: {
+			address?: string;
+			satsPerByte?: number;
+			rbf?: boolean;
+			broadcast?: boolean;
+		} = {}
+	): Promise<Result<string>> {
+		const options = { ...params };
+		return this.runSend(() => this.sendMaxLocked(options));
+	}
+
+	private async sendMaxLocked({
 		address,
 		satsPerByte,
 		rbf = false,
 		broadcast = true
-	}: {
-		address?: string;
-		satsPerByte?: number;
-		rbf?: boolean;
-		broadcast?: boolean;
-	} = {}): Promise<Result<string>> {
+	}: Parameters<Wallet['sendMax']>[0] = {}): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
@@ -5058,7 +5098,11 @@ export class Wallet {
 		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
 		try {
-			const setupTransactionRes = await this.transaction.setupTransaction();
+			// transaction.sendMax only stages rbf when it does the setup itself,
+			// which it skips once inputs are staged here.
+			const setupTransactionRes = await this.transaction.setupTransaction({
+				rbf
+			});
 			if (setupTransactionRes.isErr()) {
 				return err(setupTransactionRes.error.message);
 			}
@@ -6187,7 +6231,7 @@ export class Wallet {
 	 */
 	public addTxInput({ input }: { input: IUtxo }): Result<IUtxo[]> {
 		try {
-			if (input.value < TRANSACTION_DEFAULTS.dustLimit) {
+			if (input.value < getDustThreshold(input.address)) {
 				return err('Input value is below dust limit.');
 			}
 			const txData = this.transaction.data;
