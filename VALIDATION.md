@@ -1,3 +1,14 @@
+# Portable engine validation, 2026-10-08 addendum
+
+The fork tracks Beignet **0.30.1** at `4a1006c67841ce84a3e527cd21f17053cf6b7ede`. This addendum supersedes the prior baseline statements below. The existing portable patch reapplies to pristine upstream source without rejection or fuzz, and the resynced tree differs from the 0.30.0 fork by upstream's own change only (see `PATCHES.md`).
+
+- `npm test`: all 213 unit tests pass. `npm run check:types` passes. A full `tsc --noEmit -p .` reports the same 27 errors as the 0.30.0 tree, by file and message.
+- The built bundle reports `0.30.1-portable`.
+- `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS against the local Bitcoin and Electrum containers, with the primary taken from the published `beignet@0.30.1` npm tarball through `BEIGNET_SOURCE_DIR`. The teardown keeps the three known `close connect` messages.
+- `scripts/smoke-regtest.cjs` passes against the local CLN at port 19846.
+
+Not run for this resync: `test:regtest:channelize`, `test:regtest:send-max`, the FFOR regtests, a device start, and upstream's own suites (its CI ran on the merged PRs).
+
 # Portable engine validation, 2026-10-07 addendum
 
 The fork tracks Beignet **0.30.0** at `966a7e1099b2ac04db05d4359a1a453f493a5e1b`. This addendum supersedes the prior baseline statements below. The existing portable patch reapplies to pristine upstream source without rejection, and the resulting source matches the combined candidate used for the device and funded-regtest checks.
