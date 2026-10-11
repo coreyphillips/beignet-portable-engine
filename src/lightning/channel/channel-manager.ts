@@ -437,6 +437,13 @@ export interface IChannelManagerConfig {
 		scriptPubKey: Buffer;
 	}) => Promise<'unspent' | 'spent-or-missing' | 'unknown'>;
 	/**
+	 * Node-wide ceiling on the prev_tx bytes peers' tx_add_input messages may
+	 * have live interactive-tx sessions retain, v2 opens and splices together
+	 * (issue #1457). An input that would cross it fails its negotiation.
+	 * Defaults to DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES.
+	 */
+	maxRetainedPeerPrevTxBytes?: number;
+	/**
 	 * Whether a durable channel row a restart could restore survives for
 	 * this id (issue #311). Consulted before releasing the funding pledges
 	 * of an abandoned v2 open: the node's channel:abandoned listener can
@@ -545,6 +552,27 @@ const MAX_HELD_UNKNOWN_REESTABLISH_PER_PEER = 64;
  * which is the safe direction (it is what an unconfigured node does).
  */
 const MAX_HELD_UNKNOWN_REESTABLISH = 1024;
+
+/**
+ * Ceiling on inbound opens one peer may hold unfunded at once (issues #1394,
+ * #1456). Each costs a derived key set and a retained Channel, a v2 one an
+ * interactive-tx session as well. A temporary one lives until disconnect and
+ * a promoted one whose funding never appears for 2016 blocks, so a peer could
+ * otherwise pile them up without bound.
+ * Per peer only, so reaching it is always self-inflicted. LDK allows four
+ * and counts unconfirmed channels the same way; an honest opener rarely has
+ * more than one channel waiting on us or the chain.
+ */
+const MAX_PENDING_INBOUND_OPENS_PER_PEER = 4;
+
+/**
+ * Default ceiling on peer prev_tx bytes retained across every live
+ * interactive-tx session (issue #1457). A memory backstop rather than a
+ * policy: MAX_PEER_PREVTX_BYTES_PER_SESSION bounds one negotiation, and this
+ * bounds many together, since channel peers bypass the inbound connection
+ * cap. 32 full sessions, eight peers at their four-open quota.
+ */
+const DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES = 32 * 1024 * 1024;
 
 /**
  * setTimeout turns anything past 2^31-1 ms into a 1 ms delay, which would
@@ -775,6 +803,17 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private _verifiedPeerInputs = new WeakMap<Channel, Set<string>>();
 	/**
+	 * Numbers standing in for the channel and session a pending peer input
+	 * check must still find when its verdict lands (issue #1500). Holding the
+	 * objects instead would keep a dropped negotiation's builder, prev_txs
+	 * included, alive outside the node-wide budget until the backend answers.
+	 */
+	private _peerInputCheckIds = new WeakMap<
+		Channel | DualFundingSession,
+		number
+	>();
+	private _nextPeerInputCheckId = 0;
+	/**
 	 * Channels whose funding pledges were already released (issue #311 for
 	 * v2 opens, issue #412 for v1). Several terminal sites can fire for one
 	 * death (an ERROR action in the teardown batch plus the tx_abort
@@ -816,6 +855,12 @@ export class ChannelManager extends EventEmitter {
 	 * for the reconnect, whose reestablish replays the queue first.
 	 */
 	private readonly sendsWithheldOnConnection = new Set<string>();
+	/**
+	 * Channels whose latest persist failed, so memory holds state the disk
+	 * does not (issue #1425). Unlike the set above it survives a disconnect:
+	 * only a persist that lands clears it.
+	 */
+	private readonly persistFailed = new Set<string>();
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -1760,6 +1805,11 @@ export class ChannelManager extends EventEmitter {
 	 * Fail a received HTLC on a channel. Direction defaults to RECEIVED; an
 	 * offered id must be passed explicitly so channel.failHtlc can reject it
 	 * rather than cancel an unrelated same-id received HTLC.
+	 *
+	 * sendsWithheld means the fail is not on disk: this persist failed, or
+	 * memory already had the fail from one that did and nothing has landed
+	 * since, or quiescence deferred it to a memory-only queue. A restart
+	 * before the next landed persist forgets it.
 	 */
 	failHtlc(
 		channelId: Buffer,
@@ -1790,7 +1840,7 @@ export class ChannelManager extends EventEmitter {
 				direction
 			})
 		) {
-			return { ok: true, actions: [] };
+			return { ok: true, actions: [], sendsWithheld: true };
 		}
 
 		const actions = channel.failHtlc(htlcId, reason, direction);
@@ -1802,7 +1852,9 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return this.resultFromActions(actions);
+		const result = this.resultFromActions(actions);
+		if (this.persistFailed.has(idHex)) result.sendsWithheld = true;
+		return result;
 	}
 
 	/**
@@ -3984,6 +4036,16 @@ export class ChannelManager extends EventEmitter {
 				peerPubkey,
 				msg.temporaryChannelId,
 				'open_channel refused: temporary_channel_id is already in use'
+			);
+			return;
+		}
+		// Issue #1394: ahead of the key derivation, so a refused open costs no
+		// EC work and retains nothing.
+		if (this._pendingInboundOpensFull(peerPubkey)) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.temporaryChannelId,
+				`open_channel refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
 			);
 			return;
 		}
@@ -7673,6 +7735,16 @@ export class ChannelManager extends EventEmitter {
 				return;
 			}
 		}
+		// Issue #1394: the per-peer quota, on the wire before derivation as in
+		// the v1 acceptor. v1 and v2 opens share it.
+		if (this._pendingInboundOpensFull(peerPubkey)) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.channelId,
+				`open_channel2 refused: ${MAX_PENDING_INBOUND_OPENS_PER_PEER} opens from this peer are already pending`
+			);
+			return;
+		}
 
 		const chKeys = this.deriveKeysForNewChannel();
 		// Issue #906: the index is consumed HERE, ahead of the parameter
@@ -8240,12 +8312,32 @@ export class ChannelManager extends EventEmitter {
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
-		const actions = channel.handleTxAddInput(msg);
+		const actions = channel.handleTxAddInput(msg, this._peerPrevTxBytesFree());
 		// Kick off the chain check before dispatching replies: a synchronous
 		// transport can drive the whole negotiation inside processActions, and
 		// the session gate below must see the state right after the add.
 		this.verifyPeerFundingInput(peerPubkey, channel, msg);
 		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * What the node-wide peer prev_tx budget has left (issue #1457). Summed
+	 * from the live builders on every call rather than tracked, so an aborted
+	 * negotiation, a replaced RBF builder or a removed channel gives its bytes
+	 * back without release bookkeeping on each of those teardown paths.
+	 */
+	private _peerPrevTxBytesFree(): number {
+		let retained = 0;
+		for (const channel of this.channels.values()) {
+			retained += channel.getRetainedPeerPrevTxBytes();
+		}
+		for (const channel of this.tempChannels.values()) {
+			retained += channel.getRetainedPeerPrevTxBytes();
+		}
+		return (
+			(this.config.maxRetainedPeerPrevTxBytes ??
+				DEFAULT_MAX_RETAINED_PEER_PREVTX_BYTES) - retained
+		);
 	}
 
 	/**
@@ -8269,8 +8361,14 @@ export class ChannelManager extends EventEmitter {
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
 			return;
 		}
-		// A prev_tx the channel already rejected (unparseable, vout out of
-		// range) never reaches the builder; nothing to verify.
+		// Only an input the builder kept is worth a query: a rejected one (bad
+		// prev_tx, over budget, duplicate serial) is already failing the
+		// negotiation (issue #1500).
+		const kept = session
+			.getTxBuilder()
+			?.getSession()
+			.inputs.get(msg.serialId.toString());
+		if (!kept || kept.prevTx !== msg.prevTx) return;
 		let prevTx: bitcoin.Transaction;
 		try {
 			prevTx = bitcoin.Transaction.fromBuffer(msg.prevTx);
@@ -8279,7 +8377,8 @@ export class ChannelManager extends EventEmitter {
 		}
 		const vout = msg.prevTxVout;
 		if (!prevTx.outs[vout]) return;
-		const txid = Buffer.from(prevTx.getHash());
+		const txid = Buffer.alloc(32);
+		prevTx.getHash().copy(txid);
 		const key = `${txid.toString('hex')}:${vout}`;
 		let seen = this._verifiedPeerInputs.get(channel);
 		if (!seen) {
@@ -8288,14 +8387,23 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (seen.has(key)) return;
 		seen.add(key);
-		void verify({ txid, vout, scriptPubKey: prevTx.outs[vout].script })
+		// The query can outlive the negotiation. Unpooled copies avoid retaining
+		// prev_tx views or shared slabs. No closure here may capture msg, channel
+		// or session: V8 shares one context among a function's closures (issue #1500).
+		const channelId = Buffer.alloc(msg.channelId.length);
+		msg.channelId.copy(channelId);
+		const channelCheckId = this._peerInputCheckId(channel);
+		const sessionCheckId = this._peerInputCheckId(session);
+		const scriptPubKey = Buffer.alloc(prevTx.outs[vout].script.length);
+		prevTx.outs[vout].script.copy(scriptPubKey);
+		void verify({ txid, vout, scriptPubKey })
 			.then((verdict) =>
 				this.applyPeerInputVerdict(
 					verdict,
 					peerPubkey,
-					channel,
-					session,
-					msg.channelId,
+					channelId,
+					channelCheckId,
+					sessionCheckId,
 					txid,
 					vout
 				)
@@ -8303,6 +8411,15 @@ export class ChannelManager extends EventEmitter {
 			.catch(() => {
 				// Verification failure is 'unknown': fail open.
 			});
+	}
+
+	private _peerInputCheckId(target: Channel | DualFundingSession): number {
+		let id = this._peerInputCheckIds.get(target);
+		if (id === undefined) {
+			id = ++this._nextPeerInputCheckId;
+			this._peerInputCheckIds.set(target, id);
+		}
+		return id;
 	}
 
 	/**
@@ -8316,9 +8433,9 @@ export class ChannelManager extends EventEmitter {
 	private applyPeerInputVerdict(
 		verdict: 'unspent' | 'spent-or-missing' | 'unknown',
 		peerPubkey: string,
-		channel: Channel,
-		session: DualFundingSession,
 		channelId: Buffer,
+		channelCheckId: number,
+		sessionCheckId: number,
 		txid: Buffer,
 		vout: number
 	): void {
@@ -8326,11 +8443,13 @@ export class ChannelManager extends EventEmitter {
 		// Instance identity: the id must still resolve to this very object,
 		// registered to this very peer. A disconnect plus a same-id retry
 		// replaces the instance; a late verdict must not touch its successor.
-		const found =
+		const channel =
 			this.findChannelByChannelId(channelId) ||
 			this.findChannelByChannelIdInTemp(channelId) ||
 			this.findTempChannel(channelId);
-		if (found !== channel) return;
+		if (!channel || this._peerInputCheckIds.get(channel) !== channelCheckId) {
+			return;
+		}
 		const idHex = channelId.toString('hex');
 		const registeredPeer = this.channelPeers.get(idHex);
 		if (registeredPeer !== undefined && registeredPeer !== peerPubkey) return;
@@ -8342,7 +8461,10 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getState() === ChannelState.AWAITING_REESTABLISH) return;
 		// Session identity: a peer abort or completed open nulls or replaces
 		// the session.
-		if (channel.getDualFundingSession() !== session) return;
+		const session = channel.getDualFundingSession();
+		if (!session || this._peerInputCheckIds.get(session) !== sessionCheckId) {
+			return;
+		}
 		// The outpoint must still be contributed. RBF resets the builder
 		// inside the SAME session object, so builder membership, not session
 		// identity, is the staleness guard for a renegotiated attempt.
@@ -8958,6 +9080,44 @@ export class ChannelManager extends EventEmitter {
 			this.channelPeers.has(idHex) ||
 			this.channelIdReservations.has(idHex)
 		);
+	}
+
+	/**
+	 * Whether this peer already holds MAX_PENDING_INBOUND_OPENS_PER_PEER
+	 * opens it proposed whose funding this node has not seen on chain.
+	 * Promoted channels count as well as temporary ones: funding_created
+	 * promotes before the txid it names has to exist, and a promoted channel
+	 * survives disconnect and restart (issue #1456). A trusted zero-conf open
+	 * is exempt, since accepting it already trusted the peer's unconfirmed
+	 * funding. So is a CLOSED channel: every way into CLOSED either spent the
+	 * funding on chain or ran through NORMAL, even when no confirmation was
+	 * recorded (a v2 open that force-closed first, a resolved restore that no
+	 * longer watches its funding).
+	 */
+	private _pendingInboundOpensFull(peerPubkey: string): boolean {
+		let pending = 0;
+		for (const [tempId, channel] of this.tempChannels) {
+			if (
+				this.channelPeers.get(tempId) === peerPubkey &&
+				channel.getRole() === ChannelRole.ACCEPTOR
+			) {
+				pending++;
+			}
+		}
+		for (const [channelId, channel] of this.channels) {
+			if (
+				this.channelPeers.get(channelId) !== peerPubkey ||
+				channel.getRole() !== ChannelRole.ACCEPTOR ||
+				channel.getState() === ChannelState.CLOSED ||
+				channel.isFundingKnownOnChain()
+			) {
+				continue;
+			}
+			const state = channel.getFullState();
+			if (state.zeroConfEnabled && state.trustedPeer) continue;
+			pending++;
+		}
+		return pending >= MAX_PENDING_INBOUND_OPENS_PER_PEER;
 	}
 
 	/** Whether this exact lifecycle may claim an id without replacing another. */
@@ -9907,8 +10067,12 @@ export class ChannelManager extends EventEmitter {
 						if (typeof channel.fforNoteStateWritten === 'function') {
 							channel.fforNoteStateWritten(false);
 						}
+						this.persistFailed.add(channel.getChannelId()!.toString('hex'));
 						setSendsBlocked(true);
 						break;
+					}
+					if (persistRequest) {
+						this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
 					}
 					// The channel learns that its state is on disk: what it
 					// still owed to storage (an observed capability hold of a

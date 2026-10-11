@@ -169,6 +169,11 @@ still without running a swap:
   the reverse and submarine lifecycles as compare-and-swap arrows, a
   write-once preimage no transition removes, and no private key stored
   (`keys.ts` re-derives per-swap keys from the node key and the swap id).
+  Each engine deletes its terminal rows once the chain is
+  `terminalRetentionBlocks` (default 144) past the refund height, or past
+  the resolution's height when that is later. A REFUNDED row whose hold
+  cancel never landed is kept for `start()`. On the node the rows are found
+  by key scan, so an insert or delete writes one row (issue #1387).
 - **Chain resolver** (`chain-resolver.ts`): `observe` reports the funding
   output's status, every spend classified as claim (with the extracted
   preimage), refund or unknown, confirmations against the operator's policy,
@@ -203,7 +208,13 @@ even types required, odd optional):
 The client receives exactly `onchainAmountSat`; the invoice is that plus
 `totalFeeSat` (flat + ppm + the quoted funding miner fee). The swap id is
 derived from the peer and the hash, so an identical repeated create returns
-the same ack and any other reuse of a hash is refused. `verifyReverseSwapTerms`
+the same ack and any other reuse of a hash is refused. A create is also
+refused (`RATE_LIMITED`) while its peer has `maxCreatedPerPeer` (default 4)
+unpaid rows, or while the provider has `maxUnpaidSwaps` (default 64, node
+config `swaps.timeouts.maxUnpaidSwaps`) rows in CREATED across every peer,
+connected or not: each keeps a row and a hold invoice until its invoice
+expires, and the exposure caps only count a row once it is held.
+`verifyReverseSwapTerms`
 (`client.ts`) is the pure check a client runs before paying: it rebuilds the
 contract from its own hash and claim key plus the ack's refund key and height
 and requires the ack's script, address, invoice and amounts to agree. It also
@@ -264,11 +275,14 @@ already mined; a create is refused for any hash the node already holds a
 record for (an invoice, a payment it is sending, a parked hold), because
 minting a hold invoice on it would overwrite that record; no swap is quoted
 while the sweep destination is not native segwit, the only kind the refund
-builder pays. On the node side a parked set that already covers the invoice
+builder pays; an unpaid swap is cancelled when its invoice expires, partial
+set and all, since the payer picks how long its parts would otherwise stay
+parked. On the node side a parked set that already covers the invoice
 takes no further part (a late short-expiry part would drag the whole set
-into the sweeper's margin), and the per-block sweep waits, bounded, for the
-provider's chain look so a claim seen at the block settles before the sweep
-judges its hash.
+into the sweeper's margin), one hold parks at most
+`MAX_HELD_PARTS_PER_HASH` (64) parts, and the per-block sweep waits,
+bounded, for the provider's chain look so a claim seen at the block settles
+before the sweep judges its hash.
 
 Before the funding bytes leave for the first time the hold is judged again,
 live (`heldSnapshot` complete and ACCEPTED, the admission margins at the
@@ -338,7 +352,11 @@ claimSafetyBlocks - resolutionSafetyBlocks` and the fit is `height +
 fundingConfirmations + routeCltvBudgetBlocks + min_final_cltv_expiry + 3 <=
 C` (`CLTV_UNFITTABLE` otherwise, FAILED when it stops holding before the
 payment goes out); `validateSubmarineSwapAdmission` is run on the same
-numbers.
+numbers. A create is also refused (`RATE_LIMITED`) while its peer has
+`maxCreatedPerPeer` unfunded rows, or while the provider has `maxUnpaidSwaps`
+(default 64) rows in CREATED, FUNDING_SEEN, FUNDED or FUNDING_LOST: each is
+looked up on chain every block, and the exposure caps only count a row once
+it has paid.
 
 Lifecycle, every arrow a compare-and-swap on the ledger row, persisted BEFORE
 the action it licenses:

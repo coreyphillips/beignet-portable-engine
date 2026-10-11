@@ -87,6 +87,7 @@ import {
 	appendDescriptorChecksum,
 	buildSortedMultisigPayment,
 	clampFeeRate,
+	createOpReturnScript,
 	decodeOpReturnMessage,
 	err,
 	filterAddressesObjForGapLimit,
@@ -4925,7 +4926,7 @@ export class Wallet {
 	 */
 	public getFeeInfo({
 		satsPerByte = this.feeEstimates.normal,
-		message = '',
+		message,
 		transaction,
 		fundingLightning = false,
 		coinSelectPreference = this.coinSelectPreference
@@ -4946,11 +4947,13 @@ export class Wallet {
 	}
 
 	/**
-	 * Serializes send, sendMany and sendMax. They share one staged
+	 * Serializes send, sendMany, sendMax and buildPsbt. They share one staged
 	 * transaction, and the coins a broadcast spends leave the UTXO set only
 	 * when it returns. Two overlapping calls would stage the same coins, and
 	 * under RBF the later broadcast replaces the earlier one after both have
-	 * reported a txid.
+	 * reported a txid. Staging a recipient overwrites only its own index, so
+	 * an overlapping call with fewer recipients would also pay the other
+	 * call's trailing ones (#1464).
 	 */
 	private sendLock: Promise<unknown> = Promise.resolve();
 
@@ -5000,6 +5003,7 @@ export class Wallet {
 		// process. The live copy stays readable (fee, inputs) until the next
 		// call resets it.
 		await this.resetSendTransaction();
+		let hex: string;
 		try {
 			const setupTransactionRes = await this.transaction.setupTransaction({
 				rbf
@@ -5049,18 +5053,37 @@ export class Wallet {
 				runCoinSelect: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
-			const { hex } = createRes.value;
-			if (!broadcast) {
-				return ok(hex);
+			hex = createRes.value.hex;
+			if (broadcast) {
+				const broadcastRes = await this.electrum.broadcastTransaction({
+					rawTx: hex
+				});
+				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+				return ok(broadcastRes.value);
 			}
-			const broadcastRes = await this.electrum.broadcastTransaction({
-				rawTx: hex
-			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-			return ok(broadcastRes.value);
 		} finally {
 			await this.transaction.clearStoredSendTransaction();
 		}
+		return this.unfrozenSignedHex(hex);
+	}
+
+	/**
+	 * Returns the signed hex of an unbroadcast send unless it spends a frozen
+	 * coin. createTransaction checked for frozen inputs before the send's
+	 * final cleanup awaited storage, and a freeze can complete during that
+	 * await. Callers run this after the cleanup with no await between it and
+	 * their return.
+	 * @param {string} hex
+	 * @returns {Result<string>}
+	 */
+	private unfrozenSignedHex(hex: string): Result<string> {
+		for (const { hash, index } of bitcoin.Transaction.fromHex(hex).ins) {
+			const txid = Buffer.from(hash).reverse().toString('hex');
+			if (this.isUtxoFrozen(txid, index)) {
+				return err(`Staged input ${txid}:${index} is frozen.`);
+			}
+		}
+		return ok(hex);
 	}
 
 	/**
@@ -5097,6 +5120,7 @@ export class Wallet {
 		// Same working-area rule as sendMany: empty on entry, dropped from
 		// storage on exit, live copy readable until the next call.
 		await this.resetSendTransaction();
+		let hex: string;
 		try {
 			// transaction.sendMax only stages rbf when it does the setup itself,
 			// which it skips once inputs are staged here.
@@ -5120,18 +5144,18 @@ export class Wallet {
 				shuffleOutputs: true
 			});
 			if (createRes.isErr()) return err(createRes.error.message);
-			const { hex } = createRes.value;
-			if (!broadcast) {
-				return ok(hex);
+			hex = createRes.value.hex;
+			if (broadcast) {
+				const broadcastRes = await this.electrum.broadcastTransaction({
+					rawTx: hex
+				});
+				if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+				return ok(broadcastRes.value);
 			}
-			const broadcastRes = await this.electrum.broadcastTransaction({
-				rawTx: hex
-			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
-			return ok(broadcastRes.value);
 		} finally {
 			await this.transaction.clearStoredSendTransaction();
 		}
+		return this.unfrozenSignedHex(hex);
 	}
 
 	/**
@@ -5182,7 +5206,14 @@ export class Wallet {
 	 * @param {IBuildPsbtArgs} args
 	 * @returns {Promise<Result<IBuildPsbtResponse>>}
 	 */
-	public async buildPsbt({
+	public async buildPsbt(
+		args: IBuildPsbtArgs
+	): Promise<Result<IBuildPsbtResponse>> {
+		const options = { ...args };
+		return this.runSend(() => this.buildPsbtLocked(options));
+	}
+
+	private async buildPsbtLocked({
 		txs,
 		address,
 		amount,
@@ -5191,6 +5222,8 @@ export class Wallet {
 		rbf = false,
 		shuffleOutputs = true
 	}: IBuildPsbtArgs): Promise<Result<IBuildPsbtResponse>> {
+		let psbt: bitcoin.Psbt;
+		let response: IBuildPsbtResponse;
 		try {
 			let sendTxs: ISendTx[] = txs ?? [];
 			if (!sendTxs.length) {
@@ -5227,13 +5260,28 @@ export class Wallet {
 			}
 			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
 			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			// updateFee priced only the coins the wallet's coinSelectPreference
+			// selects, so build from those coins, as sendMany does.
+			const staged = this.transaction.data;
+			const coinSelectRes = this.transaction.autoCoinSelect({
+				inputs: staged.inputs,
+				outputs: staged.outputs,
+				satsPerByte: staged.satsPerByte,
+				changeAddress: staged.changeAddress,
+				message: staged.message,
+				coinSelectPreference: this.coinSelectPreference
+			});
+			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
+			// A local copy, not applyAutoCoinSelect: narrowing the shared staged
+			// inputs would shrink the pool a concurrent build is still pricing,
+			// and that build could restage the shared copy while this one awaits.
+			const txData = { ...staged, inputs: coinSelectRes.value.inputs };
 			const psbtRes = await this.transaction.createUnsignedPsbt({
+				transactionData: txData,
 				shuffleOutputs
 			});
 			if (psbtRes.isErr()) return err(psbtRes.error.message);
-			const psbt = psbtRes.value;
-			this._rememberBuiltPsbt(psbt);
-			const txData = this.transaction.data;
+			psbt = psbtRes.value;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
 			});
@@ -5266,14 +5314,14 @@ export class Wallet {
 				value: input.value,
 				path: input.path
 			}));
-			return ok({
+			response = {
 				psbtBase64: psbt.toBase64(),
 				fee,
 				vsizeEstimate,
 				satsPerByte: effectiveSatsPerByte,
 				inputs,
 				outputs
-			});
+			};
 		} catch (e) {
 			return err(e);
 		} finally {
@@ -5282,6 +5330,17 @@ export class Wallet {
 			// importSignedPsbt) reads the staged send.
 			await this.transaction.clearStoredSendTransaction();
 		}
+		// createUnsignedPsbt checked for frozen inputs before the cleanup
+		// above awaited storage, and a freeze can complete during that await.
+		// No await may sit between this check and return.
+		for (const { hash, index } of psbt.txInputs) {
+			const txid = Buffer.from(hash).reverse().toString('hex');
+			if (this.isUtxoFrozen(txid, index)) {
+				return err(`Staged input ${txid}:${index} is frozen.`);
+			}
+		}
+		this._rememberBuiltPsbt(psbt);
+		return ok(response);
 	}
 
 	/**
@@ -5924,7 +5983,7 @@ export class Wallet {
 		let value = 0;
 		const addressType = EAddressType.p2wpkh;
 		const outputs: IOutput[] = [];
-		let message = '';
+		const messages: Buffer[] = [];
 		let inputTotal = 0;
 		let outputTotal = 0;
 		let fee = 0;
@@ -5937,7 +5996,12 @@ export class Wallet {
 			})
 		);
 		const { vins, vouts } = insAndOuts[0];
+		// The original fee is read from the inputs rebuilt here, and the
+		// replacement spends only those. An input this wallet cannot sign is
+		// refused, because skipping it would understate that fee.
 		for (let i = 0; i < vins.length; i++) {
+			// A prevout with no address must not inherit the previous input's.
+			address = '';
 			try {
 				const input = vins[i];
 				// A coinbase input has no prevout and can never be RBF'd; the
@@ -5962,13 +6026,16 @@ export class Wallet {
 					address = txVout.scriptPubKey.addresses[0];
 				}
 				if (!address) {
-					continue;
+					return err(
+						'Unable to determine the address of an input. Unable to RBF.'
+					);
 				}
 				scriptHash = getScriptHash({ address, network: this._network });
 				// Check that we are in possession of this scriptHash.
 				if (!(scriptHash in allAddresses)) {
-					// This output did not come from us.
-					continue;
+					return err(
+						'Transaction spends an input this wallet does not own. Unable to RBF.'
+					);
 				}
 				path = allAddresses[scriptHash].path;
 				value = btcToSats(txVout.value);
@@ -5989,24 +6056,42 @@ export class Wallet {
 				}
 			} catch (e) {
 				this.logger.error('Failed to get input value.', e);
+				return err('Failed to get input value. Unable to RBF.');
 			}
 		}
 		for (let i = 0; i < vouts.length; i++) {
 			const vout = vouts[i];
 			const voutValue = btcToSats(vout.value);
+			address = '';
 			if (vout.scriptPubKey?.addresses) {
 				address = vout.scriptPubKey.addresses[0];
 			} else if (vout.scriptPubKey?.address) {
 				address = vout.scriptPubKey.address;
-			} else {
-				try {
-					if (vout.scriptPubKey.asm.includes('OP_RETURN')) {
-						message = decodeOpReturnMessage(vout.scriptPubKey.asm)[0] || '';
-					}
-				} catch {}
-			}
-			if (!address) {
+			} else if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) {
+				// The replacement rebuilds this output from its message. Pushing it
+				// would stage a payment to whichever address was read last.
+				// The hex is read because the asm shows a push of up to 4 bytes
+				// as a number.
+				const [opcode, ...pushes] =
+					bitcoin.script.decompile(
+						Buffer.from(vout.scriptPubKey.hex ?? '', 'hex')
+					) ?? [];
+				if (
+					opcode !== bitcoin.opcodes.OP_RETURN ||
+					!pushes.every(Buffer.isBuffer)
+				) {
+					return err('Unable to read an OP_RETURN output. Unable to RBF.');
+				}
+				messages.push(...pushes);
+				outputTotal = outputTotal + voutValue;
 				continue;
+			}
+			// The replacement can only pay outputs by address. Skipping this one
+			// would turn its payment into change.
+			if (!address) {
+				return err(
+					'Transaction pays an output without an address. Unable to RBF.'
+				);
 			}
 			const changeAddressScriptHash = getScriptHash({
 				address,
@@ -6040,6 +6125,26 @@ export class Wallet {
 			 * suggest a CPFP transaction.
 			 */
 			return err('Unable to determine change address.');
+		}
+
+		// The replacement carries a single message, so any other would be lost.
+		if (messages.length > 1) {
+			return err(
+				'Transaction carries more than one OP_RETURN message. Unable to RBF.'
+			);
+		}
+
+		// The replacement rebuilds the OP_RETURN from this string as UTF-8, and
+		// builds none for a blank message.
+		const message = messages[0]?.toString() ?? '';
+		if (
+			messages.length &&
+			(!Buffer.from(message).equals(messages[0]) ||
+				!createOpReturnScript(message))
+		) {
+			return err(
+				'Transaction carries an OP_RETURN message the replacement cannot rebuild. Unable to RBF.'
+			);
 		}
 
 		if (outputTotal > inputTotal) {
@@ -6463,9 +6568,6 @@ export class Wallet {
 			return err(getUtxoRes.error.message);
 		}
 		const { balance, utxos } = getUtxoRes.value;
-		if (balance < TRANSACTION_DEFAULTS.dustLimit) {
-			return err('Balance is below dust limit.');
-		}
 		return ok({ balance, utxos, keyPair, addresses });
 	}
 
@@ -6494,13 +6596,27 @@ export class Wallet {
 		if (privateKeyInfo.isErr()) {
 			return err(privateKeyInfo.error.message);
 		}
-		const { balance, keyPair } = privateKeyInfo.value;
-		let utxos = privateKeyInfo.value.utxos;
-		utxos = utxos.map((utxo) => {
-			return { ...utxo, keyPair };
-		});
+		const { keyPair } = privateKeyInfo.value;
+		if (!privateKeyInfo.value.utxos.length) {
+			return err('No UTXOs found for this private key.');
+		}
+		// addInput refuses a coin below its script's dust threshold, so one
+		// unsolicited dust deposit would abort the sweep of every other coin.
+		let utxos: IUtxo[] = privateKeyInfo.value.utxos
+			.filter((utxo) => utxo.value >= getDustThreshold(utxo.address))
+			.map((utxo) => {
+				return { ...utxo, keyPair };
+			});
+		if (!utxos.length) {
+			return err('Every UTXO held by this key is below the dust limit.');
+		}
+		const balance = utxos.reduce((total, utxo) => total + utxo.value, 0);
 		if (combineWithWalletUtxos) {
-			const walletUtxos = this.data.utxos;
+			// setupTransaction only drops frozen coins it gathers itself, not an
+			// explicit utxos list.
+			const walletUtxos = this.transaction.removeBlackListedUtxos(
+				this.data.utxos
+			);
 			utxos = [...walletUtxos, ...utxos];
 		}
 		await this.transaction.resetSendTransaction();

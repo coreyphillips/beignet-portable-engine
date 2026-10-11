@@ -63,7 +63,20 @@ export interface ILedgerCodec<R extends ILedgerRecord> {
 export interface ILedgerKeyValueStorage {
 	saveMetadata(key: string, value: string): void;
 	loadMetadata(key: string): string | null;
+	loadMetadataByPrefix?(prefix: string): Array<{ key: string; value: string }>;
+	deleteMetadata?(key: string): void;
 	transaction<T>(fn: () => T): T;
+}
+
+export interface IMetadataLedgerStoreOptions {
+	/**
+	 * Find rows by key prefix instead of through the id index, when the
+	 * storage offers loadMetadataByPrefix and deleteMetadata. A put or delete
+	 * then writes one row rather than the whole index. loadAll returns rows
+	 * in id order, not insertion order, so a ledger whose rehydrate depends
+	 * on that order must not opt in.
+	 */
+	scanRows?: boolean;
 }
 
 /* eslint-disable brace-style -- prettier wraps the long class heads */
@@ -103,19 +116,36 @@ export class MemoryLedgerStore<R extends ILedgerRecord>
  * deleted record's row is overwritten with an empty tombstone and dropped
  * from the index.
  *
+ * With `scanRows` and a storage that can scan and delete, there is no index:
+ * `loadAll` reads every `<prefix>:row:` key and a delete removes the row.
+ * Rows written under the index layout are already under those keys, and
+ * its empty tombstones are skipped, so the switch needs no migration. The
+ * old index row is left as it was.
+ *
  * A row that no longer decodes cannot be served, so its engine forgets the
  * record. `loadAll` reports its metadata key to `onCorruptRow` and leaves
  * the row and its index entry as stored, so it is skipped, not erased.
+ * A malformed index hides every row: `loadAll` reports the index key and
+ * returns nothing, and `put` and `delete` throw before writing, so the
+ * index and the rows it names stay as stored.
  */
 export class MetadataLedgerStore<R extends ILedgerRecord>
 	implements IDurableLedgerStore<R>
 {
+	private readonly scanRows: boolean;
+
 	constructor(
 		private readonly storage: ILedgerKeyValueStorage,
 		private readonly prefix: string,
 		private readonly codec: ILedgerCodec<R>,
-		private readonly onCorruptRow?: (key: string) => void
-	) {}
+		private readonly onCorruptRow?: (key: string) => void,
+		options: IMetadataLedgerStoreOptions = {}
+	) {
+		this.scanRows =
+			options.scanRows === true &&
+			typeof storage.loadMetadataByPrefix === 'function' &&
+			typeof storage.deleteMetadata === 'function';
+	}
 
 	private rowKey(id: string): string {
 		return `${this.prefix}:row:${id}`;
@@ -125,17 +155,33 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 		return `${this.prefix}:index`;
 	}
 
-	private loadIndex(): string[] {
+	/**
+	 * The stored ids, or null when the index is not a JSON array of strings.
+	 * Only a missing index is empty: no write stores '', so a present empty
+	 * value is corrupt.
+	 */
+	private readIndex(): string[] | null {
 		const raw = this.storage.loadMetadata(this.indexKey());
-		if (!raw) return [];
+		if (raw === null) return [];
 		try {
 			const parsed = JSON.parse(raw) as unknown;
-			return Array.isArray(parsed)
-				? parsed.filter((x): x is string => typeof x === 'string')
-				: [];
+			return Array.isArray(parsed) &&
+				parsed.every((x): x is string => typeof x === 'string')
+				? parsed
+				: null;
 		} catch {
-			return [];
+			return null;
 		}
+	}
+
+	/**
+	 * The stored ids, for a write that rewrites the index. Throws on a
+	 * malformed index: rewriting it would drop every id it still names.
+	 */
+	private loadIndex(): string[] {
+		const ids = this.readIndex();
+		if (!ids) throw new Error(`malformed ledger index: ${this.indexKey()}`);
+		return ids;
 	}
 
 	private saveIndex(ids: string[]): void {
@@ -149,12 +195,24 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	}
 
 	loadAll(): R[] {
+		let stored: Array<{ key: string; value: string | null }>;
+		if (this.scanRows) {
+			stored = this.storage.loadMetadataByPrefix!(this.rowKey(''));
+		} else {
+			const ids = this.readIndex();
+			if (!ids) {
+				this.onCorruptRow?.(this.indexKey());
+				return [];
+			}
+			stored = ids.map((id) => {
+				const key = this.rowKey(id);
+				return { key, value: this.storage.loadMetadata(key) };
+			});
+		}
 		const out: R[] = [];
-		for (const id of this.loadIndex()) {
-			const key = this.rowKey(id);
-			const raw = this.storage.loadMetadata(key);
-			if (!raw) continue;
-			const row = this.codec.decode(raw);
+		for (const { key, value } of stored) {
+			if (!value) continue;
+			const row = this.codec.decode(value);
 			if (row) out.push(row);
 			else this.onCorruptRow?.(key);
 		}
@@ -163,12 +221,12 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 
 	put(record: R): void {
 		this.storage.transaction(() => {
+			const ids = this.scanRows ? null : this.loadIndex();
 			this.storage.saveMetadata(
 				this.rowKey(record.id),
 				this.codec.encode(record)
 			);
-			const ids = this.loadIndex();
-			if (!ids.includes(record.id)) {
+			if (ids && !ids.includes(record.id)) {
 				ids.push(record.id);
 				this.saveIndex(ids);
 			}
@@ -176,9 +234,13 @@ export class MetadataLedgerStore<R extends ILedgerRecord>
 	}
 
 	delete(id: string): void {
+		if (this.scanRows) {
+			this.storage.deleteMetadata!(this.rowKey(id));
+			return;
+		}
 		this.storage.transaction(() => {
-			this.storage.saveMetadata(this.rowKey(id), '');
 			const ids = this.loadIndex().filter((x) => x !== id);
+			this.storage.saveMetadata(this.rowKey(id), '');
 			this.saveIndex(ids);
 		});
 	}
@@ -326,6 +388,23 @@ export class DurableLedger<R extends ILedgerRecord> {
 			return false;
 		}
 		this.records.delete(id);
+		return true;
+	}
+
+	/**
+	 * Drop several records in one store transaction: on a storage failure
+	 * none goes. Ids not present are skipped.
+	 */
+	removeSet(ids: readonly string[]): boolean {
+		const present = [...new Set(ids)].filter((id) => this.records.has(id));
+		try {
+			this.store.transaction(() => {
+				for (const id of present) this.store.delete(id);
+			});
+		} catch {
+			return false;
+		}
+		for (const id of present) this.records.delete(id);
 		return true;
 	}
 }

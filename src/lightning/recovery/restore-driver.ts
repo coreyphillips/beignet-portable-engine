@@ -751,11 +751,16 @@ export class RestoreDriver {
 	 * reestablish reconciles it. ACROSS epochs adopt the highest epoch
 	 * BACKED BY A QUORUM OF TAKEOVER CERTIFICATES: a single guardian sitting
 	 * at a higher epoch proves only that it accepted an acquisition, which a
-	 * partially completed takeover also produces.
+	 * partially completed takeover also produces. A possibly-stale head is
+	 * never a candidate, but the grants it signed still count toward that
+	 * quorum: a rollback loses rows, it does not unsign a certificate.
 	 */
-	private selectHead(readings: IHeadReading[]): IHeadReading {
+	private selectHead(
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): IHeadReading {
 		const certifiedEpochs = new Set<string>();
-		for (const bundle of this.certificateBundles(readings)) {
+		for (const bundle of this.certificateBundles([...readings, ...stale])) {
 			if (bundle.length >= this.config.required) {
 				certifiedEpochs.add(bundle[0].newEpoch.toString());
 			}
@@ -791,8 +796,9 @@ export class RestoreDriver {
 
 	/**
 	 * Step 3: repair laggards until `required` guardians share the adopted
-	 * head. Certificate bundles are assembled across ALL readings, since a
-	 * single guardian's response need not carry the whole quorum.
+	 * head. Certificate bundles are assembled across ALL readings, stale ones
+	 * included, since a single guardian's response need not carry the whole
+	 * quorum.
 	 */
 	private async repairLaggards(
 		readings: IHeadReading[],
@@ -800,7 +806,7 @@ export class RestoreDriver {
 		target: IHeadReading
 	): Promise<number> {
 		let repaired = 0;
-		const bundles = this.certificateBundles(readings);
+		const bundles = this.certificateBundles([...readings, ...stale]);
 		const forEpoch = (epoch: bigint): IGuardianTakeoverCertificate[] =>
 			bundles.find(
 				(bundle) =>
@@ -810,11 +816,17 @@ export class RestoreDriver {
 		// set recovers, even though their word never counted as recency.
 		for (const reading of [...readings, ...stale]) {
 			if (statesEqual(reading.state, target.state)) continue;
-			if (reading.state.lease.epoch < target.state.lease.epoch) {
-				const bundle = forEpoch(target.state.lease.epoch);
-				if (bundle.length >= this.config.required) {
-					await reading.client.syncEpoch(bundle);
-				}
+			const bundle =
+				reading.state.lease.epoch < target.state.lease.epoch
+					? forEpoch(target.state.lease.epoch)
+					: [];
+			// SYNC_EPOCH needs the head the epoch was granted over, so a
+			// guardian below it takes the epoch after the backfill instead.
+			const belowGrant =
+				bundle.length >= this.config.required &&
+				reading.state.logHead.sequence < certifiedBy(bundle).logHead.sequence;
+			if (bundle.length >= this.config.required && !belowGrant) {
+				await reading.client.syncEpoch(bundle);
 			}
 			if (reading.state.logHead.sequence < target.state.logHead.sequence) {
 				const missing = await this.downloadRecords(
@@ -839,6 +851,7 @@ export class RestoreDriver {
 					}
 				}
 			}
+			if (belowGrant) await reading.client.syncEpoch(bundle);
 			const after = await reading.client.getHead(
 				this.config.recoveryRoot.recoveryId
 			);
@@ -932,6 +945,84 @@ export class RestoreDriver {
 				writerPublicKey: attempt.writer.publicKey
 			}
 		});
+	}
+
+	/**
+	 * Whether a quorum certified another takeover over this attempt: a later
+	 * epoch, or its own epoch under another key. Either fences it for good,
+	 * so a possibly-stale guardian's certificates count here too.
+	 */
+	private superseded(
+		attempt: IPendingAttempt,
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): boolean {
+		return this.certificateBundles([...readings, ...stale]).some(
+			(bundle) =>
+				bundle.length >= this.config.required &&
+				bundle[0].supersededState.recoveryId.equals(
+					attempt.expectedState.recoveryId
+				) &&
+				(bundle[0].newEpoch > attempt.newEpoch ||
+					(bundle[0].newEpoch === attempt.newEpoch &&
+						!bundle[0].newWriterPublicKey.equals(attempt.writer.publicKey)))
+		);
+	}
+
+	/**
+	 * Whether a takeover past this attempt may hold a quorum that the heads
+	 * read cannot show: some head is past the attempt, and the members
+	 * without a fresh head short of it could make up a quorum. A missing
+	 * signer hides the bundle superseded() counts, and so does a rolled-back
+	 * one: a possibly-stale head may have lost the epoch rows of grants its
+	 * guardian signed, so it rules nobody out here.
+	 */
+	private mayBeSuperseded(
+		attempt: IPendingAttempt,
+		readings: IHeadReading[],
+		stale: IHeadReading[]
+	): boolean {
+		const past = (reading: IHeadReading): boolean =>
+			reading.state.lease.epoch > attempt.newEpoch ||
+			(reading.state.lease.epoch === attempt.newEpoch &&
+				!reading.state.lease.writerPublicKey.equals(attempt.writer.publicKey));
+		if (![...readings, ...stale].some(past)) return false;
+		const ruledOut = new Set(
+			readings
+				.filter((reading) => !past(reading))
+				.map((reading) => reading.guardianId.toString('hex'))
+		);
+		return (
+			this.config.context.members.filter(
+				(member) => !ruledOut.has(member.toString('hex'))
+			).length >= this.config.required
+		);
+	}
+
+	/**
+	 * Fresh heads when a quorum fenced the attempt after the heads its
+	 * evidence came from were read, otherwise null. A guardian answers a
+	 * repeated ACQUIRE with the certificate and receipt it stored, even
+	 * after a later takeover moved it on, and a split grant is assembled
+	 * from heads read before its repair, so neither shows that takeover.
+	 * Refuses, keeping the attempt, while that takeover may have a quorum
+	 * the reachable heads cannot prove: abandoning it could strand an epoch
+	 * the takeover never won, and promoting it could install a fenced lease.
+	 */
+	private async fencedSince(
+		attempt: IPendingAttempt
+	): Promise<{ readings: IHeadReading[]; stale: IHeadReading[] } | null> {
+		const fresh = await this.readHeads();
+		this.assertNoConflict(fresh.readings, fresh.stale);
+		if (this.superseded(attempt, fresh.readings, fresh.stale)) return fresh;
+		if (this.mayBeSuperseded(attempt, fresh.readings, fresh.stale)) {
+			throw new RestoreRefusedError(
+				'no-quorum',
+				`a guardian is past epoch ${attempt.newEpoch}, and that takeover may hold ` +
+					'a quorum whose certificates are not all reachable; keeping the acquisition'
+			);
+		}
+		return null;
 	}
 
 	/** A guardian that granted this attempt and has not moved past it. */
@@ -1032,14 +1123,17 @@ export class RestoreDriver {
 	 * guard can gather a quorum any more, and none has to, because the
 	 * takeover is complete at the highest head. The other members are
 	 * brought onto it: one still under the old lease through SYNC_EPOCH,
-	 * one granted over a lower head by relaying the records up to it.
+	 * one granted over a lower head by relaying the records up to it. A
+	 * possibly-stale signer's grant counts toward the quorum, but its head
+	 * is never the source. A quorum over one head is finished the same way
+	 * when too few of its signers can answer the round.
 	 */
 	private async finishSplitGrant(
 		attempt: IPendingAttempt,
 		pool: IHeadReading[],
 		stale: IHeadReading[]
 	): Promise<IAcquired | null> {
-		const bundle = this.certificateBundles(pool).find(
+		const bundle = this.certificateBundles([...pool, ...stale]).find(
 			(certs) =>
 				certs.length >= this.config.required &&
 				certs[0].newEpoch === attempt.newEpoch &&
@@ -1049,8 +1143,16 @@ export class RestoreDriver {
 		if (!bundle) return null;
 		const certified = certifiedBy(bundle);
 		// One head for the whole quorum is an ordinary grant: the round
-		// collects it from the guardians' idempotent replies.
-		if (bundle.every((cert) => statesEqual(cert.supersededState, certified))) {
+		// collects it from the guardians' idempotent replies. Only signers
+		// with a fresh head can reply, since a possibly-stale one refuses
+		// every acquisition (wire 5.3).
+		const answering = bundle.filter((cert) =>
+			pool.some((reading) => reading.guardianId.equals(cert.guardianId))
+		);
+		if (
+			answering.length >= this.config.required &&
+			bundle.every((cert) => statesEqual(cert.supersededState, certified))
+		) {
 			return null;
 		}
 		const source = pool.find((reading) =>
@@ -1058,15 +1160,6 @@ export class RestoreDriver {
 		);
 		if (!source) return null;
 		const repaired = await this.repairLaggards(pool, stale, source);
-		// No ACQUIRE goes out on this path, so no ERR_SET_RETIRED answer can
-		// reveal a retirement that landed after the heads were read.
-		const rotation = await this.refetchRotation();
-		if (rotation) throw this.rotated(rotation);
-		this.emit(
-			'epoch:acquired',
-			`epoch ${attempt.newEpoch} acquired with ${bundle.length} certificates ` +
-				`granted over different heads, certifying sequence ${certified.logHead.sequence}`
-		);
 		return {
 			lease: {
 				epoch: attempt.newEpoch,
@@ -1101,6 +1194,17 @@ export class RestoreDriver {
 		let repaired = 0;
 		let pending = this.loadPending();
 		let held = false;
+		// Checked before the first round, not only after a failed one: a
+		// guardian replays its grant of the attempt after it has moved on to
+		// a later takeover, so the round would complete a fenced epoch.
+		if (pending && this.superseded(pending, pool, stalePool)) {
+			this.emit(
+				'epoch:abandoned',
+				`epoch ${pending.newEpoch} was won by another writer; starting a new acquisition`
+			);
+			this.clearPending();
+			pending = null;
+		}
 		if (pending) {
 			held = this.mayBeHeld(pending, pool, stalePool);
 			this.emit(
@@ -1108,12 +1212,42 @@ export class RestoreDriver {
 				`resuming the acquisition of epoch ${pending.newEpoch} with its original writer key`
 			);
 		}
+		// The next round acquires over the heads that showed the fence.
+		const abandonFenced = (
+			fenced: IPendingAttempt,
+			fresh: { readings: IHeadReading[]; stale: IHeadReading[] }
+		): void => {
+			this.emit(
+				'epoch:abandoned',
+				`epoch ${fenced.newEpoch} was won by another writer; starting a new acquisition`
+			);
+			this.clearPending();
+			pending = null;
+			held = false;
+			pool = fresh.readings;
+			stalePool = fresh.stale;
+			expected = this.selectHead(pool, stalePool);
+		};
 
 		for (let attempt = 1; attempt <= this.maxCasAttempts; attempt++) {
-			const split = pending
-				? await this.finishSplitGrant(pending, pool, stalePool)
-				: null;
-			if (split) return { ...split, repaired: repaired + split.repaired };
+			if (pending) {
+				const split = await this.finishSplitGrant(pending, pool, stalePool);
+				// No ACQUIRE goes out on this path, so only fresh heads show a
+				// takeover or a retirement that landed since its quorum was read.
+				const fenced = split ? await this.fencedSince(pending) : null;
+				if (fenced) {
+					abandonFenced(pending, fenced);
+					continue;
+				}
+				if (split) {
+					this.emit(
+						'epoch:acquired',
+						`epoch ${pending.newEpoch} acquired with ${split.certificates.length} certificates ` +
+							`read from the guardians' heads, certifying sequence ${split.certifiedState.logHead.sequence}`
+					);
+					return { ...split, repaired: repaired + split.repaired };
+				}
+			}
 			// A guardian that may hold the pending attempt can grant nothing
 			// else, so this round completes it over its own guard or not at
 			// all. Repairing laggards toward a newer head would carry them past
@@ -1172,6 +1306,17 @@ export class RestoreDriver {
 			}
 			const certificates = this.collectCertificates(results, pending);
 			if (certificates.length >= this.config.required) {
+				// A fresh grant is made at the guardian's current head, so only
+				// a replayed one can hide a takeover that fenced the attempt.
+				const fenced = results.some(
+					(entry) => entry.result?.status === GuardianStatus.OK_DUPLICATE
+				)
+					? await this.fencedSince(pending)
+					: null;
+				if (fenced) {
+					abandonFenced(pending, fenced);
+					continue;
+				}
 				const lease: IWriterLeaseKeys = {
 					epoch: pending.newEpoch,
 					writerSecret: pending.writer.secret,
@@ -1211,22 +1356,14 @@ export class RestoreDriver {
 			this.assertNoConflict(refreshed.readings, refreshed.stale);
 			pool = refreshed.readings;
 			stalePool = refreshed.stale;
-			expected = this.selectHead(pool);
+			expected = this.selectHead(pool, stalePool);
 			// A pending acquisition keeps its epoch and key while any guardian
 			// might be bound to it, which is what makes a partial acceptance
 			// recoverable. It is retired in exactly two cases.
 			const attemptSoFar = pending as IPendingAttempt;
 			// One: a quorum-certified takeover superseded it, so it can never
 			// complete no matter how often it is retried.
-			const superseded = this.certificateBundles(pool).some(
-				(bundle) =>
-					bundle.length >= this.config.required &&
-					(bundle[0].newEpoch > attemptSoFar.newEpoch ||
-						(bundle[0].newEpoch === attemptSoFar.newEpoch &&
-							!bundle[0].newWriterPublicKey.equals(
-								attemptSoFar.writer.publicKey
-							)))
-			);
+			const superseded = this.superseded(attemptSoFar, pool, stalePool);
 			// Two: NOTHING can hold it (no certificate collected, and every
 			// guardian's head shows it never granted the attempt), while the
 			// reconciled head has moved on. That is the still-live-old-writer
@@ -1303,7 +1440,7 @@ export class RestoreDriver {
 		}
 		const { readings, stale } = await this.readHeads();
 		this.assertNoConflict(readings, stale);
-		const target = this.selectHead(readings);
+		const target = this.selectHead(readings, stale);
 		this.emit(
 			'head:adopted',
 			`adopted epoch ${target.state.lease.epoch} sequence ${target.state.logHead.sequence}`

@@ -46,6 +46,13 @@ const DEFAULT_PONG_TIMEOUT_MS = 60_000;
 const TCP_KEEPALIVE_DELAY_MS = 45_000;
 const ENCRYPTED_LENGTH_SIZE = 18; // 2-byte length + 16-byte tag
 const MAX_READ_BUFFER = 2 * 1024 * 1024; // 2 MB
+// A ping of a few bytes may ask for a 65531-byte pong, so pong bytes are
+// metered per connection: a burst of two maximum pongs, refilled at one
+// per 30s. LND asks for at most 4096 bytes a minute and LDK and CLN ask
+// for 0 or 1, so only a peer farming the amplification runs dry.
+const MAX_PONG_BYTES = 65531;
+const PONG_BYTES_BURST = 2 * MAX_PONG_BYTES;
+const PONG_BYTES_PER_MS = MAX_PONG_BYTES / 30_000;
 
 export interface IPeerOptions {
 	/** Local node private key (32 bytes) */
@@ -149,6 +156,9 @@ export class Peer extends EventEmitter {
 	private pongTimer: ReturnType<typeof setTimeout> | null = null;
 	private pingIntervalMs: number;
 	private pongTimeoutMs: number;
+	/** Pong bytes the remote may still request (see PONG_BYTES_BURST). */
+	private pongBytesAllowance = PONG_BYTES_BURST;
+	private pongAllowanceUpdatedAt = Date.now();
 
 	// Optional transport factory (e.g. SOCKS5/Tor proxy sockets, WebSocket)
 	private createSocketFn?: (
@@ -224,6 +234,10 @@ export class Peer extends EventEmitter {
 		// frames nor skip holding because the first release nulled the
 		// queue: every establishment starts a fresh hold lifecycle.
 		this.rearmHeldMessages();
+		// A handler run by the post-init drain may disconnect and start a new
+		// establishment before this one fails. The failure cleanup below then
+		// belongs to that replacement and must leave it alone.
+		const lifecycle = this.heldLifecycleId;
 
 		this.state = 'connecting';
 		this.aborted = false;
@@ -283,14 +297,17 @@ export class Peer extends EventEmitter {
 				this.socket.markEstablished?.();
 				this.state = 'ready';
 				this.setupMessageLoop();
+				this.throwIfClosedByDrain();
 				this.startPingTimer();
 				this.emit('connect');
 			} catch (err) {
-				this.state = 'disconnected';
-				this.destroySocket();
+				if (this.heldLifecycleId === lifecycle) {
+					this.state = 'disconnected';
+					this.destroySocket();
+				}
 				throw err;
 			} finally {
-				this.establishmentAbort = null;
+				if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 			}
 		} else {
 			// Direct TCP connection with connect timeout (Fix 3.1)
@@ -330,11 +347,12 @@ export class Peer extends EventEmitter {
 						this.socket!.setTimeout(0); // Clear handshake timeout
 						this.state = 'ready';
 						this.setupMessageLoop();
+						this.throwIfClosedByDrain();
 						this.startPingTimer();
 						this.emit('connect');
 						resolve();
 					} catch (err) {
-						this.destroySocket();
+						if (this.heldLifecycleId === lifecycle) this.destroySocket();
 						reject(err);
 					}
 				};
@@ -342,7 +360,7 @@ export class Peer extends EventEmitter {
 					void onConnect();
 				});
 			}).finally(() => {
-				this.establishmentAbort = null;
+				if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 			});
 		}
 	}
@@ -356,8 +374,10 @@ export class Peer extends EventEmitter {
 		if (this.state !== 'disconnected') {
 			throw new Error(`Cannot accept: peer is ${this.state}`);
 		}
-		// See connect(): state validated first, then a fresh hold lifecycle.
+		// See connect(): state validated first, then a fresh hold lifecycle,
+		// whose id scopes the failure cleanup.
 		this.rearmHeldMessages();
+		const lifecycle = this.heldLifecycleId;
 
 		this.socket = socket;
 		this.state = 'handshaking';
@@ -388,14 +408,15 @@ export class Peer extends EventEmitter {
 			socket.markEstablished?.();
 			this.state = 'ready';
 			this.setupMessageLoop();
+			this.throwIfClosedByDrain();
 			this.startPingTimer();
 			this.emit('connect');
 		} catch (err) {
-			this.destroySocket();
+			if (this.heldLifecycleId === lifecycle) this.destroySocket();
 			throw err;
 		} finally {
 			clearTimeout(deadline);
-			this.establishmentAbort = null;
+			if (this.heldLifecycleId === lifecycle) this.establishmentAbort = null;
 		}
 	}
 
@@ -405,8 +426,9 @@ export class Peer extends EventEmitter {
 	 * Backpressure: when the socket's write buffer is saturated (slow link, e.g.
 	 * a stalled Tor circuit) best-effort gossip messages are dropped instead of
 	 * growing the buffer without bound — replying to a full-graph gossip query
-	 * over a slow circuit must not OOM the node. Channel-critical messages are
-	 * always queued regardless of buffer depth.
+	 * over a slow circuit must not OOM the node. Other messages are queued
+	 * until the buffer passes MAX_WRITE_BUFFER, and then the peer is
+	 * disconnected.
 	 */
 	sendMessage(type: number, payload: Buffer): void {
 		if (this.state !== 'ready' || !this.transport || !this.socket) {
@@ -419,6 +441,20 @@ export class Peer extends EventEmitter {
 		}
 
 		const buffered = this.socket.writableLength;
+		if (buffered > Peer.MAX_WRITE_BUFFER) {
+			// Disconnect before the error goes out, so a send from an error
+			// observer throws instead of re-entering this branch. The message
+			// is lost with the rest of the buffer, as it would be in a socket
+			// that died, and reestablish retransmits what a channel needs.
+			this.disconnect();
+			this.emit(
+				'error',
+				new Error(
+					`Write buffer overflow: ${buffered} bytes exceeds ${Peer.MAX_WRITE_BUFFER}`
+				)
+			);
+			return;
+		}
 		if (
 			Peer.GOSSIP_MESSAGE_TYPES.has(type) &&
 			buffered > Peer.MAX_GOSSIP_WRITE_BUFFER
@@ -475,9 +511,19 @@ export class Peer extends EventEmitter {
 		Peer.MAX_GOSSIP_WRITE_BUFFER + 1024 * 1024;
 
 	/**
+	 * Above this many buffered bytes the peer is disconnected, whatever the
+	 * message type. The largest burst a legitimate sender queues at once is a
+	 * guardian GET_STATE page written in one loop, which a client accepts up
+	 * to 64 MiB (guardian-client DEFAULT_MAX_RESPONSE_BYTES), so a lower cap
+	 * would fail a restore from a full namespace on every retry.
+	 */
+	private static readonly MAX_WRITE_BUFFER = 72 * 1024 * 1024; // 72 MB
+
+	/**
 	 * Disconnect from the peer gracefully.
 	 */
 	disconnect(): void {
+		const established = this.state === 'ready';
 		// An in-flight connect/accept must not survive this call: the abort
 		// flag stops the handshake at its next boundary, a socket factory
 		// that resolves later destroys its socket instead of adopting it, and
@@ -493,6 +539,18 @@ export class Peer extends EventEmitter {
 		this.stopPingTimer();
 		this.destroySocket();
 		this.state = 'disconnected';
+		if (established) {
+			// destroySocket strips the socket's close listener, so the close
+			// owners rely on to release this connection (PeerManager's
+			// registration and inbound slot) is reported here instead. It is
+			// deferred like a socket's close, so a caller's own teardown after
+			// disconnect() runs first, and dropped if a new connect/accept
+			// (which bumps heldLifecycleId) began meanwhile.
+			const lifecycle = this.heldLifecycleId;
+			queueMicrotask(() => {
+				if (this.heldLifecycleId === lifecycle) this.emit('close', false);
+			});
+		}
 	}
 
 	/**
@@ -698,6 +756,18 @@ export class Peer extends EventEmitter {
 		}
 	}
 
+	/**
+	 * setupMessageLoop drains the frames that arrived with the init, and one
+	 * of them can close the connection (an invalid frame, a ping flood). An
+	 * establishment whose connection closed there fails instead of reporting
+	 * connect.
+	 */
+	private throwIfClosedByDrain(): void {
+		if (this.state !== 'ready') {
+			throw new Error('Connection closed while draining buffered frames');
+		}
+	}
+
 	private processReadBuffer(): void {
 		// eslint-disable-next-line no-constant-condition -- drains buffered frames until it returns
 		while (true) {
@@ -764,7 +834,15 @@ export class Peer extends EventEmitter {
 		// Handle ping/pong internally
 		if (type === MessageType.PING) {
 			const ping = decodePingMessage(payload);
-			if (ping.numPongBytes <= 65531) {
+			if (ping.numPongBytes <= MAX_PONG_BYTES) {
+				if (!this.takePongAllowance(ping.numPongBytes)) {
+					this.emit(
+						'error',
+						new Error('Ping flood: peer exceeded its pong byte allowance')
+					);
+					this.disconnect();
+					return;
+				}
 				const pong = encodePongMessage(ping.numPongBytes);
 				this.sendMessage(MessageType.PONG, pong);
 			}
@@ -964,6 +1042,19 @@ export class Peer extends EventEmitter {
 		} catch {
 			// Ignore send errors during ping
 		}
+	}
+
+	private takePongAllowance(bytes: number): boolean {
+		const now = Date.now();
+		const elapsed = Math.max(0, now - this.pongAllowanceUpdatedAt);
+		this.pongAllowanceUpdatedAt = now;
+		this.pongBytesAllowance = Math.min(
+			PONG_BYTES_BURST,
+			this.pongBytesAllowance + elapsed * PONG_BYTES_PER_MS
+		);
+		if (bytes > this.pongBytesAllowance) return false;
+		this.pongBytesAllowance -= bytes;
+		return true;
 	}
 
 	private handlePong(): void {
