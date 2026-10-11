@@ -1453,6 +1453,8 @@ export interface ISwapNodeConfig {
 		refundBumpIntervalBlocks?: number;
 		maxFundingAttempts?: number;
 		maxCreatedPerPeer?: number;
+		/** Unpaid reverse swaps across every peer (default 64). */
+		maxUnpaidSwaps?: number;
 	};
 	/**
 	 * The submarine direction (on-chain to Lightning, issue #743): off by
@@ -1473,6 +1475,8 @@ export interface ISwapNodeConfig {
 		paymentMaxFeePpm?: number;
 		claimBumpIntervalBlocks?: number;
 		minInvoiceExpirySeconds?: number;
+		/** Swaps nothing has been paid for yet, across every peer (default 64). */
+		maxUnpaidSwaps?: number;
 	};
 	/**
 	 * A chain view for the provider that wins over the node's chain backend.

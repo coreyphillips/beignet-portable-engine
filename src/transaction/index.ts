@@ -301,6 +301,45 @@ export class Transaction {
 	}
 
 	/**
+	 * Whether a send below 2 sat/vB is priced at getByteCount's size instead
+	 * of at least 256 vB. A max send pays its fee out of its one output, so
+	 * padding only shrinks what the recipient gets and can push a small sweep
+	 * below dust. getByteCount counts every key as compressed, 32 vB short
+	 * for an uncompressed one, so those keep the padding.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @returns {boolean}
+	 */
+	private skipsSizeFloor(
+		transaction: Partial<ISendTransaction>,
+		inputs: IUtxo[]
+	): boolean {
+		return (
+			!!transaction.max &&
+			!inputs.some((input) => input.keyPair?.publicKey.length === 65)
+		);
+	}
+
+	/**
+	 * The vbytes getByteCount leaves out for inputs signed with an
+	 * uncompressed key. It prices a P2PKH scriptSig with a 33 byte key, and
+	 * an uncompressed one is 65 bytes.
+	 * @private
+	 * @param {IUtxo[]} inputs
+	 * @returns {number}
+	 */
+	private uncompressedKeyBytes(inputs: IUtxo[]): number {
+		return (
+			inputs.filter(
+				(input) =>
+					input.keyPair?.publicKey.length === 65 &&
+					getAddressInfo(input.address).type === 'p2pkh'
+			).length * 32
+		);
+	}
+
+	/**
 	 * Rewrites plain P2WSH input counts to the weight-accurate
 	 * MULTISIG-P2WSH:m-n key for multisig wallets. getByteCount has no
 	 * generic P2WSH input weight; without this the byte count is unusable.
@@ -326,12 +365,73 @@ export class Transaction {
 	}
 
 	/**
+	 * Returns the change address createPsbtFromTransactionData will add to a
+	 * transaction staged without one, or undefined when it adds none. The
+	 * builder adds it for any leftover at or above dust and does not reprice
+	 * the fee, so the estimate has to count it. The leftover is measured at the
+	 * fee without change, as the builder would see it. Measuring it after the
+	 * change's own cost leaves out change the builder still adds.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {string | undefined}
+	 */
+	private generatedChangeAddress({
+		transaction,
+		inputs,
+		fee
+	}: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): string | undefined {
+		if (transaction.changeAddress || transaction.max) return undefined;
+		const address =
+			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
+			this.changeAddressStandIn();
+		if (!address) return undefined;
+		const leftover =
+			this.getTransactionInputValue({ inputs }) -
+			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
+			fee;
+		return leftover >= getDustThreshold(address) ? address : undefined;
+	}
+
+	/**
+	 * An address of the type getChangeAddress derives, for a wallet that has
+	 * not set its change index yet. getChangeAddress derives one on the fly
+	 * there and the builder pays change to it. The estimate only needs the
+	 * output's size and dust threshold, which the script type alone sets, so
+	 * an all-zero program stands in.
+	 * @private
+	 * @returns {string | undefined}
+	 */
+	private changeAddressStandIn(): string | undefined {
+		const network = getBitcoinJsNetwork(this._wallet.network);
+		const hash = Buffer.alloc(20);
+		switch (this._wallet.addressType) {
+			case EAddressType.p2wpkh:
+				return bitcoin.payments.p2wpkh({ hash, network }).address;
+			case EAddressType.p2sh:
+				return bitcoin.payments.p2sh({ hash, network }).address;
+			case EAddressType.p2pkh:
+				return bitcoin.payments.p2pkh({ hash, network }).address;
+			case EAddressType.p2wsh:
+				return bitcoin.address.toBech32(Buffer.alloc(32), 0, network.bech32);
+			case EAddressType.p2tr:
+				return bitcoin.address.toBech32(Buffer.alloc(32), 1, network.bech32);
+		}
+	}
+
+	/**
 	 * Attempt to estimate the current fee for a given transaction and its UTXO's
 	 * @param {number} [satsPerByte]
 	 * @param {string} [message]
 	 * @param {Partial<ISendTransaction>} [transaction]
 	 * @param {boolean} [fundingLightning]
 	 * @param {ECoinSelectPreference} [coinSelectPreference]
+	 * @param {boolean} [generatesChange] Prices the change output the builder adds when no change address is staged.
 	 * @returns {number}
 	 */
 	getTotalFee = ({
@@ -339,13 +439,15 @@ export class Transaction {
 		message = '',
 		transaction = this.data,
 		fundingLightning = false,
-		coinSelectPreference = this._wallet.coinSelectPreference
+		coinSelectPreference = this._wallet.coinSelectPreference,
+		generatesChange = true
 	}: {
 		satsPerByte: number;
 		message?: string;
 		transaction?: Partial<ISendTransaction>;
 		fundingLightning?: boolean;
 		coinSelectPreference?: ECoinSelectPreference;
+		generatesChange?: boolean;
 	}): number => {
 		const baseTransactionSize = TRANSACTION_DEFAULTS.recommendedBaseFee;
 		try {
@@ -368,50 +470,96 @@ export class Transaction {
 			}
 			const outputs = transaction.outputs || [];
 			const changeAddress = transaction.changeAddress;
-
-			//Group all input & output addresses into their respective array.
-			const inputAddresses = inputs.map((input) => input.address);
-			const outputAddresses = outputs.map((output) => output.address);
-
 			//No need for a change address when draining the wallet
-			if (changeAddress && !transaction.max) {
-				outputAddresses.push(changeAddress);
-			}
-
-			// Every transaction pays to at least one output, even when the caller has
-			// not named it yet. sendMax works out the amount before it knows where it
-			// is going, so the outputs are still empty here; counting none of them
-			// priced the sweep one output short and it went out below the rate that
-			// was asked for. getTotalFeeObj already assumes the output. Assume it here
-			// too, or the two disagree about the same transaction.
-			let increaseAddressCount = 0;
-			if (!outputAddresses.length) {
-				increaseAddressCount++;
-			}
+			const pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
+			const inputAddresses = inputs.map((input) => input.address);
 			const inputParam = this.applyMultisigInputWeights(
 				constructByteCountParam(inputAddresses)
 			);
-			const outputParam = constructByteCountParam(outputAddresses, [
-				{ addrType: this._wallet.addressType, count: increaseAddressCount }
-			]);
-			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
-			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
-			// every channel funding transaction by 12 vB, which is a real shortfall
-			// at the fee rates a funding transaction is actually broadcast at.
-			if (fundingLightning) {
-				const fundingOutputs = outputParam as TGetByteCountOutputs;
-				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
-			}
 
-			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
-				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
-				if (transactionByteCount < minByteCount)
-					transactionByteCount = minByteCount;
+			const feeFor = (withChange: boolean): number => {
+				const outputAddresses = outputs.map((output) => output.address);
+				if (withChange && changeAddress) {
+					outputAddresses.push(changeAddress);
+				}
+
+				// Every transaction pays to at least one output, even when the caller has
+				// not named it yet. sendMax works out the amount before it knows where it
+				// is going, so the outputs are still empty here; counting none of them
+				// priced the sweep one output short and it went out below the rate that
+				// was asked for. getTotalFeeObj already assumes the output. Assume it here
+				// too, or the two disagree about the same transaction.
+				let increaseAddressCount = 0;
+				if (!outputAddresses.length) {
+					increaseAddressCount++;
+				}
+
+				const outputParam = constructByteCountParam(outputAddresses, [
+					{ addrType: this._wallet.addressType, count: increaseAddressCount }
+				]);
+				// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+				// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+				// every channel funding transaction by 12 vB, which is a real shortfall
+				// at the fee rates a funding transaction is actually broadcast at.
+				if (fundingLightning) {
+					const fundingOutputs = outputParam as TGetByteCountOutputs;
+					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+				}
+
+				// The inputs and outputs are known, so the transaction is priced at
+				// its size, not at getByteCount's default 166 vB floor.
+				let transactionByteCount =
+					getByteCount(inputParam, outputParam, message, 0) +
+					this.uncompressedKeyBytes(inputs);
+				if (satsPerByte < 2 && !this.skipsSizeFloor(transaction, inputs)) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (transactionByteCount < minByteCount)
+						transactionByteCount = minByteCount;
+				}
+				// Outputs are whole sats, so a fractional rate rounds the fee up.
+				return Math.ceil(transactionByteCount * satsPerByte);
+			};
+
+			const fee = feeFor(pricesChange);
+			if (pricesChange) {
+				// The change output can cost more than the inputs have left over,
+				// or leave less than dust, which the builder adds to the fee. The
+				// payment may still meet the rate without it, and quoting the whole
+				// leftover as the fee leaves the builder nothing to pay change from.
+				const available =
+					this.getTransactionInputValue({ inputs }) -
+					this.getTransactionOutputValue({ outputs });
+				if (
+					available - fee < getDustThreshold(changeAddress) &&
+					feeFor(false) <= available
+				) {
+					return available;
+				}
 			}
-			return transactionByteCount * satsPerByte;
+			const generatedChange =
+				generatesChange &&
+				this.generatedChangeAddress({
+					transaction,
+					inputs,
+					fee
+				});
+			if (generatedChange) {
+				// Consolidate keeps the inputs already selected above.
+				return this.getTotalFee({
+					satsPerByte,
+					message,
+					transaction: {
+						...transaction,
+						inputs,
+						changeAddress: generatedChange
+					},
+					fundingLightning,
+					coinSelectPreference: ECoinSelectPreference.consolidate
+				});
+			}
+			return fee;
 		} catch {
 			return baseTransactionSize * satsPerByte;
 		}
@@ -428,8 +576,9 @@ export class Transaction {
 	 */
 	getTotalFeeObj = ({
 		satsPerByte = this._wallet.feeEstimates.normal,
-		message = '',
 		transaction = this.data,
+		// updateFee prices the staged message, so the quote must too.
+		message = transaction.message ?? '',
 		fundingLightning = false,
 		coinSelectPreference = this._wallet.coinSelectPreference
 	}: {
@@ -453,15 +602,18 @@ export class Transaction {
 							?.address
 				};
 			}
-			const changeAddress = transaction.changeAddress;
+			let changeAddress = transaction.changeAddress;
 
 			let inputs = transaction.inputs || [];
 			const outputs = transaction.outputs || [];
 
-			if (
+			// A replacement spends every input of the original, so coin selection
+			// must not price a subset of them.
+			const selectsCoins =
 				coinSelectPreference !== ECoinSelectPreference.consolidate &&
-				!transaction.max
-			) {
+				!transaction.max &&
+				transaction.boostType !== EBoostType.rbf;
+			if (selectsCoins) {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs,
 					outputs,
@@ -485,61 +637,249 @@ export class Transaction {
 				});
 			}
 
-			//Group all input & output addresses into their respective array.
-			const inputAddresses = inputs.map((input) => input.address);
-			const outputAddresses = outputs.map((output) => output.address);
-
-			// Always assume we're sending to at least one output for a proper base calculation.
-			let increaseAddressCount = 0;
-			if (!outputAddresses.length) {
-				increaseAddressCount++;
-			}
 			//No need for a change address when draining the wallet
-			if (changeAddress && !transaction.max) {
-				outputAddresses.push(changeAddress);
-			}
+			let pricesChange = !!changeAddress && !transaction.max;
 
 			//Determine the address type of each address and construct the object for fee calculation
+			const inputAddresses = inputs.map((input) => input.address);
 			const inputParam = this.applyMultisigInputWeights(
 				constructByteCountParam(inputAddresses)
 			);
-			const outputParam = constructByteCountParam(outputAddresses, [
-				{ addrType: this._wallet.addressType, count: increaseAddressCount }
-			]);
-			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
-			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
-			// every channel funding transaction by 12 vB, which is a real shortfall
-			// at the fee rates a funding transaction is actually broadcast at.
-			if (fundingLightning) {
-				const fundingOutputs = outputParam as TGetByteCountOutputs;
-				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
-			}
 
-			let transactionByteCount = getByteCount(inputParam, outputParam, message);
-			if (satsPerByte < 2) {
-				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
-				if (transactionByteCount < minByteCount)
-					transactionByteCount = minByteCount;
+			const byteCountFor = (
+				withChange: boolean,
+				rate = satsPerByte
+			): number => {
+				const outputAddresses = outputs.map((output) => output.address);
+
+				// Always assume we're sending to at least one output for a proper base calculation.
+				let increaseAddressCount = 0;
+				if (!outputAddresses.length) {
+					increaseAddressCount++;
+				}
+				if (withChange && changeAddress) {
+					outputAddresses.push(changeAddress);
+				}
+
+				const outputParam = constructByteCountParam(outputAddresses, [
+					{ addrType: this._wallet.addressType, count: increaseAddressCount }
+				]);
+				// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+				// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+				// every channel funding transaction by 12 vB, which is a real shortfall
+				// at the fee rates a funding transaction is actually broadcast at.
+				if (fundingLightning) {
+					const fundingOutputs = outputParam as TGetByteCountOutputs;
+					fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
+				}
+
+				// See getTotalFee: priced at its size, without the 166 vB floor.
+				let transactionByteCount =
+					getByteCount(inputParam, outputParam, message, 0) +
+					this.uncompressedKeyBytes(inputs);
+				if (rate < 2 && !this.skipsSizeFloor(transaction, inputs)) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (transactionByteCount < minByteCount)
+						transactionByteCount = minByteCount;
+				}
+				return transactionByteCount;
+			};
+
+			let transactionByteCount = byteCountFor(pricesChange);
+			const generatedChange = this.generatedChangeAddress({
+				transaction,
+				inputs,
+				fee: Math.ceil(transactionByteCount * satsPerByte)
+			});
+			if (generatedChange) {
+				// Priced on the inputs already selected above. Recursing with
+				// consolidate would hide from the half-balance guard below that a
+				// lower rate selects its own coins.
+				changeAddress = generatedChange;
+				pricesChange = true;
 			}
 			const inputAmount = this.getTransactionInputValue({ inputs });
 			const outputAmount = this.getTransactionOutputValue({ outputs });
 			// To prevent the user from spending more in fees than their output, use the output amount if available.
 			const txBalance =
 				outputAmount && outputAmount < inputAmount ? outputAmount : inputAmount;
-			const maxSatPerByte = this.getMaxSatsPerByte({
+			// See getTotalFee: a payment that cannot also pay for its change output,
+			// or would leave it below dust, goes without it, with the whole leftover
+			// as the fee. updateFee refuses a fee of half the balance, so a leftover
+			// that large keeps change it cannot pay for. Dust change cannot stay: the
+			// fee with it looks payable, and updateFee prices the leftover.
+			const available = inputAmount - outputAmount;
+			const quoteAt = (
+				rate: number
+			): { totalFee: number; transactionByteCount: number } => {
+				// A rate capped below 2 sat/vB takes the size floor that updateFee
+				// prices it with.
+				const byteCount = byteCountFor(pricesChange, rate);
+				const fee = Math.ceil(byteCount * rate);
+				const leftover = available - fee;
+				if (
+					pricesChange &&
+					changeAddress &&
+					leftover < getDustThreshold(changeAddress) &&
+					(leftover >= 0 || available < txBalance / 2)
+				) {
+					const noChangeByteCount = byteCountFor(false, rate);
+					if (Math.ceil(noChangeByteCount * rate) <= available) {
+						return {
+							totalFee: available,
+							transactionByteCount: noChangeByteCount
+						};
+					}
+				}
+				return { totalFee: fee, transactionByteCount: byteCount };
+			};
+			const quote = quoteAt(satsPerByte);
+			transactionByteCount = quote.transactionByteCount;
+			let maxSatPerByte = this.getMaxSatsPerByte({
 				transactionByteCount,
 				balance: txBalance
 			});
-			if (maxSatPerByte < satsPerByte) {
+			// updateFee refuses a fee of exactly half the balance. A rate that drops
+			// the change output pays only the leftover, which is under half. A
+			// lower rate can also select fewer coins than this quote did.
+			const feeAt = (rate: number, generatesChange = true): number =>
+				selectsCoins
+					? this.getTotalFee({
+							satsPerByte: rate,
+							message,
+							transaction,
+							fundingLightning,
+							coinSelectPreference,
+							generatesChange
+					  })
+					: quoteAt(rate).totalFee;
+			// The highest rate below `over` that fits.
+			const highestFitting = (
+				over: number,
+				fits: (rate: number) => boolean
+			): number => {
+				let fit = 0;
+				while (over - fit > 1) {
+					const mid = Math.floor((fit + over) / 2);
+					if (fits(mid)) fit = mid;
+					else over = mid;
+				}
+				return fit;
+			};
+			// The highest rate below `over` whose fee is under half.
+			const highestUnderHalf = (
+				over: number,
+				fee: (rate: number) => number
+			): number => highestFitting(over, (rate) => fee(rate) < txBalance / 2);
+			// A higher rate can select more coins than this quote did, so the
+			// size-based maximum can be many rates over half. Coin selection only
+			// adds coins as the rate rises, so the fee does not fall with it,
+			// except where the leftover becomes dust and generated change goes.
+			// The fee without generated change never falls and is never above the
+			// real one, so the highest rate it fits at bounds the search. If that
+			// rate still prices change, every lower rate where change goes is
+			// already under half, and a plain search below it is safe.
+			const fitUnderHalf = (rate: number): number => {
+				if (!rate || feeAt(rate) < txBalance / 2) return rate;
+				const withoutChange = (r: number): number => feeAt(r, false);
+				const top =
+					withoutChange(rate) < txBalance / 2
+						? rate
+						: highestUnderHalf(rate, withoutChange);
+				return feeAt(top) < txBalance / 2 ? top : highestUnderHalf(top, feeAt);
+			};
+			maxSatPerByte = fitUnderHalf(maxSatPerByte);
+			// updateFee refuses a fee the staged inputs cannot pay on top of the
+			// outputs. A max send is exempt, since it sizes its output from the fee.
+			// A rate that leaves no room for the change output drops it, so a
+			// replacement, whose inputs are fixed, is capped on the size without it.
+			if (transaction.boostType === EBoostType.rbf && !transaction.max) {
+				const remaining = Math.max(0, inputAmount - outputAmount);
+				maxSatPerByte = Math.min(
+					maxSatPerByte,
+					Math.floor(remaining / byteCountFor(false))
+				);
+			} else if (!transaction.max) {
+				// An ordinary send can select more coins at a higher rate. A selection
+				// that pays one rate pays every lower one too, so the rates the staged
+				// inputs cover end at a single highest one.
+				const stagedAmount = this.getTransactionInputValue({
+					inputs: transaction.inputs
+				});
+				const covers = (rate: number): boolean =>
+					outputAmount + feeAt(rate) <= stagedAmount;
+				if (!covers(maxSatPerByte)) {
+					maxSatPerByte = highestFitting(maxSatPerByte, covers);
+				}
+			}
+			// Lowering the maximum can put the remainder above dust. The builder
+			// then adds change, which needs its own fee. Below 2 sat/vB the size
+			// floor can keep the remainder under dust, so size at the maximum.
+			if (!pricesChange) {
+				const changeAtMax = this.generatedChangeAddress({
+					transaction,
+					inputs,
+					fee: Math.ceil(byteCountFor(false, maxSatPerByte) * maxSatPerByte)
+				});
+				if (changeAtMax) {
+					changeAddress = changeAtMax;
+					pricesChange = true;
+					maxSatPerByte = fitUnderHalf(
+						Math.min(
+							maxSatPerByte,
+							this.getMaxSatsPerByte({
+								transactionByteCount: byteCountFor(true, maxSatPerByte),
+								balance: txBalance
+							})
+						)
+					);
+				}
+			}
+			// The maximum is a whole rate, but updateFee takes any rate whose fee
+			// fits its limits, so a fractional rate just past the maximum can too.
+			const paysRequested =
+				quote.totalFee < txBalance / 2 &&
+				(!!transaction.max || quote.totalFee <= available);
+			// Below 2 sat/vB the size floor can leave dust change that a higher
+			// rate keeps, so a maximum above the request does not mean it fits.
+			if (!paysRequested && maxSatPerByte >= satsPerByte) {
+				maxSatPerByte = fitUnderHalf(Math.ceil(satsPerByte) - 1);
+				if (!transaction.max && feeAt(maxSatPerByte) > available) {
+					maxSatPerByte = highestFitting(
+						maxSatPerByte,
+						(rate) => feeAt(rate) <= available
+					);
+				}
+			}
+			if (maxSatPerByte < satsPerByte && !paysRequested) {
+				// quoteAt prices the coins selected at the requested rate. The capped
+				// rate can select fewer, and their change can be dust.
+				if (selectsCoins && maxSatPerByte) {
+					const atMax = this.getTotalFeeObj({
+						satsPerByte: maxSatPerByte,
+						message,
+						transaction,
+						fundingLightning,
+						coinSelectPreference
+					});
+					if (atMax.isErr()) return atMax;
+					return ok({
+						totalFee: atMax.value.totalFee,
+						transactionByteCount: atMax.value.transactionByteCount,
+						satsPerByte: maxSatPerByte,
+						maxSatPerByte
+					});
+				}
+				const capped = quoteAt(maxSatPerByte);
 				return ok({
-					totalFee: transactionByteCount * maxSatPerByte,
-					transactionByteCount: maxSatPerByte ? transactionByteCount : 0,
+					totalFee: capped.totalFee,
+					transactionByteCount: maxSatPerByte ? capped.transactionByteCount : 0,
 					satsPerByte: maxSatPerByte,
 					maxSatPerByte
 				});
 			}
 			return ok({
-				totalFee: transactionByteCount * satsPerByte,
+				totalFee: quote.totalFee,
 				transactionByteCount,
 				satsPerByte,
 				maxSatPerByte
@@ -570,12 +910,14 @@ export class Transaction {
 	 * @param {ISendTransaction} [transactionData]
 	 * @param {boolean} [shuffleOutputs]
 	 * @param {coinSelectPreference} [ECoinSelectPreference]
+	 * @param {boolean} [spendFrozen] Signs staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 * @returns {Promise<Result<{id: string, hex: string}>>}
 	 */
 	createTransaction = async ({
 		transactionData = this.data,
 		shuffleOutputs = true,
-		runCoinSelect = false
+		runCoinSelect = false,
+		spendFrozen = false
 	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
 		let transaction = transactionData;
 		if (runCoinSelect) {
@@ -612,6 +954,20 @@ export class Transaction {
 			const message = 'No inputs to spend.';
 			return err(message);
 		}
+
+		// Staging leaves frozen coins out, but a coin frozen since stays staged
+		// until something restages, and sendMax turning max off does not.
+		if (!spendFrozen) {
+			const frozen = transaction.inputs.find((input) =>
+				this._wallet.isUtxoFrozen(input.tx_hash, input.tx_pos)
+			);
+			if (frozen) {
+				return err(
+					`Staged input ${frozen.tx_hash}:${frozen.tx_pos} is frozen.`
+				);
+			}
+		}
+
 		const fee = inputValue - outputValue;
 
 		//Refuse tx if the fee is greater than the amount we're attempting to send.
@@ -641,6 +997,18 @@ export class Transaction {
 			}
 
 			const psbt = psbtRes.value;
+
+			// A freeze can land while the awaits above derive keys and load
+			// prevouts, so check what is about to be signed. No await may sit
+			// between this check and signPsbt.
+			if (!spendFrozen) {
+				for (const { hash, index } of psbt.txInputs) {
+					const txid = Buffer.from(hash).reverse().toString('hex');
+					if (this._wallet.isUtxoFrozen(txid, index)) {
+						return err(`Staged input ${txid}:${index} is frozen.`);
+					}
+				}
+			}
 
 			const signedPsbtRes = await this.signPsbt({
 				psbt,
@@ -782,9 +1150,10 @@ export class Transaction {
 		//Change address and amount to send back to wallet.
 		if (changeAddress) {
 			const changeAddressValue = balance - (outputValue + fee);
-			// Ensure we're not creating unspendable dust.
-			// If we have less than 2x the recommended base fee, just contribute it to the fee in this transaction.
-			if (changeAddressValue >= TRANSACTION_DEFAULTS.dustLimit) {
+			// Change below its own script's dust threshold would not relay, so it
+			// goes to the fee. The flat 546 is only P2PKH's threshold and gave
+			// away relayable segwit change.
+			if (changeAddressValue >= getDustThreshold(changeAddress)) {
 				targets.push({
 					address: changeAddress,
 					value: changeAddressValue,
@@ -794,13 +1163,14 @@ export class Transaction {
 			// Looks like we don't need a change address.
 			// Double check we don't have any spare sats hanging around.
 		} else if (outputValue + fee < balance) {
-			// If we have spare sats hanging around and the difference is greater than the dust limit, generate a changeAddress to send them to.
+			// The threshold depends on the change script, so fetch the address
+			// before deciding whether the spare sats are worth an output.
 			const diffValue = balance - (outputValue + fee);
-			if (diffValue >= TRANSACTION_DEFAULTS.dustLimit) {
-				const changeAddressRes = await this._wallet.getChangeAddress();
-				if (changeAddressRes.isErr()) {
-					return err(changeAddressRes.error.message);
-				}
+			const changeAddressRes = await this._wallet.getChangeAddress();
+			if (changeAddressRes.isErr()) {
+				return err(changeAddressRes.error.message);
+			}
+			if (diffValue >= getDustThreshold(changeAddressRes.value.address)) {
 				changeAddress = changeAddressRes.value.address;
 				targets.push({
 					address: changeAddress,
@@ -912,14 +1282,17 @@ export class Transaction {
 	 * stops before signing.
 	 * @param {ISendTransaction} [transactionData]
 	 * @param {boolean} [shuffleOutputs]
+	 * @param {boolean} [spendFrozen] Keeps staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	createUnsignedPsbt = async ({
 		transactionData = this.data,
-		shuffleOutputs = true
+		shuffleOutputs = true,
+		spendFrozen = false
 	}: {
 		transactionData?: ISendTransaction;
 		shuffleOutputs?: boolean;
+		spendFrozen?: boolean;
 	} = {}): Promise<Result<Psbt>> => {
 		const inputValue = this.getTransactionInputValue({
 			inputs: transactionData.inputs
@@ -952,6 +1325,16 @@ export class Transaction {
 			if (metadataRes.isErr()) return err(metadataRes.error.message);
 			const changeRes = await this.addChangeOutputMetadata(psbt);
 			if (changeRes.isErr()) return err(changeRes.error.message);
+			// A coin frozen since staging, or during the awaits above, must not
+			// reach an external signer. No await may sit between this and return.
+			if (!spendFrozen) {
+				for (const { hash, index } of psbt.txInputs) {
+					const txid = Buffer.from(hash).reverse().toString('hex');
+					if (this._wallet.isUtxoFrozen(txid, index)) {
+						return err(`Staged input ${txid}:${index} is frozen.`);
+					}
+				}
+			}
 			return ok(psbt);
 		} catch (e) {
 			return err(e);
@@ -1525,6 +1908,17 @@ export class Transaction {
 		index?: number;
 		transaction?: ISendTransaction;
 	}): Result<{ fee: number }> {
+		// setupRbf sets minFee no lower than the rate at which the replacement
+		// outbids the original. Nodes reject anything under it.
+		if (
+			transaction.boostType === EBoostType.rbf &&
+			satsPerByte < transaction.minFee
+		) {
+			return err(
+				`A replacement needs at least ${transaction.minFee} sats/vbyte to outbid the original transaction.`
+			);
+		}
+
 		const inputTotal = this.getTransactionInputValue({
 			inputs: transaction.inputs
 		});
@@ -1535,7 +1929,17 @@ export class Transaction {
 			address = outputs[index]?.address ?? '';
 		}
 
-		const newFee = this.getTotalFee({ satsPerByte, transaction, message });
+		// A replacement spends every input of the original, so coin selection
+		// must not price a subset of them.
+		const newFee = this.getTotalFee({
+			satsPerByte,
+			transaction,
+			message,
+			coinSelectPreference:
+				transaction.boostType === EBoostType.rbf
+					? ECoinSelectPreference.consolidate
+					: undefined
+		});
 
 		//Return if the new fee exceeds half of the user's input balance
 		if (newFee >= inputTotal / 2) {
@@ -1587,19 +1991,22 @@ export class Transaction {
 	 * @param {number} [index]
 	 * @param satsPerByte
 	 * @param rbf
+	 * @param {boolean} [spendFrozen] Keeps staged inputs that are frozen, for a caller that froze them to reserve them for this send.
 	 */
 	sendMax = async ({
 		address,
 		transaction,
 		index = 0,
 		satsPerByte,
-		rbf = false
+		rbf = false,
+		spendFrozen = false
 	}: {
 		address?: string;
 		transaction?: ISendTransaction;
 		index?: number;
 		satsPerByte?: number;
 		rbf?: boolean;
+		spendFrozen?: boolean;
 	} = {}): Promise<Result<string>> => {
 		try {
 			if (!transaction) {
@@ -1608,6 +2015,10 @@ export class Transaction {
 			if (!transaction.inputs?.length) {
 				const setupRes = await this.setupTransaction({ rbf });
 				if (setupRes.isErr()) return err(setupRes.error.message);
+				// Setup stages the inputs on a new _data, not on the transaction read
+				// above. Only the inputs are taken, since setup also resets the staged
+				// outputs and rate that the address and rate below fall back to.
+				transaction = { ...transaction, inputs: this._data.inputs };
 			}
 			if (!satsPerByte) {
 				satsPerByte = transaction?.satsPerByte ?? 1;
@@ -1618,6 +2029,16 @@ export class Transaction {
 				address = outputs[index]?.address ?? '';
 			}
 
+			// setupTransaction leaves frozen coins out, but a coin frozen since is
+			// still staged, and createTransaction signs what is staged.
+			const unfrozen = (utxos: IUtxo[]): IUtxo[] =>
+				spendFrozen ? utxos : this.removeBlackListedUtxos(utxos);
+			const stagedInputs = transaction.inputs ?? [];
+			const inputs = unfrozen(stagedInputs);
+			if (stagedInputs.length && !inputs.length) {
+				return err('Every staged input is frozen.');
+			}
+
 			// Priced as the one output staged below. With no outputs, getTotalFee
 			// assumes one of the wallet's own type, which is 12 vB short for a p2wpkh
 			// wallet sweeping to a p2tr or p2wsh address.
@@ -1626,6 +2047,7 @@ export class Transaction {
 				selectedFeeId: transaction.selectedFeeId,
 				transaction: {
 					...transaction,
+					inputs,
 					outputs: address ? [{ address, value: 0, index }] : []
 				}
 			});
@@ -1639,6 +2061,7 @@ export class Transaction {
 					transaction: {
 						satsPerByte,
 						max: true,
+						inputs: unfrozen(this._data.inputs),
 						outputs: [{ address, value: amount, index }],
 						fee
 					}
@@ -1683,15 +2106,18 @@ export class Transaction {
 				inputs: spendableUtxos
 			});
 
+			// A coin frozen after it was staged is still among the inputs, and
+			// sendMax restages without it.
+			const stagedInputs = this.removeBlackListedUtxos(transaction.inputs);
 			const inputValue = this.getTransactionInputValue({
-				inputs: transaction.inputs
+				inputs: stagedInputs
 			});
 			const amount = onchainBalance > inputValue ? onchainBalance : inputValue;
 
 			let utxos: IUtxo[] = [];
 			//Ensure we add the larger utxo set for a more accurate fee.
-			if (transaction.inputs.length > spendableUtxos.length) {
-				utxos = transaction.inputs;
+			if (stagedInputs.length > spendableUtxos.length) {
+				utxos = stagedInputs;
 			} else {
 				utxos = spendableUtxos;
 			}
@@ -1825,6 +2251,11 @@ export class Transaction {
 			if (receiveAddress.isErr()) {
 				return err(receiveAddress.error.message);
 			}
+			const child = {
+				...this.data,
+				...setupTransactionRes.value,
+				boostType: EBoostType.cpfp
+			};
 
 			// try to calculate satsPerByte if not provided.
 			// child + parent combined fee rate should be higher than fastest.
@@ -1833,7 +2264,20 @@ export class Transaction {
 				const parent = this._wallet.data.transactions[txid];
 				if (parent) {
 					const parentVsize = parent.vsize;
-					const childVsize = 141; // assume segwit 1 input 1 output
+					// The child spends every output of the parent that pays us, so it
+					// is sized as the max send that sendMax prices below. Below 2
+					// sat/vB getTotalFee can floor the size at 256 vB, so the size is
+					// read at 2.
+					const childVsize =
+						this.getTotalFee({
+							satsPerByte: 2,
+							message: child.message,
+							transaction: {
+								...child,
+								max: true,
+								outputs: [{ address: receiveAddress.value, value: 0, index: 0 }]
+							}
+						}) / 2;
 					const { fast, normal } = this._wallet.feeEstimates;
 					// IFormattedTransaction.fee is denominated in BTC. Subtracting it
 					// from a sat figure took roughly 0.00001 off where it meant to take
@@ -1863,11 +2307,7 @@ export class Transaction {
 			}
 
 			const sendMaxRes = await this.sendMax({
-				transaction: {
-					...this.data,
-					...setupTransactionRes.value,
-					boostType: EBoostType.cpfp
-				},
+				transaction: child,
 				address: receiveAddress.value,
 				satsPerByte,
 				rbf: this._wallet.rbf
@@ -1918,13 +2358,25 @@ export class Transaction {
 			// getTotalFee prices the change output from changeAddress, so it is
 			// given the outputs without it. The replacement spends every input of
 			// the original, so coin selection must not price a subset of them.
-			const satsPerByte = this._wallet.feeEstimates.fast;
-			const newFee = this.getTotalFee({
-				transaction: { ...transaction, outputs },
-				satsPerByte,
-				message: transaction.message,
-				coinSelectPreference: ECoinSelectPreference.consolidate
-			});
+			const priceAt = (rate: number): number =>
+				this.getTotalFee({
+					transaction: { ...transaction, outputs },
+					satsPerByte: rate,
+					message: transaction.message,
+					coinSelectPreference: ECoinSelectPreference.consolidate
+				});
+			// Nodes only relay a replacement that pays the original fee plus its
+			// own size at the incremental relay rate, and estimates can have
+			// fallen below what the original paid. Below 2 sat/vB getTotalFee
+			// floors the size at 256 vB, so the size is read at 2.
+			const vsize = priceAt(2) / 2;
+			const relayFloor = Math.ceil(
+				(transaction.fee + vsize * TRANSACTION_DEFAULTS.incrementalRelayFee) /
+					vsize
+			);
+			const minFee = Math.max(this._wallet.feeEstimates.slow, relayFloor);
+			const satsPerByte = Math.max(this._wallet.feeEstimates.fast, minFee);
+			const newFee = priceAt(satsPerByte);
 
 			const inputTotal = this.getTransactionInputValue({
 				inputs: transaction.inputs
@@ -1933,8 +2385,30 @@ export class Transaction {
 			const outputTotal = this.getTransactionOutputValue({
 				outputs
 			});
+			// The relay floor is a rate on the size with change. A replacement that
+			// drops its change pays the leftover, the same at every rate, on the
+			// smaller size, so the leftover must outbid the original at that size.
+			// A fee that keeps the change already clears this.
+			const noChangeVsize =
+				this.getTotalFee({
+					transaction: { ...transaction, outputs, changeAddress: '' },
+					satsPerByte: 2,
+					message: transaction.message,
+					coinSelectPreference: ECoinSelectPreference.consolidate,
+					generatesChange: false
+				}) / 2;
+			const outbidsOriginal =
+				newFee >=
+				transaction.fee +
+					noChangeVsize * TRANSACTION_DEFAULTS.incrementalRelayFee;
 
-			if (outputTotal + newFee >= inputTotal || newFee >= inputTotal / 2) {
+			// A replacement that drops its change pays the whole leftover as fee,
+			// so its outputs and fee add up to exactly the inputs.
+			if (
+				outputTotal + newFee > inputTotal ||
+				newFee >= inputTotal / 2 ||
+				!outbidsOriginal
+			) {
 				/*
 				 * We could always pull the fee from the output total,
 				 * but this may negatively impact the transaction made by the user.
@@ -1948,7 +2422,7 @@ export class Transaction {
 			const newTransaction: Partial<ISendTransaction> = {
 				...transaction,
 				outputs,
-				minFee: this._wallet.feeEstimates.slow,
+				minFee,
 				fee: newFee,
 				satsPerByte,
 				rbf: true,
@@ -2075,33 +2549,39 @@ export class Transaction {
 				}
 			}
 
-			// Output address types for the fee calculation. Input types are counted
-			// per selection in calculateFee below, since the selection can grow.
-			const outputTypes = {} as IAddressTypesIO['outputs'];
-
-			const outputAddresses = outputs.map(({ address }) => address);
-			if (changeAddress) {
-				outputAddresses.push(changeAddress);
-			}
-			outputAddresses.forEach((address) => {
-				if (!address) {
-					return;
-				}
-				const validateResponse = getAddressInfo(address);
-				if (!validateResponse) {
-					return;
-				}
-				const type = validateResponse.type.toUpperCase() as EAddressType;
-				if (type in outputTypes) {
-					outputTypes[type] = outputTypes[type] + 1;
-				} else {
-					outputTypes[type] = 1;
-				}
-			});
+			// Output address types for the fee calculation, with and without the
+			// change output. Input types are counted per selection in calculateFee
+			// below, since the selection can grow.
+			const countOutputTypes = (
+				addresses: string[]
+			): IAddressTypesIO['outputs'] => {
+				const types = {} as IAddressTypesIO['outputs'];
+				addresses.forEach((address) => {
+					if (!address) {
+						return;
+					}
+					const validateResponse = getAddressInfo(address);
+					if (!validateResponse) {
+						return;
+					}
+					const type = validateResponse.type.toUpperCase() as EAddressType;
+					if (type in types) {
+						types[type] = types[type] + 1;
+					} else {
+						types[type] = 1;
+					}
+				});
+				return types;
+			};
+			const paymentAddresses = outputs.map(({ address }) => address);
+			const noChangeOutputTypes = countOutputTypes(paymentAddresses);
+			const outputTypes = changeAddress
+				? countOutputTypes([...paymentAddresses, changeAddress])
+				: noChangeOutputTypes;
 
 			//Price the current selection. Every input added costs weight, so this
 			//has to be recomputed whenever the selection changes.
-			const calculateFee = (selected: IUtxo[]): number => {
+			const calculateFee = (selected: IUtxo[], types = outputTypes): number => {
 				const inputTypes = {} as IAddressTypesIO['inputs'];
 				selected.forEach(({ address }) => {
 					const validateResponse = getAddressInfo(address);
@@ -2115,11 +2595,14 @@ export class Transaction {
 						inputTypes[type] = 1;
 					}
 				});
-				let baseFee = getByteCount(
-					this.applyMultisigInputWeights(inputTypes),
-					outputTypes,
-					message
-				);
+				// See getTotalFee: priced at its size, without the 166 vB floor.
+				let baseFee =
+					getByteCount(
+						this.applyMultisigInputWeights(inputTypes),
+						types,
+						message,
+						0
+					) + this.uncompressedKeyBytes(selected);
 				if (satsPerByte < 2) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (baseFee < minByteCount) baseFee = minByteCount;
@@ -2128,6 +2611,11 @@ export class Transaction {
 			};
 
 			let fee = calculateFee(newInputs);
+			// The top-up below can add a coin worth less than its own weight costs,
+			// leaving a selection that no longer pays the rate even without change.
+			// The last one that did is kept to fall back on.
+			let noChangeInputs: IUtxo[] | undefined;
+			let noChangeAmount = 0;
 
 			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
 			//Repricing after each addition matters: the fee the top-up is measured
@@ -2136,6 +2624,13 @@ export class Transaction {
 			if (amountToSend) {
 				for (const input of oldInputs) {
 					if (inputAmount >= amountToSend + fee) break;
+					if (
+						inputAmount >=
+						amountToSend + calculateFee(newInputs, noChangeOutputTypes)
+					) {
+						noChangeInputs = [...newInputs];
+						noChangeAmount = inputAmount;
+					}
 					inputAmount += input.value;
 					newInputs.push(input);
 					fee = calculateFee(newInputs);
@@ -2143,8 +2638,79 @@ export class Transaction {
 			}
 
 			//The provided UTXO's do not have enough to cover the transaction.
-			if (inputAmount < amountToSend + fee || !newInputs?.length) {
+			if (!newInputs?.length) {
 				return err('Not enough funds');
+			}
+			if (inputAmount < amountToSend + fee) {
+				// The payment can still meet the rate without its change output.
+				// getTotalFee then quotes the whole leftover as the fee, and the
+				// builder finds no change to add.
+				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
+				if (inputAmount < amountToSend + noChangeFee) {
+					if (!noChangeInputs) {
+						if (coinSelectPreference === 'consolidate' || !amountToSend) {
+							return err('Not enough funds');
+						}
+						// Every input is selected by now. A coin the first pass picked
+						// stays in every shorter selection too, so one worth less than
+						// what it adds to the fee is left out by selecting again.
+						// Inputs of one type and key size add the same, so each kind is
+						// priced once.
+						const kindOf = (input: IUtxo): string => {
+							const { type } = getAddressInfo(input.address);
+							return `${type}:${input.keyPair?.publicKey.length}`;
+						};
+						const added = new Map<string, number>();
+						const economic: IUtxo[] = [];
+						const dropped: IUtxo[] = [];
+						newInputs.forEach((input, i) => {
+							const kind = kindOf(input);
+							let cost = added.get(kind);
+							if (cost === undefined) {
+								cost = fee - calculateFee(newInputs.filter((_, j) => j !== i));
+								added.set(kind, cost);
+							}
+							(input.value > cost ? economic : dropped).push(input);
+						});
+						if (!economic.length || !dropped.length) {
+							return err('Not enough funds');
+						}
+						// Dropping coins can bring the selection down to the size floor,
+						// where a coin adds less than it did to the whole selection. Each
+						// dropped coin is offered back, largest first, at what it adds to
+						// the coins kept. Keeping coins only moves the selection away
+						// from the floor, so once one of a kind is refused the smaller
+						// ones of that kind are too.
+						dropped.sort((a, b) => b.value - a.value);
+						const refused = new Set<string>();
+						let keptFee = calculateFee(economic);
+						for (const input of dropped) {
+							const kind = kindOf(input);
+							if (refused.has(kind)) continue;
+							const withInput = calculateFee([...economic, input]);
+							if (input.value > withInput - keptFee) {
+								economic.push(input);
+								keptFee = withInput;
+							} else {
+								refused.add(kind);
+							}
+						}
+						if (economic.length === newInputs.length) {
+							return err('Not enough funds');
+						}
+						return this.autoCoinSelect({
+							inputs: economic,
+							outputs,
+							changeAddress,
+							satsPerByte,
+							message,
+							coinSelectPreference
+						});
+					}
+					newInputs = noChangeInputs;
+					inputAmount = noChangeAmount;
+				}
+				fee = inputAmount - amountToSend;
 			}
 			return ok({ inputs: newInputs, outputs, fee });
 		} catch (e) {

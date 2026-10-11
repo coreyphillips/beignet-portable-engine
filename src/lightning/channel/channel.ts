@@ -2995,6 +2995,21 @@ export class Channel {
 				this._state.v2InFlight.confirmed = true;
 				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
 			}
+			// A v2 open force-closed before this attempt confirmed (issue
+			// #1493). The commitment it broadcast already spends this output,
+			// so only the fact is owed. It goes on the failed-channel stamp,
+			// not the record: on a FORCE_CLOSED channel a confirmed record is
+			// what the node's close re-drive keys off, and that is for a
+			// superseded attempt the channel adopted.
+			if (
+				this._state.state === ChannelState.FORCE_CLOSED &&
+				this._state.v2InFlight &&
+				!this._state.v2InFlight.confirmed &&
+				!this._state.fundingConfirmedLate
+			) {
+				this._state.fundingConfirmedLate = true;
+				return [...prefix, { type: ChannelActionType.PERSIST_STATE }];
+			}
 			// A v1 depth observation the ready flow cannot consume: the
 			// zero-conf fast-track already ran it (NORMAL long before real
 			// depth), or the channel has already failed. The callback is
@@ -3048,7 +3063,10 @@ export class Channel {
 			// The peer's channel_ready means it holds the complete funding tx,
 			// so the v2 opening record has nothing left to resume or retransmit
 			// (the funding tx itself stays in pendingFundingTxHex until depth).
+			// The session goes too: its builder holds the peer's prev_txs, which
+			// count against the node-wide budget (issue #1501).
 			this._state.v2InFlight = null;
+			this._state.dualFundingSession = null;
 			return [
 				...prefix,
 				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(msg)),
@@ -3293,6 +3311,7 @@ export class Channel {
 			// opening record has nothing left to resume or retransmit, and no
 			// other attempt of this open can confirm any more.
 			this._state.v2InFlight = null;
+			this._state.dualFundingSession = null;
 			this._state.v2PreviousAttempts = undefined;
 			return [
 				...prefix,
@@ -7120,6 +7139,18 @@ export class Channel {
 	}
 
 	/**
+	 * Fill in `closeSpendsFundingTxid` on a row written before the field
+	 * existed (issue #1547), from spend evidence the caller has verified. A
+	 * marker already present was written by the plan itself and is left
+	 * alone. Returns true when this call wrote it, so the caller persists.
+	 */
+	recoverCloseSpendsFunding(fundingTxid: Buffer): boolean {
+		if (this._state.closeSpendsFundingTxid) return false;
+		this._state.closeSpendsFundingTxid = Buffer.from(fundingTxid);
+		return true;
+	}
+
+	/**
 	 * Force close, in one call: plan, then apply.
 	 *
 	 * Kept for callers with nothing to sequence between the two. The operator
@@ -7800,6 +7831,9 @@ export class Channel {
 			? Buffer.from(plan.provisionalSpliceClose.spliceTxid)
 			: null;
 		this._forceCloseBroadcastView = plan.provisionalSpliceClose?.view ?? null;
+		this._state.closeSpendsFundingTxid = Buffer.from(
+			bitcoin.Transaction.fromBuffer(plan.commitmentTx).ins[0].hash
+		);
 		if (plan.v2Adoption) {
 			Object.assign(this._state, plan.v2Adoption);
 			// Durable proof of which attempt this close was planned against:
@@ -17483,6 +17517,17 @@ export class Channel {
 	}
 
 	/**
+	 * prev_tx bytes the peer's inputs hold across this channel's live
+	 * interactive-tx builders, v2 open and splice (issue #1457).
+	 */
+	getRetainedPeerPrevTxBytes(): number {
+		return (
+			(this._state.dualFundingSession?.getTxBuilder()?.getPeerPrevTxBytes() ??
+				0) + (this._spliceSession?.getTxBuilder()?.getPeerPrevTxBytes() ?? 0)
+		);
+	}
+
+	/**
 	 * Initiate opening a v2 (dual-funded) channel. Sends open_channel2.
 	 */
 	initiateOpenV2(params: IDualFundingParams): ChannelAction[] {
@@ -18177,9 +18222,13 @@ export class Channel {
 	}
 
 	/**
-	 * Handle tx_add_input from peer during v2 opening.
+	 * Handle tx_add_input from peer during v2 opening. `prevTxBytesFree` is
+	 * what the manager's node-wide prev_tx budget has left (issue #1457).
 	 */
-	handleTxAddInput(msg: ITxAddInputMessage): ChannelAction[] {
+	handleTxAddInput(
+		msg: ITxAddInputMessage,
+		prevTxBytesFree?: number
+	): ChannelAction[] {
 		// Splicing reuses the interactive-tx protocol. If a splice negotiation is
 		// in progress, route the peer's input into the splice session.
 		if (this._spliceTxNegotiationActive()) {
@@ -18228,7 +18277,7 @@ export class Channel {
 				prevTxVout: msg.prevTxVout,
 				isShared: !!msg.sharedInputTxid
 			};
-			const err = this._spliceSession!.addPeerInput(input);
+			const err = this._spliceSession!.addPeerInput(input, prevTxBytesFree);
 			if (err) {
 				// BOLT 2: an invalid tx_add_input fails the NEGOTIATION. For a
 				// splice that means tx_abort + unwind; the channel keeps operating
@@ -18269,7 +18318,7 @@ export class Channel {
 			prevTxVout: msg.prevTxVout
 		};
 
-		const result = session.addPeerInput(input);
+		const result = session.addPeerInput(input, prevTxBytesFree);
 		if (!result.ok) {
 			return [
 				{
@@ -21286,11 +21335,12 @@ export class Channel {
 
 		// BOLT 2: tx_signatures MUST be ignored once either side has sent or
 		// received channel_ready; the opening exchange is over. Checked before
-		// the session requirement, and before anything with an effect: the
-		// record is cleared at NORMAL while the live session object remains,
-		// so without this gate a replay of the original (valid) message would
-		// recreate the record, re-persist, rebroadcast, and pull the channel
-		// from NORMAL back to AWAITING_FUNDING_CONFIRMED. The shared predicate
+		// the session requirement, and before anything with an effect: until
+		// NORMAL the live session object remains, so without this gate a
+		// replay of the original (valid) message would recreate the record,
+		// re-persist, rebroadcast, and pull the channel back to
+		// AWAITING_FUNDING_CONFIRMED. At NORMAL the session is gone, and the
+		// replay would be refused instead of ignored. The shared predicate
 		// counts a transiently stashed early ready too (issue #581): the
 		// peer's witnesses are necessarily already in the session by stash
 		// time, so anything landing here afterwards is a replay to ignore,

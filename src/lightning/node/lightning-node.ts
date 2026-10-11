@@ -124,6 +124,8 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
 	INodeAddress,
+	IQueryChannelRangeMessage,
+	IQueryShortChannelIdsMessage,
 	IRoute,
 	IRouteHop,
 	TGossipVerified,
@@ -648,6 +650,13 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
  */
 export const HELD_HTLC_EXPIRY_MARGIN = 18;
 /**
+ * Parts one hold invoice may park at once. Each parked part holds an inbound
+ * HTLC slot until the hold resolves, and a swap hands out hold invoices to
+ * anyone, so without a bound one unpaid hold could fill every slot of a
+ * channel with dust parts. Payers split into far fewer (LND 16, LDK 10).
+ */
+export const MAX_HELD_PARTS_PER_HASH = 64;
+/**
  * Blocks between our chain tip and the lowest outgoing cltv_expiry a forward
  * may carry (issue #1009). An onward HTLC whose expiry has passed, or sits
  * this close to the tip, is failed upstream with expiry_too_soon rather than
@@ -949,6 +958,14 @@ const GRAPH_READING_GOSSIP: ReadonlySet<number> = new Set([
 	MessageType.GOSSIP_TIMESTAMP_FILTER
 ]);
 
+/** A peer's gossip query waiting for the query budget (issue #1398). */
+type TGossipQuery =
+	| { type: MessageType.QUERY_CHANNEL_RANGE; msg: IQueryChannelRangeMessage }
+	| {
+			type: MessageType.QUERY_SHORT_CHANNEL_IDS;
+			msg: IQueryShortChannelIdsMessage;
+	  };
+
 /** A cooperative restore of the stored network map (beginGraphRestore). */
 interface IGraphRestoreRun {
 	restore: GossipGraphRestore;
@@ -1156,6 +1173,31 @@ export class LightningNode extends EventEmitter {
 	private gossipIntakeDropped = 0;
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
+	/**
+	 * Peers' gossip queries share this much main-thread time per window
+	 * (issue #1398). A 40-byte query_channel_range scans and sorts the whole
+	 * graph, about 50 ms at NetworkGraph.MAX_CHANNELS, so answering every
+	 * query as it arrives let one peer hold the event loop. Past the budget,
+	 * queries wait in gossipQueries for the next window.
+	 */
+	private static readonly GOSSIP_QUERY_BUDGET_MS = 100;
+	private static readonly GOSSIP_QUERY_WINDOW_MS = 1000;
+	/**
+	 * Queries one peer may have waiting. BOLT 7 has a peer await each reply
+	 * before it asks again, so an honest one waits on at most one of each
+	 * kind; a query past this is dropped.
+	 */
+	private static readonly GOSSIP_QUERIES_PER_PEER = 2;
+	/**
+	 * Waiting queries by peer. Served one per turn from the front peer, which
+	 * then moves to the back, so a flooding peer cannot delay the others by
+	 * more than one query each.
+	 */
+	private gossipQueries = new Map<string, TGossipQuery[]>();
+	private gossipQueryTimer: ReturnType<typeof setTimeout> | null = null;
+	private gossipQueryWindowStart = 0;
+	private gossipQuerySpentMs = 0;
+	private gossipQueriesDropped = 0;
 	/**
 	 * Time slice of a cooperative Rapid Gossip Sync import
 	 * (loadRapidGossipSnapshotAsync), in milliseconds. A mainnet snapshot
@@ -1482,18 +1524,21 @@ export class LightningNode extends EventEmitter {
 	 * terminal (FAILED, forward_refused); the refund is owed here and
 	 * retried when the channel reestablishes and on every block, so a live
 	 * reconnect resolves it, not only a restart. Keyed by inbound identity.
-	 * A late hold part turned away as `held_set_complete` (issue #822), a
-	 * part refused as `settled_row_full` (issue #1189), and an MPP part failed
-	 * at the MPP timeout (issue #1233), is owed here too. An MPP part's entry
-	 * carries its failure code and is persisted (issue #1265): nothing else
-	 * durable says the part was rejected, and the restore repair would put
-	 * it into a new set.
+	 * A late hold part turned away as `held_set_complete` (issue #822) or
+	 * `held_parts_full` (issue #1390), a part refused as `settled_row_full`
+	 * (issue #1189), and an MPP part failed at the MPP timeout (issue #1233),
+	 * is owed here too. An MPP part's entry carries its failure code and is
+	 * persisted (issue #1265): nothing else durable says the part was
+	 * rejected, and the restore repair would put it into a new set.
 	 */
 	private owedHeldForwardFailures = new Map<
 		string,
 		{ inChannelIdHex: string; fail: () => boolean; failureCode?: number }
 	>();
-	/** The last `owed_part_failures` write failed; every block retries it. */
+	/**
+	 * The last `owed_part_failures` write failed; every block retries it, and
+	 * no owed part's fail goes out until it lands.
+	 */
 	private owedPartFailuresUnsaved = false;
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
@@ -2227,6 +2272,8 @@ export class LightningNode extends EventEmitter {
 		);
 		this.heldForwardLedger.rehydrate();
 		// Swap ledger (issue #737): same rule, rehydrated at construction.
+		// A create is free to send, so its rows are found by key scan: an
+		// insert writes one row, not an index of every swap (issue #1387).
 		if (config.swaps?.enabled) {
 			this.swapLedger = new SwapLedger(
 				this.storage
@@ -2234,7 +2281,8 @@ export class LightningNode extends EventEmitter {
 							this.storage,
 							SWAP_LEDGER_PREFIX,
 							swapCodec,
-							onCorruptLedgerRow
+							onCorruptLedgerRow,
+							{ scanRows: true }
 					  )
 					: new MemoryLedgerStore<ISwapRecord>()
 			);
@@ -7353,6 +7401,8 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.handlePeerDisconnected(pubkey);
 			this.dropGossipSync(pubkey);
 			this.rateLimiter.removePeer(pubkey);
+			this.swapProvider?.forgetPeer(pubkey);
+			this.submarineSwapProvider?.forgetPeer(pubkey);
 			this.notifyPeerDisconnectObservers(pubkey);
 		});
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
@@ -10409,7 +10459,14 @@ export class LightningNode extends EventEmitter {
 				confirmedTxid
 		) {
 			if (retired) this.persistChannel(channelId);
-			void this.redriveSpliceAdoptedClose(channelId);
+			// The marker precedes broadcast and monitor persistence. Without a
+			// monitor, replay must still recover a close that never reached the chain.
+			if (
+				!this.channelManager.getMonitor(channelId) ||
+				!this.v2CloseSpendsConfirmedFunding(channelId)
+			) {
+				void this.redriveSpliceAdoptedClose(channelId);
+			}
 			return;
 		}
 		// Issue #413: a v1 channel failed by a BOLT 1 error before its funding
@@ -11377,6 +11434,11 @@ export class LightningNode extends EventEmitter {
 		// checks _destroyed so an in-flight slice stops rescheduling.
 		this.gossipIntake = [];
 		this.gossipIntakeHead = 0;
+		this.gossipQueries.clear();
+		if (this.gossipQueryTimer) {
+			clearTimeout(this.gossipQueryTimer);
+			this.gossipQueryTimer = null;
+		}
 		// Anything held behind the barrier is refused rather than left parked.
 		// A shutdown is not permission either, and the barrier's retry timer
 		// must not keep the process alive.
@@ -13414,6 +13476,42 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether the close this v2 channel broadcast spends the funding its
+	 * confirmed record names (issue #1523), so no adoption awaits a re-drive.
+	 *
+	 * A row written before `closeSpendsFundingTxid` existed has no marker, and
+	 * once its close is mined nothing rebuilds the plan that would write one
+	 * (issue #1547). The monitor holds the evidence instead: our own
+	 * commitment, reported spending that exact funding outpoint. The marker
+	 * is recovered from it and persisted. A close on a superseded attempt
+	 * names another outpoint and still re-drives.
+	 */
+	private v2CloseSpendsConfirmedFunding(channelId: Buffer): boolean {
+		const channel = this.channelManager.getChannel(channelId);
+		const state = channel?.getFullState();
+		const record = state?.v2InFlight;
+		if (!channel || !state || record?.confirmed !== true) return false;
+		if (state.closeSpendsFundingTxid) {
+			return state.closeSpendsFundingTxid.equals(record.fundingTxid);
+		}
+		const broadcast = this.channelManager.getMonitor(channelId)?.getFullState()
+			.commitmentBroadcast;
+		const spent = broadcast?.spentOutpoint;
+		if (
+			broadcast?.commitmentType !== CommitmentType.OUR_COMMITMENT ||
+			spent?.txid !==
+				Buffer.from(record.fundingTxid).reverse().toString('hex') ||
+			spent.outputIndex !== record.fundingOutputIndex
+		) {
+			return false;
+		}
+		if (channel.recoverCloseSpendsFunding(record.fundingTxid)) {
+			this.persistChannel(channelId);
+		}
+		return true;
+	}
+
+	/**
 	 * Issue #357: a splice that confirms on a FORCE_CLOSED channel voids the
 	 * old-funding commitment we broadcast (both spend the old funding
 	 * outpoint), and until now only an operator rebroadcastClose re-planned
@@ -13458,9 +13556,11 @@ export class LightningNode extends EventEmitter {
 					chState?.spliceInFlight?.confirmedHeight !== undefined ||
 					chState?.closeSpendsSpliceTxid != null ||
 					// A v2 RBF candidate adoption (issue #360) re-drives on the
-					// same machinery and retries the same way.
+					// same machinery and retries the same way, unless the close
+					// already spends the confirmed funding and nothing awaits.
 					(chState?.fundingVersion === 2 &&
-						chState.v2InFlight?.confirmed === true);
+						chState.v2InFlight?.confirmed === true &&
+						!this.v2CloseSpendsConfirmedFunding(channelId));
 				if (rebuilt.retryable === true && confirmedAdoption) {
 					this._pendingSpliceCloseRedrives.add(idHex);
 				}
@@ -16294,9 +16394,10 @@ export class LightningNode extends EventEmitter {
 		}
 		switch (type) {
 			// Broadcast gossip is queued, not handled inline: see gossipIntake.
-			// Query/reply traffic stays synchronous below; it is low-volume,
+			// Replies to our queries stay synchronous below; they are
 			// request-scoped, and a sync manager mid-conversation should not
-			// wait behind a queued dump.
+			// wait behind a queued dump. Peers' queries share a time budget:
+			// see gossipQueries.
 			case MessageType.CHANNEL_ANNOUNCEMENT:
 			case MessageType.NODE_ANNOUNCEMENT:
 				this.enqueueBroadcastGossip(pubkey, type, payload);
@@ -16355,24 +16456,18 @@ export class LightningNode extends EventEmitter {
 				}
 				break;
 			}
-			case MessageType.QUERY_CHANNEL_RANGE: {
-				const syncMgr = this.getOrCreateSyncManager(pubkey);
-				const msg = decodeQueryChannelRangeMessage(payload);
-				const responses = syncMgr.handleQueryChannelRange(msg);
-				for (const resp of responses) {
-					this.emitOutbound(pubkey, resp.type, resp.payload);
-				}
+			case MessageType.QUERY_CHANNEL_RANGE:
+				this.admitGossipQuery(pubkey, {
+					type: MessageType.QUERY_CHANNEL_RANGE,
+					msg: decodeQueryChannelRangeMessage(payload)
+				});
 				break;
-			}
-			case MessageType.QUERY_SHORT_CHANNEL_IDS: {
-				const syncMgr = this.getOrCreateSyncManager(pubkey);
-				const msg = decodeQueryShortChannelIdsMessage(payload);
-				const responses = syncMgr.handleQueryShortChannelIds(msg);
-				for (const resp of responses) {
-					this.emitOutbound(pubkey, resp.type, resp.payload);
-				}
+			case MessageType.QUERY_SHORT_CHANNEL_IDS:
+				this.admitGossipQuery(pubkey, {
+					type: MessageType.QUERY_SHORT_CHANNEL_IDS,
+					msg: decodeQueryShortChannelIdsMessage(payload)
+				});
 				break;
-			}
 			case MessageType.GOSSIP_TIMESTAMP_FILTER:
 				// A peer requesting gossip: at minimum send our own announcements so we
 				// propagate into its graph (and onward to explorers). We always include
@@ -16487,6 +16582,107 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Answer a peer's gossip query now if no other query waits and the
+	 * window's budget is not spent, else queue it behind the others.
+	 */
+	private admitGossipQuery(pubkey: string, query: TGossipQuery): void {
+		if (this.gossipQueries.size === 0 && this.gossipQueryBudgetLeft()) {
+			this.serveGossipQuery(pubkey, query);
+			return;
+		}
+		const queued = this.gossipQueries.get(pubkey) ?? [];
+		if (queued.length >= LightningNode.GOSSIP_QUERIES_PER_PEER) {
+			if (this.gossipQueriesDropped === 0) {
+				this.emitStructuredLog('peer', 'gossip_query_overflow', { pubkey });
+			}
+			this.gossipQueriesDropped++;
+			return;
+		}
+		queued.push(query);
+		this.gossipQueries.set(pubkey, queued);
+		this.scheduleGossipQuery();
+	}
+
+	private gossipQueryBudgetLeft(): boolean {
+		const now = Date.now();
+		if (
+			now - this.gossipQueryWindowStart >=
+			LightningNode.GOSSIP_QUERY_WINDOW_MS
+		) {
+			this.gossipQueryWindowStart = now;
+			this.gossipQuerySpentMs = 0;
+		}
+		return this.gossipQuerySpentMs < LightningNode.GOSSIP_QUERY_BUDGET_MS;
+	}
+
+	/** Serve the next waiting query at once, or when the window renews. */
+	private scheduleGossipQuery(): void {
+		if (this.gossipQueryTimer || this._destroyed) return;
+		const delay = this.gossipQueryBudgetLeft()
+			? 0
+			: this.gossipQueryWindowStart +
+			  LightningNode.GOSSIP_QUERY_WINDOW_MS -
+			  Date.now();
+		this.gossipQueryTimer = setTimeout(() => {
+			this.gossipQueryTimer = null;
+			this.serveNextGossipQuery();
+		}, delay);
+	}
+
+	/**
+	 * One query per turn, so the event loop runs between them, from the
+	 * front peer, which then goes to the back of the queue.
+	 */
+	private serveNextGossipQuery(): void {
+		if (this._destroyed) return;
+		const next = this.gossipQueries.entries().next();
+		if (!next.done && this.gossipQueryBudgetLeft()) {
+			const [pubkey, queued] = next.value;
+			this.gossipQueries.delete(pubkey);
+			const query = queued.shift()!;
+			if (queued.length > 0) this.gossipQueries.set(pubkey, queued);
+			try {
+				this.serveGossipQuery(pubkey, query);
+			} catch (err) {
+				// A query answered inline disconnects its peer when it throws.
+				// Doing the same here keeps a malformed query from costing a
+				// logged failure per turn without any budget charged.
+				this.emitStructuredLog('peer', 'gossip_query_failed', {
+					pubkey,
+					type: query.type,
+					error: err instanceof Error ? err.message : String(err)
+				});
+				this.requestPeerDisconnect(pubkey);
+			}
+		}
+		if (this.gossipQueries.size > 0) {
+			this.scheduleGossipQuery();
+		} else if (this.gossipQueriesDropped > 0) {
+			this.emitStructuredLog('peer', 'gossip_query_overflow_ended', {
+				dropped: this.gossipQueriesDropped
+			});
+			this.gossipQueriesDropped = 0;
+		}
+	}
+
+	/** Answer one query, charging its time, sends included, to the budget. */
+	private serveGossipQuery(pubkey: string, query: TGossipQuery): void {
+		const started = Date.now();
+		try {
+			const syncMgr = this.getOrCreateSyncManager(pubkey);
+			const responses =
+				query.type === MessageType.QUERY_CHANNEL_RANGE
+					? syncMgr.handleQueryChannelRange(query.msg)
+					: syncMgr.handleQueryShortChannelIds(query.msg);
+			for (const resp of responses) {
+				this.emitOutbound(pubkey, resp.type, resp.payload);
+			}
+		} finally {
+			this.gossipQuerySpentMs += Date.now() - started;
+		}
+	}
+
+	/**
 	 * Check queued channels' funding outputs on chain, one at a time (issue
 	 * #1105). A signature only proves keys the announcement carries, so this
 	 * is what separates a real channel, kept at the graph ceiling from then
@@ -16570,7 +16766,10 @@ export class LightningNode extends EventEmitter {
 		return mgr;
 	}
 
-	/** End a peer's sync with its connection, keeping any repair it owed. */
+	/**
+	 * End a peer's sync and its waiting queries with its connection, keeping
+	 * any repair it owed.
+	 */
 	private dropGossipSync(pubkey: string): void {
 		const syncMgr = this.gossipSyncManagers.get(pubkey);
 		if (syncMgr?.repairPending) {
@@ -16578,6 +16777,7 @@ export class LightningNode extends EventEmitter {
 		}
 		syncMgr?.stop();
 		this.gossipSyncManagers.delete(pubkey);
+		this.gossipQueries.delete(pubkey);
 	}
 
 	/**
@@ -16619,12 +16819,18 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		pubkey = normalizeHexPubkey(pubkey);
+		// A sync that ended IDLE keeps the repair it could not finish, and its
+		// peer may stay connected, so the repair moves to this sync.
+		for (const syncMgr of this.gossipSyncManagers.values()) {
+			if (syncMgr.releaseRepair()) this.gossipRepairPending = true;
+		}
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync(this.gossipRepairPending);
 		for (const msg of messages) {
 			this.emitOutbound(pubkey, msg.type, msg.payload);
 		}
-		// The manager holds the repair now. Its disconnect hands it back.
+		// The manager holds the repair now. Its disconnect hands it back, and
+		// so does the next sync started after it ends IDLE.
 		this.gossipRepairPending = false;
 	}
 
@@ -21568,13 +21774,24 @@ export class LightningNode extends EventEmitter {
 					(finalInvoice?.amountMsat &&
 						finalInvoice.amountMsat > 0n &&
 						parkedMsat >= finalInvoice.amountMsat));
+			const partsFull =
+				!alreadyParked &&
+				!setComplete &&
+				parked.length >= MAX_HELD_PARTS_PER_HASH;
 			// Settlement lists every parked part on the payment row.
 			const rowFull =
-				!alreadyParked && !setComplete && !this.settledRowFits(hashHex);
-			if (setComplete || rowFull) {
+				!alreadyParked &&
+				!setComplete &&
+				!partsFull &&
+				!this.settledRowFits(hashHex);
+			if (setComplete || partsFull || rowFull) {
 				this.emitStructuredLog(
 					'htlc',
-					setComplete ? 'held_set_complete' : 'settled_row_full',
+					setComplete
+						? 'held_set_complete'
+						: partsFull
+						? 'held_parts_full'
+						: 'settled_row_full',
 					{
 						paymentHash: hashHex,
 						parkedMsat: parkedMsat.toString(),
@@ -22000,12 +22217,15 @@ export class LightningNode extends EventEmitter {
 	 * fulfilled part of the set, or when the channel refused any parked part.
 	 * Refused parts stay parked and the cancel is retried, with its original
 	 * failure code and reason, on reestablish and on every block; true only
-	 * once every part was failed back.
+	 * once every part was failed back. A cancel refused for every part is
+	 * retried only with `bindWhenRefused`; otherwise nothing reached the
+	 * payer and the caller may still settle instead.
 	 */
 	cancelHeldHtlc(
 		paymentHash: Buffer,
 		failureCode: number = INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
-		cancelReason: HoldCancelReason = 'api'
+		cancelReason: HoldCancelReason = 'api',
+		bindWhenRefused = false
 	): boolean {
 		const hashHex = paymentHash.toString('hex');
 		const held = this.heldHtlcs.get(hashHex);
@@ -22061,10 +22281,9 @@ export class LightningNode extends EventEmitter {
 		}
 		// Nothing reached the payer (a channel awaiting reestablish refuses every
 		// fail, for one). Report the refusal and leave the set parked rather than
-		// closing the invoice CANCELLED over HTLCs the payer still holds; the
-		// expiry sweeper retries this same call on every block.
+		// closing the invoice CANCELLED over HTLCs the payer still holds.
 		if (refused.length === held.length) {
-			if (!chosen) {
+			if (!chosen && !bindWhenRefused) {
 				this.heldResolutions.delete(hashHex);
 				this.persistHeldHtlcs();
 			}
@@ -22182,6 +22401,39 @@ export class LightningNode extends EventEmitter {
 		this.markHoldInvoiceCancelled(hashHex, 'api', 0, 0n);
 		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
 		return { htlcsFailed: 0 };
+	}
+
+	/**
+	 * Delete a cancelled hold invoice's invoice, payment and secret records.
+	 * A swap engine calls this once its swap has ended: every remote create
+	 * mints a hold invoice, and one that ends unpaid would otherwise stay in
+	 * memory and storage for good. Refuses an open or settled hold, a hash
+	 * with a part still parked or resolving, and a payment record that is not
+	 * an unsettled incoming one. True once no invoice is left under the hash.
+	 */
+	private forgetCancelledHoldInvoice(paymentHash: Buffer): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const invoice = this.invoices.get(hashHex);
+		if (!invoice) return true;
+		if (!invoice.hold || !invoice.cancelledAt) return false;
+		if (
+			this.heldInvoiceHashes.has(hashHex) ||
+			this.heldHtlcs.has(hashHex) ||
+			this.heldResolutions.has(hashHex) ||
+			this.resolvingHeldHtlcs.has(hashHex) ||
+			this.pendingMppPayments.has(hashHex)
+		) {
+			return false;
+		}
+		const payment = this.payments.get(hashHex);
+		if (
+			!payment ||
+			payment.direction !== PaymentDirection.INCOMING ||
+			payment.status === PaymentStatus.COMPLETED
+		) {
+			return false;
+		}
+		return this.deleteInvoiceRecords('forgetCancelledHoldInvoice', [hashHex]);
 	}
 
 	/**
@@ -23779,18 +24031,16 @@ export class LightningNode extends EventEmitter {
 			// total is now ambiguous, keeping parked parts alive locks the
 			// payer's funds until the MPP timeout, and a sender could keep
 			// injecting mismatched parts to hold state open indefinitely.
+			const rejected: Array<{ channelId: Buffer; htlcId: bigint }> = [];
 			for (const p of pending.receivedParts) {
 				if (p.status !== PaymentStatus.PENDING) continue;
 				p.status = PaymentStatus.FAILED;
-				this.failRejectedMppPart(
-					p.channelId,
-					p.htlcId,
-					FINAL_INCORRECT_HTLC_AMOUNT
-				);
+				rejected.push({ channelId: p.channelId, htlcId: p.htlcId });
 			}
+			rejected.push({ channelId, htlcId });
 			this.pendingMppPayments.delete(hashHex);
 			this.clearJitSkim(hashHex);
-			this.failRejectedMppPart(channelId, htlcId, FINAL_INCORRECT_HTLC_AMOUNT);
+			this.rejectMismatchedMppParts(rejected);
 			return;
 		}
 
@@ -23956,7 +24206,47 @@ export class LightningNode extends EventEmitter {
 		this.persistOwedPartFailures();
 	}
 
-	/** A rejected MPP part's fail: true once the channel takes it. */
+	/**
+	 * Fail every part of a total mismatch: the set's pending parts and the
+	 * part that disagreed. Each one is owed on disk before any fail goes out.
+	 * The committed parts are the only durable record of the mismatch, so a
+	 * restart that finds no owed row must still find every part committed,
+	 * and the restore repair then rejects the set again. A refused write
+	 * leaves the fails to the owed retry, which writes first.
+	 */
+	private rejectMismatchedMppParts(
+		parts: Array<{ channelId: Buffer; htlcId: bigint }>
+	): void {
+		const keys = parts.map(({ channelId, htlcId }) => {
+			const key = `${channelId.toString('hex')}:${htlcId}`;
+			this.owedHeldForwardFailures.set(key, {
+				inChannelIdHex: channelId.toString('hex'),
+				fail: this.rejectedPartFail(
+					channelId,
+					htlcId,
+					FINAL_INCORRECT_HTLC_AMOUNT
+				),
+				failureCode: FINAL_INCORRECT_HTLC_AMOUNT
+			});
+			return key;
+		});
+		this.persistOwedPartFailures();
+		if (this.owedPartFailuresUnsaved) return;
+		let retired = false;
+		for (const key of keys) {
+			if (this.owedHeldForwardFailures.get(key)?.fail()) {
+				this.owedHeldForwardFailures.delete(key);
+				retired = true;
+			}
+		}
+		if (retired) this.persistOwedPartFailures();
+	}
+
+	/**
+	 * A rejected MPP part's fail: true once the channel takes it and the fail
+	 * is on disk. The debt is durable, so retiring it on a fail the disk
+	 * lacks would leave a restart with the part committed and nothing owed.
+	 */
 	private rejectedPartFail(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -23968,7 +24258,8 @@ export class LightningNode extends EventEmitter {
 			const reason = sharedSecret
 				? createFailureMessage(sharedSecret, failureCode)
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
-			if (!this.channelManager.failHtlc(channelId, htlcId, reason).ok) {
+			const result = this.channelManager.failHtlc(channelId, htlcId, reason);
+			if (!result.ok || result.sendsWithheld) {
 				return false;
 			}
 			this.cleanupHtlcSharedSecret(secretKey);
@@ -24676,6 +24967,7 @@ export class LightningNode extends EventEmitter {
 	 * dropped: there is nothing left to fail.
 	 */
 	private retryOwedHeldForwardFailures(inChannelIdHex?: string): void {
+		if (this.owedPartFailuresUnsaved) this.persistOwedPartFailures();
 		let retiredPersisted = false;
 		for (const [key, owed] of this.owedHeldForwardFailures) {
 			if (inChannelIdHex && owed.inChannelIdHex !== inChannelIdHex) continue;
@@ -24699,18 +24991,32 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			const htlc = channel?.getFullState().htlcs.get(`received-${htlcId}`);
-			const stillCommitted =
+			// FAILED is still asked: memory has the fail, but its persist may
+			// have failed, and the fail closure is what says it reached disk.
+			const stillOwed =
 				htlc !== undefined &&
 				(htlc.state === HtlcState.COMMITTED ||
-					htlc.state === HtlcState.PENDING);
-			if (!stillCommitted || owed.fail()) {
+					htlc.state === HtlcState.PENDING ||
+					htlc.state === HtlcState.FAILED);
+			if (!stillOwed) {
+				// Resolved, so no fail will ever need the secret. A fail that
+				// left through the quiescence queue lands here, not below.
+				this.owedHeldForwardFailures.delete(key);
+				this.cleanupHtlcSharedSecret(key);
+				retiredPersisted ||= owed.failureCode !== undefined;
+			} else if (
+				owed.failureCode !== undefined &&
+				this.owedPartFailuresUnsaved
+			) {
+				// Its row is not on disk, and for a total mismatch the committed
+				// parts are the only durable record (rejectMismatchedMppParts).
+				continue;
+			} else if (owed.fail()) {
 				this.owedHeldForwardFailures.delete(key);
 				retiredPersisted ||= owed.failureCode !== undefined;
 			}
 		}
-		if (retiredPersisted || this.owedPartFailuresUnsaved) {
-			this.persistOwedPartFailures();
-		}
+		if (retiredPersisted) this.persistOwedPartFailures();
 	}
 
 	/**
@@ -28390,9 +28696,25 @@ export class LightningNode extends EventEmitter {
 				hashInUse: (paymentHash) => this.paymentHashInUse(paymentHash),
 				settleHeld: (paymentHash, preimage) =>
 					this.settleHeldHtlc(paymentHash, preimage),
-				cancelHold: (paymentHash) => {
-					this.cancelHoldInvoice(paymentHash);
+				cancelHold: (paymentHash): boolean => {
+					const hashHex = paymentHash.toString('hex');
+					// The swap has ended, so the cancel is owed for good: one the
+					// channel refuses for every part stays bound for the retries
+					// on reestablish, on every block and after a restart.
+					if (this.heldHtlcs.has(hashHex)) {
+						this.cancelHeldHtlc(
+							paymentHash,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							'api',
+							true
+						);
+					} else {
+						this.cancelHoldInvoice(paymentHash);
+					}
+					return !this.heldHtlcs.has(hashHex);
 				},
+				forgetHold: (paymentHash): boolean =>
+					this.forgetCancelledHoldInvoice(paymentHash),
 				onHeld: (cb): (() => void) => {
 					const handler = (e: { paymentHash: Buffer }): void => cb(e);
 					this.on('htlc:held', handler);
@@ -31120,19 +31442,32 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		if (toRemove.length === 0) return;
+		if (!this.deleteInvoiceRecords('sweepExpiredIssuedInvoices', toRemove)) {
+			return;
+		}
+		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
+			removed: toRemove.length,
+			expired: expiredCount,
+			capEvicted: toRemove.length - expiredCount
+		});
+	}
 
-		// Durable rows FIRST: if the transaction fails, the in-memory copies
-		// are kept too, so runtime and persisted state never diverge and the
-		// next sweep retries the whole batch. All five deletes are REQUIRED
-		// interface members (no optional chaining): a backend skipping
-		// deletePreimage would leave an orphaned preimage row that a restart
-		// restores WITHOUT the invoice's bolt12 marker or expected path_id,
-		// making the hash claimable outside the fail-closed path check, and
-		// one skipping deleteInvoicePathId would accumulate path_id rows
-		// forever, the amplification this sweep exists to stop.
+	/**
+	 * Delete every record an issued invoice left under these hashes (preimage,
+	 * legacy payment secret, path_id, invoice, payment), durable rows FIRST:
+	 * if the transaction fails, the in-memory copies are kept too, so runtime
+	 * and persisted state never diverge and the caller can retry the batch.
+	 * All five deletes are REQUIRED interface members (no optional chaining):
+	 * a backend skipping deletePreimage would leave an orphaned preimage row
+	 * that a restart restores WITHOUT the invoice's bolt12 marker or expected
+	 * path_id, making the hash claimable outside the fail-closed path check,
+	 * and one skipping deleteInvoicePathId would accumulate path_id rows
+	 * forever, the amplification these deletes exist to stop.
+	 */
+	private deleteInvoiceRecords(label: string, hashes: string[]): boolean {
 		if (this.storage) {
 			const mutations: RecoveryMutation[] = [];
-			for (const hashHex of toRemove) {
+			for (const hashHex of hashes) {
 				mutations.push(
 					{ type: 'delete_preimage', paymentHash: hashHex },
 					{ type: 'delete_payment_secret', paymentHash: hashHex },
@@ -31141,20 +31476,20 @@ export class LightningNode extends EventEmitter {
 					{ type: 'delete_payment', paymentHash: hashHex }
 				);
 			}
-			// SafetyCritical, and journaled: a restore that resurrected a swept
-			// preimage would reopen the issued-unpaid amplification this sweep
-			// exists to close.
+			// SafetyCritical, and journaled: a restore that resurrected a
+			// deleted preimage would reopen the issued-unpaid amplification
+			// these deletes exist to close.
 			if (
 				!this.commitMutations(
-					'sweepExpiredIssuedInvoices',
+					label,
 					mutations,
 					RecoveryCriticality.SafetyCritical
 				)
 			) {
-				return;
+				return false;
 			}
 		}
-		for (const hashHex of toRemove) {
+		for (const hashHex of hashes) {
 			this.preimages.delete(hashHex);
 			this.paymentSecrets.delete(hashHex);
 			this.invoices.delete(hashHex);
@@ -31164,11 +31499,7 @@ export class LightningNode extends EventEmitter {
 			// already withdraws it; this drops what an in-flight part conceded.
 			this.clearJitSkim(hashHex);
 		}
-		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
-			removed: toRemove.length,
-			expired: expiredCount,
-			capEvicted: toRemove.length - expiredCount
-		});
+		return true;
 	}
 
 	/**

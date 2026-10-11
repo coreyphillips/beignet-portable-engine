@@ -46,6 +46,7 @@ import type {
 	IDfPeerMessaging
 } from '../direct-funding/transport/types';
 import type { IHeldInvoiceSnapshot } from '../node/types';
+import { PeerRateLimiter } from '../node/rate-limiter';
 import { buildSwapHtlc, ISwapHtlc } from './htlc';
 import { buildSwapRefundTx } from './transactions';
 import { validateReverseSwapAdmission } from './policy';
@@ -127,8 +128,26 @@ export interface IReverseSwapProviderConfig {
 	/** Funding BUILD attempts, not broadcasts. */
 	maxFundingAttempts: number;
 	maxCreatedPerPeer: number;
+	/**
+	 * CREATED rows across every peer, connected or not. Each keeps a ledger
+	 * row and a hold invoice until its invoice expires, and the exposure caps
+	 * only count a row once it is held, so a create past this is refused.
+	 */
+	maxUnpaidSwaps: number;
+	/**
+	 * Per-peer budget for quote, create and status requests: a token bucket
+	 * of rate times multiplier. A request past it is dropped unanswered.
+	 */
+	maxRequestsPerSecond: number;
+	requestBurstMultiplier: number;
 	fundingVbytesEstimate: number;
 	refundVbytesEstimate: number;
+	/**
+	 * Blocks a terminal row is kept past its refund height (or its later
+	 * resolution) before it is deleted. Every unpaid create ends in a row,
+	 * so without this the ledger grows with every create ever sent.
+	 */
+	terminalRetentionBlocks: number;
 }
 
 export const REVERSE_SWAP_DEFAULTS: Omit<
@@ -152,8 +171,12 @@ export const REVERSE_SWAP_DEFAULTS: Omit<
 	refundBumpIntervalBlocks: 2,
 	maxFundingAttempts: 3,
 	maxCreatedPerPeer: 4,
+	maxUnpaidSwaps: 64,
+	maxRequestsPerSecond: 5,
+	requestBurstMultiplier: 4,
 	fundingVbytesEstimate: 200,
-	refundVbytesEstimate: 160
+	refundVbytesEstimate: 160,
+	terminalRetentionBlocks: 144
 };
 
 export const REVERSE_SWAP_DEFAULT_EXPOSURE: ISwapExposurePolicy = {
@@ -187,8 +210,21 @@ export interface IReverseSwapProviderDeps {
 	hashInUse?(paymentHash: Buffer): boolean;
 	/** True when parked parts were released against the preimage. */
 	settleHeld(paymentHash: Buffer, preimage: Buffer): boolean;
-	/** Idempotent; a closed hash is not an error. */
-	cancelHold(paymentHash: Buffer): void;
+	/**
+	 * Idempotent; a closed hash is not an error. True once nothing is left
+	 * parked under the hash. A cancel the channel refuses stays the node's
+	 * to retry, and it reports the cancel through onHoldCancelled once it
+	 * lands.
+	 */
+	cancelHold(paymentHash: Buffer): boolean;
+	/**
+	 * Delete the node's records of a cancelled hold: its invoice, payment and
+	 * secret. Called once the swap is terminal; a no-op for a hold that is
+	 * still open, settled, or holding parts. True once no invoice is left
+	 * under the hash; until then the swap's row is kept so the forget is
+	 * retried.
+	 */
+	forgetHold?(paymentHash: Buffer): boolean;
 	onHeld(cb: (event: { paymentHash: Buffer }) => void): () => void;
 	onHoldCancelled(
 		cb: (event: { paymentHash: Buffer; reason: string }) => void
@@ -271,13 +307,36 @@ const WATCHED_STATES: readonly SwapState[] = [
 	'CLAIMED',
 	'EXPOSED'
 ];
+/** The requests this engine answers, each paid from the peer's budget. */
+const REQUEST_SUBTYPES: ReadonlySet<number> = new Set([
+	BeignetCustomSubtype.SWAP_QUOTE_REQUEST,
+	BeignetCustomSubtype.SWAP_CREATE,
+	BeignetCustomSubtype.SWAP_STATUS_REQUEST
+]);
 const DUST_FLOOR_SAT = SWAP_DUST_FLOOR_SAT;
 /** Padding past the admission inequality so any pay height satisfies it. */
 const HOLD_CLTV_PADDING = 8;
 
+/**
+ * An ended swap whose hold cancel has not landed: REFUNDED before its
+ * cancel ran, or a row carrying the cancel's reason alone. A move to
+ * CANCELLED or FAILED that cancels the hold writes that reason with the
+ * state, so a crash before the cancel still leaves it owed; cancelHoldFor
+ * writes it on a refusal.
+ */
+function owesHoldCancel(record: ISwapRecord): boolean {
+	return (
+		record.direction === 'reverse' &&
+		isTerminalSwapState(record.state) &&
+		!record.holdCancelledAt &&
+		(record.state === 'REFUNDED' || record.holdCancelReason !== undefined)
+	);
+}
+
 export class ReverseSwapProvider extends EventEmitter {
 	readonly config: IReverseSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
+	private readonly requestBudget: PeerRateLimiter;
 	private queue: Promise<void> = Promise.resolve();
 	private stopped = false;
 
@@ -309,6 +368,16 @@ export class ReverseSwapProvider extends EventEmitter {
 				'refundDeltaBlocks must exceed the funding and resolution margins'
 			);
 		}
+		if (
+			!Number.isSafeInteger(this.config.terminalRetentionBlocks) ||
+			this.config.terminalRetentionBlocks < 0
+		) {
+			throw new Error('terminalRetentionBlocks must be a non-negative integer');
+		}
+		this.requestBudget = new PeerRateLimiter({
+			maxHtlcsPerSecond: this.config.maxRequestsPerSecond,
+			burstMultiplier: this.config.requestBurstMultiplier
+		});
 		// Subscribed at construction so nothing between construction and
 		// start() is missed; every handler contains its own errors because
 		// the node runs all custom-message listeners in one try/catch.
@@ -330,8 +399,19 @@ export class ReverseSwapProvider extends EventEmitter {
 				await this.processRecord(record.id, 'start');
 			}
 			for (const record of this.deps.ledger.list()) {
-				if (record.state === 'REFUNDED' && !record.holdCancelledAt) {
-					this.cancelHoldFor(record.id, 'refund_confirmed');
+				if (owesHoldCancel(record)) {
+					this.cancelHoldFor(
+						record.id,
+						record.holdCancelReason ?? 'refund_confirmed'
+					);
+				} else if (
+					record.direction === 'reverse' &&
+					record.holdCancelledAt &&
+					isTerminalSwapState(record.state)
+				) {
+					// A crash between the cancel and the forget, or a hold left
+					// by a swap that ended before holds were forgotten.
+					this.forgetHold(record);
 				}
 			}
 		});
@@ -341,6 +421,12 @@ export class ReverseSwapProvider extends EventEmitter {
 		this.stopped = true;
 		for (const off of this.unsubscribe) off();
 		this.unsubscribe.length = 0;
+		this.requestBudget.clear();
+	}
+
+	/** Forget a disconnected peer's request budget. */
+	forgetPeer(peerHex: string): void {
+		this.requestBudget.removePeer(peerHex);
 	}
 
 	/** Per-block work; ticks are serialized and never overlap. */
@@ -349,7 +435,30 @@ export class ReverseSwapProvider extends EventEmitter {
 			for (const record of this.deps.ledger.unresolved()) {
 				await this.processRecord(record.id, `block ${height}`);
 			}
+			this.forgetEnded(height);
 		});
+	}
+
+	/** Delete terminal rows past retention (see terminalRetentionBlocks). */
+	private forgetEnded(height: number): void {
+		if (this.stopped) return;
+		const ended: string[] = [];
+		for (const record of this.deps.ledger.pastRetention(
+			'reverse',
+			height,
+			this.config.terminalRetentionBlocks
+		)) {
+			// The row is what start() re-asks the owed hold cancel from, and
+			// what records it once the node lands it.
+			if (owesHoldCancel(record)) continue;
+			// The row is the only record that a refused or failed hold forget
+			// is still owed.
+			if (record.holdCancelledAt && !this.forgetHold(record)) continue;
+			ended.push(record.id);
+		}
+		// One transaction: the first block after an upgrade finds every
+		// terminal row ever written due at once.
+		if (ended.length > 0) this.deps.ledger.forgetAll(ended);
 	}
 
 	list(): ISwapRecord[] {
@@ -429,7 +538,8 @@ export class ReverseSwapProvider extends EventEmitter {
 			return { ok: false, reason: `swap is ${record.state}` };
 		}
 		const moved = this.deps.ledger.move(swapIdHex, 'CANCELLED', {
-			failureReason: 'operator cancel'
+			failureReason: 'operator cancel',
+			holdCancelReason: 'operator'
 		});
 		if (moved.outcome !== 'applied') {
 			return { ok: false, reason: `ledger ${moved.outcome}` };
@@ -442,6 +552,10 @@ export class ReverseSwapProvider extends EventEmitter {
 	// ─────────────── wire ───────────────
 
 	private onMessage(msg: IDfCustomMessage): void {
+		if (!REQUEST_SUBTYPES.has(msg.subtype)) return;
+		// Spent before decoding. Not logged: the node persists every log
+		// line, so logging a flood would make it cost a write per message.
+		if (!this.requestBudget.tryConsume(msg.peerPubkey)) return;
 		let work: Promise<void> | undefined;
 		try {
 			switch (msg.subtype) {
@@ -591,7 +705,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.amountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -685,11 +799,17 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (destinationProblem) {
 			return refuse(SwapRefusalReason.INTERNAL, destinationProblem);
 		}
-		const createdByPeer = this.deps.ledger
-			.list()
-			.filter((r) => r.peerNodeIdHex === peer && r.state === 'CREATED').length;
-		if (createdByPeer >= this.config.maxCreatedPerPeer) {
+		if (this.deps.ledger.createdCount(peer) >= this.config.maxCreatedPerPeer) {
 			return refuse(SwapRefusalReason.RATE_LIMITED, 'too many unpaid swaps');
+		}
+		if (
+			this.deps.ledger.countInStates('reverse', ['CREATED']) >=
+			this.config.maxUnpaidSwaps
+		) {
+			return refuse(
+				SwapRefusalReason.RATE_LIMITED,
+				'too many unpaid swaps on this provider'
+			);
 		}
 		const fee = await this.quoteFee(req.onchainAmountSat);
 		if (!fee)
@@ -706,7 +826,7 @@ export class ReverseSwapProvider extends EventEmitter {
 			amountSat: req.onchainAmountSat,
 			estimatedFundingFeeSat: fee.minerFeeSat,
 			feeRateSatPerVbyte: fee.feeRate,
-			live: this.deps.ledger.unresolved()
+			live: this.deps.ledger.atRisk(this.config.resolutionConfirmations)
 		});
 		if (!verdict.ok)
 			return refuse(exposureRefusal(verdict.reason), verdict.detail);
@@ -920,6 +1040,11 @@ export class ReverseSwapProvider extends EventEmitter {
 		for (const record of this.deps.ledger.byPaymentHash(
 			paymentHash.toString('hex')
 		)) {
+			// The node's retry landed a cancel this ended swap still owed.
+			if (owesHoldCancel(record)) {
+				this.cancelHoldFor(record.id, record.holdCancelReason ?? reason);
+				continue;
+			}
 			if (isTerminalSwapState(record.state) || record.holdCancelledAt) continue;
 			const patch = { holdCancelledAt: this.now(), holdCancelReason: reason };
 			switch (record.state) {
@@ -929,8 +1054,10 @@ export class ReverseSwapProvider extends EventEmitter {
 						...patch,
 						failureReason: `hold cancelled (${reason})`
 					});
-					if (moved.outcome === 'applied')
+					if (moved.outcome === 'applied') {
+						this.forgetHold(moved.record!);
 						this.emitSwap('swap:hold-cancelled', moved.record!, { reason });
+					}
 					break;
 				}
 				case 'FUNDING': {
@@ -966,6 +1093,7 @@ export class ReverseSwapProvider extends EventEmitter {
 					});
 					if (moved.outcome === 'applied') {
 						void this.dropUnsentFunding(moved.record!);
+						this.forgetHold(moved.record!);
 						this.emitSwap('swap:failed', moved.record!, {
 							reason: moved.record!.failureReason
 						});
@@ -1022,20 +1150,50 @@ export class ReverseSwapProvider extends EventEmitter {
 	private cancelHoldFor(swapIdHex: string, why: string): void {
 		const record = this.deps.ledger.get(swapIdHex);
 		if (!record) return;
+		let released = false;
 		try {
-			this.deps.cancelHold(Buffer.from(record.paymentHashHex, 'hex'));
+			released = this.deps.cancelHold(
+				Buffer.from(record.paymentHashHex, 'hex')
+			);
 		} catch (err) {
 			this.deps.log('swap_cancel_hold_failed', {
 				swapId: swapIdHex,
 				error: err instanceof Error ? err.message : String(err)
 			});
+		}
+		if (!released) {
+			// Parts are still parked, so the payer's HTLCs are too: the
+			// reason alone marks the cancel as owed (see owesHoldCancel).
+			if (!record.holdCancelReason) {
+				this.deps.ledger.patch(swapIdHex, { holdCancelReason: why });
+			}
 			return;
 		}
 		if (!record.holdCancelledAt) {
 			this.deps.ledger.patch(swapIdHex, {
 				holdCancelledAt: this.now(),
-				holdCancelReason: why
+				holdCancelReason: record.holdCancelReason ?? why
 			});
+		}
+		this.forgetHold(record);
+	}
+
+	/**
+	 * Drop the node's records of an ended swap's cancelled hold. A create is
+	 * free to send and mints an invoice, payment and secret, so leaving them
+	 * behind every swap that ends unpaid grows memory and storage for good.
+	 * The swap's own row stays the record of what happened.
+	 */
+	private forgetHold(record: ISwapRecord): boolean {
+		if (!this.deps.forgetHold) return true;
+		try {
+			return this.deps.forgetHold(Buffer.from(record.paymentHashHex, 'hex'));
+		} catch (err) {
+			this.deps.log('swap_forget_hold_failed', {
+				swapId: record.id,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return false;
 		}
 	}
 
@@ -1076,7 +1234,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (!record.bolt11) {
 			// Crashed between the insert and the invoice.
 			const moved = this.deps.ledger.move(record.id, 'FAILED', {
-				failureReason: 'no hold invoice was recorded'
+				failureReason: 'no hold invoice was recorded',
+				holdCancelReason: 'no_invoice'
 			});
 			if (moved.outcome === 'applied') {
 				this.cancelHoldFor(record.id, 'no_invoice');
@@ -1096,13 +1255,16 @@ export class ReverseSwapProvider extends EventEmitter {
 					expectedMsat: record.invoiceMsat
 				});
 			}
+			// A partial set goes with the invoice too: the sender picks its
+			// parts' expiry, so waiting for the sweeper would let anyone hold
+			// this node's inbound HTLC slots for weeks at the cost of a create.
 			if (
 				record.invoiceExpiresAt !== undefined &&
-				this.now() > record.invoiceExpiresAt * 1000 &&
-				(!snapshot || snapshot.parts.length === 0)
+				this.now() > record.invoiceExpiresAt * 1000
 			) {
 				const moved = this.deps.ledger.move(record.id, 'CANCELLED', {
-					failureReason: 'invoice expired unpaid'
+					failureReason: 'invoice expired unpaid',
+					holdCancelReason: 'invoice_expired'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(record.id, 'invoice_expired');
@@ -1117,7 +1279,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		const refusal = this.admissionProblem(record, snapshot, height);
 		if (refusal) {
 			const moved = this.deps.ledger.move(record.id, 'CANCELLED', {
-				failureReason: refusal
+				failureReason: refusal,
+				holdCancelReason: 'admission_refused'
 			});
 			if (moved.outcome === 'applied') {
 				this.cancelHoldFor(record.id, 'admission_refused');
@@ -1259,7 +1422,8 @@ export class ReverseSwapProvider extends EventEmitter {
 		if (!current.fundingTxHex) {
 			if (current.fundingAttempts >= this.config.maxFundingAttempts) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: `funding could not be built after ${current.fundingAttempts} attempts`
+					failureReason: `funding could not be built after ${current.fundingAttempts} attempts`,
+					holdCancelReason: 'funding_failed'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(current.id, 'funding_failed');
@@ -1305,7 +1469,8 @@ export class ReverseSwapProvider extends EventEmitter {
 				this.deps.log('swap_funding_rejected', { swapId: current.id, problem });
 				await this.release(built.txHex);
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: problem
+					failureReason: problem,
+					holdCancelReason: 'funding_rejected'
 				});
 				if (moved.outcome === 'applied') {
 					this.cancelHoldFor(current.id, 'funding_rejected');
@@ -1361,7 +1526,8 @@ export class ReverseSwapProvider extends EventEmitter {
 			const problem = this.broadcastProblem(current);
 			if (problem) {
 				const moved = this.deps.ledger.move(current.id, 'FAILED', {
-					failureReason: `broadcast refused: ${problem}`
+					failureReason: `broadcast refused: ${problem}`,
+					holdCancelReason: 'broadcast_refused'
 				});
 				if (moved.outcome === 'applied') {
 					await this.dropUnsentFunding(moved.record!);

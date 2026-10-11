@@ -1127,9 +1127,18 @@ export class ReferenceGuardian {
 					);
 					const strayEpochs = this.store.listEpochs(state.recoveryId);
 					if (strayEpochs.length > 0) {
+						// Like a tombstone, this discards every lease the
+						// namespace held and re-anchors below them.
+						this.rememberErasedLease(state.recoveryId, null, 0n);
 						this.store.deleteAllEpochs(state.recoveryId);
 					}
-					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
+					// A surviving mark is history too: it bounds grants an
+					// earlier rollback or tombstone discarded, and an
+					// unreadable one may bound any of them.
+					strandedHistory =
+						strayRecords > 0 ||
+						strayEpochs.length > 0 ||
+						this.store.getErasedEpoch(state.recoveryId) !== null;
 					if (strandedHistory) {
 						this.alarm(
 							state.recoveryId,
@@ -3030,6 +3039,29 @@ export class ReferenceGuardian {
 						current
 					};
 				}
+				// A quorum's receipts show the target was current once, not that
+				// it still is, so they cannot lift a lease below one it held.
+				// An unreadable mark may have recorded any epoch.
+				const mark = this.store.getErasedEpoch(request.recoveryId);
+				const erased = tryReadU64(mark);
+				if (mark !== null && erased === null) {
+					return {
+						...err(
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'the epoch a rollback discarded is unreadable; this guardian may have granted any later one'
+						),
+						current
+					};
+				}
+				if (erased !== null && target.lease.epoch < erased) {
+					return {
+						...err(
+							GuardianStatus.ERR_EPOCH_REGRESSION,
+							`a rollback discarded epoch ${erased}, which this guardian may have granted; continue SYNC repair up to it`
+						),
+						current
+					};
+				}
 				this.store.setPossiblyStale(request.recoveryId, false);
 				return { status: GuardianStatus.OK };
 			});
@@ -3207,6 +3239,9 @@ export class ReferenceGuardian {
 			// Wire 5.10 step 1: without the stored registration there is no
 			// checkpoint at all.
 			const hadAnything = ns.state !== null || ns.registrationState !== null;
+			// No lease survives a tombstone, and re-registration re-anchors
+			// below every one this guardian granted.
+			this.rememberErasedLease(recoveryId, ns.state, 0n);
 			this.store.deleteAllRecords(recoveryId, 'rollback', u64be(this.clock()));
 			this.store.deleteAllEpochs(recoveryId);
 			this.store.deleteRetainFloor(recoveryId);
@@ -3601,6 +3636,7 @@ export class ReferenceGuardian {
 		reason: string
 	): void {
 		const recoveryId = ns.recoveryId;
+		this.rememberErasedLease(recoveryId, ns.state, checkpoint.lease.epoch);
 		this.store.archiveRecordsAbove(
 			recoveryId,
 			u64be(checkpoint.logHead.sequence),
@@ -3678,6 +3714,34 @@ export class ReferenceGuardian {
 			GuardianStatus.ERR_STORE_UNCERTAIN,
 			`store rolled back to sequence ${checkpoint.logHead.sequence}, epoch ${checkpoint.lease.epoch}: ${reason}`
 		);
+	}
+
+	/**
+	 * Grants this guardian signed above `kept` stay valid after their rows
+	 * go, so remember the highest lease it held before discarding them:
+	 * repair evidence below it cannot prove a lower state current.
+	 */
+	private rememberErasedLease(
+		recoveryId: Buffer,
+		declaredState: Buffer | null,
+		kept: bigint
+	): void {
+		const declared = tryParseState(declaredState);
+		let held =
+			declared !== null && declared.recoveryId.equals(recoveryId)
+				? declared.lease.epoch
+				: 0n;
+		for (const row of this.store.listEpochs(recoveryId)) {
+			const epoch = tryReadU64(row.epoch);
+			if (epoch !== null && epoch > held) held = epoch;
+		}
+		// An unreadable mark already refuses all evidence; a number would
+		// narrow that.
+		const mark = this.store.getErasedEpoch(recoveryId);
+		const erased = tryReadU64(mark);
+		if (held > kept && (mark === null || (erased !== null && held > erased))) {
+			this.store.setErasedEpoch(recoveryId, u64be(held));
+		}
 	}
 
 	private internalError(error: unknown): IErr {

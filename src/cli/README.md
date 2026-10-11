@@ -743,9 +743,10 @@ figure as the daily limit: `sendOnchain`, an address-targeted `spliceOut` and
 whole sweep. The exclusions above are outside it too.
 
 Circular rebalances (`rebalanceChannel`, `executeRebalances` and their routes)
-are refused with `SERVICE_DRAINING` while the node drains, and a drain that
-starts during an `executeRebalances` run stops the plans it has not tried
-yet. The amount comes back to the node, so only the routing fee counts
+are refused with `SERVICE_DRAINING` while the node drains, and with
+`NODE_DESTROYED` once a shutdown starts, before anything is charged. A drain
+or shutdown that starts during an `executeRebalances` run stops the plans it
+has not tried yet. The amount comes back to the node, so only the routing fee counts
 against the daily limit. The day is charged `maxFeeSats` (`rebalanceChannel`)
 or the day's advisor fee budget (`executeRebalances`) when the call starts,
 and gets back what the fees actually paid did not use when it returns. A
@@ -1861,7 +1862,7 @@ beignet invoice held
 beignet invoice settle-hold <preimage>       # fulfills the parked HTLC(s)
 beignet invoice cancel-hold <paymentHash>    # fails them back to the payer
 
-beignet payment list
+beignet payment list [--limit 1000] [--offset 0]
 beignet payment get <paymentHash>
 beignet payment cancel <paymentHash>
 beignet payment wait <paymentHash> [--timeout 60000]
@@ -2022,6 +2023,7 @@ Every response follows this format:
   "connectTimeoutMs": 15000,
   "tlsCert": "/etc/ssl/beignet/cert.pem",
   "tlsKey": "/etc/ssl/beignet/key.pem",
+  "rateLimit": { "maxRequests": 100, "windowMs": 60000 },
   "htlcEvents": false
 }
 ```
@@ -2263,6 +2265,10 @@ These still count against the rate limiter when `rateLimit` is configured.
 
 A daemon bound beyond loopback refuses to start when the `apiToken` or any `apiKeys` secret is shorter than 16 characters, unless `insecure` is set: there the credential is the only lock, and the rate limiter is off unless configured. Prefer `BEIGNET_API_TOKEN` or the config file to `--api-token`, whose value any local user can read from the process list.
 
+The rate limiter is the `rateLimit` config file key: `{ "maxRequests": 100, "windowMs": 60000, "trustedProxies": [] }`, every field optional, so `{}` turns it on with those defaults. A client past its bucket gets `429 RATE_LIMITED`. Buckets are keyed on the peer address, and `X-Forwarded-For` is read only when the peer is listed in `trustedProxies`; without that, every client behind a proxy shares the proxy's bucket. A `maxRequests`, `windowMs` or `maxClients` that is not a positive integer refuses startup.
+
+Whether or not it is on, the server holds at most 256 connections at once (SSE streams and waits included) and closes any more as they arrive. A client has 30 seconds to send its headers and 120 seconds for the whole request, and an idle keep-alive connection is closed after 5 seconds.
+
 Every install `beignet init` creates carries an `apiToken` (see [Setup](#setup)). If neither `apiToken` nor `apiKeys` is configured (a config written by hand or by a release before 0.22.0's successor), all endpoints are open to local processes, `GET /mnemonic` excepted (it needs auth, and `admin`), the daemon logs a warning at boot, and three browser guards keep a web page from driving it (issue #1005):
 
 | Guard | Refusal |
@@ -2310,7 +2316,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | GET | `/channels/ready` | -- | List channels that are NORMAL and will accept a new HTLC (a capsule-restored channel holding for recency is excluded) |
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
-| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable). Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
+| GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable), newest first. One page per call: `limit` defaults to and may not exceed 1000, so page with `offset`. Read through to the node database, so a completed or failed payment stays listed after the engine prunes its in-memory record (24 hours after completion); a database read that fails answers 500, never a shorter list |
 | GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
 | GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
 | GET | `/invoices` | -- | List created invoices. `status` is `PAID` on a completed receive, from the in-memory record or the database row once the engine has pruned it, so a paid invoice never reads `EXPIRED` or `PENDING` later |
@@ -2402,7 +2408,7 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
 | POST | `/channel/update-policy` | `{ channelId?, all?, feeBaseMsat?, feeProportionalMillionths?, cltvExpiryDelta?, htlcMinimumMsat?, htlcMaximumMsat? }` | Set ROUTING fee policy per channel (or `all: true`); regenerates + re-broadcasts channel_update |
 | GET | `/channel/policy` | `?channelId=<hex>` | Effective routing policy (override or node defaults) with `source` field |
-| POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s) |
+| POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s). Like the two waits below: `timeoutMs` is capped at 10 minutes, and a credential with 16 waits already open is refused with 429 `RATE_LIMITED` |
 | POST | `/channel/wait-ready` | `{ channelId, timeoutMs? }` | Wait for channel to reach NORMAL (default 60s) |
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |
 | POST | `/offer/create` | `{ description, amountSats?, issuer? }` | Create BOLT 12 offer |

@@ -1,3 +1,21 @@
+# Portable engine validation, 2026-10-11 addendum
+
+The fork tracks Beignet **0.30.2** at `af2f13d4ad782c65204fab962788c7dcdb80e5ef`, the published tarball's `gitHead`. This addendum supersedes the prior baseline statements below. The portable patch reapplies to pristine upstream source with no fuzz except for four `sqlite-storage.ts` hunks, which were merged by hand: the scrub's `VACUUM` stays outside `open()`'s transaction. The recaptured patch differs from the 0.30.1 patch only by that merge (see `PATCHES.md`).
+
+- `npm test`: all 216 unit tests pass, including the three new `portable-tests/storage-scrub.test.cjs` tests. With the scrub moved inside the transaction, two of them fail.
+- `npm run check:types` passes. A full `tsc --noEmit -p .` reports the same 27 errors as the 0.30.1 tree, by file and message.
+- The built bundle reports `0.30.2-portable`.
+- `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS. It ran against the local Bitcoin and Electrum containers, with the primary taken from the published `beignet@0.30.2` npm tarball through `BEIGNET_SOURCE_DIR`.
+- `scripts/smoke-regtest.cjs` passes against the local CLN at port 19846.
+- `scripts/regtest-send-max.cjs` passes all seven cases against the same primary, with 73 PASS lines: jit, the three address types, unconfirmed address, phone and cln. That includes repeated drains and drains across restarts, whose on-chain sweep spends the coins it froze for itself under 0.30.2's frozen-coin rule.
+- The shared client's `npm test` passes (162 tests).
+
+Not run for this resync:
+- `test:regtest:channelize` and the FFOR regtests;
+- a device start;
+- upstream's own suites (its CI ran on the merged PRs);
+- `beignet-web`, which pins its own fork commit from GitHub.
+
 # Portable engine validation, 2026-10-08 addendum
 
 The fork tracks Beignet **0.30.1** at `4a1006c67841ce84a3e527cd21f17053cf6b7ede`. This addendum supersedes the prior baseline statements below. The existing portable patch reapplies to pristine upstream source without rejection or fuzz, and the resynced tree differs from the 0.30.0 fork by upstream's own change only (see `PATCHES.md`).
