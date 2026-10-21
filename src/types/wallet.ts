@@ -116,6 +116,16 @@ export interface ICoinbaseVin {
 
 export type TVin = IVin | ICoinbaseVin;
 
+/**
+ * An input as a formatted transaction stores it: the outpoint it spends, or
+ * the coinbase marker. The scriptSig and witness are dropped, since nothing
+ * reads them and they made up most of the stored history. Narrow with
+ * `'txid' in vin`.
+ */
+export type TFormattedVin =
+	| Pick<IVin, 'txid' | 'vout' | 'sequence'>
+	| Pick<ICoinbaseVin, 'coinbase' | 'sequence'>;
+
 export interface IFormattedTransaction {
 	address: string;
 	blockhash?: string;
@@ -135,7 +145,7 @@ export interface IFormattedTransaction {
 	value: number; // BTC
 	txid: string;
 	messages: string[];
-	vin: TVin[];
+	vin: TFormattedVin[];
 	timestamp: number;
 	confirmTimestamp?: number;
 	exists?: boolean;
@@ -220,6 +230,10 @@ export type TAddressLabels = { [address: string]: string };
 
 export type TWalletDataKeys = keyof IWalletData;
 
+// Must return ok(undefined) for a key the storage does not hold, and err only
+// when the read itself fails. Wallet.create refuses to start on an err (see
+// IWallet.resetOnReadFailure), since a wallet loaded from defaults would save
+// them over the data it could not read.
 export type TGetData = <K extends keyof IWalletData>(
 	key: string
 ) => Promise<Result<IWalletData[K]>>;
@@ -256,6 +270,10 @@ export interface IWallet {
 	coinSelectPreference?: ECoinSelectPreference;
 	data?: IWalletData;
 	storage?: TStorage;
+	// Treat a storage read that fails as a missing key and start from the
+	// default for it. Off by default: the wallet's next save then overwrites
+	// whatever the storage could not read, frozen coins and labels included.
+	resetOnReadFailure?: boolean;
 	electrumOptions: {
 		net: Net;
 		tls: Tls;
@@ -265,6 +283,9 @@ export interface IWallet {
 	};
 	remainOffline?: boolean;
 	onMessage?: TOnMessage;
+	// Answers every single-key address in place of the wallet's own
+	// derivation. The answer is used as given, so it must be the address
+	// and public key at the path asked for.
 	customGetAddress?: (
 		data: ICustomGetAddress
 	) => Promise<Result<IGetAddressResponse>>;
@@ -273,6 +294,9 @@ export interface IWallet {
 	selectedFeeId?: EFeeId;
 	feeEstimationSource?: TFeeEstimationSource;
 	disableMessages?: boolean;
+	/** Hold onMessage until the first refresh ends, so stored history does not
+	 *  replay as news. A storageWriteFailed message still passes: it is the
+	 *  only word a host gets of a write that storage refused at startup. */
 	disableMessagesOnCreate?: boolean;
 	/** Skip the refreshWallet Wallet.create fires in the background, for a
 	 *  host that owns the startup refresh itself and needs to hold the ONE
@@ -393,6 +417,23 @@ export interface IGetNextAvailableAddressResponse {
 	changeAddressIndex: IAddress;
 	lastUsedChangeAddressIndex: IAddress;
 }
+
+/**
+ * What a refresh's gap-limit scan hands the steps after it, so each script
+ * hash's history is asked for once and the UTXOs are listed once.
+ */
+export type TAddressScan = {
+	/** The history answered so far, by script hash. */
+	history: Map<string, TTxResult[]>;
+	/**
+	 * Whether those answers can stand in for a new lookup: the wallet is on
+	 * the network that gave them, and no stored transaction has been cleared
+	 * or repaired since the first was asked for.
+	 */
+	current: () => boolean;
+	/** What the UTXO scan of each extension round would have listed. */
+	utxoAddresses: IAddresses;
+};
 
 export interface ITxHashes extends TTxResult {
 	scriptHash: string;
@@ -532,6 +573,19 @@ export type TMessageDataMap = {
 	reorg: IUtxo[];
 	rbf: string[];
 	connectedToElectrum: boolean; // True if connected, false if disconnected.
+	storageWriteFailed: TStorageWriteFailure;
+};
+
+/**
+ * A write the storage adapter refused or threw on. Sent for every such write,
+ * including those whose method also returns the error: storage still holds
+ * the value from before, and the next start loads it.
+ */
+export type TStorageWriteFailure = {
+	key: TWalletDataKeys;
+	/** The key handed to setData, which names the wallet and network. */
+	storageKey: string;
+	error: string;
 };
 
 export type TTransactionMessage = {
@@ -672,6 +726,21 @@ export interface IBoostedTransaction {
 
 export interface IBoostedTransactions {
 	[txId: string]: IBoostedTransaction;
+}
+
+export interface IBoost {
+	txid: string;
+	type: EBoostType;
+	/** Defaults to the rate setupRbf or setupCpfp picks. */
+	satsPerByte?: number;
+}
+
+export interface IBoostRes {
+	/** Txid of the replacement (RBF) or child (CPFP) transaction. */
+	id: string;
+	hex: string;
+	/** Total fee paid by the new transaction, in sats. */
+	fee: number;
 }
 
 export interface IPrivateKeyInfo {

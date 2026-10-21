@@ -12,9 +12,11 @@ import {
 	IUtxo,
 	IWalletData,
 	ObjectKeys,
+	TFormattedVin,
 	TGapLimitOptions,
 	TGetData,
-	TKeyDerivationPurpose
+	TKeyDerivationPurpose,
+	TVin
 } from '../types';
 import { err, ok, Result } from './result';
 import {
@@ -322,6 +324,31 @@ export const decodeOpReturnMessage = (opReturn = ''): string[] => {
 	}
 };
 
+const STORED_INPUT_FIELDS = new Set(['txid', 'vout', 'sequence', 'coinbase']);
+
+/**
+ * Returns the inputs as a formatted transaction stores them.
+ * @param {(TVin | TFormattedVin)[]} vin
+ * @returns {TFormattedVin[]}
+ */
+export const trimInputs = (vin: (TVin | TFormattedVin)[]): TFormattedVin[] =>
+	vin.map((input) =>
+		'coinbase' in input
+			? { coinbase: input.coinbase, sequence: input.sequence }
+			: { txid: input.txid, vout: input.vout, sequence: input.sequence }
+	);
+
+/**
+ * Whether any input carries a field trimInputs drops, as records stored
+ * before inputs were trimmed do.
+ * @param {(TVin | TFormattedVin)[]} vin
+ * @returns {boolean}
+ */
+export const hasUntrimmedInputs = (vin: (TVin | TFormattedVin)[]): boolean =>
+	vin.some((input) =>
+		Object.keys(input).some((field) => !STORED_INPUT_FIELDS.has(field))
+	);
+
 /**
  * Returns the seed for a given mnemonic and passphrase.
  * @param {string} mnemonic
@@ -362,17 +389,38 @@ export const getWalletDataStorageKey = (
 	return `${name}-${network}-${key}`;
 };
 
+// The network is spelled out rather than matched as any segment: the name may
+// contain hyphens, and a generic segment would read "acct1" as the network.
+const STORAGE_KEY_PATTERN = new RegExp(
+	`^(.*)-(${[...new Set(Object.values(EAvailableNetworks))].join('|')})` +
+		'(?:-acct([1-9]\\d*))?-([^-]+)$'
+);
+
+/**
+ * Parses a key built by getWalletDataStorageKey.
+ * @param {string} storageKey
+ * @returns {object | undefined} undefined when storageKey is not a wallet data key.
+ */
 export const getStorageKeyValues = (
 	storageKey: string
-): {
-	walletName: string;
-	network: EAvailableNetworks;
-	value: keyof IWalletData;
-} => {
-	const [walletName, network, value] = storageKey.split('-');
+):
+	| {
+			walletName: string;
+			network: EAvailableNetworks;
+			account: number;
+			value: keyof IWalletData;
+	  }
+	| undefined => {
+	const match = STORAGE_KEY_PATTERN.exec(storageKey);
+	if (!match) return undefined;
+	const [, walletName, network, account, value] = match;
+	if (!Object.prototype.hasOwnProperty.call(defaultWalletData, value)) {
+		return undefined;
+	}
 	return {
 		walletName,
 		network: network as EAvailableNetworks,
+		account: account === undefined ? 0 : Number(account),
 		value: value as keyof IWalletData
 	};
 };

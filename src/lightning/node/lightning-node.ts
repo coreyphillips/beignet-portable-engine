@@ -1174,6 +1174,11 @@ export class LightningNode extends EventEmitter {
 	private static readonly GOSSIP_INTAKE_MAX = 30_000;
 	private static readonly GOSSIP_INTAKE_SLICE_MS = 10;
 	/**
+	 * The gossip row writes of the drain slice now running, keyed by row,
+	 * committed together when it ends (see writeGossipRow). Null outside one.
+	 */
+	private gossipRowWrites: Map<string, () => void> | null = null;
+	/**
 	 * Peers' gossip queries share this much main-thread time per window
 	 * (issue #1398). A 40-byte query_channel_range scans and sorts the whole
 	 * graph, about 50 ms at NetworkGraph.MAX_CHANNELS, so answering every
@@ -2166,7 +2171,8 @@ export class LightningNode extends EventEmitter {
 			onChannelEvicted: (scidHex) => {
 				this.gossipFundingQueue.delete(scidHex);
 				if (typeof this.storage?.deleteGossipChannel === 'function') {
-					this.safeStorage(
+					this.writeGossipRow(
+						`channel:${scidHex}`,
 						() => this.storage!.deleteGossipChannel!(scidHex),
 						'deleteGossipChannel'
 					);
@@ -2185,7 +2191,8 @@ export class LightningNode extends EventEmitter {
 					typeof this.storage?.deleteGossipNode === 'function' &&
 					typeof this.storage.deleteGossipChannel === 'function'
 				) {
-					this.safeStorage(
+					this.writeGossipRow(
+						`node:${nodeIdHex}`,
 						() => this.storage!.deleteGossipNode!(nodeIdHex),
 						'deleteGossipNode'
 					);
@@ -2204,7 +2211,8 @@ export class LightningNode extends EventEmitter {
 			onChannelAnnouncementFailed: (scidHex): void => {
 				const channel = this.graph.getChannel(Buffer.from(scidHex, 'hex'));
 				if (channel) {
-					this.safeStorage(
+					this.writeGossipRow(
+						`channel:${scidHex}`,
 						() => this.storage!.saveGossipChannel(scidHex, channel),
 						'saveGossipChannel'
 					);
@@ -4722,7 +4730,7 @@ export class LightningNode extends EventEmitter {
 		// the channel deletes back until here cannot change what the node
 		// rows were judged against on disk.
 		if (complete) {
-			this.batchStorageDeletes(
+			this.batchStorageWrites(
 				run.restore.staleRowDeletes,
 				'gossipRestoreCleanup'
 			);
@@ -4868,32 +4876,33 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Run a batch of best-effort storage deletes as ONE transaction.
+	 * Run a batch of best-effort storage writes as ONE transaction.
 	 *
-	 * Each delete used to commit on its own, and the SQLite backend opens
+	 * Each write used to commit on its own, and the SQLite backend opens
 	 * `journal_mode = WAL` with `synchronous = FULL`, so every row cost a
 	 * separate fsync on the daemon's only thread. Deleting a mainnet-sized
 	 * graph's worth of stale rows that way blocks the event loop for as long
 	 * as the disk takes: /health goes silent, and peers pass their BOLT 1
 	 * ping timeout and drop the connection. One transaction is one fsync.
 	 *
-	 * The deletes stay best-effort. A row that throws is counted and skipped
+	 * The writes stay best-effort. A row that throws is counted and skipped
 	 * rather than rolling the batch back, and a backend whose transaction
-	 * will not open falls back to the plain loop. Deleting by primary key is
-	 * idempotent, so that fallback cannot double-delete anything.
+	 * will not open falls back to the plain loop. Every write must be
+	 * idempotent (a delete or an upsert by primary key), since that fallback
+	 * runs the batch again.
 	 */
-	private batchStorageDeletes(
-		deletes: Array<() => void>,
+	private batchStorageWrites(
+		writes: Array<() => void>,
 		operation: string
 	): void {
-		if (!this.storage || deletes.length === 0) return;
+		if (!this.storage || writes.length === 0) return;
 		let failed = 0;
 		let lastError = '';
 		const run = (): void => {
 			failed = 0;
-			for (const del of deletes) {
+			for (const write of writes) {
 				try {
-					del();
+					write();
 				} catch (err) {
 					failed++;
 					lastError = (err as Error).message;
@@ -4911,7 +4920,7 @@ export class LightningNode extends EventEmitter {
 		if (failed > 0) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
-				message: `${operation}: ${failed} of ${deletes.length} deletes failed (${lastError})`,
+				message: `${operation}: ${failed} of ${writes.length} writes failed (${lastError})`,
 				timestamp: Date.now()
 			} as ILightningError);
 		}
@@ -11654,9 +11663,43 @@ export class LightningNode extends EventEmitter {
 		// not history yet: its outcome, and the preimage a late fulfil
 		// reveals, still belong to it (#743 audit). A COMPLETED incoming record
 		// with a part whose fulfill was refused is still owed that fulfill.
+		//
+		// getOutgoingHtlcs walks every channel and the whole htlcPaymentMap, so
+		// it is asked only about a hash that can have a non-terminal HTLC: one
+		// a channel still carries as offered, or one mapped to a channel with a
+		// monitor (a mapped HTLC on a channel without one is terminal). The set
+		// is built once per pass, and only if a candidate needs it.
+		let possiblyLive: Set<string> | undefined;
+		const mayHaveLiveHtlc = (hash: string): boolean => {
+			if (!possiblyLive) {
+				const hashes = new Set<string>();
+				for (const channel of this.channelManager.listChannels()) {
+					for (const [key, htlc] of channel.getFullState().htlcs) {
+						if (key.startsWith('offered-')) {
+							hashes.add(htlc.paymentHash.toString('hex'));
+						}
+					}
+				}
+				const monitored = new Map<string, boolean>();
+				for (const [key, hashHex] of this.htlcPaymentMap) {
+					const channelHex = key.slice(0, key.indexOf(':'));
+					let hasMonitor = monitored.get(channelHex);
+					if (hasMonitor === undefined) {
+						hasMonitor =
+							this.channelManager.getMonitor(Buffer.from(channelHex, 'hex')) !==
+							undefined;
+						monitored.set(channelHex, hasMonitor);
+					}
+					if (hasMonitor) hashes.add(hashHex);
+				}
+				possiblyLive = hashes;
+			}
+			return possiblyLive.has(hash);
+		};
 		const stillLive = (hash: string, payment: IPaymentInfo): boolean =>
 			payment.direction === PaymentDirection.OUTGOING
-				? !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
+				? mayHaveLiveHtlc(hash) &&
+				  !this.getOutgoingHtlcs(Buffer.from(hash, 'hex')).resolved
 				: this.owesSettledFulfill(payment);
 
 		const forget = (hash: string, payment: IPaymentInfo): void => {
@@ -11700,26 +11743,39 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Phase 2: If still over cap, remove oldest completed/failed first
-		const completed: [string, IPaymentInfo][] = [];
-		for (const entry of this.payments) {
+		// Phase 2: If still over cap, remove oldest completed/failed first. Live
+		// records do not count toward the cap, so with every terminal record
+		// under it there is nothing to prune and no liveness to check.
+		let terminal = 0;
+		for (const payment of this.payments.values()) {
 			if (
-				(entry[1].status === PaymentStatus.COMPLETED ||
-					entry[1].status === PaymentStatus.FAILED) &&
-				!stillLive(entry[0], entry[1])
+				payment.status === PaymentStatus.COMPLETED ||
+				payment.status === PaymentStatus.FAILED
 			) {
-				completed.push(entry);
+				terminal++;
 			}
 		}
-		if (completed.length > max) {
-			completed.sort(
-				(a, b) =>
-					(a[1].completedAt || a[1].createdAt) -
-					(b[1].completedAt || b[1].createdAt)
-			);
-			const toRemove = completed.length - max;
-			for (let i = 0; i < toRemove; i++) {
-				forget(completed[i][0], completed[i][1]);
+		if (terminal > max) {
+			const completed: [string, IPaymentInfo][] = [];
+			for (const entry of this.payments) {
+				if (
+					(entry[1].status === PaymentStatus.COMPLETED ||
+						entry[1].status === PaymentStatus.FAILED) &&
+					!stillLive(entry[0], entry[1])
+				) {
+					completed.push(entry);
+				}
+			}
+			if (completed.length > max) {
+				completed.sort(
+					(a, b) =>
+						(a[1].completedAt || a[1].createdAt) -
+						(b[1].completedAt || b[1].createdAt)
+				);
+				const toRemove = completed.length - max;
+				for (let i = 0; i < toRemove; i++) {
+					forget(completed[i][0], completed[i][1]);
+				}
 			}
 		}
 
@@ -16526,31 +16582,38 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		const sliceStart = Date.now();
-		while (
-			this.gossipIntakeHead < this.gossipIntake.length &&
-			!this._destroyed &&
-			Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
-		) {
-			const item = this.gossipIntake[this.gossipIntakeHead++];
-			try {
-				switch (item.type) {
-					case MessageType.CHANNEL_ANNOUNCEMENT:
-						this.handleChannelAnnouncement(item.payload);
-						break;
-					case MessageType.NODE_ANNOUNCEMENT:
-						this.handleNodeAnnouncement(item.payload);
-						break;
-					case MessageType.CHANNEL_UPDATE:
-						this.handleChannelUpdate(item.payload);
-						break;
+		const writes = new Map<string, () => void>();
+		this.gossipRowWrites = writes;
+		try {
+			while (
+				this.gossipIntakeHead < this.gossipIntake.length &&
+				!this._destroyed &&
+				Date.now() - sliceStart < LightningNode.GOSSIP_INTAKE_SLICE_MS
+			) {
+				const item = this.gossipIntake[this.gossipIntakeHead++];
+				try {
+					switch (item.type) {
+						case MessageType.CHANNEL_ANNOUNCEMENT:
+							this.handleChannelAnnouncement(item.payload);
+							break;
+						case MessageType.NODE_ANNOUNCEMENT:
+							this.handleNodeAnnouncement(item.payload);
+							break;
+						case MessageType.CHANNEL_UPDATE:
+							this.handleChannelUpdate(item.payload);
+							break;
+					}
+				} catch (err) {
+					this.emitStructuredLog('peer', 'gossip_intake_failed', {
+						pubkey: item.pubkey,
+						type: item.type,
+						error: err instanceof Error ? err.message : String(err)
+					});
 				}
-			} catch (err) {
-				this.emitStructuredLog('peer', 'gossip_intake_failed', {
-					pubkey: item.pubkey,
-					type: item.type,
-					error: err instanceof Error ? err.message : String(err)
-				});
 			}
+		} finally {
+			this.gossipRowWrites = null;
+			this.batchStorageWrites([...writes.values()], 'gossipIntake');
 		}
 		if (this.gossipIntakeHead < this.gossipIntake.length && !this._destroyed) {
 			setImmediate(() => this.drainGossipIntake());
@@ -16565,6 +16628,28 @@ export class LightningNode extends EventEmitter {
 			});
 			this.gossipIntakeDropped = 0;
 		}
+	}
+
+	/**
+	 * Write one gossip_channels or gossip_nodes row. During a drain slice
+	 * the rows wait and commit together when it ends: under
+	 * `synchronous = FULL` every commit is an fsync, and a first sync
+	 * accepts hundreds of thousands of messages. Only the last write to a
+	 * row counts, an eviction's delete included. The handlers themselves
+	 * stay outside that transaction, because an update for one of our
+	 * channels persists channel state through a journaled commit, which
+	 * refuses to join one.
+	 */
+	private writeGossipRow(
+		row: string,
+		write: () => void,
+		operation: string
+	): void {
+		if (this.gossipRowWrites) {
+			this.gossipRowWrites.set(row, write);
+			return;
+		}
+		this.safeStorage(write, operation);
 	}
 
 	/**
@@ -16871,13 +16956,11 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.addChannelAnnouncement(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
+			const scidHex = msg.shortChannelId.toString('hex');
 			if (ch)
-				this.safeStorage(
-					() =>
-						this.storage!.saveGossipChannel(
-							msg.shortChannelId.toString('hex'),
-							ch
-						),
+				this.writeGossipRow(
+					`channel:${scidHex}`,
+					() => this.storage!.saveGossipChannel(scidHex, ch),
 					'saveGossipChannel'
 				);
 		}
@@ -16927,24 +17010,14 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.applyNodeAnnouncement(msg, { verified })) {
 			const node = this.graph.getNode(msg.nodeId);
+			const nodeIdHex = msg.nodeId.toString('hex');
 			if (node)
-				this.safeStorage(
-					() => this.storage!.saveGossipNode(msg.nodeId.toString('hex'), node),
+				this.writeGossipRow(
+					`node:${nodeIdHex}`,
+					() => this.storage!.saveGossipNode(nodeIdHex, node),
 					'saveGossipNode'
 				);
 		}
-	}
-
-	/** Pubkeys of every peer we currently have a channel with. */
-	private channelPeerPubkeys(): Set<string> {
-		const peers = new Set<string>();
-		for (const channel of this.channelManager.listChannels()) {
-			const channelId = channel.getChannelId();
-			if (!channelId) continue;
-			const peer = this.channelManager.getPeerForChannel(channelId);
-			if (peer) peers.add(peer);
-		}
-		return peers;
 	}
 
 	/**
@@ -16967,7 +17040,7 @@ export class LightningNode extends EventEmitter {
 	): boolean {
 		if (!this.peerManager) return false;
 		const pubkey = msg.nodeId.toString('hex');
-		if (!this.channelPeerPubkeys().has(pubkey)) return false;
+		if (!this.channelManager.hasChannelWithPeer(pubkey)) return false;
 		const previous = this.announcedPeerAddresses.get(pubkey);
 		return !previous || msg.timestamp > previous.timestamp;
 	}
@@ -16975,7 +17048,7 @@ export class LightningNode extends EventEmitter {
 	private captureChannelPeerAddresses(msg: INodeAnnouncementMessage): void {
 		if (!this.peerManager) return;
 		const pubkey = msg.nodeId.toString('hex');
-		if (!this.channelPeerPubkeys().has(pubkey)) return;
+		if (!this.channelManager.hasChannelWithPeer(pubkey)) return;
 		// A valid signature does not make an old announcement current: reject
 		// anything not strictly newer than what we already hold (mirrors the
 		// graph's freshness rule, which cannot cover private-only peers).
@@ -17050,13 +17123,11 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.graph.applyChannelUpdate(msg, { verified })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
+			const scidHex = msg.shortChannelId.toString('hex');
 			if (ch)
-				this.safeStorage(
-					() =>
-						this.storage!.saveGossipChannel(
-							msg.shortChannelId.toString('hex'),
-							ch
-						),
+				this.writeGossipRow(
+					`channel:${scidHex}`,
+					() => this.storage!.saveGossipChannel(scidHex, ch),
 					'saveGossipChannel'
 				);
 		}
@@ -17121,20 +17192,11 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Whether a channel_update's SCID (real or either side's alias) names one
 	 * of our own channels: the intake fork between the synchronous own-channel
-	 * path and the queued crowd-gossip path. Mirrors the candidate matching in
-	 * maybeAdoptPeerChannelPolicy below; they must not drift.
+	 * path and the queued crowd-gossip path. Uses the same candidates as
+	 * maybeAdoptPeerChannelPolicy below.
 	 */
 	private channelUpdateTargetsOurChannel(msg: IChannelUpdateMessage): boolean {
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			const scids = [
-				state.shortChannelId,
-				state.scidAlias,
-				state.remoteScidAlias
-			].filter((s): s is Buffer => s !== null);
-			if (scids.some((s) => s.equals(msg.shortChannelId))) return true;
-		}
-		return false;
+		return this.channelManager.getChannelsByScid(msg.shortChannelId).length > 0;
 	}
 
 	private maybeAdoptPeerChannelPolicy(
@@ -17150,15 +17212,9 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		const ourNodeId = this.ownNodeId();
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			const scids = [
-				state.shortChannelId,
-				state.scidAlias,
-				state.remoteScidAlias
-			].filter((s): s is Buffer => s !== null);
-			if (!scids.some((s) => s.equals(msg.shortChannelId))) continue;
-
+		for (const channel of this.channelManager.getChannelsByScid(
+			msg.shortChannelId
+		)) {
 			// A non-matching candidate must NOT end the scan: remoteScidAlias is a
 			// peer-chosen value, so a malicious peer could otherwise alias-collide
 			// with the real SCID of an honest peer's channel and (by sorting
@@ -20356,7 +20412,14 @@ export class LightningNode extends EventEmitter {
 	): Promise<{
 		preimagesKnown: number[];
 		witnesses: Awaited<ReturnType<LightningNode['fetchFforWitnessRecords']>>;
-		action: 'closed' | 'force-closed' | 'nothing' | 'synced';
+		action:
+			| 'closed'
+			| 'force-closed'
+			| 'force-close-refused'
+			| 'nothing'
+			| 'synced';
+		/** The engine's reason, with action 'force-close-refused'. */
+		error?: string;
 	}> {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
@@ -20430,6 +20493,12 @@ export class LightningNode extends EventEmitter {
 				this.getBitcoinNetwork()
 			);
 			if (res.ok) return { preimagesKnown, witnesses, action: 'force-closed' };
+			return {
+				preimagesKnown,
+				witnesses,
+				action: 'force-close-refused',
+				error: res.error ?? 'Force close failed'
+			};
 		}
 		return { preimagesKnown, witnesses, action: 'nothing' };
 	}
@@ -20684,8 +20753,10 @@ export class LightningNode extends EventEmitter {
 				};
 				mutations.push(mutation);
 			}
+			// The copy carries only the HTLC snapshots storage lacks, which is
+			// all a save of it writes.
 			mutation.state = deserializeChannelState(
-				serializeChannelState(mutation.state)
+				serializeChannelState(mutation.state, { htlcHistory: 'unsaved' })
 			);
 			const durable = mutation.state.ffor;
 			if (
@@ -28348,9 +28419,25 @@ export class LightningNode extends EventEmitter {
 					getScriptHashHistory: (scriptHash) =>
 						this.directFundingChain().getScriptHashHistory(scriptHash)
 				},
+				estimateFeeSatPerVbyte: (targetBlocks) =>
+					this.estimateClampedFeeSatPerVbyte(targetBlocks),
 				liquidityPeer: () => policy.liquidityPeer ?? null,
 				newFundingRefused,
 				usableChannelWith: (peerHex) => this.usableChannelWith(peerHex),
+				spliceChangeDustFloorSat: (channelId) =>
+					this.getRawChannel(channelId)?.spliceInteractiveTxDustFloor() ?? null,
+				// The same balance and reserve the channel's own splice-in refusal
+				// reads in initiateSplice.
+				spliceReserveShortfallSat: (channelId, relativeSats) => {
+					const channel = this.getRawChannel(channelId);
+					if (!channel) return null;
+					const reserveSats = channel.spliceReserveWeKeepSats(
+						channel.getFundingSatoshis() + relativeSats
+					);
+					const postLocalSats =
+						channel.getBalances().localMsat / 1000n + relativeSats;
+					return postLocalSats < reserveSats ? reserveSats - postLocalSats : 0n;
+				},
 				spliceInFlightWith: (peerHex) => this.spliceInFlightWith(peerHex),
 				fundingPubkeys: (channelId) =>
 					this.getRawChannel(channelId)?.getFundingPubkeys() ?? null,
@@ -28664,13 +28751,8 @@ export class LightningNode extends EventEmitter {
 			connectPeer: (peerHex: string, host: string, port: number) =>
 				this.connectPeer(peerHex, host, port)
 		};
-		const estimateFee = async (
-			targetBlocks: number
-		): Promise<number | null> => {
-			if (!this.feeEstimator) return null;
-			const raw = await this.feeEstimator.estimateFee(targetBlocks);
-			return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
-		};
+		const estimateFee = (targetBlocks: number): Promise<number | null> =>
+			this.estimateClampedFeeSatPerVbyte(targetBlocks);
 		const broadcast = async (txHex: string): Promise<string> => {
 			const fp = this.fundingProvider;
 			if (fp) return fp.broadcastTransaction(txHex);
@@ -29673,6 +29755,20 @@ export class LightningNode extends EventEmitter {
 			!state.localChannelReady &&
 			!state.remoteChannelReady
 		);
+	}
+
+	/**
+	 * The estimator's sat/vB for a confirmation target, clamped to what this
+	 * node trusts an estimator with, or null without an estimator or an
+	 * estimate. The swap provider and the direct-funding receiver quote from
+	 * this.
+	 */
+	private async estimateClampedFeeSatPerVbyte(
+		targetBlocks: number
+	): Promise<number | null> {
+		if (!this.feeEstimator) return null;
+		const raw = await this.feeEstimator.estimateFee(targetBlocks);
+		return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
 	}
 
 	/**
@@ -31901,6 +31997,10 @@ export class LightningNode extends EventEmitter {
 	 * from their monitors. `resolved` is never true while any HTLC is
 	 * non-terminal, whatever the record says: a wall-clock failPayment is not
 	 * an outcome.
+	 *
+	 * pruneCompletedPayments skips this call for a hash that no channel
+	 * carries as offered and that is mapped to no channel with a monitor, so
+	 * only those two may yield a non-terminal view.
 	 */
 	getOutgoingHtlcs(paymentHash: Buffer): IOutgoingPaymentResolution {
 		const hashHex = paymentHash.toString('hex');
@@ -32909,12 +33009,12 @@ export class LightningNode extends EventEmitter {
 		// Delete from storage, in one transaction rather than one per row.
 		// This runs hourly against the whole graph, and a bare loop fsyncs
 		// once per channel with the daemon's only thread held (see
-		// batchStorageDeletes).
+		// batchStorageWrites).
 		if (
 			this.storage &&
 			typeof this.storage.deleteGossipChannel === 'function'
 		) {
-			this.batchStorageDeletes(
+			this.batchStorageWrites(
 				staleScids.map(
 					(scidHex) => () => this.storage!.deleteGossipChannel!(scidHex)
 				),

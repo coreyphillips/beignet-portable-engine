@@ -6,6 +6,14 @@
  */
 
 import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import {
+	ElectrumTlsConfig,
+	checkElectrumTls,
+	claimElectrumTls,
+	electrumTlsModule,
+	releaseElectrumTls,
+	validateElectrumTlsConfig
+} from './electrum-tls-config';
 import type { IrohEndpointFactory } from '../lightning/transport/iroh';
 import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
@@ -13,7 +21,6 @@ import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
-import * as tls from 'tls';
 import { promises as dnsPromises } from 'dns';
 import {
 	acquireInstanceLock,
@@ -28,6 +35,7 @@ import { EAddressType, ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
+import { BoostError } from '../utils/boost';
 import {
 	EAvailableNetworks,
 	EBoostType,
@@ -260,6 +268,7 @@ import {
 	PaymentValidationCheck,
 	PaymentValidationStatus,
 	ChannelPolicyInfo,
+	ChannelPolicyUpdateParams,
 	HoldInvoiceInfo,
 	HoldInvoiceEvent,
 	GraphInfo,
@@ -290,13 +299,16 @@ export interface LogEntry {
 	timestamp: number;
 }
 
-export interface BeignetNodeOptions extends IrohDaemonConfig {
+export interface BeignetNodeOptions
+	extends IrohDaemonConfig,
+		ElectrumTlsConfig {
 	/** Host admission fence for new funding. Existing protocol work continues. */
 	newChannelsRefused?: () => string | null;
 	irohFactory?: IrohEndpointFactory;
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
 	mnemonic?: string;
+	/** Required by create(), which throws INVALID_PARAMS without it. */
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
 	dataDir?: string;
@@ -1310,6 +1322,17 @@ const MAX_DIRECT_FUNDING_CHARGES = 1024;
  * size is a memory cost here, not just a transfer one.
  */
 const DEFAULT_L402_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
+const NETWORK_NAMES = ['mainnet', 'testnet', 'signet', 'regtest'] as const;
+type NetworkName = (typeof NETWORK_NAMES)[number];
+
+/** Typed `never` so a network missing from a converter's switch fails to compile. */
+function unknownNetwork(network: never): never {
+	throw new BeignetError(
+		'INVALID_PARAMS',
+		`unknown network '${String(network)}'`
+	);
+}
 
 const DEFAULT_ELECTRUM: Record<
 	string,
@@ -2326,11 +2349,36 @@ export class BeignetNode extends EventEmitter {
 	static async create(opts: BeignetNodeOptions = {}): Promise<BeignetNode> {
 		try {
 			validateIrohConfig(opts);
+			validateElectrumTlsConfig(opts);
 		} catch (err) {
 			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 		}
+		// No default. Mainnet would put real coins under a seed the caller may
+		// never have seen. Regtest would open an empty regtest.db for a caller
+		// whose node lives in mainnet.db, leaving its channels unwatched.
+		if (!opts.network) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				"network is required: 'mainnet', 'testnet', 'signet' or 'regtest'"
+			);
+		}
+		// JSON config, BEIGNET_NETWORK and CLI flags are not type checked, and
+		// the lock and database below are named after this value.
+		if (!NETWORK_NAMES.includes(opts.network)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`unknown network '${opts.network}': expected 'mainnet', 'testnet', 'signet' or 'regtest'`
+			);
+		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
-		const networkName = opts.network || 'mainnet';
+		const networkName = opts.network;
+		// Before the lock and the database, so a node refused for another
+		// node's Electrum TLS setting leaves nothing held. initNode claims it.
+		try {
+			checkElectrumTls(networkName, opts);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
 		// Namespace the default storage per-wallet so different mnemonics never
 		// share a database (which would load another seed's channels/identity).
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
@@ -2675,6 +2723,35 @@ export class BeignetNode extends EventEmitter {
 				ipv4: electrumHost
 			});
 		}
+		// Certificate verification (issue #1776) checks every TLS connection the
+		// wallet opens, the public fallback peers included, and keeps the
+		// configured name for the check when the pin above replaced it.
+		const walletTls = electrumTlsModule(opts, electrumHost, rawElectrumHost);
+		// Every node in this process shares the network's Electrum connection,
+		// so one with another setting would make this one's moot. create()
+		// already checked; the claim also refuses a node that raced it there.
+		// Released once the wallet has stopped, or now if it never existed.
+		try {
+			claimElectrumTls(this, networkName, opts);
+		} catch (err) {
+			throw new BeignetError('INVALID_PARAMS', (err as Error).message);
+		}
+		if (opts.electrumTlsVerify === true) {
+			const pinnedFingerprints = opts.electrumTlsFingerprints?.length ?? 0;
+			this.log('info', 'Verifying Electrum TLS certificates', {
+				pinnedFingerprints
+			});
+			// Not refused: verification still covers the TLS fallback peers.
+			if (!electrumTls) {
+				this.log(
+					'warn',
+					'The configured Electrum server is plain TCP, so its certificate is ' +
+						'never checked and pinned fingerprints are not used for it; only ' +
+						'the TLS fallback servers are verified',
+					{ host: rawElectrumHost, port: electrumPort, pinnedFingerprints }
+				);
+			}
+		}
 
 		// 1. Map network name to beignet types
 		const beignetNetwork = this.toBeignetNetwork(networkName);
@@ -2708,7 +2785,7 @@ export class BeignetNode extends EventEmitter {
 				: {}),
 			electrumOptions: {
 				net,
-				tls,
+				tls: walletTls,
 				servers: electrumServer
 			},
 			disableMessagesOnCreate: true,
@@ -2717,7 +2794,9 @@ export class BeignetNode extends EventEmitter {
 			// through the initial sync above, so history never replays as
 			// arrivals; what reaches the handler happened while the daemon was
 			// watching, or was found new at a catch-up sync, which is still
-			// news to whoever runs the node.
+			// news to whoever runs the node. A refused storage write is the one
+			// message that passes even then: startup is when the stored copy
+			// is most likely to be left stale, and nothing else reports it.
 			onMessage: (key, data) => this.onWalletMessage(key, data),
 			// Route wallet diagnostics through the injected logger when provided;
 			// otherwise keep the wallet's default console logger (status quo).
@@ -2734,6 +2813,7 @@ export class BeignetNode extends EventEmitter {
 			storage: createWalletStorage(this.storage)
 		});
 		if (walletResult.isErr()) {
+			releaseElectrumTls(this);
 			throw new BeignetError(
 				'WALLET_CREATE_FAILED',
 				walletResult.error.message
@@ -6717,6 +6797,18 @@ export class BeignetNode extends EventEmitter {
 		return run;
 	}
 
+	/**
+	 * Run an on-chain send under the wallet's send lock as well, through the
+	 * read of what it staged, the broadcast and the reset. A send made on the
+	 * wallet directly would otherwise stage in that gap and lose its inputs to
+	 * this send's reset (#1617).
+	 */
+	private _runWalletSend<T>(
+		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
+	): Promise<T> {
+		return this._runOnchainSend(() => this.wallet.withSendLock(fn));
+	}
+
 	async sendOnchain(
 		address: string,
 		amountSats: number,
@@ -6726,16 +6818,16 @@ export class BeignetNode extends EventEmitter {
 		// Lightning payments. Fail fast on the amount alone before building.
 		this._checkMaxPayment(amountSats);
 		this._checkSpendLimit(amountSats);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the built fee) and reset on every
-			// way out, as _boostRbf does: what one send staged must not outlive
+			// way out, as Wallet.boost does: what one send staged must not outlive
 			// it (#1002).
 			try {
 				// wallet.send with broadcast:true resolves to the txid, not the raw
 				// hex, so build first (broadcast:false returns the hex) and broadcast
 				// separately to report both txid and hex. rbf must be passed per-send:
 				// the wallet-level flag does not propagate into setupTransaction.
-				const result = await this.wallet.send({
+				const result = await locked.send({
 					address,
 					amount: amountSats,
 					broadcast: false,
@@ -6798,11 +6890,11 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 		this._validateFeeRate(satsPerVbyte);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// Everything the later steps need (import-signed, combine) is in the
 			// PSBT itself; none of them reads the staged send, so it is reset here.
 			try {
-				const result = await this.wallet.buildPsbt({
+				const result = await locked.buildPsbt({
 					txs: outputs.map((o) => ({
 						address: o.address,
 						amount: o.amountSats
@@ -7158,11 +7250,11 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		this._validateFeeRate(satsPerVbyte);
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the swept inputs) and reset on every
-			// way out, as _boostRbf does (#1002).
+			// way out, as Wallet.boost does (#1002).
 			try {
-				const result = await this.wallet.sendMax({
+				const result = await locked.sendMax({
 					address,
 					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
 					rbf: this.wallet.rbf,
@@ -7244,7 +7336,7 @@ export class BeignetNode extends EventEmitter {
 
 	/** Bind a drain's reviewed inputs to one durable signed transaction. */
 	prepareOnchainSweep(request: OnchainSweepRequest): Promise<OnchainSweepInfo> {
-		return this._runOnchainSend(() => this.onchainSweeps().prepare(request));
+		return this._runWalletSend(() => this.onchainSweeps().prepare(request));
 	}
 
 	/** Submit or rebroadcast the same saved transaction, without coin selection. */
@@ -7281,7 +7373,7 @@ export class BeignetNode extends EventEmitter {
 					: `Transaction ${txid} is not boostable (unknown, already confirmed, or balance too low)`
 			);
 		}
-		return this._boostRbf(txid, satsPerVbyte);
+		return this._boost(txid, EBoostType.rbf, satsPerVbyte);
 	}
 
 	/**
@@ -7305,7 +7397,7 @@ export class BeignetNode extends EventEmitter {
 		}
 		if (can.rbf) {
 			try {
-				return await this._boostRbf(txid, satsPerVbyte);
+				return await this._boost(txid, EBoostType.rbf, satsPerVbyte);
 			} catch (e) {
 				const rbfImpossible =
 					e instanceof BeignetError &&
@@ -7313,124 +7405,44 @@ export class BeignetNode extends EventEmitter {
 				if (!(rbfImpossible && can.cpfp)) throw e;
 			}
 		}
-		return this._boostCpfp(txid, satsPerVbyte);
+		return this._boost(txid, EBoostType.cpfp, satsPerVbyte);
 	}
 
-	private async _boostRbf(
+	/**
+	 * The wallet stages the boost under its own send lock, which an on-chain
+	 * sweep's prepare also holds. This lock keeps the boost in order with the
+	 * node's other on-chain operations.
+	 */
+	private _boost(
 		txid: string,
+		type: EBoostType,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
 		return this._runOnchainSend(async () => {
-			const setup = await this.wallet.transaction.setupRbf({ txid });
-			if (setup.isErr()) {
-				await this.wallet.resetSendTransaction();
-				throw new BeignetError(
-					BeignetErrorCode.NOT_BOOSTABLE,
-					setup.error.message
-				);
-			}
-			try {
-				// setupRbf defaults to the fast feerate; apply a requested rate through
-				// updateFee so the wallet's fee-overpayment guards run.
-				if (satsPerVbyte !== undefined) {
-					const feeRes = this.wallet.transaction.updateFee({
-						satsPerByte: satsPerVbyte
-					});
-					if (feeRes.isErr()) {
-						throw new BeignetError(
-							BeignetErrorCode.INVALID_PARAMS,
-							feeRes.error.message
-						);
-					}
-				}
-				// BIP 125 rule 3/4: the replacement must pay strictly more than the
-				// original fee or the network rejects it; fail with a clear message
-				// instead of a broadcast error.
-				const original =
-					this.wallet.unconfirmedTransactions[txid] ??
-					this.wallet.transactions[txid];
-				const originalFeeSats = original ? btcToSats(original.fee) : 0;
-				const newFeeSats = this.wallet.transaction.data.fee;
-				if (newFeeSats <= originalFeeSats) {
-					throw new BeignetError(
-						BeignetErrorCode.INVALID_PARAMS,
-						`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
-					);
-				}
-				const createRes = await this.wallet.transaction.createTransaction();
-				if (createRes.isErr()) {
-					throw new BeignetError('SEND_FAILED', createRes.error.message);
-				}
-				const info = await this._broadcastRawTx(createRes.value.hex);
-				await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
-				return {
-					...info,
-					boostType: 'rbf',
-					feeSats: newFeeSats,
-					originalTxid: txid
-				};
-			} finally {
-				await this.wallet.resetSendTransaction();
-			}
-		});
-	}
-
-	private async _boostCpfp(
-		txid: string,
-		satsPerVbyte?: number
-	): Promise<BoostResult> {
-		return this._runOnchainSend(async () => {
-			const setup = await this.wallet.transaction.setupCpfp({
+			const res = await this.wallet.boost({
 				txid,
+				type,
 				...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
 			});
-			if (setup.isErr()) {
-				await this.wallet.resetSendTransaction();
-				throw new BeignetError(
-					BeignetErrorCode.NOT_BOOSTABLE,
-					setup.error.message
-				);
+			if (res.isErr()) {
+				const code =
+					res.error instanceof BoostError
+						? {
+								NOT_BOOSTABLE: BeignetErrorCode.NOT_BOOSTABLE,
+								INVALID_FEE: BeignetErrorCode.INVALID_PARAMS,
+								SEND_FAILED: BeignetErrorCode.SEND_FAILED
+						  }[res.error.code]
+						: BeignetErrorCode.SEND_FAILED;
+				throw new BeignetError(code, res.error.message);
 			}
-			try {
-				const feeSats = setup.value.fee;
-				const createRes = await this.wallet.transaction.createTransaction();
-				if (createRes.isErr()) {
-					throw new BeignetError('SEND_FAILED', createRes.error.message);
-				}
-				const info = await this._broadcastRawTx(createRes.value.hex);
-				await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
-				return {
-					...info,
-					boostType: 'cpfp',
-					feeSats,
-					originalTxid: txid
-				};
-			} finally {
-				await this.wallet.resetSendTransaction();
-			}
+			return {
+				txid: res.value.id,
+				hex: res.value.hex,
+				boostType: type === EBoostType.rbf ? 'rbf' : 'cpfp',
+				feeSats: res.value.fee,
+				originalTxid: txid
+			};
 		});
-	}
-
-	/** Record a broadcast boost; bookkeeping failure must not fail the bump. */
-	private async _recordBoost(
-		oldTxId: string,
-		newTxId: string,
-		type: EBoostType,
-		fee: number
-	): Promise<void> {
-		const res = await this.wallet.addBoostedTransaction({
-			oldTxId,
-			newTxId,
-			type,
-			fee
-		});
-		if (res.isErr()) {
-			this.log('warn', 'Failed to record boosted transaction', {
-				oldTxId,
-				newTxId,
-				error: res.error.message
-			});
-		}
 	}
 
 	/** Unconfirmed wallet transactions that can be fee-bumped, by method. */
@@ -7464,11 +7476,11 @@ export class BeignetNode extends EventEmitter {
 			);
 		}
 		const address = await this.getNewAddress();
-		return this._runOnchainSend(async () => {
+		return this._runWalletSend(async (locked) => {
 			// The staged send is read below (the fee) and reset on every way out,
-			// as _boostRbf does (#1002).
+			// as Wallet.boost does (#1002).
 			try {
-				const result = await this.wallet.sendMax({
+				const result = await locked.sendMax({
 					address,
 					satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
 					rbf: this.wallet.rbf,
@@ -7512,6 +7524,17 @@ export class BeignetNode extends EventEmitter {
 				txids: data as string[]
 			});
 			this.emit('onchain:rbf', { txids: data as string[] });
+			return;
+		}
+		// Some writes (the header, the fee cache) return nothing a caller could
+		// check, so this message is the only sign that storage is now stale.
+		if (key === 'storageWriteFailed') {
+			const failure = data as TMessageDataMap['storageWriteFailed'];
+			this.log('error', 'Wallet storage write failed', {
+				key: failure.key,
+				storageKey: failure.storageKey,
+				error: failure.error
+			});
 			return;
 		}
 		const relayed = {
@@ -8180,13 +8203,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── FFOR: offline receive (issue #729) ───────────────
 
 	private fforChannelId(channelId: unknown): Buffer {
-		if (typeof channelId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(channelId)) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'channelId must be 64 hex characters'
-			);
-		}
-		const idBuf = Buffer.from(channelId, 'hex');
+		const idBuf = requireChannelIdHex(channelId);
 		if (!this.node.getChannel(idBuf)) {
 			throw new BeignetError(
 				BeignetErrorCode.CHANNEL_NOT_FOUND,
@@ -8674,6 +8691,14 @@ export class BeignetNode extends EventEmitter {
 				}
 				throw err;
 			});
+		// Same code as /channel/forceclose and /ffor/enforce: nothing was
+		// broadcast, and the operator asked for a close.
+		if (r.action === 'force-close-refused') {
+			throw new BeignetError(
+				BeignetErrorCode.FORCE_CLOSE_FAILED,
+				r.error ?? 'Force close failed'
+			);
+		}
 		return {
 			action: r.action,
 			preimagesKnown: r.preimagesKnown,
@@ -8845,13 +8870,7 @@ export class BeignetNode extends EventEmitter {
 		// caller's spelling is not an identity: 'AB...' and 'ab...xyz' both
 		// decode to the same channel while matching no canonical id, which
 		// walked straight past the acknowledgement below.
-		if (!/^[0-9a-fA-F]{64}$/.test(channelId)) {
-			throw new BeignetError(
-				'INVALID_PARAMS',
-				'channelId must be 64 hex characters'
-			);
-		}
-		const idBuf = Buffer.from(channelId, 'hex');
+		const idBuf = requireChannelIdHex(channelId);
 		// Same reason closeChannel refuses one: an unknown channel is a caller
 		// mistake, and FORCE_CLOSE_FAILED carries no status, so it shipped as a
 		// 500 (issue #474). Checked before the acknowledgement so a typo is
@@ -8971,13 +8990,13 @@ export class BeignetNode extends EventEmitter {
 	 * always rebuilds from the latest state, so no older commitment can be
 	 * selected.
 	 */
-	rebroadcastClose(channelId: string): Promise<{
+	async rebroadcastClose(channelId: string): Promise<{
 		ok: boolean;
 		error?: string;
 		txid?: string;
 		broadcastOk?: boolean;
 	}> {
-		return this.node.rebroadcastClose(Buffer.from(channelId, 'hex'));
+		return this.node.rebroadcastClose(requireChannelIdHex(channelId));
 	}
 
 	listChannels(): ChannelInfo[] {
@@ -8985,7 +9004,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	getChannel(channelId: string): ChannelInfo | null {
-		const ch = this.node.getChannel(Buffer.from(channelId, 'hex'));
+		const ch = this.node.getChannel(requireChannelIdHex(channelId));
 		if (!ch) return null;
 		return this.toChannelInfo(ch);
 	}
@@ -8993,11 +9012,11 @@ export class BeignetNode extends EventEmitter {
 	getChannelHealth(
 		channelId: string
 	): import('../lightning/node/types').IChannelHealth | null {
-		return this.node.getChannelHealth(Buffer.from(channelId, 'hex'));
+		return this.node.getChannelHealth(requireChannelIdHex(channelId));
 	}
 
 	getChannelDiagnostics(channelId: string): Record<string, unknown> | null {
-		const channelIdBuf = Buffer.from(channelId, 'hex');
+		const channelIdBuf = requireChannelIdHex(channelId);
 		const channel = this.node.getChannelManager().getChannel(channelIdBuf);
 		if (!channel) return null;
 
@@ -12379,26 +12398,48 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw: number
 	): { ok: boolean; error?: string } {
 		return this.node.updateChannelFee(
-			Buffer.from(channelId, 'hex'),
+			requireChannelIdHex(channelId),
 			feeratePerKw
 		);
 	}
 
 	/**
-	 * Set the ROUTING fee policy for one channel or all channels. Msat fields
-	 * accept number or decimal string (they are bigint in the library).
-	 * Regenerates and re-broadcasts the channel_update. Throws on invalid
-	 * values or unknown channelId.
+	 * Set the ROUTING fee policy for one channel. Msat fields accept number or
+	 * decimal string (they are bigint in the library). Regenerates and
+	 * re-broadcasts the channel_update. Throws on invalid values or unknown
+	 * channelId.
 	 */
 	updateChannelPolicy(
-		channelId: string | 'all',
-		policy: {
-			feeBaseMsat?: number;
-			feeProportionalMillionths?: number;
-			cltvExpiryDelta?: number;
-			htlcMinimumMsat?: number | string;
-			htlcMaximumMsat?: number | string;
-		}
+		channelId: string,
+		policy: ChannelPolicyUpdateParams
+	): { updated: number; policies: ChannelPolicyInfo[] } {
+		return this.applyChannelPolicy(
+			requireChannelIdHex(channelId),
+			[channelId],
+			policy
+		);
+	}
+
+	/**
+	 * updateChannelPolicy for every channel. A separate method rather than a
+	 * channelId of 'all', so no string a caller passes as an id can address
+	 * every channel.
+	 */
+	updateAllChannelPolicies(policy: ChannelPolicyUpdateParams): {
+		updated: number;
+		policies: ChannelPolicyInfo[];
+	} {
+		return this.applyChannelPolicy(
+			'all',
+			this.node.listChannels().map((ch) => ch.channelId.toString('hex')),
+			policy
+		);
+	}
+
+	private applyChannelPolicy(
+		target: Buffer | 'all',
+		channelIds: string[],
+		policy: ChannelPolicyUpdateParams
 	): { updated: number; policies: ChannelPolicyInfo[] } {
 		const update: import('../lightning/node/types').IChannelPolicyUpdate = {};
 		if (policy.feeBaseMsat !== undefined)
@@ -12423,15 +12464,8 @@ export class BeignetNode extends EventEmitter {
 				'htlcMaximumMsat'
 			);
 
-		const targets =
-			channelId === 'all'
-				? this.node.listChannels().map((ch) => ch.channelId.toString('hex'))
-				: [channelId];
-		this.node.setChannelPolicy(
-			channelId === 'all' ? 'all' : Buffer.from(channelId, 'hex'),
-			update
-		);
-		const policies = targets
+		this.node.setChannelPolicy(target, update);
+		const policies = channelIds
 			.map((id) => this.getChannelPolicy(id))
 			.filter((p): p is ChannelPolicyInfo => p !== null);
 		return { updated: policies.length, policies };
@@ -12439,7 +12473,7 @@ export class BeignetNode extends EventEmitter {
 
 	/** Effective routing policy for a channel, or null if unknown. */
 	getChannelPolicy(channelId: string): ChannelPolicyInfo | null {
-		const policy = this.node.getChannelPolicy(Buffer.from(channelId, 'hex'));
+		const policy = this.node.getChannelPolicy(requireChannelIdHex(channelId));
 		if (!policy) return null;
 		return {
 			channelId,
@@ -12564,7 +12598,7 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000
 	): Promise<void> {
 		return this.node.waitForChannelReady(
-			Buffer.from(channelId, 'hex'),
+			requireChannelIdHex(channelId),
 			timeoutMs
 		);
 	}
@@ -13146,8 +13180,9 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Every invoice with its status, judged as getInvoice judges one. The
 	 * durable rows are read at most once per call, for the invoices the map
-	 * has no record of; a wallet polls this every few seconds, and a row
-	 * lookup per invoice would not scale with its history.
+	 * has no record of, and only their plaintext status and direction: a
+	 * wallet polls this every few seconds, and decrypting a row per invoice,
+	 * or every row, would not scale with its history (issue #1675).
 	 */
 	listInvoices(): InvoiceInfo[] {
 		let durablePaid: Set<string> | undefined;
@@ -13157,20 +13192,17 @@ export class BeignetNode extends EventEmitter {
 			if (live) {
 				paid = settlesInvoice(live);
 			} else {
-				if (!durablePaid) durablePaid = this.durablePaidHashes();
+				// The two fields settlesInvoice reads, so the answer is the same.
+				if (!durablePaid) {
+					durablePaid = this.storage.paymentHashesWith({
+						status: 'COMPLETED',
+						direction: 'INCOMING'
+					});
+				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
 			return this.toInvoiceInfo(inv, paid);
 		});
-	}
-
-	/** The hashes whose durable row is a completed receive. */
-	private durablePaidHashes(): Set<string> {
-		const paid = new Set<string>();
-		for (const { paymentHash, payment } of this.storage.loadAllPayments()) {
-			if (settlesInvoice(payment)) paid.add(paymentHash);
-		}
-		return paid;
 	}
 
 	private toInvoiceInfo(inv: IInvoiceInfo, paid: boolean): InvoiceInfo {
@@ -13581,16 +13613,8 @@ export class BeignetNode extends EventEmitter {
 		maxFeeSats: number
 	): Promise<RebalanceResult> {
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
-		if (!/^[0-9a-fA-F]{64}$/.test(fromChannelId))
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'fromChannelId must be 64 hex chars'
-			);
-		if (!/^[0-9a-fA-F]{64}$/.test(toChannelId))
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'toChannelId must be 64 hex chars'
-			);
+		const fromIdBuf = requireChannelIdHex(fromChannelId, 'fromChannelId');
+		const toIdBuf = requireChannelIdHex(toChannelId, 'toChannelId');
 		if (!Number.isInteger(amountSats) || amountSats <= 0)
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -13623,8 +13647,8 @@ export class BeignetNode extends EventEmitter {
 		let result: IRebalanceResult;
 		try {
 			result = await this.node.rebalanceChannel({
-				fromChannelId: Buffer.from(fromChannelId, 'hex'),
-				toChannelId: Buffer.from(toChannelId, 'hex'),
+				fromChannelId: fromIdBuf,
+				toChannelId: toIdBuf,
 				amountSats: BigInt(amountSats),
 				maxFeeSats: BigInt(maxFeeSats)
 			});
@@ -13888,13 +13912,13 @@ export class BeignetNode extends EventEmitter {
 			GRAPH_DESCRIBE_MAX_LIMIT
 		);
 		const safeOffset = Math.max(0, Math.floor(offset ?? 0));
-		const all = this.node.getGraph().getAllChannels();
+		const graph = this.node.getGraph();
 		return {
-			totalChannels: all.length,
+			totalChannels: graph.getChannelCount(),
 			limit: cappedLimit,
 			offset: safeOffset,
-			channels: all
-				.slice(safeOffset, safeOffset + cappedLimit)
+			channels: graph
+				.getChannelPage(safeOffset, cappedLimit)
 				.map((ch) => this.toGraphChannelInfo(ch))
 		};
 	}
@@ -15374,7 +15398,10 @@ export class BeignetNode extends EventEmitter {
 		this._nodeStorageView?.close();
 		this.removeAllListeners();
 		try {
-			await (this.wallet as Wallet | undefined)?.stop();
+			const stopped = await (this.wallet as Wallet | undefined)?.stop();
+			// A wallet whose Electrum client did not stop may still hold the
+			// shared connection, so its claim on the TLS setting stays.
+			if (!stopped?.isErr()) releaseElectrumTls(this);
 		} catch {
 			// Ignore shutdown errors
 		}
@@ -15400,7 +15427,7 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Internal Helpers ───────────────
 
-	private toBeignetNetwork(network: string): EAvailableNetworks {
+	private toBeignetNetwork(network: NetworkName): EAvailableNetworks {
 		switch (network) {
 			case 'mainnet':
 				return EAvailableNetworks.bitcoin;
@@ -15411,11 +15438,11 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return EAvailableNetworks.signet;
 			default:
-				return EAvailableNetworks.bitcoin;
+				return unknownNetwork(network);
 		}
 	}
 
-	private toLnNetwork(network: string): Network {
+	private toLnNetwork(network: NetworkName): Network {
 		switch (network) {
 			case 'mainnet':
 				return Network.MAINNET;
@@ -15426,11 +15453,11 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return Network.SIGNET;
 			default:
-				return Network.MAINNET;
+				return unknownNetwork(network);
 		}
 	}
 
-	private toCoinType(network: string): number {
+	private toCoinType(network: NetworkName): number {
 		switch (network) {
 			case 'mainnet':
 				return LnCoinType.BITCOIN;
@@ -15441,7 +15468,7 @@ export class BeignetNode extends EventEmitter {
 			case 'signet':
 				return LnCoinType.SIGNET;
 			default:
-				return LnCoinType.BITCOIN;
+				return unknownNetwork(network);
 		}
 	}
 

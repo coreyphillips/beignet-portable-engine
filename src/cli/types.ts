@@ -4,6 +4,7 @@
  */
 
 import type { IrohDaemonConfig } from './iroh-config';
+import type { ElectrumTlsConfig } from './electrum-tls-config';
 import type { IIrohDiagnostics } from '../lightning/transport/iroh';
 import { TLogLevel } from '../logger';
 import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
@@ -279,6 +280,16 @@ export interface ChannelPolicyInfo {
 	htlcMaximumMsat: string;
 	/** 'override' when a per-channel override is set, 'default' otherwise */
 	source: 'override' | 'default';
+}
+
+/** Routing policy fields to change; an omitted field keeps its value. */
+export interface ChannelPolicyUpdateParams {
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	/** Number or decimal string (bigint in the library) */
+	htlcMinimumMsat?: number | string;
+	htlcMaximumMsat?: number | string;
 }
 
 export interface PaymentRouteHop {
@@ -784,7 +795,7 @@ export interface Bolt12InvoiceInfo {
 	relativeExpiry?: number;
 }
 
-export interface BeignetConfig extends IrohDaemonConfig {
+export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
 	mnemonic?: string;

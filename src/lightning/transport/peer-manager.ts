@@ -235,6 +235,10 @@ export interface IPeerManagerOptions {
 	 * maxInboundPeers, so strangers filling the slots cannot lock them out.
 	 */
 	isChannelPeer?: (pubkey: string) => boolean;
+	/** Established inbound peers from one public source address (default 8),
+	 *  so sybil keys from one host cannot take every maxInboundPeers slot. A
+	 *  peer isChannelPeer approves is admitted past it; see inboundAddressKey. */
+	maxInboundPeersPerAddress?: number;
 	/** Inbound handshakes in flight at once, all addresses together
 	 *  (default 50). Sockets past it are destroyed on accept. */
 	maxPendingInbound?: number;
@@ -382,6 +386,7 @@ export class PeerManager extends EventEmitter {
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private isChannelPeer?: (pubkey: string) => boolean;
+	private maxInboundPeersPerAddress: number;
 	private maxPendingInbound: number;
 	private maxPendingInboundPerAddress: number;
 	private inboundHandshakeTimeoutMs: number;
@@ -401,6 +406,8 @@ export class PeerManager extends EventEmitter {
 	private laneGate: IPeerLaneGate | null = null;
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
+	/** The inboundAddressKey of each established inbound peer that has one. */
+	private inboundAddressKeys = new Map<string, string>();
 	private irohConfig?: IIrohConfig;
 	private irohEndpoint?: IIrohEndpoint;
 	private irohBinding?: Promise<IIrohEndpoint>;
@@ -426,6 +433,15 @@ export class PeerManager extends EventEmitter {
 			throw new Error('maxInboundPeers must be a non-negative integer');
 		}
 		this.isChannelPeer = options.isChannelPeer;
+		this.maxInboundPeersPerAddress = options.maxInboundPeersPerAddress ?? 8;
+		if (
+			!Number.isInteger(this.maxInboundPeersPerAddress) ||
+			this.maxInboundPeersPerAddress < 0
+		) {
+			throw new Error(
+				'maxInboundPeersPerAddress must be a non-negative integer'
+			);
+		}
 		this.maxPendingInbound = options.maxPendingInbound ?? 50;
 		this.maxPendingInboundPerAddress = options.maxPendingInboundPerAddress ?? 4;
 		this.inboundHandshakeTimeoutMs =
@@ -941,6 +957,7 @@ export class PeerManager extends EventEmitter {
 		this.clearStabilityTimer(pubkey);
 		if (this.inboundPeerSet.delete(pubkey)) {
 			this.inboundPeerCount--;
+			this.inboundAddressKeys.delete(pubkey);
 		}
 		captureWireEvent('close', pubkey);
 		this.emitPeerDisconnect(pubkey);
@@ -1760,11 +1777,21 @@ export class PeerManager extends EventEmitter {
 					peer.disconnect();
 					return;
 				}
-				// The cap is applied here, once identity is known, and not
+				// The caps are applied here, once identity is known, and not
 				// on accept: a stranger holding every slot must not keep a
-				// channel peer from reconnecting.
+				// channel peer from reconnecting. An inbound connection this
+				// one replaces (newest wins, below) counts against neither
+				// cap, or a stale socket would block its own redial.
+				const otherInbound =
+					this.inboundPeerCount - (this.inboundPeerSet.has(pubkey) ? 1 : 0);
+				let fromAddress = 0;
+				for (const [other, key] of this.inboundAddressKeys) {
+					if (key === addressKey && other !== pubkey) fromAddress++;
+				}
 				if (
-					this.inboundPeerCount >= this.maxInboundPeers &&
+					(otherInbound >= this.maxInboundPeers ||
+						(addressKey !== null &&
+							fromAddress >= this.maxInboundPeersPerAddress)) &&
 					!this.admitsPastInboundCap(pubkey)
 				) {
 					peer.disconnect();
@@ -1835,6 +1862,9 @@ export class PeerManager extends EventEmitter {
 				// Track inbound peer count
 				this.inboundPeerCount++;
 				this.inboundPeerSet.add(pubkey);
+				if (addressKey !== null) {
+					this.inboundAddressKeys.set(pubkey, addressKey);
+				}
 				// Do NOT store inbound peer address — peer.port is the TCP source (ephemeral) port,
 				// not the node's listening port. Reconnect attempts to ephemeral ports always fail.
 				captureWireEvent('connect', pubkey, 'inbound');
@@ -1928,6 +1958,7 @@ export class PeerManager extends EventEmitter {
 			if (this.inboundPeerSet.has(pubkey)) {
 				this.inboundPeerCount--;
 				this.inboundPeerSet.delete(pubkey);
+				this.inboundAddressKeys.delete(pubkey);
 			}
 			// Snapshot BEFORE the emit: a synchronous peer:disconnect
 			// observer may call disconnectPeer() to cancel this peer for

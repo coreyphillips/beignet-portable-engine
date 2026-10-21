@@ -3,7 +3,6 @@ import {
 	EBoostType,
 	ECoinSelectPreference,
 	EFeeId,
-	IAddresses,
 	IAddressTypesIO,
 	ICoinSelectResponse,
 	IOutput,
@@ -25,6 +24,7 @@ import {
 } from '../utils';
 import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
 import { btcToSats } from '../utils/conversion';
+import { derivePathCached } from '../utils/derive-path-cached';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
@@ -51,30 +51,10 @@ import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 bitcoin.initEccLib(ecc);
 
 /**
- * The staged send as it may be written to wallet storage. The live copy keeps
- * each input's key pair so that signing works; the stored copy never carries
- * one. Storage adapters JSON-stringify what they are handed, and an ECPair or
- * BIP32 node stringifies with its private key, so a key handed to
- * sweepPrivateKey or addExternalInputs used to sit in storage in the clear
- * (#1011). The inputs, outputs and tags are copied too: saveWalletData queues
- * a write behind the previous one for the same key, so a write serialises
- * what the arrays hold when its turn comes, not when it was issued.
- * @param {ISendTransaction} data
- * @returns {ISendTransaction}
+ * The staged send lives in memory only and is never written to wallet
+ * storage. Nothing reads a stored copy, and one has replayed recipients after
+ * a restart (#1002) and leaked swept key pairs (#1011).
  */
-export const persistableTransaction = (
-	data: ISendTransaction
-): ISendTransaction => ({
-	...data,
-	outputs: data.outputs.map((output) => ({ ...output })),
-	tags: [...(data.tags ?? [])],
-	inputs: data.inputs.map((input) => {
-		const { keyPair, ...rest } = input;
-		void keyPair;
-		return rest;
-	})
-});
-
 export class Transaction {
 	private _data: ISendTransaction;
 	private readonly _wallet: Wallet;
@@ -91,9 +71,8 @@ export class Transaction {
 	/**
 	 * Sets up a transaction for a given wallet by gathering inputs, setting the next available change address as an output and sets up the baseline fee structure.
 	 * This function will not override previously set transaction data. To do that you'll need to call resetSendTransaction.
-	 * Outputs come only from the outputs argument. The copy of the staged send
-	 * that wallet storage holds is never read, so a restart cannot replay an
-	 * earlier call's recipients (#1002).
+	 * Outputs come only from the outputs argument, so a restart cannot replay
+	 * an earlier call's recipients (#1002).
 	 * @param {string[]} [inputTxHashes] Errs when none of them has a spendable UTXO.
 	 * @param {IUtxo[]} [utxos]
 	 * @param {boolean} [rbf]
@@ -158,20 +137,6 @@ export class Transaction {
 				return err('No inputs specified in setupTransaction.');
 			}
 
-			const currentChangeAddresses = currentWallet.changeAddresses;
-
-			const addressTypeKeys = Object.values(EAddressType);
-			let changeAddresses: IAddresses = {};
-			addressTypeKeys.forEach((key) => {
-				changeAddresses = {
-					...changeAddresses,
-					...currentChangeAddresses[key]
-				};
-			});
-			const changeAddressesArr = Object.values(changeAddresses).map(
-				({ address }) => address
-			);
-
 			const changeAddressIndexContent =
 				currentWallet.changeAddressIndex[addressType];
 			// Set the current change address.
@@ -190,7 +155,7 @@ export class Transaction {
 				//Remove any potential change address that may have been included from a previous tx attempt.
 				outputs = outputs.filter((output) => {
 					return !!(
-						output.address && !changeAddressesArr.includes(output.address)
+						output.address && !this._wallet.isChangeAddress(output.address)
 					);
 				});
 			}
@@ -220,8 +185,6 @@ export class Transaction {
 				...payload
 			};
 
-			await this._persist();
-
 			return ok(payload);
 		} catch (e) {
 			return err(e);
@@ -239,8 +202,6 @@ export class Transaction {
 		};
 		this._data = data;
 
-		await this._persist();
-
 		return ok(data);
 	}
 
@@ -250,34 +211,7 @@ export class Transaction {
 	 */
 	async resetSendTransaction(): Promise<Result<string>> {
 		this._data = getDefaultSendTransaction();
-		await this._persist();
 		return ok('Transaction reset.');
-	}
-
-	/**
-	 * Drops the stored copy of the staged send and leaves the live copy in
-	 * place. The send and build paths call this on their way out: what they
-	 * staged stays readable to the caller (the fee, the inputs) until the next
-	 * call resets it, and nothing of it outlives the process (#1002).
-	 * @returns {Promise<Result<string>>}
-	 */
-	async clearStoredSendTransaction(): Promise<Result<string>> {
-		return await this._wallet.saveWalletData(
-			'transaction',
-			getDefaultSendTransaction()
-		);
-	}
-
-	/**
-	 * Writes the staged send to wallet storage without its signing keys.
-	 * @private
-	 * @returns {Promise<Result<string>>}
-	 */
-	private async _persist(): Promise<Result<string>> {
-		return await this._wallet.saveWalletData(
-			'transaction',
-			persistableTransaction(this._data)
-		);
 	}
 
 	/**
@@ -365,6 +299,37 @@ export class Transaction {
 	}
 
 	/**
+	 * The change address createPsbtFromTransactionData fetches for a
+	 * transaction staged without one, and what the inputs leave after the
+	 * outputs and `fee`. Undefined for a staged change address or a max send.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {{ address: string; leftover: number } | undefined}
+	 */
+	private unstagedChange({
+		transaction,
+		inputs,
+		fee
+	}: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): { address: string; leftover: number } | undefined {
+		if (transaction.changeAddress || transaction.max) return undefined;
+		const address =
+			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
+			this.changeAddressStandIn();
+		if (!address) return undefined;
+		const leftover =
+			this.getTransactionInputValue({ inputs }) -
+			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
+			fee;
+		return { address, leftover };
+	}
+
+	/**
 	 * Returns the change address createPsbtFromTransactionData will add to a
 	 * transaction staged without one, or undefined when it adds none. The
 	 * builder adds it for any leftover at or above dust and does not reprice
@@ -377,25 +342,38 @@ export class Transaction {
 	 * @param {number} fee
 	 * @returns {string | undefined}
 	 */
-	private generatedChangeAddress({
-		transaction,
-		inputs,
-		fee
-	}: {
+	private generatedChangeAddress(args: {
 		transaction: Partial<ISendTransaction>;
 		inputs: IUtxo[];
 		fee: number;
 	}): string | undefined {
-		if (transaction.changeAddress || transaction.max) return undefined;
-		const address =
-			this._wallet.data.changeAddressIndex[this._wallet.addressType]?.address ||
-			this.changeAddressStandIn();
-		if (!address) return undefined;
-		const leftover =
-			this.getTransactionInputValue({ inputs }) -
-			this.getTransactionOutputValue({ outputs: transaction.outputs ?? [] }) -
-			fee;
-		return leftover >= getDustThreshold(address) ? address : undefined;
+		const change = this.unstagedChange(args);
+		return change && change.leftover >= getDustThreshold(change.address)
+			? change.address
+			: undefined;
+	}
+
+	/**
+	 * The leftover createPsbtFromTransactionData adds to `fee` for a
+	 * transaction staged without a change address: all of it when it is under
+	 * the dust threshold of the change the builder would add, otherwise none.
+	 * @private
+	 * @param {Partial<ISendTransaction>} transaction
+	 * @param {IUtxo[]} inputs
+	 * @param {number} fee
+	 * @returns {number}
+	 */
+	private droppedDust(args: {
+		transaction: Partial<ISendTransaction>;
+		inputs: IUtxo[];
+		fee: number;
+	}): number {
+		const change = this.unstagedChange(args);
+		return change &&
+			change.leftover >= 0 &&
+			change.leftover < getDustThreshold(change.address)
+			? change.leftover
+			: 0;
 	}
 
 	/**
@@ -431,7 +409,7 @@ export class Transaction {
 	 * @param {Partial<ISendTransaction>} [transaction]
 	 * @param {boolean} [fundingLightning]
 	 * @param {ECoinSelectPreference} [coinSelectPreference]
-	 * @param {boolean} [generatesChange] Prices the change output the builder adds when no change address is staged.
+	 * @param {boolean} [generatesChange] Prices what the builder does with the leftover when no change address is staged: a change output, or dust added to the fee.
 	 * @returns {number}
 	 */
 	getTotalFee = ({
@@ -559,7 +537,9 @@ export class Transaction {
 					coinSelectPreference: ECoinSelectPreference.consolidate
 				});
 			}
-			return fee;
+			return generatesChange
+				? fee + this.droppedDust({ transaction, inputs, fee })
+				: fee;
 		} catch {
 			return baseTransactionSize * satsPerByte;
 		}
@@ -587,7 +567,42 @@ export class Transaction {
 		transaction?: Partial<ISendTransaction>;
 		fundingLightning?: boolean;
 		coinSelectPreference?: ECoinSelectPreference;
-	} = {}): Result<TGetTotalFeeObj> => {
+	} = {}): Result<TGetTotalFeeObj> =>
+		this.quoteTotalFee(
+			{
+				satsPerByte,
+				message,
+				transaction,
+				fundingLightning,
+				coinSelectPreference
+			},
+			new Map()
+		);
+
+	/**
+	 * getTotalFeeObj, given the fees coin selection has already priced for
+	 * this quote. Its searches and its quote at a capped rate ask for the same
+	 * rates more than once, and each one selects coins again.
+	 * @private
+	 * @param {Map<string, number>} selectedFees getTotalFee by rate and generatesChange.
+	 * @returns {Result<TGetTotalFeeObj>}
+	 */
+	private quoteTotalFee(
+		{
+			satsPerByte,
+			message,
+			transaction,
+			fundingLightning,
+			coinSelectPreference
+		}: {
+			satsPerByte: number;
+			message: string;
+			transaction: Partial<ISendTransaction>;
+			fundingLightning: boolean;
+			coinSelectPreference: ECoinSelectPreference;
+		},
+		selectedFees: Map<string, number>
+	): Result<TGetTotalFeeObj> {
 		try {
 			// With no inputs, price the transaction against every spendable UTXO, as
 			// setupTransaction would gather them, but in memory. Staging them here
@@ -731,7 +746,13 @@ export class Transaction {
 						};
 					}
 				}
-				return { totalFee: fee, transactionByteCount: byteCount };
+				// Without a change address staged, the builder adds dust to the fee.
+				return {
+					totalFee: pricesChange
+						? fee
+						: fee + this.droppedDust({ transaction, inputs, fee }),
+					transactionByteCount: byteCount
+				};
 			};
 			const quote = quoteAt(satsPerByte);
 			transactionByteCount = quote.transactionByteCount;
@@ -742,17 +763,23 @@ export class Transaction {
 			// updateFee refuses a fee of exactly half the balance. A rate that drops
 			// the change output pays only the leftover, which is under half. A
 			// lower rate can also select fewer coins than this quote did.
-			const feeAt = (rate: number, generatesChange = true): number =>
-				selectsCoins
-					? this.getTotalFee({
-							satsPerByte: rate,
-							message,
-							transaction,
-							fundingLightning,
-							coinSelectPreference,
-							generatesChange
-					  })
-					: quoteAt(rate).totalFee;
+			const feeAt = (rate: number, generatesChange = true): number => {
+				if (!selectsCoins) return quoteAt(rate).totalFee;
+				const key = `${rate}:${generatesChange}`;
+				let fee = selectedFees.get(key);
+				if (fee === undefined) {
+					fee = this.getTotalFee({
+						satsPerByte: rate,
+						message,
+						transaction,
+						fundingLightning,
+						coinSelectPreference,
+						generatesChange
+					});
+					selectedFees.set(key, fee);
+				}
+				return fee;
+			};
 			// The highest rate below `over` that fits.
 			const highestFitting = (
 				over: number,
@@ -855,13 +882,16 @@ export class Transaction {
 				// quoteAt prices the coins selected at the requested rate. The capped
 				// rate can select fewer, and their change can be dust.
 				if (selectsCoins && maxSatPerByte) {
-					const atMax = this.getTotalFeeObj({
-						satsPerByte: maxSatPerByte,
-						message,
-						transaction,
-						fundingLightning,
-						coinSelectPreference
-					});
+					const atMax = this.quoteTotalFee(
+						{
+							satsPerByte: maxSatPerByte,
+							message,
+							transaction,
+							fundingLightning,
+							coinSelectPreference
+						},
+						selectedFees
+					);
 					if (atMax.isErr()) return atMax;
 					return ok({
 						totalFee: atMax.value.totalFee,
@@ -887,7 +917,7 @@ export class Transaction {
 		} catch (e) {
 			return err(e);
 		}
-	};
+	}
 
 	/**
 	 * Returns the maximum sats per byte that can be used for a given transaction.
@@ -984,12 +1014,16 @@ export class Transaction {
 			if (bip32InterfaceRes.isErr()) {
 				return err(bip32InterfaceRes.error.message);
 			}
+			// The build fills it and the signer reads it, so each input's key is
+			// derived once.
+			const keys = new Map<string, BIP32Interface>();
 
 			//Create PSBT before signing inputs
 			const psbtRes = await this.createPsbtFromTransactionData({
 				transactionData: transaction,
 				bip32Interface: bip32InterfaceRes.value,
-				shuffleTargets: shuffleOutputs
+				shuffleTargets: shuffleOutputs,
+				keys
 			});
 
 			if (psbtRes.isErr()) {
@@ -1012,7 +1046,8 @@ export class Transaction {
 
 			const signedPsbtRes = await this.signPsbt({
 				psbt,
-				bip32Interface: bip32InterfaceRes.value
+				bip32Interface: bip32InterfaceRes.value,
+				keys
 			});
 
 			if (signedPsbtRes.isErr()) {
@@ -1058,17 +1093,42 @@ export class Transaction {
 	};
 
 	/**
+	 * The key at an input's path, read from `keys` or derived into it along
+	 * with the branch nodes above it.
+	 * @param {BIP32Interface} root
+	 * @param {string} path
+	 * @param {Map<string, BIP32Interface>} keys Nodes derived from root only.
+	 * @returns {BIP32Interface}
+	 * @private
+	 */
+	private inputKey(
+		root: BIP32Interface,
+		path: string,
+		keys: Map<string, BIP32Interface>
+	): BIP32Interface {
+		let key = keys.get(path);
+		if (!key) {
+			key = derivePathCached(root, path, keys);
+			keys.set(path, key);
+		}
+		return key;
+	}
+
+	/**
 	 * Loops through inputs and signs them
 	 * @param {Psbt} psbt
 	 * @param {BIP32Interface} bip32Interface
+	 * @param {Map<string, BIP32Interface>} [keys] Keys createPsbtFromTransactionData derived from the same bip32Interface.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	signPsbt = async ({
 		psbt,
-		bip32Interface
+		bip32Interface,
+		keys = new Map()
 	}: {
 		psbt: Psbt;
 		bip32Interface: BIP32Interface;
+		keys?: Map<string, BIP32Interface>;
 	}): Promise<Result<Psbt>> => {
 		const transactionDataRes = this.data;
 
@@ -1077,7 +1137,7 @@ export class Transaction {
 			try {
 				let keyPair = input?.keyPair;
 				if (!keyPair && input?.path) {
-					keyPair = bip32Interface.derivePath(input.path);
+					keyPair = this.inputKey(bip32Interface, input.path, keys);
 				}
 				if (!keyPair) return err('Unable to derive keyPair.');
 				if (isP2trPrefix(input.address)) {
@@ -1109,16 +1169,19 @@ export class Transaction {
 	 * @param {ISendTransaction} transactionData
 	 * @param {BIP32Interface} bip32Interface
 	 * @param shuffleTargets
+	 * @param {Map<string, BIP32Interface>} [keys] Filled with the input keys derived from bip32Interface, for signPsbt to reuse.
 	 * @returns {Promise<Result<Psbt>>}
 	 */
 	createPsbtFromTransactionData = async ({
 		transactionData,
 		bip32Interface,
-		shuffleTargets = true
+		shuffleTargets = true,
+		keys = new Map()
 	}: {
 		transactionData: ISendTransaction;
 		bip32Interface?: BIP32Interface;
 		shuffleTargets?: boolean;
+		keys?: Map<string, BIP32Interface>;
 	}): Promise<Result<Psbt>> => {
 		const { inputs, outputs, fee, rbf, message } = transactionData;
 		let { changeAddress } = transactionData;
@@ -1203,6 +1266,7 @@ export class Transaction {
 
 		const root = bip32Interface;
 		const psbt = new bitcoin.Psbt({ network });
+		const prevTxs = await this.fetchPrevTxs(inputs);
 
 		//Add Inputs from inputs array
 		try {
@@ -1210,7 +1274,7 @@ export class Transaction {
 				if (this._wallet.isMultisig) {
 					// Multisig inputs are built from the sortedmulti script, not a
 					// single key pair (watch-only multisig has no derivable key).
-					const addRes = await this.addInput({ psbt, input });
+					const addRes = await this.addInput({ psbt, input, prevTxs });
 					if (addRes.isErr()) return err(addRes.error.message);
 					continue;
 				}
@@ -1218,7 +1282,7 @@ export class Transaction {
 					input?.keyPair;
 				if (!keyPair && input?.path) {
 					if (root) {
-						keyPair = root.derivePath(input.path);
+						keyPair = this.inputKey(root, input.path, keys);
 					} else {
 						const publicNodeRes = this._wallet.derivePublicNode(input.path);
 						if (publicNodeRes.isErr()) {
@@ -1233,7 +1297,8 @@ export class Transaction {
 				const addRes = await this.addInput({
 					psbt,
 					keyPair,
-					input
+					input,
+					prevTxs
 				});
 				if (addRes.isErr()) return err(addRes.error.message);
 			}
@@ -1511,7 +1576,40 @@ export class Transaction {
 	}
 
 	/**
-	 * Fetches the full previous transaction for a PSBT input, as a spreadable
+	 * Fetches the raw previous transaction of every input that attaches one
+	 * (all but p2tr) in one batched lookup rather than a round trip per input,
+	 * once per distinct parent. Answers are keyed by the txid Electrum tags
+	 * them with, since a batch may be answered in any order.
+	 * @param {IUtxo[]} inputs
+	 * @returns {Promise<Result<Map<string, string>>>} hex by txid
+	 * @private
+	 */
+	private async fetchPrevTxs(
+		inputs: IUtxo[]
+	): Promise<Result<Map<string, string>>> {
+		const txHashes = [
+			...new Set(
+				inputs
+					.filter(({ address }) => !isP2trPrefix(address))
+					.map(({ tx_hash }) => tx_hash)
+			)
+		].map((tx_hash) => ({ tx_hash }));
+		const hexes = new Map<string, string>();
+		if (!txHashes.length) return ok(hexes);
+		try {
+			const res = await this._wallet.electrum.getTransactions({ txHashes });
+			if (res.isErr()) return err(res.error.message);
+			for (const { data, result } of res.value.data) {
+				if (data?.tx_hash && result?.hex) hexes.set(data.tx_hash, result.hex);
+			}
+			return ok(hexes);
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Looks up the full previous transaction for a PSBT input, as a spreadable
 	 * { nonWitnessUtxo } field. Segwit v0 signers postdating CVE-2020-14199
 	 * (Ledger 2.x, Trezor >= 2.3.5) require non_witness_utxo alongside
 	 * witness_utxo to verify input amounts. Returns {} when the backend
@@ -1520,23 +1618,17 @@ export class Transaction {
 	 * contradicts the input (see checkPrevTx).
 	 * @param {IUtxo} input
 	 * @param {Buffer} script
-	 * @returns {Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>>}
+	 * @param {Result<Map<string, string>>} prevTxs from fetchPrevTxs
+	 * @returns {Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>}
 	 * @private
 	 */
-	private async nonWitnessUtxoField(
+	private nonWitnessUtxoField(
 		input: IUtxo,
-		script: Buffer
-	): Promise<Result<{ nonWitnessUtxo: Buffer } | Record<string, never>>> {
-		let hex: string | undefined;
-		try {
-			const transaction = await this._wallet.electrum.getTransactions({
-				txHashes: [{ tx_hash: input.tx_hash }]
-			});
-			if (transaction.isErr()) return ok({});
-			hex = transaction.value.data[0]?.result?.hex;
-		} catch {
-			return ok({});
-		}
+		script: Buffer,
+		prevTxs: Result<Map<string, string>>
+	): Result<{ nonWitnessUtxo: Buffer } | Record<string, never>> {
+		if (prevTxs.isErr()) return ok({});
+		const hex = prevTxs.value.get(input.tx_hash);
 		if (!hex) return ok({});
 		const prevTxRes = this.checkPrevTx({ hex, input, script });
 		if (prevTxRes.isErr()) return err(prevTxRes.error.message);
@@ -1590,7 +1682,8 @@ export class Transaction {
 	addInput = async ({
 		psbt,
 		keyPair,
-		input
+		input,
+		prevTxs
 	}: IAddInput): Promise<Result<string>> => {
 		try {
 			const network = getBitcoinJsNetwork(this._wallet.network);
@@ -1609,6 +1702,8 @@ export class Transaction {
 				keyPair = input.keyPair;
 			}
 
+			prevTxs = prevTxs ?? (await this.fetchPrevTxs([input]));
+
 			if (type === 'p2wsh') {
 				// Sorted-multisig input: the witnessScript comes from the wallet's
 				// multisig configuration, keyed by the input's BIP 48 path.
@@ -1620,7 +1715,7 @@ export class Transaction {
 						`Multisig script for path ${input.path} does not produce address ${input.address}.`
 					);
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, output);
+				const prevTxRes = this.nonWitnessUtxoField(input, output, prevTxs);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1647,7 +1742,11 @@ export class Transaction {
 				if (!p2wpkh?.output) {
 					return err('p2wpkh.output is undefined.');
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, p2wpkh.output);
+				const prevTxRes = this.nonWitnessUtxoField(
+					input,
+					p2wpkh.output,
+					prevTxs
+				);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1672,7 +1771,7 @@ export class Transaction {
 				if (!p2sh?.redeem) {
 					return err('p2sh.redeem.output is undefined.');
 				}
-				const prevTxRes = await this.nonWitnessUtxoField(input, p2sh.output);
+				const prevTxRes = this.nonWitnessUtxoField(input, p2sh.output, prevTxs);
 				if (prevTxRes.isErr()) return err(prevTxRes.error.message);
 				psbt.addInput({
 					hash: input.tx_hash,
@@ -1694,13 +1793,13 @@ export class Transaction {
 				if (!p2pkh?.output) {
 					return err('p2pkh.output is undefined.');
 				}
-				const transaction = await this._wallet.electrum.getTransactions({
-					txHashes: [{ tx_hash: input.tx_hash }]
-				});
-				if (transaction.isErr()) {
-					return err(transaction.error.message);
+				if (prevTxs.isErr()) return err(prevTxs.error.message);
+				const hex = prevTxs.value.get(input.tx_hash);
+				if (!hex) {
+					return err(
+						`Previous transaction for ${input.tx_hash}:${input.tx_pos} is unavailable.`
+					);
 				}
-				const hex = transaction.value.data[0].result.hex;
 				const prevTxRes = this.checkPrevTx({
 					hex,
 					input,
@@ -1880,8 +1979,6 @@ export class Transaction {
 				...this._data,
 				...transaction
 			};
-
-			void this._persist();
 
 			return ok('Transaction updated');
 		} catch (e) {
@@ -2471,7 +2568,7 @@ export class Transaction {
 			}
 			// A malformed output value must not become 0. amountToSend being falsy
 			// takes the consolidate branch below, which selects every UTXO in the
-			// wallet, and applyAutoCoinSelect persists that selection before
+			// wallet, and applyAutoCoinSelect stages that selection before
 			// validateTransaction ever sees the transaction. reduceValue tells a
 			// genuine 0, which legitimately means "spend everything", apart from
 			// non-numeric data, which does not.
@@ -2481,6 +2578,9 @@ export class Transaction {
 			}
 			const amountToSend = amountToSendRes.value;
 
+			// Sorted as a copy: callers pass the staged transaction's inputs, and a
+			// fee quote must not reorder what the send will spend.
+			inputs = [...inputs];
 			switch (coinSelectPreference) {
 				case 'large':
 					// Sort by the largest UTXO amount (Lowest fee, but reveals your largest UTXO's)
@@ -2550,8 +2650,7 @@ export class Transaction {
 			}
 
 			// Output address types for the fee calculation, with and without the
-			// change output. Input types are counted per selection in calculateFee
-			// below, since the selection can grow.
+			// change output. Input types are counted below, as the selection grows.
 			const countOutputTypes = (
 				addresses: string[]
 			): IAddressTypesIO['outputs'] => {
@@ -2579,30 +2678,67 @@ export class Transaction {
 				? countOutputTypes([...paymentAddresses, changeAddress])
 				: noChangeOutputTypes;
 
-			//Price the current selection. Every input added costs weight, so this
-			//has to be recomputed whenever the selection changes.
-			const calculateFee = (selected: IUtxo[], types = outputTypes): number => {
-				const inputTypes = {} as IAddressTypesIO['inputs'];
-				selected.forEach(({ address }) => {
-					const validateResponse = getAddressInfo(address);
-					if (!validateResponse) {
-						return;
-					}
-					const type = validateResponse.type.toUpperCase() as EAddressType;
-					if (type in inputTypes) {
-						inputTypes[type] = inputTypes[type] + 1;
-					} else {
-						inputTypes[type] = 1;
-					}
-				});
+			// A selection is priced from its count of inputs per script type, and
+			// each coin's address is decoded once. The top-up below reprices after
+			// every coin it adds, so walking the whole selection each time is
+			// quadratic in the number of coins.
+			const addressTypes = new Map<IUtxo, string>();
+			const typeOf = (input: IUtxo): string => {
+				let type = addressTypes.get(input);
+				if (type === undefined) {
+					type = getAddressInfo(input.address).type.toUpperCase();
+					addressTypes.set(input, type);
+				}
+				return type;
+			};
+			type TSelection = { types: Record<string, number>; uncompressed: number };
+			// Adds `input` to the counts, or with -1 takes it out. A type with none
+			// left is dropped, as a fresh count would have it. A zero P2WSH count
+			// is not rewritten by applyMultisigInputWeights, and getByteCount has
+			// no plain P2WSH input weight.
+			const count = (
+				selection: TSelection,
+				input: IUtxo,
+				by: 1 | -1 = 1
+			): TSelection => {
+				const type = typeOf(input);
+				const left = (selection.types[type] ?? 0) + by;
+				if (left) selection.types[type] = left;
+				else delete selection.types[type];
+				// See uncompressedKeyBytes.
+				if (type === 'P2PKH' && input.keyPair?.publicKey.length === 65) {
+					selection.uncompressed += by;
+				}
+				return selection;
+			};
+			const countAll = (selected: IUtxo[]): TSelection => {
+				const selection: TSelection = { types: {}, uncompressed: 0 };
+				selected.forEach((input) => count(selection, input));
+				return selection;
+			};
+			const copyOf = (selection: TSelection): TSelection => ({
+				types: { ...selection.types },
+				uncompressed: selection.uncompressed
+			});
+
+			//Price a selection. Every input added costs weight, so this has to be
+			//recomputed whenever the selection changes.
+			const calculateFee = (
+				selection: TSelection,
+				types = outputTypes
+			): number => {
 				// See getTotalFee: priced at its size, without the 166 vB floor.
+				// applyMultisigInputWeights rewrites the counts it is given.
 				let baseFee =
 					getByteCount(
-						this.applyMultisigInputWeights(inputTypes),
+						this.applyMultisigInputWeights({
+							...selection.types
+						} as TGetByteCountInputs),
 						types,
 						message,
 						0
-					) + this.uncompressedKeyBytes(selected);
+					) +
+					selection.uncompressed * 32;
 				if (satsPerByte < 2) {
 					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
 					if (baseFee < minByteCount) baseFee = minByteCount;
@@ -2610,11 +2746,13 @@ export class Transaction {
 				return baseFee * satsPerByte;
 			};
 
-			let fee = calculateFee(newInputs);
+			const selection = countAll(newInputs);
+			let fee = calculateFee(selection);
 			// The top-up below can add a coin worth less than its own weight costs,
 			// leaving a selection that no longer pays the rate even without change.
-			// The last one that did is kept to fall back on.
-			let noChangeInputs: IUtxo[] | undefined;
+			// The last one that did is kept to fall back on. The top-up only
+			// appends, so that selection is a prefix of newInputs.
+			let noChangeLength: number | undefined;
 			let noChangeAmount = 0;
 
 			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
@@ -2626,14 +2764,14 @@ export class Transaction {
 					if (inputAmount >= amountToSend + fee) break;
 					if (
 						inputAmount >=
-						amountToSend + calculateFee(newInputs, noChangeOutputTypes)
+						amountToSend + calculateFee(selection, noChangeOutputTypes)
 					) {
-						noChangeInputs = [...newInputs];
+						noChangeLength = newInputs.length;
 						noChangeAmount = inputAmount;
 					}
 					inputAmount += input.value;
 					newInputs.push(input);
-					fee = calculateFee(newInputs);
+					fee = calculateFee(count(selection, input));
 				}
 			}
 
@@ -2645,9 +2783,9 @@ export class Transaction {
 				// The payment can still meet the rate without its change output.
 				// getTotalFee then quotes the whole leftover as the fee, and the
 				// builder finds no change to add.
-				const noChangeFee = calculateFee(newInputs, noChangeOutputTypes);
+				const noChangeFee = calculateFee(selection, noChangeOutputTypes);
 				if (inputAmount < amountToSend + noChangeFee) {
-					if (!noChangeInputs) {
+					if (noChangeLength === undefined) {
 						if (coinSelectPreference === 'consolidate' || !amountToSend) {
 							return err('Not enough funds');
 						}
@@ -2656,18 +2794,16 @@ export class Transaction {
 						// what it adds to the fee is left out by selecting again.
 						// Inputs of one type and key size add the same, so each kind is
 						// priced once.
-						const kindOf = (input: IUtxo): string => {
-							const { type } = getAddressInfo(input.address);
-							return `${type}:${input.keyPair?.publicKey.length}`;
-						};
+						const kindOf = (input: IUtxo): string =>
+							`${typeOf(input)}:${input.keyPair?.publicKey.length}`;
 						const added = new Map<string, number>();
 						const economic: IUtxo[] = [];
 						const dropped: IUtxo[] = [];
-						newInputs.forEach((input, i) => {
+						newInputs.forEach((input) => {
 							const kind = kindOf(input);
 							let cost = added.get(kind);
 							if (cost === undefined) {
-								cost = fee - calculateFee(newInputs.filter((_, j) => j !== i));
+								cost = fee - calculateFee(count(copyOf(selection), input, -1));
 								added.set(kind, cost);
 							}
 							(input.value > cost ? economic : dropped).push(input);
@@ -2683,13 +2819,15 @@ export class Transaction {
 						// ones of that kind are too.
 						dropped.sort((a, b) => b.value - a.value);
 						const refused = new Set<string>();
-						let keptFee = calculateFee(economic);
+						const kept = countAll(economic);
+						let keptFee = calculateFee(kept);
 						for (const input of dropped) {
 							const kind = kindOf(input);
 							if (refused.has(kind)) continue;
-							const withInput = calculateFee([...economic, input]);
+							const withInput = calculateFee(count(copyOf(kept), input));
 							if (input.value > withInput - keptFee) {
 								economic.push(input);
+								count(kept, input);
 								keptFee = withInput;
 							} else {
 								refused.add(kind);
@@ -2707,7 +2845,7 @@ export class Transaction {
 							coinSelectPreference
 						});
 					}
-					newInputs = noChangeInputs;
+					newInputs = newInputs.slice(0, noChangeLength);
 					inputAmount = noChangeAmount;
 				}
 				fee = inputAmount - amountToSend;

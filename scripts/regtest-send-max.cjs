@@ -92,6 +92,10 @@ async function payer(h) {
 		logger: { debug() {}, info() {}, warn() {}, error() {} }
 	});
 	try {
+		// As regtest.cjs does for its stranger. On 0.31.0 a second node in this
+		// process that asks for an address before its first refresh gets none,
+		// because the shared Electrum connection answered too recently to ping.
+		await node.refreshWallet();
 		btc('sendtoaddress', await node.getNewAddress(), '0.02000000');
 		btc('-generate', '1');
 		await wait('payer coins confirmed', async () => {
