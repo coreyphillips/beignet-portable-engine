@@ -1,13 +1,14 @@
-# Portable engine validation, 2026-10-21 addendum for #1784
+# Portable engine validation, 2026-10-21 addendum for 0.31.1
 
-The fork tracks upstream `master` at `514d5680446ac1ed1e2726e66c7c1c1e4013d0ee` (#1784), two commits after the 0.31.0 version bump `9288fa9a`. This addendum supersedes the baseline statement of the 0.31.0 addendum below; the rest of that addendum still describes the code this resync did not touch. The patch reapplies with no rejection, fuzz or offset, and the tree's change is upstream's own, line for line (see `PATCHES.md`).
+The fork tracks Beignet **0.31.1** at `04a2d925b720540a433aebb1dd4f28d6de69a8e0`, npm's `gitHead` for the release. Its `src/` is the same as `514d5680` (#1784), two commits after 0.31.0, whose published `gitHead` is `9288fa9a`. This addendum supersedes the baseline statement of the 0.31.0 addendum below; the rest of that addendum still describes the code this resync did not touch. The patch reapplies with no rejection, fuzz or offset, and the tree's change is upstream's own, line for line (see `PATCHES.md`).
 
 All on Node 24.22.1:
 - `npm test`: 224 of 224 pass.
 - `npm run check:types` passes. A full `tsc --noEmit -p .` reports the same 27 errors as the 0.31.0 tree, by file and message.
-- The built bundle reports `0.31.0-portable`, as upstream's `package.json` still says 0.31.0. Its esbuild warnings are the same eight.
+- The built bundle reports `0.31.1-portable`. Its esbuild warnings are the same eight.
+- The published `beignet@0.31.1` tarball matches npm's integrity hash, and its `dist/` is byte-identical to a local `tsc` build of `514d5680`.
 - Upstream's new offline suites, run in an upstream `514d5680` tree with this fork's `src/` in place of its own: `tests/cli/address-before-first-refresh.test.ts` (#1784) and `tests/cli/block-refresh-requests.test.ts` (#1769) pass, 23 tests.
-- The send-max payer without its removed refresh, recreated in a scratch script against the local Electrum: a primary created as `regtest-harness.cjs` creates it, then two more `BeignetNode`s in the same process, each asking for an address straight after `create`. With upstream built from `9288fa9a` as the primary package, both fail with `Reduce of empty array with no initial value`. Built from `514d5680`, both get a `bcrt1` address.
+- The send-max payer without its removed refresh, recreated in a scratch script against the local Electrum: a primary created as `regtest-harness.cjs` creates it, then two more `BeignetNode`s in the same process, each asking for an address straight after `create`. With upstream built from `9288fa9a` as the primary package, both fail with `Reduce of empty array with no initial value`. Built from `514d5680`, and with the published `beignet@0.31.1` tarball, both get a `bcrt1` address.
 
 Not run for this resync:
 - `scripts/regtest.cjs`, `smoke-regtest.cjs` and `regtest-send-max.cjs`. This machine has no shared wallet client or `beignet-relay` checkout for the harness and no CLN on port 19846, and its regtest bitcoind has no `default` wallet to fund from, so the payer's funding step past its address was not run either;
