@@ -41,10 +41,24 @@ export async function createSqlJsDatabaseFactory(options: {
 					!(params[0] instanceof Uint8Array)))
 				? params[0]
 				: params;
+		const blob = (value: any) =>
+			value instanceof Uint8Array ? Buffer.from(value) : value;
 		const result = {
 			portableGossipBatch: true,
+			// better-sqlite3's flag, which storage reads to leave the revoked HTLC
+			// snapshots of a state loaded or committed inside a transaction that
+			// may still roll back unmarked.
+			get inTransaction() {
+				return depth > 0;
+			},
 			prepare(sql: string) {
+				// pluck() as in better-sqlite3: rows become their first column.
+				let plucked = false;
 				return {
+					pluck(toggle = true) {
+						plucked = toggle;
+						return this;
+					},
 					run(...params: any[]) {
 						assert();
 						db.run(sql, values(params));
@@ -65,14 +79,13 @@ export async function createSqlJsDatabaseFactory(options: {
 							const rows = [];
 							while (statement.step())
 								rows.push(
-									Object.fromEntries(
-										Object.entries(statement.getAsObject()).map(
-											([key, value]) => [
-												key,
-												value instanceof Uint8Array ? Buffer.from(value) : value
-											]
-										)
-									)
+									plucked
+										? blob(statement.get()[0])
+										: Object.fromEntries(
+												Object.entries(statement.getAsObject()).map(
+													([key, value]) => [key, blob(value)]
+												)
+										  )
 								);
 							return rows;
 						} finally {

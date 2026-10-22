@@ -5,6 +5,7 @@
  */
 
 import { validateIrohConfig } from './iroh-config';
+import { validateElectrumTlsConfig } from './electrum-tls-config';
 import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
@@ -44,6 +45,7 @@ import {
 	clientKeyForRequest
 } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
+import { unpatchedNodeWarning } from '../utils/node-version';
 import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
@@ -497,6 +499,9 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// Its transient sibling (issue #633): the splice was held off by a state
 	// that ends on its own, so waiting genuinely changes the answer.
 	SPLICE_BUSY: 503,
+	// A commitment feerate the channel would not take: its state, the opener
+	// rule, an FFOR epoch's frozen feerate, the bounds or the reserve.
+	UPDATE_FEE_FAILED: 409,
 	CHANNEL_NOT_FOUND: 404,
 	// A hold settle or cancel that left parts parked (issue #823): the hold is
 	// live, not absent, and a reestablish or the settle already under way
@@ -935,6 +940,7 @@ async function bootDaemon(
 	// caller no handle to destroy.
 	try {
 		validateIrohConfig(opts);
+		validateElectrumTlsConfig(opts);
 	} catch (err) {
 		throw new BeignetError('INVALID_PARAMS', (err as Error).message);
 	}
@@ -2029,7 +2035,13 @@ async function bootDaemon(
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
 			if (feeratePerKw === undefined)
 				return failure('INVALID_PARAMS', 'feeratePerKw required');
-			return success(node.updateChannelFee(channelId, feeratePerKw));
+			const result = node.updateChannelFee(channelId, feeratePerKw);
+			if (!result.ok)
+				return failure(
+					'UPDATE_FEE_FAILED',
+					result.error || 'Commitment feerate update failed'
+				);
+			return success({ updated: true });
 		},
 		// Sets the ROUTING fee policy advertised in channel_update. Unrelated to
 		// the commitment feerate endpoint above.
@@ -2053,15 +2065,18 @@ async function bootDaemon(
 			};
 			if (!channelId && all !== true)
 				return failure('INVALID_PARAMS', 'channelId or all:true required');
+			const policy = {
+				feeBaseMsat,
+				feeProportionalMillionths,
+				cltvExpiryDelta,
+				htlcMinimumMsat,
+				htlcMaximumMsat
+			};
 			try {
 				return success(
-					node.updateChannelPolicy(all === true ? 'all' : channelId!, {
-						feeBaseMsat,
-						feeProportionalMillionths,
-						cltvExpiryDelta,
-						htlcMinimumMsat,
-						htlcMaximumMsat
-					})
+					all === true
+						? node.updateAllChannelPolicies(policy)
+						: node.updateChannelPolicy(channelId!, policy)
 				);
 			} catch (err) {
 				return failure('INVALID_PARAMS', (err as Error).message);
@@ -3332,9 +3347,17 @@ async function bootDaemon(
 			// Strict boolean, the rule /channel/forceclose uses: this route
 			// publishes the same commitment, so a capsule-restored channel
 			// needs the same acknowledgement (issue #908).
-			return success(
-				node.fforEnforce(channelId, acceptStaleStateRisk === true)
+			const { ok, error, ...enforced } = node.fforEnforce(
+				channelId,
+				acceptStaleStateRisk === true
 			);
+			// The engine refuses in band; same code as /channel/forceclose.
+			if (ok !== true)
+				return failure(
+					'FORCE_CLOSE_FAILED',
+					String(error || 'Force close failed')
+				);
+			return success(enforced);
 		},
 		'POST /ffor/witness/close': async (body) => {
 			const { channelId } = body as { channelId?: string };
@@ -3345,12 +3368,14 @@ async function bootDaemon(
 		'GET /ffor/issuer/status': () => success(node.fforIssuerStatus()),
 		'GET /ffor/issuer/issued': async (body, query) => {
 			const b = body as { channelId?: string; issuerNodeId?: string };
-			return success(
-				await node.fforIssuedSlots(
-					query.get('channelId') || b.channelId,
-					query.get('issuerNodeId') || b.issuerNodeId
-				)
+			const { ok, error, ...issued } = await node.fforIssuedSlots(
+				query.get('channelId') || b.channelId,
+				query.get('issuerNodeId') || b.issuerNodeId
 			);
+			// The issuer's ff_issuer_status_resp refusal, answered in band.
+			if (ok !== true)
+				return failure('FFOR_REFUSED', String(error || 'issuer refused'));
+			return success(issued);
 		},
 		// Reverse swap provider (issue #737): terms and exposure, the ledger,
 		// and an operator cancel of a swap nothing has moved for yet.
@@ -4203,6 +4228,11 @@ async function bootDaemon(
 		server.listen(port, host, () => {
 			logger?.info(`Daemon listening on ${host}:${port}`);
 			if (!authenticator.enabled) logger?.warn(AUTH_OFF_WARNING);
+			// A Node.js release without the October 21, 2026 security fixes
+			// (issue #1773). Warn and keep running: the operator owns the
+			// runtime, and refusing to start would take the node offline.
+			const nodeWarning = unpatchedNodeWarning(process.versions.node);
+			if (nodeWarning) logger?.warn(nodeWarning);
 			// The queue's start (once the node can pay, issue #967) and its
 			// poke on channel:usable were wired when the node built it above;
 			// stop() halts the queue first, so a start that comes after it

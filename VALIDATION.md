@@ -1,3 +1,26 @@
+# Portable engine validation, 2026-10-21 addendum
+
+The fork tracks Beignet **0.31.0** at `9288fa9a127e5d0433aa35ffb6a690d427b9257d`, upstream's version bump on `master`. 0.31.0 is not on npm yet, so this is the git commit, not a published tarball's `gitHead`. This addendum supersedes the prior baseline statements below. The portable patch reapplies to pristine upstream source with no fuzz except for three hunks that upstream added lines beside, merged by hand with their content unchanged. The recaptured patch has the same added and removed lines as the 0.30.2 patch (see `PATCHES.md`). The SQLite adapters gain `pluck()` and `inTransaction`, which 0.31.0 storage reads.
+
+All on Node 24.22.1:
+- `npm test`: all 224 unit tests pass, including the eight new `portable-tests/sqlite-surface.test.cjs` tests. Without the adapter change all fail but the control, an adapter whose `inTransaction` is always false, which loses the rolled-back snapshot either way.
+- `npm run check:types` passes. A full `tsc --noEmit -p .` reports the same 27 errors as the 0.30.2 tree, by file and message.
+- The built bundle reports `0.31.0-portable`. Its esbuild warnings are the same eight as the 0.30.2 tree's.
+- Upstream suites, bundled with this fork's `src/` and `better-sqlite3` aliased to `portable/sqlite.ts` over the SQL.js adapter:
+  - `tests/lightning/revoked-htlc-history-store.test.ts` passes all 17 tests, both on the SQL.js adapter and on one stripped of `pluck()` and `inTransaction`. On the stripped adapter without the shim, five rollback tests fail.
+  - `storage`, `storage-resilience`, `action-log`, `forwarding-history`, `recovery-phase2`, `recovery-phase3`, `persistence-crash-safety`, `revoked-sweep-retry`, `penalty-deadline-split`, `prune-liveness-scan` and `tests/cli/durable-payment-reads` pass, 315 tests. `durable-payment-reads` also passes on the stripped adapter.
+  - Failures that come from the harness, not the fork: `storage-encryption` reads the database file from disk, where SQL.js keeps none; `recovery-phase5-restore` opens the reference guardian's store, which uses better-sqlite3's `transaction.immediate`; `agent-ergonomics` reads upstream's `package.json`; four `tests/cli/node-storage-view` tests read better-sqlite3's `open` property and error text, or a TEMP table that SQL.js drops each time it exports the database.
+- `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS. It ran against the local Bitcoin and Electrum containers, with the primary taken from a tarball `npm pack`ed from upstream `9288fa9a` through `BEIGNET_SOURCE_DIR`. The log has no teardown stacks this time.
+- `scripts/smoke-regtest.cjs` passes against the local CLN at port 19846. Three invoices are listed before and after a full engine restart, so `GET /invoices` reads paid status through `pluck()`.
+- `scripts/regtest-send-max.cjs` passes all seven cases against the same primary, with 73 PASS lines: jit, the three address types, unconfirmed address, phone and cln. That includes repeated drains and drains across restarts. Its payer now refreshes before asking for an address (see `PATCHES.md`); without that, the first case fails at the payer's first address. The log carries six `close connect` teardown stacks and two `Connection to server lost` messages from the primary's Electrum client as cases end.
+- The shared client's `npm test` passes (162 tests).
+
+Not run for this resync:
+- `test:regtest:channelize` and the FFOR regtests;
+- a device start;
+- upstream's full suites beyond those named above (its CI ran on the merged PRs);
+- `beignet-web`, which pins its own fork commit from GitHub.
+
 # Portable engine validation, 2026-10-11 addendum
 
 The fork tracks Beignet **0.30.2** at `af2f13d4ad782c65204fab962788c7dcdb80e5ef`, the published tarball's `gitHead`. This addendum supersedes the prior baseline statements below. The portable patch reapplies to pristine upstream source with no fuzz except for four `sqlite-storage.ts` hunks, which were merged by hand: the scrub's `VACUUM` stays outside `open()`'s transaction. The recaptured patch differs from the 0.30.1 patch only by that merge (see `PATCHES.md`).

@@ -13,12 +13,16 @@ export interface SQLiteStatement {
 	get(...parameters: any[]): any;
 	all(...parameters: any[]): any[];
 	iterate(...parameters: any[]): IterableIterator<any>;
+	/** As in better-sqlite3. The engine supplies it when an adapter has none. */
+	pluck?(toggle?: boolean): SQLiteStatement;
 }
 export interface SQLiteCompatDatabase {
 	prepare(sql: string): SQLiteStatement;
 	exec(sql: string): unknown;
 	pragma(sql: string): unknown;
 	transaction<T extends (...args: any[]) => any>(fn: T): T;
+	/** As in better-sqlite3. The engine supplies it when an adapter has none. */
+	readonly inTransaction?: boolean;
 	close(): void;
 	backup?(destination: string): Promise<void>;
 }

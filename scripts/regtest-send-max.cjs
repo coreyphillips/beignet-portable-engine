@@ -92,6 +92,10 @@ async function payer(h) {
 		logger: { debug() {}, info() {}, warn() {}, error() {} }
 	});
 	try {
+		// As regtest.cjs does for its stranger. On 0.31.0 a fresh wallet has no
+		// stored addresses before its first refresh, and getHighestStoredAddressIndex
+		// then reduces an empty map (upstream #1783, fixed after 0.31.0 by #1784).
+		await node.refreshWallet();
 		btc('sendtoaddress', await node.getNewAddress(), '0.02000000');
 		btc('-generate', '1');
 		await wait('payer coins confirmed', async () => {
