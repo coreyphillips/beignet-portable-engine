@@ -215,6 +215,11 @@ export class Wallet {
 	private _refreshOwed = false;
 	// onStart callbacks of refresh calls whose body has not started yet.
 	private _refreshStartCallbacks: Array<() => void> = [];
+	// Whether a refresh failed, or left a transaction unread or a window
+	// address unsubscribed, since the last refresh body started. A new block
+	// only runs a full refresh when something calls for one, and this is what
+	// retries it.
+	private _refreshFailed = false;
 	// Outpoints our own broadcasts have spent, keyed 'txid:vout', each holding
 	// the value _spendSeq had when the broadcast landed. The UTXO set is only
 	// ever replaced wholesale by a scan, so a scan already in flight at that
@@ -524,6 +529,13 @@ export class Wallet {
 
 	public get balance(): number {
 		return this._data.balance;
+	}
+
+	/** Whether a refresh failed, or left a transaction unread or a window
+	 *  address unsubscribed, since the last refresh began. The next block
+	 *  refreshes in full while it is set. */
+	public get refreshFailed(): boolean {
+		return this._refreshFailed;
 	}
 
 	public get network(): EAvailableNetworks {
@@ -1200,11 +1212,13 @@ export class Wallet {
 						// A caller's hook must not cost the refresh.
 					}
 				}
+				this._refreshFailed = false;
 				try {
 					result = await this._runRefresh(scan);
 				} catch (e) {
 					result = err(e);
 				}
+				if (result.isErr()) this._refreshFailed = true;
 				// A call queued while this body ran is answered with a scan that
 				// starts after it, however many were queued. Only the last body in
 				// flight answers the queue, so a nested or sibling forced refresh
@@ -1278,8 +1292,20 @@ export class Wallet {
 			return err(r3.error.message);
 		}
 		if (this._stopped) return err(stopped);
-		await this.electrum.subscribeToAddresses();
+		await this.subscribeWindows();
 		return ok(this.data);
+	}
+
+	/**
+	 * Subscribes the receive and change gap windows. An address left
+	 * unsubscribed is only read again by a full refresh, so a failure owes the
+	 * next block one.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async subscribeWindows(): Promise<void> {
+		const subscribed = await this.electrum.subscribeToAddresses();
+		if (subscribed.isErr()) this._refreshFailed = true;
 	}
 
 	/** Releases the refresh flag and hands `result` to every queued caller. */
@@ -2120,19 +2146,28 @@ export class Wallet {
 			let lastUsedChangeAddressIndex =
 				currentWallet.lastUsedChangeAddressIndex[addressType];
 
-			const originalHighestStoredIndexes = this.getHighestStoredAddressIndex({
-				addressType
-			});
-			if (originalHighestStoredIndexes.isErr()) {
-				return err(originalHighestStoredIndexes.error.message);
-			}
-			const originalHighestStoredIndex =
-				originalHighestStoredIndexes.value.addressIndex;
-			const originalHighestStoredChangeIndex =
-				originalHighestStoredIndexes.value.changeAddressIndex;
+			// A call that gets here before the first refresh has stored any
+			// addresses finds a chain with none. That chain reads as -1, so its
+			// first window is derived below.
+			const highestIndex = (stored: IAddresses): number =>
+				Object.values(stored).reduce(
+					(highest, { index }) => Math.max(highest, index),
+					-1
+				);
+			// Read from the map, not from what addAddresses answered: a refresh
+			// running beside this call may have stored the same window first, and
+			// addAddresses answers only the addresses it added itself.
+			const lowestAddress = (stored: IAddresses): IAddress | undefined =>
+				Object.values(stored).sort((a, b) => a.index - b.index)[0];
+			const originalHighestStoredIndex = highestIndex(
+				currentWallet.addresses[addressType]
+			);
+			const originalHighestStoredChangeIndex = highestIndex(
+				currentWallet.changeAddresses[addressType]
+			);
 
 			const addressIndexDiff = getAddressIndexDiff(
-				originalHighestStoredIndex.index,
+				originalHighestStoredIndex,
 				lastUsedAddressIndex.index
 			);
 			const addressesToGenerate =
@@ -2141,7 +2176,7 @@ export class Wallet {
 				// Every address below this one is already stored.
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: addressesToGenerate,
-					addressIndex: originalHighestStoredIndex.index + 1,
+					addressIndex: originalHighestStoredIndex + 1,
 					changeAddressAmount: 0,
 					keyDerivationPath,
 					addressType,
@@ -2151,18 +2186,14 @@ export class Wallet {
 					return err(generatedAddresses.error);
 				}
 				this.markGrownAddressMaps(generatedAddresses.value);
-				if (addressIndex.index < 0) {
-					const addresses = generatedAddresses.value.addresses;
-					const sorted = Object.values(addresses).sort(
-						(a, b) => a.index - b.index
-					);
-					if (sorted.length >= 1 && sorted[0].index >= 0)
-						addressIndex = sorted[0];
-				}
+			}
+			if (addressIndex.index < 0) {
+				const lowest = lowestAddress(this._data.addresses[addressType]);
+				if (lowest && lowest.index >= 0) addressIndex = lowest;
 			}
 
 			const changeAddressIndexDiff = getAddressIndexDiff(
-				originalHighestStoredChangeIndex.index,
+				originalHighestStoredChangeIndex,
 				lastUsedChangeAddressIndex.index
 			);
 			const changeAddressesToGenerate =
@@ -2172,7 +2203,7 @@ export class Wallet {
 				const generatedAddresses = await this.addAddresses({
 					addressAmount: 0,
 					changeAddressAmount: changeAddressesToGenerate,
-					changeAddressIndex: originalHighestStoredChangeIndex.index + 1,
+					changeAddressIndex: originalHighestStoredChangeIndex + 1,
 					keyDerivationPath,
 					addressType,
 					saveAddresses: false
@@ -2181,14 +2212,10 @@ export class Wallet {
 					return err(generatedAddresses.error);
 				}
 				this.markGrownAddressMaps(generatedAddresses.value);
-				if (changeAddressIndex.index < 0) {
-					const changeAddresses = generatedAddresses.value.changeAddresses;
-					const sorted = Object.values(changeAddresses).sort(
-						(a, b) => a.index - b.index
-					);
-					if (sorted.length >= 1 && sorted[0].index >= 0)
-						changeAddressIndex = sorted[0];
-				}
+			}
+			if (changeAddressIndex.index < 0) {
+				const lowest = lowestAddress(this._data.changeAddresses[addressType]);
+				if (lowest && lowest.index >= 0) changeAddressIndex = lowest;
 			}
 
 			// Save any addresses that have been created thus far if necessary.
@@ -2492,6 +2519,7 @@ export class Wallet {
 	/**
 	 * Returns the highest address and change address index stored in the app for the specified wallet and network.
 	 * Retrives the highest stored address index for the provided address type.
+	 * Errs when either chain has none stored, as before the first refresh.
 	 * @param {EAddressType} addressType
 	 * @returns {Result<{ addressIndex: IAddress; changeAddressIndex: IAddress }>}
 	 */
@@ -2505,15 +2533,20 @@ export class Wallet {
 	}> {
 		try {
 			const currentWallet = this.data;
-			const addresses = currentWallet.addresses[addressType];
-			const changeAddresses = currentWallet.changeAddresses[addressType];
+			const addresses = Object.values(currentWallet.addresses[addressType]);
+			const changeAddresses = Object.values(
+				currentWallet.changeAddresses[addressType]
+			);
+			if (!addresses.length || !changeAddresses.length) {
+				return err('No addresses stored yet.');
+			}
 
-			const addressIndex = Object.values(addresses).reduce((prev, current) => {
+			const addressIndex = addresses.reduce((prev, current) => {
 				return prev.index > current.index ? prev : current;
 			});
 
-			const changeAddressIndex = Object.values(changeAddresses).reduce(
-				(prev, current) => (prev.index > current.index ? prev : current)
+			const changeAddressIndex = changeAddresses.reduce((prev, current) =>
+				prev.index > current.index ? prev : current
 			);
 
 			return ok({ addressIndex, changeAddressIndex });
@@ -3040,7 +3073,13 @@ export class Wallet {
 		next: IAddress
 	): Promise<Result<IAddress>> {
 		this.moveReceiveIndex(addressType, next);
-		return this.savedReceiveAddress(addressType);
+		const issued = await this.savedReceiveAddress(addressType);
+		// A block no longer rescans the receive window, so the window this move
+		// shifted is subscribed before the address is handed out. Not before the
+		// index is read, which a concurrent issuance could move meanwhile, and
+		// never while disconnected, when the client would dial a random peer.
+		if (this.electrum.connectedToElectrum) await this.subscribeWindows();
+		return issued;
 	}
 
 	/**
@@ -3188,9 +3227,10 @@ export class Wallet {
 		this._data.utxos = utxos;
 		this._data.balance = balance;
 		// A refused write is logged and left to the next scan, which writes both
-		// again. An Err here would stop refreshWallet before updateTransactions
-		// and subscribeToAddresses, and deposits would go unseen.
-		await this.saveUtxoState();
+		// again and which the next block now owes. An Err here would stop
+		// refreshWallet before updateTransactions and subscribeToAddresses, and
+		// deposits would go unseen.
+		if ((await this.saveUtxoState()).isErr()) this._refreshFailed = true;
 		return ok({ utxos, balance });
 	}
 
@@ -4052,6 +4092,15 @@ export class Wallet {
 		});
 		if (formatTransactionsResponse.isErr()) {
 			return err(formatTransactionsResponse.error.message);
+		}
+		// A transaction whose batch or entry failed, or whose inputs could not
+		// all be looked up, is left out of the answer rather than failing it,
+		// and only a full refresh asks for it again.
+		if (
+			Object.keys(formatTransactionsResponse.value).length <
+			filteredTxHashes.length
+		) {
+			this._refreshFailed = true;
 		}
 		// Nothing below awaits before the records are merged, so this is the
 		// last point a switch can have landed before the write.
