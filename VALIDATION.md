@@ -3,7 +3,7 @@
 The fork tracks Beignet **0.31.0** at `9288fa9a127e5d0433aa35ffb6a690d427b9257d`, upstream's version bump on `master`. 0.31.0 is not on npm yet, so this is the git commit, not a published tarball's `gitHead`. This addendum supersedes the prior baseline statements below. The portable patch reapplies to pristine upstream source with no fuzz except for three hunks that upstream added lines beside, merged by hand with their content unchanged. The recaptured patch has the same added and removed lines as the 0.30.2 patch (see `PATCHES.md`). The SQLite adapters gain `pluck()` and `inTransaction`, which 0.31.0 storage reads.
 
 All on Node 24.22.1:
-- `npm test`: all 221 unit tests pass, including the five new `portable-tests/sqlite-surface.test.cjs` tests. Without the adapter change all five fail.
+- `npm test`: all 224 unit tests pass, including the eight new `portable-tests/sqlite-surface.test.cjs` tests. Without the adapter change all fail but the control, an adapter whose `inTransaction` is always false, which loses the rolled-back snapshot either way.
 - `npm run check:types` passes. A full `tsc --noEmit -p .` reports the same 27 errors as the 0.30.2 tree, by file and message.
 - The built bundle reports `0.31.0-portable`. Its esbuild warnings are the same eight as the 0.30.2 tree's.
 - Upstream suites, bundled with this fork's `src/` and `better-sqlite3` aliased to `portable/sqlite.ts` over the SQL.js adapter:

@@ -26,6 +26,9 @@ const compiled = build({
 		export { createSqlJsDatabaseFactory } from './portable/sqljs';
 		export { SqliteStorage } from './src/lightning/storage/sqlite-storage';
 		export { PaymentStatus, PaymentDirection } from './src/lightning/node/types';
+		export { createOpenerState } from './src/lightning/channel/channel-state';
+		export { DEFAULT_CHANNEL_CONFIG, HtlcDirection } from './src/lightning/channel/types';
+		export { recordRevokedHtlcSnapshot } from './src/lightning/channel/htlc-snapshots';
 	` },
 	bundle: true, platform: 'browser', format: 'cjs', target: 'es2020', write: false,
 	alias: aliases, inject: [path.join(root, 'portable/globals.ts')],
@@ -87,6 +90,52 @@ function payment(api, byte, status, direction) {
 	};
 }
 
+// A channel state with what saveChannel and loadChannel round-trip.
+function channelState(api) {
+	const point = byte => api.Buffer.alloc(33, byte);
+	return api.createOpenerState({
+		temporaryChannelId: api.Buffer.alloc(32, 0xdd),
+		fundingSatoshis: 1_000_000n,
+		pushMsat: 0n,
+		localConfig: { ...api.DEFAULT_CHANNEL_CONFIG },
+		localBasepoints: {
+			fundingPubkey: point(2), revocationBasepoint: point(3), paymentBasepoint: point(4),
+			delayedPaymentBasepoint: point(5), htlcBasepoint: point(6), firstPerCommitmentPoint: point(7)
+		},
+		localPerCommitmentSeed: api.Buffer.alloc(32, 8)
+	});
+}
+
+function snapshot(api, byte) {
+	return [{ paymentHash: api.Buffer.alloc(32, byte), amountMsat: 10_000_000n, cltvExpiry: 500, direction: api.HtlcDirection.OFFERED }];
+}
+
+// What the flag protects: a channel loaded inside a transaction that rolls
+// back must write its revoked HTLC snapshots again on its next save. If they
+// were marked saved, that save leaves out the rolled-back one, and a penalty
+// for that commitment would miss its HTLC outputs. Answers the commitments
+// storage holds after that save.
+async function resaveAfterRollback(t, wrap) {
+	const { api, storage } = await fixture(t, wrap);
+	const id = 'aa'.repeat(32);
+	const peer = '02' + '11'.repeat(32);
+	const stored = () => [...(storage.loadChannel(id).state.revokedHtlcSnapshots?.keys() ?? [])];
+	const state = channelState(api);
+	api.recordRevokedHtlcSnapshot(state, '1', snapshot(api, 1));
+	storage.saveChannel(id, state, peer);
+	const loaded = storage.loadChannel(id).state;
+	let loadedInside;
+	assert.throws(() => storage.transaction(() => {
+		api.recordRevokedHtlcSnapshot(loaded, '2', snapshot(api, 2));
+		storage.saveChannel(id, loaded, peer);
+		loadedInside = storage.loadChannel(id).state;
+		throw new Error('rolled back');
+	}), /rolled back/);
+	assert.deepEqual(stored(), ['1']);
+	storage.saveChannel(id, loadedInside, peer);
+	return stored();
+}
+
 for (const [name, wrap] of [['the SQL.js adapter', undefined], ['an adapter without pluck or inTransaction', olderAdapter]]) {
 	test(`${name}: paid invoice lookup reads plaintext columns`, async t => {
 		const { api, storage } = await fixture(t, wrap);
@@ -108,7 +157,16 @@ for (const [name, wrap] of [['the SQL.js adapter', undefined], ['an adapter with
 		assert.throws(() => storage.transaction(() => { throw new Error('rolled back'); }), /rolled back/);
 		assert.equal(storage.inTransaction(), false);
 	});
+
+	test(`${name}: a channel loaded in a rolled-back transaction saves its snapshots again`, async t => {
+		assert.deepEqual(await resaveAfterRollback(t, wrap), ['1', '2']);
+	});
 }
+
+test('an adapter whose inTransaction is always false loses the snapshot, so the test above can tell', async t => {
+	const lying = db => ({ ...olderAdapter(db), inTransaction: false });
+	assert.deepEqual(await resaveAfterRollback(t, lying), ['1']);
+});
 
 test('the SQL.js adapter plucks the first column and can switch it off again', async t => {
 	const { sqljs } = await fixture(t);
