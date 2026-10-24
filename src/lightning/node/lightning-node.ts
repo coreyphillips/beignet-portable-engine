@@ -12,9 +12,9 @@ import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from '../transport/iroh';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
 	archiveFforVouchers,
-	IFforVoucherArchive,
 	fforVoucherArchiveId,
 	fforChainReceiptId,
 	fforVoucherReceiptIds,
@@ -42,84 +42,90 @@ export const SPLICE_CONFLICT_REQUEST_BACKOFF_MS = 10 * 60_000;
  * the peer's next session is a round trip away in any case.
  */
 export const SPLICE_CONFLICT_REFUTATION_TTL_MS = 30_000;
+import type {
+	ISpliceConflictAckMessage,
+	ISpliceConflictMessage
+} from '../message/splice-conflict';
 import {
 	decodeSpliceConflict,
 	decodeSpliceConflictAck,
 	encodeSpliceConflict,
-	encodeSpliceConflictAck,
-	ISpliceConflictAckMessage,
-	ISpliceConflictMessage
+	encodeSpliceConflictAck
 } from '../message/splice-conflict';
-import { EventEmitter } from 'events';
-import crypto from 'crypto';
-import { ILogger, noopLogger } from '../../logger';
+import { TypedEmitter } from '../../utils/typed-emitter';
+import type { TxidHex } from '../../utils/identifiers';
+import type { LightningNodeEvents, NodeErrorCode } from './events';
+import { randomBytes, sha256 } from '../crypto/provider';
+import type { ILogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
 	verifyMessageSignature
 } from '../crypto/message-signing';
-import {
-	constructBlindedPath,
-	processBlindedHop,
-	deriveBlindedPrivkey,
+import type {
 	IBlindedHopData,
 	IBlindedPath,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
 import {
-	ChannelManager,
-	IPerChannelKeys,
-	txInputOutpoints
-} from '../channel/channel-manager';
-import { ChannelResult } from '../channel/types';
-import { Channel, ISpliceWalletInput } from '../channel/channel';
+	constructBlindedPath,
+	processBlindedHop,
+	deriveBlindedPrivkey
+} from '../onion/blinded-path';
+import type { IPerChannelKeys } from '../channel/channel-manager';
+import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
+import type { ChannelResult } from '../channel/types';
+import type { ISpliceWalletInput } from '../channel/channel';
+import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
+import type { IHtlcEntry } from '../channel/types';
 import {
 	ChannelState,
 	ChannelRole,
 	HtlcState,
 	HtlcDirection,
-	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG,
 	BITCOIN_CHAIN_HASH,
 	TESTNET_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH
 } from '../channel/types';
-import {
-	PeerManager,
+import type {
 	IPeerDialOptions,
 	IPeerInfo,
-	PeerDialCancelledError,
 	Socks5ProxyScope
 } from '../transport/peer-manager';
-import { IPeerTransportOptions } from '../transport/duplex-transport';
+import { PeerManager, PeerDialCancelledError } from '../transport/peer-manager';
+import type { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
+import type {
+	ILocalChannelEdge,
+	TPolicyOverrides
+} from '../gossip/pathfinding';
 import {
 	findRoute,
 	findMultiPathRoute,
 	findRouteToBlindedPath,
 	calculateFee,
-	ILocalChannelEdge,
-	TPolicyOverrides,
 	policyOverrideKey
 } from '../gossip/pathfinding';
-import { findPayAllRoute, IPayAllRouteResult } from '../gossip/pay-all';
-import { IPayAllBudget, IPayAllQuote } from './types';
+import type { IPayAllRouteResult } from '../gossip/pay-all';
+import { findPayAllRoute } from '../gossip/pay-all';
+import type { IPayAllBudget, IPayAllQuote } from './types';
+import type { IRapidGossipResult } from '../gossip/rapid-sync';
 import {
 	applyRapidGossipSnapshot,
-	applyRapidGossipSnapshotAsync,
-	IRapidGossipResult
+	applyRapidGossipSnapshotAsync
 } from '../gossip/rapid-sync';
 import { MissionControl } from '../gossip/mission-control';
 import { GossipGraphRestore } from '../gossip/graph-restore';
-import {
+import type {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
@@ -128,7 +134,9 @@ import {
 	IQueryShortChannelIdsMessage,
 	IRoute,
 	IRouteHop,
-	TGossipVerified,
+	TGossipVerified
+} from '../gossip/types';
+import {
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
 	DEFAULT_PRUNE_MAX_AGE,
@@ -153,7 +161,8 @@ import {
 	decodeQueryShortChannelIdsMessage,
 	decodeGossipTimestampFilterMessage
 } from '../gossip/gossip-queries';
-import { GossipSyncManager, IGossipSyncMessage } from '../gossip/gossip-sync';
+import type { IGossipSyncMessage } from '../gossip/gossip-sync';
+import { GossipSyncManager } from '../gossip/gossip-sync';
 import {
 	verifyChannelAnnouncement,
 	verifyNodeAnnouncement,
@@ -179,8 +188,8 @@ import {
 	extractChannelUpdate,
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
+import type { IHopPayload, IProcessedOnion } from '../onion/types';
 import {
-	IHopPayload,
 	KEYSEND_TLV_TYPE,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 	FINAL_INCORRECT_CLTV_EXPIRY,
@@ -199,24 +208,23 @@ import {
 	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
-	IProcessedOnion,
 	EXPIRY_TOO_FAR
 } from '../onion/types';
 import { checkDelegatedAmounts } from '../ffor/amounts';
+import type { IFforEpochRecord } from '../ffor/types';
 import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
+import type { IRoutingHintHop } from '../invoice/types';
 import {
 	Network,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY,
-	DEFAULT_EXPIRY,
-	IRoutingHintHop
+	DEFAULT_EXPIRY
 } from '../invoice/types';
 import { MessageType } from '../message/types';
 import {
@@ -226,21 +234,23 @@ import {
 	encodePeerStorageRetrievalMessage,
 	decodePeerStorageRetrievalMessage
 } from '../message/peer-storage';
+import type { ICustomMessage } from '../message/custom';
 import {
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
 	BeignetCustomSubtype,
-	ICustomMessage,
 	encodeCustomMessage,
 	decodeCustomMessage
 } from '../message/custom';
-import { GuardianHost, IGuardianHostStatus } from '../recovery/guardian-host';
+import type { IGuardianHostStatus } from '../recovery/guardian-host';
+import { GuardianHost } from '../recovery/guardian-host';
 import { JOURNAL_META_KEYS } from '../recovery/journal';
-import {
+import type {
 	IHeldJitPart,
-	IJitReceiveConfig,
 	IJitReceiveQuote,
 	JitFeeMode,
-	IPersistedHeldPart,
+	IPersistedHeldPart
+} from '../liquidity/jit-receive';
+import {
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
@@ -250,18 +260,21 @@ import {
 	encodeJitAuthorization,
 	encodeJitQuote,
 	encodeJitQuoteRequest,
-	jitOpeningFeeMsat
+	jitOpeningFeeMsat,
+	JitReceiveError,
+	JitReceiveErrorCode
 } from '../liquidity/jit-receive';
-import {
-	DF_DEFAULT_REQUEST_TTL_MS,
-	DfTransportType,
-	DirectFundingReceiver,
-	DirectFundingRequestStore,
+import type {
 	DfRelayForwarder,
 	DfTransportRegistry,
 	IDfRequestRecord,
 	IDfOnionTransport,
-	DfTransportDescriptor,
+	DfTransportDescriptor
+} from '../direct-funding';
+import {
+	DfTransportType,
+	DirectFundingReceiver,
+	DirectFundingRequestStore,
 	chainHashForNetwork as dfChainHashForNetwork,
 	createDirectFundingTransports,
 	encodeRequestEnvelope,
@@ -269,27 +282,33 @@ import {
 	mintRequestEnvelope,
 	requestEncryptionPublicKey
 } from '../direct-funding';
+import type {
+	ISwapRecord,
+	ISwapChainSource,
+	SwapKeyRole,
+	ISubmarineSwapStatus,
+	IReverseSwapStatus
+} from '../swaps';
 import {
 	SwapLedger,
 	swapCodec,
 	SWAP_LEDGER_PREFIX,
-	ISwapRecord,
-	ISwapChainSource,
-	SwapKeyRole,
 	deriveSwapKey,
 	SwapChainResolver,
 	ReverseSwapProvider,
 	REVERSE_SWAP_EVENTS,
 	SubmarineSwapProvider,
-	SUBMARINE_SWAP_EVENTS,
-	ISubmarineSwapStatus,
-	REVERSE_SWAP_DEFAULTS,
-	REVERSE_SWAP_DEFAULT_EXPOSURE,
-	IReverseSwapStatus
+	SUBMARINE_SWAP_EVENTS
 } from '../swaps';
 import {
+	HELD_HTLC_EXPIRY_MARGIN,
+	INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+	resolveNodeConfig
+} from './config';
+import type { ResolvedNodeConfig } from './config';
+import type {
 	INodeConfig,
-	InvalidRequestError,
+	LightningNodeSeedOptions,
 	IResourceConfig,
 	IPaymentInfo,
 	ICreateInvoiceOptions,
@@ -304,8 +323,6 @@ import {
 	IFeeEstimator,
 	IPaymentRetryContext,
 	IOutboundMppState,
-	PaymentStatus,
-	PaymentDirection,
 	IPendingMppPayment,
 	IPaymentPart,
 	IInvoiceInfo,
@@ -316,24 +333,13 @@ import {
 	HoldCancelReason,
 	HoldInvoiceState,
 	ISendPaymentOptions,
-	ISwapNodeConfig,
 	IOutgoingPaymentResolution,
 	IOutgoingHtlcView,
 	OutgoingHtlcState,
 	IPaymentHtlcResolvedEvent,
 	IPaymentPreimageEvent,
-	LightningErrorCode,
-	LightningPaymentError,
-	PaymentWaitTimeoutError,
-	InvalidChannelOpenError,
-	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode,
-	InvalidSpliceError,
-	SpliceRefusalCode,
 	ISpliceRefusal,
 	ISpliceRequestResult,
-	InvalidPeerConnectError,
-	FundingWaitTimeoutError,
 	IChannelHealth,
 	IStructuredLog,
 	IGraphRestoreStats,
@@ -343,14 +349,26 @@ import {
 	IChannelPolicy,
 	IChannelPolicyUpdate,
 	ForwardPlacement,
-	clampFeeRateSatPerVbyte,
-	IAutoRebalanceConfig,
-	IAutoTuneFeesConfig,
 	IRebalanceResult,
 	IRebalanceAttempt,
 	IRebalanceExecutionSummary,
-	IDirectFundingNodeConfig,
 	IDirectFundingPolicy
+} from './types';
+import {
+	InvalidRequestError,
+	PaymentStatus,
+	PaymentDirection,
+	LightningErrorCode,
+	LightningPaymentError,
+	PaymentWaitTimeoutError,
+	InvalidChannelOpenError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode,
+	InvalidSpliceError,
+	SpliceRefusalCode,
+	InvalidPeerConnectError,
+	FundingWaitTimeoutError,
+	clampFeeRateSatPerVbyte
 } from './types';
 import {
 	canSelectDualFundingInputs,
@@ -373,7 +391,7 @@ import {
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import {
+import type {
 	IStorageBackend,
 	IPersistedChannelPolicy,
 	IForwardingEvent,
@@ -381,19 +399,22 @@ import {
 	IForwardingSummary
 } from '../storage/types';
 import { withStorageTransaction } from '../storage/transaction';
-import {
-	RecoveryManager,
-	RecoveryCriticality,
+import type {
 	RecoveryMutation,
 	IRecoveryCommitResult,
-	assertMutationEncodable,
 	GuardianStartupGate,
 	DurabilityBarrier,
 	IBarrierLatency,
+	RecoveryDurability,
+	GuardianDescriptor
+} from '../recovery';
+import {
+	RecoveryManager,
+	RecoveryCriticality,
+	assertMutationEncodable,
 	chainLostBackfill,
 	chainPromisedQuorum,
 	storedTipSequence,
-	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
@@ -402,13 +423,14 @@ import {
 	journalSupported,
 	loadWriterLease,
 	composeRecoveryCapsule,
-	assertEmptyTarget,
-	GuardianDescriptor
+	assertEmptyTarget
 } from '../recovery';
-import {
-	IChannelPersistEvent,
-	IChannelPersistRequest
+import type {
+	IChannelPersistOutbox,
+	IChannelPersistRequest,
+	IChannelPersistResult
 } from '../channel/channel-actions';
+import { ChannelErrorCode } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
 import {
 	ChainWatcher,
@@ -418,23 +440,19 @@ import {
 } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
 import { isDuplicateBroadcastRejection } from '../chain/broadcast-rejection';
+import type { ISweepUneconomicChainAction } from '../chain/types';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
 	CommitmentType,
 	MonitorState,
 	OutputStatus,
-	OutputType,
-	ISweepUneconomicChainAction
+	OutputType
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
-import { ElectrumBackend } from '../chain/electrum-backend';
-import {
-	WatchtowerClient,
-	IWatchtowerStore,
-	IJusticeContext,
-	chainHashForNetwork
-} from '../watchtower';
+import type { ElectrumBackend } from '../chain/electrum-backend';
+import type { IWatchtowerStore, IJusticeContext } from '../watchtower';
+import { WatchtowerClient, chainHashForNetwork } from '../watchtower';
 import {
 	bip32RootFromSeed,
 	deriveLightningKeys,
@@ -454,63 +472,69 @@ import {
 	hasScidAliasChannelType,
 	receivedAddIrrevocablyCommitted
 } from '../channel/types';
-import {
-	createOpenerState,
-	createAcceptorState,
+import type {
 	IAbandonedLocalAdd,
 	IChannelState,
 	ISpliceInFlight,
 	IV2InFlight,
-	mustNotBroadcastCommitment,
-	isRecencyUnproven,
-	recencyHoldOrigin,
 	ChannelCloseReason
 } from '../channel/channel-state';
 import {
-	IScbChannelEntry,
-	encodeScb,
-	parseScbAddress,
-	validateScbEntry
-} from '../backup/scb';
+	createOpenerState,
+	createAcceptorState,
+	mustNotBroadcastCommitment,
+	isRecencyUnproven,
+	recencyHoldOrigin
+} from '../channel/channel-state';
+import type { IScbChannelEntry } from '../backup/scb';
+import { encodeScb, parseScbAddress, validateScbEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
-import { ChannelSigner, SignerFactory } from '../keys/signer';
-import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
+import type { SignerFactory } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
+import type { IPeerAddress, IBootstrapConfig } from '../bootstrap';
+import { bootstrapPeers } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
-import {
-	AsyncPaymentManager,
+import type {
 	HoldAdmissionJudge,
 	IHeldForwardDriver
 } from '../async-payments/manager';
+import { AsyncPaymentManager } from '../async-payments/manager';
+import type { IHeldForwardRecord } from '../async-payments/held-forward-ledger';
 import {
 	HELD_FORWARD_LEDGER_PREFIX,
 	HeldForwardLedger,
-	IHeldForwardRecord,
 	heldForwardCodec
 } from '../async-payments/held-forward-ledger';
+import type {
+	IFforWitnessMailboxRecord,
+	IFforWitnessRecordRow
+} from '../ffor/witness-ledger';
 import {
 	FF_WITNESS_MAILBOX_LEDGER_PREFIX,
 	FF_WITNESS_RECORD_LEDGER_PREFIX,
 	FforWitnessLedger,
-	IFforWitnessMailboxRecord,
-	IFforWitnessRecordRow,
 	fforWitnessMailboxCodec,
 	fforWitnessRecordCodec
 } from '../ffor/witness-ledger';
+import type { FforWitnessEvents } from '../ffor/witness-service';
 import { FforWitnessService } from '../ffor/witness-service';
+import type { FforIssuerEvents } from '../ffor/issuer-service';
 import { FforIssuerService } from '../ffor/issuer-service';
 import { encodeOfferTlv } from '../offer/tlv';
+import type {
+	IFforIssuerManifestRecord,
+	IFforIssuerSlotRecord
+} from '../ffor/issuer-ledger';
 import {
 	FF_ISSUER_MANIFEST_LEDGER_PREFIX,
 	FF_ISSUER_SLOT_LEDGER_PREFIX,
 	FforIssuerLedger,
-	IFforIssuerManifestRecord,
-	IFforIssuerSlotRecord,
 	fforIssuerManifestCodec,
 	fforIssuerSlotCodec
 } from '../ffor/issuer-ledger';
+import type { IFforIssuerHop } from '../ffor/issuer-messages';
 import {
 	FF_ISSUER_MANIFEST_VERSION,
-	IFforIssuerHop,
 	decodeIssuerAck,
 	decodeIssuerStatusResp,
 	encodeIssuerManifest,
@@ -518,6 +542,7 @@ import {
 	encodeIssuerStatus,
 	signAttestation
 } from '../ffor/issuer-messages';
+import type { IFforWitnessProvision } from '../ffor/witness-types';
 import {
 	FF_ISSUER_PROVISION_TYPE,
 	FF_ISSUER_STATUS_RESP_TYPE,
@@ -528,7 +553,6 @@ import {
 	FF_WITNESS_PROVISION_TYPE,
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
-	IFforWitnessProvision,
 	isFforWitnessMessageType,
 	isFforWitnessResponseType
 } from '../ffor/witness-types';
@@ -545,20 +569,22 @@ import {
 } from '../ffor/witness-messages';
 import { buildVoucherBook } from '../ffor/transcript';
 import { deriveHoldRegistrationId } from '../async-payments/release-capability';
-import {
-	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
-	ASYNC_REGISTRATION_REQUEST_TLV_TYPE,
+import type {
 	IAsyncReceiveServiceMetrics,
 	IHeldForwardNotice
 } from '../async-payments/types';
 import {
+	ASYNC_REGISTRATION_REPLY_TLV_TYPE,
+	ASYNC_REGISTRATION_REQUEST_TLV_TYPE
+} from '../async-payments/types';
+import type { IAsyncRegistrationRecord } from '../async-payments/service';
+import {
 	ASYNC_REGISTRATION_LEDGER_PREFIX,
 	AsyncReceiveService,
-	IAsyncRegistrationRecord,
 	asyncRegistrationCodec
 } from '../async-payments/service';
+import type { IReceiverGrant } from '../async-payments/receiver-grant';
 import {
-	IReceiverGrant,
 	decodeReceiverGrant,
 	decodeRegistrationReply,
 	encodeReceiverGrant,
@@ -573,68 +599,32 @@ import {
 	MemoryLedgerStore,
 	MetadataLedgerStore
 } from '../storage/durable-ledger';
-import {
+import type {
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
 } from '../onion-message/types';
-import { OfferManager, ICreateOfferOptions } from '../offer/offer-manager';
-import { IOffer, IBolt12Invoice } from '../offer/types';
+import type { ICreateOfferOptions } from '../offer/offer-manager';
+import { OfferManager } from '../offer/offer-manager';
+import type { IOffer, IBolt12Invoice } from '../offer/types';
 import { PeerRateLimiter } from './rate-limiter';
-import {
-	LiquidityAdvisor,
+import type {
 	ILiquiditySnapshot,
 	IChannelSnapshot
 } from '../advisor/liquidity-advisor';
-import { FeeAdvisor, IFeeSnapshot } from '../advisor/fee-advisor';
-import {
-	ChannelSuggestions,
-	IChannelSuggestion
-} from '../advisor/channel-suggestions';
+import { LiquidityAdvisor } from '../advisor/liquidity-advisor';
+import type { IFeeSnapshot } from '../advisor/fee-advisor';
+import { FeeAdvisor } from '../advisor/fee-advisor';
+import type { IChannelSuggestion } from '../advisor/channel-suggestions';
+import { ChannelSuggestions } from '../advisor/channel-suggestions';
+import type { IRebalancePlan } from '../advisor/rebalance-planner';
 import {
 	planRebalances,
-	IRebalancePlan,
 	MIN_REBALANCE_SATS
 } from '../advisor/rebalance-planner';
-import {
-	computeFeeTuneAdjustments,
-	IFeeTuneInput,
-	IFeeTuneAdjustment,
-	DEFAULT_FEE_TUNE_FLOOR_PPM,
-	DEFAULT_FEE_TUNE_CEIL_PPM
-} from '../advisor/fee-tuner';
+import type { IFeeTuneInput, IFeeTuneAdjustment } from '../advisor/fee-tuner';
+import { computeFeeTuneAdjustments } from '../advisor/fee-tuner';
 
 bitcoin.initEccLib(ecc);
-
-/**
- * Top-level Lightning node orchestrator.
- *
- * Events:
- * - 'payment:received' (paymentInfo: IPaymentInfo)
- * - 'payment:sent' (paymentInfo: IPaymentInfo)
- * - 'payment:failed' (paymentInfo: IPaymentInfo)
- * - 'channel:ready' ({ channelId: Buffer })
- * - 'channel:closed' ({ channelId: Buffer })
- * - 'channel:resolved' ({ channelId: Buffer }) — close fully resolved on-chain
- * - 'channel:aborted' (temporaryChannelId: Buffer, reason: string) — a negotiated-but-unfunded open was torn down (funding failed after accept_channel)
- * - 'message:outbound' (peerPubkey: string, type: number, payload: Buffer)
- * - 'htlc:forward' (fromChannelId: Buffer, toChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)
- * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
- * - 'peer:connect' (pubkey: string)
- * - 'peer:disconnect' (pubkey: string)
- * - 'peer:disconnect-requested' (pubkey: string): external-transport (message:outbound) mode only; the host must sever its connection to this peer, the protocol side (channels marked for reestablish) is already applied
- * - 'peer:error' (pubkey: string, error: Error)
- * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
- * - 'recovery:reestablish-held' (peerPubkey: string, channelIdHex: string, expiresAt: number): a peer's channel_reestablish for a channel this node has no record of was parked instead of failed, because the node may still be an incomplete restore target (issue #462)
- * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
- * - 'htlc:held' ({ paymentHash: Buffer, amountMsat: bigint }): one part of a hold invoice was parked; read getHeldInvoiceSnapshot for the full committed set
- * - 'hold:accepted' (event: IHoldInvoiceStateEvent): a part joined a hold invoice's parked set, carrying the set's running total; a re-park on reestablish is not a transition and does not fire
- * - 'hold:settled' (event: IHoldInvoiceStateEvent): a hold invoice's preimage was revealed and every parked part fulfilled
- * - 'hold:cancelled' (event: IHoldCancelledEvent): a hold invoice was cancelled by the CLTV sweeper or by the API; every parked part was failed back
- * - 'payment:htlc-resolved' (event: IPaymentHtlcResolvedEvent): one offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain)
- * - 'payment:preimage' (event: IPaymentPreimageEvent): the preimage of an outgoing payment became known, from update_fulfill_htlc or from an on-chain claim, whatever the record's status was
- * - 'block:processed' (height: number): the per-block work for this height has run
- * - 'swap:*': the swap provider engines' progress (see REVERSE_SWAP_EVENTS and SUBMARINE_SWAP_EVENTS); payloads are JSON-safe
- */
 
 /**
  * How often to refresh + re-broadcast our own gossip (node_announcement) so the
@@ -643,12 +633,11 @@ bitcoin.initEccLib(ecc);
  */
 const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-/**
- * Blocks of headroom before a parked hold-invoice HTLC's CLTV expiry at which we
- * auto-fail it off-chain, rather than letting it force an on-chain timeout (which
- * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
- */
-export const HELD_HTLC_EXPIRY_MARGIN = 18;
+export {
+	HELD_HTLC_EXPIRY_MARGIN,
+	JIT_CLIENT_MAX_FLAT_FEE_SAT,
+	JIT_CLIENT_MAX_FEE_PPM
+} from './config';
 /**
  * Parts one hold invoice may park at once. Each parked part holds an inbound
  * HTLC slot until the hold resolves, and a swap hands out hold invoices to
@@ -875,15 +864,6 @@ const JIT_RECEIVE_HINT_CLTV_DELTA = 80;
 const JIT_RECEIVE_MIN_FINAL_CLTV_EXPIRY = 72;
 
 /**
- * Wallet-role refusal ceilings on an LSP's opening-fee quote. Blunt guards,
- * not a price: they exist so a peer cannot answer an intent with a quote the
- * operator never agreed to and have the wallet register an allowance for it.
- * Both are configurable through `jitReceiveClient`.
- */
-export const JIT_CLIENT_MAX_FLAT_FEE_SAT = 10_000n;
-export const JIT_CLIENT_MAX_FEE_PPM = 50_000;
-
-/**
  * Wallet-data key holding the direct-funding operator policy (issue #613). The
  * colon segments can never collide with on-chain wallet keys, which always end
  * in an IWalletData field name.
@@ -915,8 +895,8 @@ interface IForwardingPolicyTerms {
 	cltvExpiryDelta: number;
 }
 
-/** Ten minutes: the grace LND gives a superseded channel_update. */
-const DEFAULT_FORWARDING_POLICY_GRACE_MS = 10 * 60 * 1000;
+/** The channel rows startup reads once and shares across its passes. */
+type StoredChannelRows = ReturnType<IStorageBackend['loadAllChannels']>;
 
 interface IPendingFundingTx {
 	txHex: string;
@@ -966,6 +946,11 @@ type TGossipQuery =
 			msg: IQueryShortChannelIdsMessage;
 	  };
 
+/** A hold invoice transition waiting its turn in emitHoldInvoiceEvent. */
+type THoldInvoiceEvent =
+	| { name: 'hold:accepted' | 'hold:settled'; event: IHoldInvoiceStateEvent }
+	| { name: 'hold:cancelled'; event: IHoldCancelledEvent };
+
 /** A cooperative restore of the stored network map (beginGraphRestore). */
 interface IGraphRestoreRun {
 	restore: GossipGraphRestore;
@@ -976,7 +961,17 @@ interface IGraphRestoreRun {
 	resolve: (restored: boolean) => void;
 }
 
-export class LightningNode extends EventEmitter {
+/**
+ * Set while LightningNode.create constructs a node, so the constructor leaves
+ * restore() and start() to create.
+ */
+let constructingForCreate = false;
+
+/**
+ * Top-level Lightning node orchestrator. Its events and their listener
+ * signatures are LightningNodeEvents (./events.ts).
+ */
+export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private nodePrivkey: Buffer;
 	/**
 	 * Our node's public key, derived from nodePrivkey once. Deriving it is a
@@ -994,7 +989,17 @@ export class LightningNode extends EventEmitter {
 	private peerManager: PeerManager | null = null;
 	private payments: Map<string, IPaymentInfo> = new Map();
 	private prunedPayAllBudgets = new Map<string, IPayAllBudget>();
+	/**
+	 * Every archive row storage holds: loaded at startup, and only replaced by
+	 * rememberFforVoucher after the commit that wrote it. Custody preparation
+	 * reads previous rows from here, not from storage.
+	 */
 	private fforArchivedVouchers = new Map<string, IFforVoucherArchive>();
+	/** The same records by channel id, for preparation that runs on every save. */
+	private fforArchivedVouchersByChannel = new Map<
+		string,
+		Map<string, IFforVoucherArchive>
+	>();
 	private readonly fforVoucherIndex = new FforVoucherIndex();
 	private pendingFforVoucherCredits = new Map<string, IFforVoucherCredit>();
 	private preimages: Map<string, Buffer> = new Map();
@@ -1311,10 +1316,7 @@ export class LightningNode extends EventEmitter {
 			  }
 		) & { resolved: Array<{ amountMsat: bigint; cltvExpiry: number }> }
 	> = new Map();
-	private holdInvoiceEventQueue: Array<{
-		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled';
-		event: IHoldInvoiceStateEvent | IHoldCancelledEvent;
-	}> = [];
+	private holdInvoiceEventQueue: THoldInvoiceEvent[] = [];
 	private emittingHoldInvoiceEvent = false;
 	private mppTimeoutMs: number;
 	private alias?: string;
@@ -1370,7 +1372,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private reauthAttempts: Map<string, number> = new Map();
 	/**
-	 * Channels whose fully signed splice rebroadcast has already been
+	 * Splice transactions (raw hex) whose broadcast has already been
 	 * authorized IN THIS PROCESS.
 	 *
 	 * A splice has no equivalent of the funding map's 'authorized' phase, so
@@ -1379,6 +1381,10 @@ export class LightningNode extends EventEmitter {
 	 * Rebroadcasting is cheap and idempotent; re-authorizing is not. Process
 	 * local by the same rule as the funding phase: a restart must ask again,
 	 * because a local frame is not a quorum-durable one.
+	 *
+	 * Keyed by transaction rather than channel: a channel can owe a second
+	 * splice whose own persist failed or whose frame the barrier has not
+	 * released, and that one must not ride the first one's authorization.
 	 */
 	private authorizedSpliceBroadcasts: Set<string> = new Set();
 	/**
@@ -1597,8 +1603,8 @@ export class LightningNode extends EventEmitter {
 	private feeAdvisor = new FeeAdvisor();
 	private channelSuggestions = new ChannelSuggestions();
 	// Advisor execution (both OFF by default; see INodeConfig)
-	private autoRebalanceConfig: IAutoRebalanceConfig;
-	private autoTuneFeesConfig: IAutoTuneFeesConfig;
+	private autoRebalanceConfig: ResolvedNodeConfig['autoRebalance'];
+	private autoTuneFeesConfig: ResolvedNodeConfig['autoTuneFees'];
 	private autoRebalanceTimer: ReturnType<typeof setInterval> | null = null;
 	private autoTuneFeesTimer: ReturnType<typeof setInterval> | null = null;
 	/** Rebalance-fee spend for the current UTC day (mirrors persisted metadata). */
@@ -1681,14 +1687,22 @@ export class LightningNode extends EventEmitter {
 	/** A journaled commit landed after the last compose (see connect path). */
 	private capsuleDirty = false;
 
-	constructor(config: INodeConfig) {
+	/**
+	 * Builds the node, then restores it from storage and starts it. From the
+	 * next major release the constructor only builds: use
+	 * {@link LightningNode.create}, which runs all three steps either way.
+	 */
+	constructor(nodeConfig: INodeConfig) {
 		super();
 		this.setMaxListeners(50);
+		const leaveLifecycleToCreate = constructingForCreate;
+		constructingForCreate = false;
+		const config = resolveNodeConfig(nodeConfig);
 
 		this.nodePrivkey = config.nodePrivateKey;
 		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
 		this.nodeId = this.ownNodeIdBytes.toString('hex');
-		this.network = config.network || Network.REGTEST;
+		this.network = config.network;
 		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
 		if (this.storage) {
@@ -1728,18 +1742,14 @@ export class LightningNode extends EventEmitter {
 		// frame part of every safety transition's atomicity.
 		// Phase 6 (5.8): the durability mode every frame declares, and the
 		// barrier that holds wire messages until their frame is replicated.
-		// async-remote is the default because it is exactly the node's
-		// pre-Phase-6 conduct.
-		const barrier = config.recovery?.barrier;
+		const barrier = config.recovery.barrier;
 		// The journal is built before the logger field is assigned, and its
 		// sticky-durability check reports through onDurabilityRefused during
 		// construction, so the message is captured and logged below rather
 		// than reaching for a logger that does not exist yet.
 		let durabilityRefusal: string | null = null;
 		const journal =
-			this.storage &&
-			config.recovery?.enabled === true &&
-			journalSupported(this.storage)
+			this.storage && config.recovery.enabled && journalSupported(this.storage)
 				? new RecoveryJournal(
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
@@ -1748,7 +1758,7 @@ export class LightningNode extends EventEmitter {
 						// (wire spec 1.1, 3.2); never the public node id.
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
-							durability: config.recovery.durability ?? 'async-remote',
+							durability: config.recovery.durability,
 							// Binds every frame's epoch to the ACTIVE lease
 							// (import-cycle-free injection): a mismatched or
 							// vanished epoch record refuses the write instead
@@ -1846,7 +1856,7 @@ export class LightningNode extends EventEmitter {
 		// the peer_storage Recovery Capsule.
 		this.recoveryCapsuleActive = journal !== undefined;
 		this.recoveryJournal = journal;
-		this.recoveryGuardians = config.recovery?.guardians ?? [];
+		this.recoveryGuardians = config.recovery.guardians;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
@@ -1870,34 +1880,24 @@ export class LightningNode extends EventEmitter {
 							code: 'PERSISTENCE_ERROR',
 							message: `safety transition failed: ${err.message}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 			  })
 			: null;
 
-		this.resourceConfig = {
-			maxCompletedPayments:
-				config.resourceConfig?.maxCompletedPayments ?? 10_000,
-			completedPaymentTtlMs:
-				config.resourceConfig?.completedPaymentTtlMs ?? 86_400_000,
-			cleanupIntervalMs: config.resourceConfig?.cleanupIntervalMs ?? 60_000
-		};
+		this.resourceConfig = { ...config.resourceConfig };
 
-		this.htlcSafetyMargin = config.htlcSafetyMargin ?? 6;
-		this.forwardingEnabled = config.forwardingEnabled ?? true;
-		this.eagerGossipVerify = config.eagerGossipVerify ?? false;
-		this.cooperativeGraphRestore = config.cooperativeGraphRestore ?? false;
-		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
-		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
-		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
-		this.forwardingPolicyGraceMs =
-			config.forwardingPolicyGraceMs ?? DEFAULT_FORWARDING_POLICY_GRACE_MS;
-		this.mppTimeoutMs = config.mppTimeoutMs ?? 60_000;
+		this.htlcSafetyMargin = config.htlcSafetyMargin;
+		this.forwardingEnabled = config.forwarding.enabled;
+		this.eagerGossipVerify = config.eagerGossipVerify;
+		this.cooperativeGraphRestore = config.cooperativeGraphRestore;
+		this.forwardingCltvDelta = config.forwarding.cltvDelta;
+		this.forwardingFeeBaseMsat = config.forwarding.feeBaseMsat;
+		this.forwardingFeePropMillionths = config.forwarding.feePropMillionths;
+		this.forwardingPolicyGraceMs = config.forwarding.policyGraceMs;
+		this.mppTimeoutMs = config.mppTimeoutMs;
 		this.alias = config.alias;
-		// BOLT 7 requires address descriptors in ascending order by type.
-		this.announcedAddresses = [...(config.announcedAddresses ?? [])].sort(
-			(a, b) => a.type - b.type
-		);
+		this.announcedAddresses = config.announcedAddresses;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
@@ -1909,26 +1909,24 @@ export class LightningNode extends EventEmitter {
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
-		this.socks5ProxyScope = config.socks5ProxyScope ?? 'all';
-		this.initWatchtowerClient(config.watchtowers ?? []);
-		this.logger = config.logger ?? noopLogger;
+		this.socks5ProxyScope = config.socks5ProxyScope;
+		this.initWatchtowerClient(config.watchtowers);
+		this.logger = config.logger;
 		if (durabilityRefusal) {
 			this.logger.warn(`recovery durability: ${durabilityRefusal}`);
 		}
 		this.missionControl = new MissionControl();
-		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
-		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
+		this.maxPaymentRetries = config.maxPaymentRetries;
+		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs;
 		this.rateLimiter = new PeerRateLimiter(config.rateLimitConfig);
-		this.reestablishTimeoutBlocks = config.reestablishTimeoutBlocks ?? 2016;
-		// Off by default: periodically bumping the commitment feerate via update_fee
-		// repeatedly desynced channels (the fee round must complete with the peer, and
-		// a stale/uncommitted bump breaks every subsequent HTLC). A payment-focused
+		this.reestablishTimeoutBlocks = config.reestablishTimeoutBlocks;
+		// Periodically bumping the commitment feerate via update_fee repeatedly
+		// desynced channels (the fee round must complete with the peer, and a
+		// stale/uncommitted bump breaks every subsequent HTLC). A payment-focused
 		// node rarely needs it; opt in explicitly if you route and must track fees.
-		this.autoUpdateChannelFees = config.autoUpdateChannelFees ?? false;
-		// Anchors are the default channel type now that wallet-funded fee bumping
-		// (zero-fee HTLC fee-attach + commitment CPFP) makes their force-close safe.
-		// Escape hatch: pass preferAnchors: false to negotiate legacy static_remotekey.
-		const preferAnchors = config.preferAnchors ?? true;
+		this.autoUpdateChannelFees = config.autoUpdateChannelFees;
+		// Pass preferAnchors: false to negotiate legacy static_remotekey.
+		const preferAnchors = config.preferAnchors;
 
 		// Set default features if not provided (includes static_remotekey).
 		// Computed before the ChannelManager so per-peer feature-dependent
@@ -1942,12 +1940,11 @@ export class LightningNode extends EventEmitter {
 		) {
 			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 		}
-		// option_wumbo: advertise large_channels by default, matching LND, CLN and
-		// Eclair, which all default to wumbo. The bit only invites peers to propose
-		// > 2^24 sat fundings; the cap is lifted for a given peer only when wumbo is
-		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer still
-		// gets the 2^24 cap. Opt out with largeChannels: false.
-		this.largeChannels = config.largeChannels ?? true;
+		// option_wumbo: the bit only invites peers to propose > 2^24 sat
+		// fundings; the cap is lifted for a given peer only when wumbo is
+		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer
+		// still gets the 2^24 cap. Opt out with largeChannels: false.
+		this.largeChannels = config.largeChannels;
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
@@ -1961,10 +1958,10 @@ export class LightningNode extends EventEmitter {
 		if (config.leaseRates) {
 			localFeatures.setOptional(Feature.OPTION_WILL_FUND);
 		}
-		// Peer storage (option_provide_storage): on by default. When disabled,
-		// the bit must not be advertised: advertising it obliges us to store
-		// and return blobs (BOLT 1).
-		this.peerStorageEnabled = config.peerStorageEnabled ?? true;
+		// Peer storage (option_provide_storage). When disabled, the bit must
+		// not be advertised: advertising it obliges us to store and return
+		// blobs (BOLT 1).
+		this.peerStorageEnabled = config.peerStorageEnabled;
 		if (!this.peerStorageEnabled) {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
@@ -2000,29 +1997,18 @@ export class LightningNode extends EventEmitter {
 		const concurrentDependencies =
 			localFeatures.hasFeature(Feature.OPTION_FF_RECEIVE) &&
 			localFeatures.hasFeature(Feature.QUIESCE);
-		if (config.fforConcurrent?.enabled === true && !concurrentDependencies) {
+		if (config.ffor.concurrent?.enabled === true && !concurrentDependencies) {
 			throw new Error(
 				'fforConcurrent needs option_ff_receive and option_quiesce in the feature set'
 			);
 		}
-		if (config.fforConcurrent?.enabled !== false && concurrentDependencies) {
+		if (config.ffor.concurrent?.enabled !== false && concurrentDependencies) {
 			localFeatures.setOptional(Feature.OPTION_FF_CONCURRENT);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT);
 			localFeatures.clearBit(Feature.OPTION_FF_CONCURRENT + 1);
 		}
-		const zeroReserveRole =
-			config.zeroReserve?.role ??
-			(config.jitReceive?.enabled || config.zeroReserve?.waiveClientReserve
-				? 'primary'
-				: 'wallet');
-		// Qualified wallets accept waivers by default. Primaries still need
-		// the operator setting, and an explicit advertisement opt-out wins.
-		const advertiseZeroReserve =
-			config.zeroReserve?.advertise ??
-			(zeroReserveRole === 'wallet' ||
-				config.zeroReserve?.waiveClientReserve === true);
-		if (advertiseZeroReserve) {
+		if (config.zeroReserve.advertise) {
 			localFeatures.setOptional(Feature.OPTION_ZERO_RESERVE);
 		} else {
 			localFeatures.clearBit(Feature.OPTION_ZERO_RESERVE);
@@ -2031,15 +2017,16 @@ export class LightningNode extends EventEmitter {
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
+			persistence: {
+				persist: (request: IChannelPersistRequest): IChannelPersistResult =>
+					this.persistForChannelManager(request)
+			},
 			fforVoucherLookup:
 				this.storage && !this.storage.loadAllFforVouchers
 					? undefined
 					: (hash) => this.fforVoucherIndex.get(hash),
 			localFeatures,
-			zeroReserve: {
-				...config.zeroReserve,
-				role: zeroReserveRole
-			},
+			zeroReserve: { ...config.zeroReserve },
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
 			localPerCommitmentSeed: config.perCommitmentSeed,
@@ -2080,7 +2067,7 @@ export class LightningNode extends EventEmitter {
 			// for this long instead of failing it. Unset everywhere else, where
 			// the manager answers immediately exactly as before.
 			unknownChannelReestablishHoldMs:
-				config.recovery?.unknownChannelReestablishHoldMs,
+				config.recovery.unknownChannelReestablishHoldMs,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
@@ -2296,15 +2283,15 @@ export class LightningNode extends EventEmitter {
 			);
 			this.swapLedger.rehydrate();
 		}
-		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards ?? true;
+		this.autoReleaseHeldForwards = config.autoReleaseHeldForwards;
 		// FFOR settlement peer (issue #729): whether ff_init is answered here.
-		if (config.fforSettle) {
-			this.channelManager.setFforSettlePolicy(config.fforSettle);
+		if (config.ffor.settle) {
+			this.channelManager.setFforSettlePolicy(config.ffor.settle);
 		}
 		// FFOR receipt witness (section 9.6, Appendix F.5): rehydrated here,
 		// before any transport exists, so a record is served from disk with
 		// R offline and nothing is ever judged against an empty ledger.
-		if (config.fforWitness?.enabled) {
+		if (config.ffor.witness?.enabled) {
 			const ledger = new FforWitnessLedger(
 				this.storage
 					? new MetadataLedgerStore<IFforWitnessMailboxRecord>(
@@ -2324,29 +2311,22 @@ export class LightningNode extends EventEmitter {
 					: new MemoryLedgerStore<IFforWitnessRecordRow>()
 			);
 			ledger.rehydrate();
-			// The barrier's CLTV arm must fire before scanExpiringHtlcs would
-			// force-close the inbound channel to claim the HTLC we now hold the
-			// preimage for: one block earlier than that buffer.
-			const witnessConfig = {
-				...config.fforWitness,
-				safetyDelta:
-					config.fforWitness.safetyDelta ??
-					Math.max(
-						LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
-						this.htlcSafetyMargin
-					) + 1
-			};
-			this.fforWitness = new FforWitnessService(witnessConfig, {
-				ledger,
-				nodePrivkey: this.nodePrivkey,
-				nodeId: this.ownNodeId(),
-				currentHeight: () => this.currentBlockHeight,
-				send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
-				log: (action, data) => this.emitStructuredLog('htlc', action, data),
-				emit: (event, data) => this.emit(event, data),
-				release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
-			});
-			if (config.fforIssuer?.enabled) {
+			this.fforWitness = new FforWitnessService(
+				{ ...config.ffor.witness },
+				{
+					ledger,
+					nodePrivkey: this.nodePrivkey,
+					nodeId: this.ownNodeId(),
+					currentHeight: () => this.currentBlockHeight,
+					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
+					log: (action, data) => this.emitStructuredLog('htlc', action, data),
+					emit: (event, ...args): void => {
+						this.emit<keyof FforWitnessEvents>(event, ...args);
+					},
+					release: (fulfil) => this.releaseWitnessHeldForward(fulfil)
+				}
+			);
+			if (config.ffor.issuer?.enabled) {
 				const issuerLedger = new FforIssuerLedger(
 					this.storage
 						? new MetadataLedgerStore<IFforIssuerManifestRecord>(
@@ -2366,7 +2346,7 @@ export class LightningNode extends EventEmitter {
 						: new MemoryLedgerStore<IFforIssuerSlotRecord>()
 				);
 				issuerLedger.rehydrate();
-				this.fforIssuer = new FforIssuerService(config.fforIssuer, {
+				this.fforIssuer = new FforIssuerService(config.ffor.issuer, {
 					ledger: issuerLedger,
 					witnessLedger: ledger,
 					nodePrivkey: this.nodePrivkey,
@@ -2374,12 +2354,14 @@ export class LightningNode extends EventEmitter {
 					currentHeight: () => this.currentBlockHeight,
 					send: (peer, type, payload) => this.emitOutbound(peer, type, payload),
 					log: (action, data) => this.emitStructuredLog('htlc', action, data),
-					emit: (event, data) => this.emit(event, data),
+					emit: (event, ...args): void => {
+						this.emit<keyof FforIssuerEvents>(event, ...args);
+					},
 					offers: this.offerManager
 				});
 				this.fforIssuer.rehydrate();
 			}
-		} else if (config.fforIssuer?.enabled) {
+		} else if (config.ffor.issuer?.enabled) {
 			this.emitStructuredLog('htlc', 'ffor_issuer_needs_witness', {});
 		}
 		// Async receive service (issue #709): registrations live in their own
@@ -2505,23 +2487,24 @@ export class LightningNode extends EventEmitter {
 		if (config.swaps?.enabled) {
 			this.wireSwapProvider(config.swaps);
 		}
-		this.jitClientMaxFlatFeeSat =
-			config.jitReceiveClient?.maxFlatFeeSat ?? JIT_CLIENT_MAX_FLAT_FEE_SAT;
-		this.jitClientMaxFeePpm =
-			config.jitReceiveClient?.maxFeePpm ?? JIT_CLIENT_MAX_FEE_PPM;
+		this.jitClientMaxFlatFeeSat = config.jitReceiveClient.maxFlatFeeSat;
+		this.jitClientMaxFeePpm = config.jitReceiveClient.maxFeePpm;
+		// Advisor execution: both features are opt-in (enabled: true), and
+		// start() arms their timers.
+		this.autoRebalanceConfig = config.autoRebalance;
+		this.autoTuneFeesConfig = config.autoTuneFees;
 
-		// Resolved once and held: the PeerManager's disconnect-time redials and
-		// the startup recovery below must answer to the same switch, or turning
+		// Held once: the PeerManager's disconnect-time redials and the startup
+		// recovery below must answer to the same switch, or turning
 		// auto-reconnect off silences one and not the other.
-		this.autoReconnect =
-			config.autoReconnect ?? config.enableNetworking ?? false;
+		this.autoReconnect = config.autoReconnect;
 
 		// Startup ownership quarantine (recovery 5.6) arrives at CONSTRUCTION,
 		// before any networking exists, so no dial, listener or inbound
 		// handshake can race the gate's installation. A gate attached after
 		// construction would lose that race: autoReconnectPeers() below
 		// schedules real dials on zero-delay timers.
-		this.recoveryGate = config.recovery?.startupGate;
+		this.recoveryGate = config.recovery.startupGate;
 		// The barrier is wired FIRST so its own gate hook is registered before
 		// the gate's peer bring-up runs: replication is then already in flight
 		// when the first batch arrives to be held.
@@ -2641,283 +2624,304 @@ export class LightningNode extends EventEmitter {
 
 		this.wireChannelManagerEvents();
 
-		// Restore from storage if available
-		if (this.storage) {
-			// The quorum eligibility preflight runs BEFORE restoration touches
-			// anything: restore deletes record-less DUAL_FUNDING_V2 rows
-			// durably (RBF residue) and can journal the first quorum frame
-			// while doing it, so a post-restore scan would both miss rows and
-			// leave a half-mutated database behind its own refusal, making
-			// the suggested async-remote retry impossible.
-			let carriedV2Rows: string[] = [];
-			if (barrier?.enforcing === true) {
-				carriedV2Rows = this.assertQuorumCanCarryStoredV2Opens(
-					chainPromisedQuorum(
-						this.storage,
-						deriveRecoveryMasterKey(config.nodePrivateKey),
-						this.ownNodeId()
-					)
-				);
-			}
-			// REPAIR INTENT FIRST: the schema migration consumes its marker
-			// and restore consumes the carried rows, so a crash after either
-			// but before the receipt target is stored would leave the next
-			// boot with no trigger at all while the guardians still owe the
-			// receipt. Persist the owed marker BEFORE any trigger is
-			// consumed; the concrete tail overwrites it below, and a boot
-			// that finds the bare marker gates on its own verified tip.
-			const REPAIR_TAIL_KEY = 'startup_repair_tail';
-			const priorTail = this.storage.getRecoveryMeta?.(REPAIR_TAIL_KEY);
-			const tailOwed = priorTail != null && priorTail !== '';
-			// The stored tail is either the bare intent sentinel or a decimal
-			// frame sequence, nothing else. An unrecognized value means the
-			// metadata is corrupt, and guessing between 'owed' and a sequence
-			// would rewrite a guardian obligation from garbage: refuse.
-			if (
-				barrier != null &&
-				tailOwed &&
-				priorTail !== 'owed' &&
-				!/^\d+$/.test(priorTail!)
-			) {
-				throw new Error(
-					`recovery: the stored startup repair marker '${priorTail}' ` +
-						`is not recognized; refusing to start`
-				);
-			}
-			const needsSchemaRepair =
-				this.recoveryJournal?.needsSnapshotSchemaRepair() ?? false;
-			const owesRepair =
-				barrier !== undefined &&
-				barrier !== null &&
-				(carriedV2Rows.length > 0 || needsSchemaRepair || tailOwed);
-			// Write the bare sentinel ONLY when no trigger is stored yet: an
-			// existing numeric tail is already durable AND may sit above the
-			// local tip, so replacing it with 'owed' would let a crash right
-			// here lower the next boot's receipt target to its own tip and
-			// lift quarantine before the original target was receipted.
-			if (owesRepair && !tailOwed) {
-				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
-			}
-			const restoreStarted = Date.now();
-			this.restoreFromStorage();
-			this.storageRestoreMs = Date.now() - restoreStarted;
-			// Inline, the network map is already back; in slices, it reports
-			// once it is.
-			if (this.graphRestoreStats) this.reportGraphRestore();
-			this.reconcileFforVoucherPayments();
-			// Channels and forward linkage are loaded: settle every held
-			// forward whose outcome those durable facts already decide.
-			this.asyncPaymentManager.reconcile();
-			// One-time snapshot-content repair: heads compacted by an older
-			// release omitted deleted channels' key-index rows, and a quiet
-			// upgraded node might never write a replacement frame. Forcing a
-			// fresh full snapshot here (once, versioned) restores the burned
-			// high-water marks to whatever the guardians hold next.
-			const schemaRepairSeq =
-				this.recoveryJournal?.snapshotSchemaRepair() ?? null;
-			if (schemaRepairSeq !== null) {
-				this.emitStructuredLog('channel', 'snapshot_schema_repaired', {
-					frameSequence: String(schemaRepairSeq)
-				});
-			}
-			// A carried row entered this database OUTSIDE the journal (it
-			// predates the record, or was written by a release without the
-			// preflight), so guardian reconstruction would omit a channel
-			// whose funding the peer may be able to broadcast. Repair that
-			// BEFORE any networking, fail-closed: one frame carries every
-			// still-tracked carried row, a carried row whose deletion
-			// disposition FAILED refuses startup outright, and the node stays
-			// quarantined behind its own traffic gates until the JOURNAL TIP
-			// (which covers the repair frame, every deletion frame written
-			// during restore, and the schema-repair snapshot) is
-			// quorum-RECEIPTED, so nothing this node ever says can outrun
-			// what the guardians can restore.
-			const failedCarried = carriedV2Rows.filter((idHex) =>
-				this.restoreDeletionFailures.includes(idHex)
+		if (leaveLifecycleToCreate) return;
+		this.restore();
+		this.start();
+	}
+
+	// ─────────────── Startup ───────────────
+
+	/**
+	 * Bring back what storage holds and repair what a crash left owed. Runs
+	 * before start(), so no timer, dial or chain event acts on a node that
+	 * is only partly restored.
+	 */
+	private restore(): void {
+		if (!this.storage) return;
+		const barrier = this.recoveryBarrier;
+		// Every startup pass over the channel rows shares this one read:
+		// each read decrypts and deserializes the whole table, revoked
+		// HTLC history included. Nothing writes a channel row before
+		// restore's main loop has walked them.
+		const storedChannels = this.storage.loadAllChannels();
+		// The quorum eligibility preflight runs BEFORE restoration touches
+		// anything: restore deletes record-less DUAL_FUNDING_V2 rows
+		// durably (RBF residue) and can journal the first quorum frame
+		// while doing it, so a post-restore scan would both miss rows and
+		// leave a half-mutated database behind its own refusal, making
+		// the suggested async-remote retry impossible.
+		let carriedV2Rows: string[] = [];
+		if (barrier?.enforcing === true) {
+			carriedV2Rows = this.assertQuorumCanCarryStoredV2Opens(
+				storedChannels,
+				chainPromisedQuorum(
+					this.storage,
+					deriveRecoveryMasterKey(this.nodePrivkey),
+					this.ownNodeId()
+				)
 			);
-			if (failedCarried.length > 0) {
+		}
+		// REPAIR INTENT FIRST: the schema migration consumes its marker
+		// and restore consumes the carried rows, so a crash after either
+		// but before the receipt target is stored would leave the next
+		// boot with no trigger at all while the guardians still owe the
+		// receipt. Persist the owed marker BEFORE any trigger is
+		// consumed; the concrete tail overwrites it below, and a boot
+		// that finds the bare marker gates on its own verified tip.
+		const REPAIR_TAIL_KEY = 'startup_repair_tail';
+		const priorTail = this.storage.getRecoveryMeta?.(REPAIR_TAIL_KEY);
+		const tailOwed = priorTail != null && priorTail !== '';
+		// The stored tail is either the bare intent sentinel or a decimal
+		// frame sequence, nothing else. An unrecognized value means the
+		// metadata is corrupt, and guessing between 'owed' and a sequence
+		// would rewrite a guardian obligation from garbage: refuse.
+		if (
+			barrier != null &&
+			tailOwed &&
+			priorTail !== 'owed' &&
+			!/^\d+$/.test(priorTail!)
+		) {
+			throw new Error(
+				`recovery: the stored startup repair marker '${priorTail}' ` +
+					`is not recognized; refusing to start`
+			);
+		}
+		const needsSchemaRepair =
+			this.recoveryJournal?.needsSnapshotSchemaRepair() ?? false;
+		const owesRepair =
+			barrier !== undefined &&
+			barrier !== null &&
+			(carriedV2Rows.length > 0 || needsSchemaRepair || tailOwed);
+		// Write the bare sentinel ONLY when no trigger is stored yet: an
+		// existing numeric tail is already durable AND may sit above the
+		// local tip, so replacing it with 'owed' would let a crash right
+		// here lower the next boot's receipt target to its own tip and
+		// lift quarantine before the original target was receipted.
+		if (owesRepair && !tailOwed) {
+			this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
+		}
+		const restoreStarted = Date.now();
+		this.restoreFromStorage(storedChannels);
+		this.storageRestoreMs = Date.now() - restoreStarted;
+		// Inline, the network map is already back; in slices, it reports
+		// once it is.
+		if (this.graphRestoreStats) this.reportGraphRestore();
+		this.reconcileFforVoucherPayments();
+		// Channels and forward linkage are loaded: settle every held
+		// forward whose outcome those durable facts already decide.
+		this.asyncPaymentManager.reconcile();
+		// One-time snapshot-content repair: heads compacted by an older
+		// release omitted deleted channels' key-index rows, and a quiet
+		// upgraded node might never write a replacement frame. Forcing a
+		// fresh full snapshot here (once, versioned) restores the burned
+		// high-water marks to whatever the guardians hold next.
+		const schemaRepairSeq =
+			this.recoveryJournal?.snapshotSchemaRepair() ?? null;
+		if (schemaRepairSeq !== null) {
+			this.emitStructuredLog('channel', 'snapshot_schema_repaired', {
+				frameSequence: String(schemaRepairSeq)
+			});
+		}
+		// A carried row entered this database OUTSIDE the journal (it
+		// predates the record, or was written by a release without the
+		// preflight), so guardian reconstruction would omit a channel
+		// whose funding the peer may be able to broadcast. Repair that
+		// BEFORE any networking, fail-closed: one frame carries every
+		// still-tracked carried row, a carried row whose deletion
+		// disposition FAILED refuses startup outright, and the node stays
+		// quarantined behind its own traffic gates until the JOURNAL TIP
+		// (which covers the repair frame, every deletion frame written
+		// during restore, and the schema-repair snapshot) is
+		// quorum-RECEIPTED, so nothing this node ever says can outrun
+		// what the guardians can restore.
+		const failedCarried = carriedV2Rows.filter((idHex) =>
+			this.restoreDeletionFailures.includes(idHex)
+		);
+		if (failedCarried.length > 0) {
+			throw new Error(
+				`recovery: the carried v2 open(s) ${failedCarried.join(', ')} ` +
+					`could not be dispositioned durably (deletion failed); ` +
+					`refusing to start over an unrepaired quorum database`
+			);
+		}
+		const repairMutations: RecoveryMutation[] = [];
+		for (const idHex of carriedV2Rows) {
+			const channel = this.channelManager.getChannel(Buffer.from(idHex, 'hex'));
+			if (!channel) continue; // took a (durable) deletion disposition
+			const peer = this.channelManager.getPeerForChannel(
+				Buffer.from(idHex, 'hex')
+			);
+			repairMutations.push({
+				type: 'channel_state',
+				channelId: idHex,
+				state: channel.getFullState(),
+				peerPubkey: peer ?? ''
+			});
+		}
+		if (repairMutations.length > 0 && this.recovery) {
+			const repair = this.recovery.commit({
+				criticality: RecoveryCriticality.Important,
+				mutations: repairMutations,
+				outboundMessages: [],
+				reportedByCaller: true
+			});
+			if (!repair.committed) {
 				throw new Error(
-					`recovery: the carried v2 open(s) ${failedCarried.join(', ')} ` +
-						`could not be dispositioned durably (deletion failed); ` +
-						`refusing to start over an unrepaired quorum database`
+					`recovery: could not journal the carried v2 open(s) ` +
+						`(${repair.error?.message ?? 'commit refused'}); refusing ` +
+						`to start over an unrepaired quorum database`
 				);
 			}
-			const repairMutations: RecoveryMutation[] = [];
-			for (const idHex of carriedV2Rows) {
-				const channel = this.channelManager.getChannel(
-					Buffer.from(idHex, 'hex')
+		}
+		// Receipt gating keys on the TIP, not one frame: deletion-only
+		// dispositions and the schema repair write frames this boot too,
+		// and receipts are cumulative, so the tip covers them all. The
+		// intent marker written above survives any crash between trigger
+		// consumption and here; the concrete tail replaces it now.
+		if (owesRepair) {
+			const tip = storedTipSequence(this.storage);
+			if (tip === null) {
+				// Fail closed: a repair is owed but the local tip cannot
+				// be verified, so there is nothing sound to wait on.
+				throw new Error(
+					`recovery: a startup repair is owed but the journal tip ` +
+						`cannot be verified; refusing to start`
 				);
-				if (!channel) continue; // took a (durable) deletion disposition
-				const peer = this.channelManager.getPeerForChannel(
-					Buffer.from(idHex, 'hex')
-				);
-				repairMutations.push({
-					type: 'channel_state',
-					channelId: idHex,
-					state: channel.getFullState(),
-					peerPubkey: peer ?? ''
-				});
 			}
-			if (repairMutations.length > 0 && this.recovery) {
-				const repair = this.recovery.commit({
-					criticality: RecoveryCriticality.Important,
-					mutations: repairMutations,
-					outboundMessages: [],
-					reportedByCaller: true
-				});
-				if (!repair.committed) {
-					throw new Error(
-						`recovery: could not journal the carried v2 open(s) ` +
-							`(${repair.error?.message ?? 'commit refused'}); refusing ` +
-							`to start over an unrepaired quorum database`
-					);
-				}
-			}
-			// Receipt gating keys on the TIP, not one frame: deletion-only
-			// dispositions and the schema repair write frames this boot too,
-			// and receipts are cumulative, so the tip covers them all. The
-			// intent marker written above survives any crash between trigger
-			// consumption and here; the concrete tail replaces it now.
-			if (owesRepair) {
-				const tip = storedTipSequence(this.storage);
-				if (tip === null) {
-					// Fail closed: a repair is owed but the local tip cannot
-					// be verified, so there is nothing sound to wait on.
-					throw new Error(
-						`recovery: a startup repair is owed but the journal tip ` +
-							`cannot be verified; refusing to start`
-					);
-				}
-				const numericPrior =
-					tailOwed && /^\d+$/.test(priorTail!) ? BigInt(priorTail!) : null;
-				const repairTail =
-					numericPrior !== null && numericPrior > tip ? numericPrior : tip;
-				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, repairTail.toString());
-				this.startupRepairPending = true;
-				this.emitStructuredLog('channel', 'startup_repair_pending', {
-					frameSequence: String(repairTail),
-					channels: carriedV2Rows
-				});
-				barrier!.kickReplication?.();
-				void barrier!
-					.whenReleased(repairTail)
-					.then((outcome) => {
-						if (this._destroyed) return;
-						if (!outcome.released) {
-							// Quarantine holds: the operator sees why, the
-							// stored tail survives the restart, and the gates
-							// keep refusing until a boot with a reachable
-							// quorum receipts it.
-							try {
-								this.emitStructuredLog(
-									'channel',
-									'startup_repair_unreceipted',
-									{ reason: outcome.reason }
-								);
-							} catch {
-								// Reporting is best effort; the state holds.
-							}
-							try {
-								this.emit('node:error', {
-									code: 'STARTUP_REPAIR_UNRECEIPTED',
-									message:
-										`the startup repair frames were not accepted ` +
-										`by a guardian quorum (${outcome.reason}); the ` +
-										`node stays quarantined`,
-									timestamp: Date.now()
-								} as ILightningError);
-							} catch {
-								// Observer threw; quarantine already holds.
-							}
-							return;
-						}
-						// Observers first, CONTAINED: reporting must never be
-						// able to corrupt the receipt transition itself.
+			const numericPrior =
+				tailOwed && /^\d+$/.test(priorTail!) ? BigInt(priorTail!) : null;
+			const repairTail =
+				numericPrior !== null && numericPrior > tip ? numericPrior : tip;
+			this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, repairTail.toString());
+			this.startupRepairPending = true;
+			this.emitStructuredLog('channel', 'startup_repair_pending', {
+				frameSequence: String(repairTail),
+				channels: carriedV2Rows
+			});
+			barrier!.kickReplication?.();
+			void barrier!
+				.whenReleased(repairTail)
+				.then((outcome) => {
+					if (this._destroyed) return;
+					if (!outcome.released) {
+						// Quarantine holds: the operator sees why, the
+						// stored tail survives the restart, and the gates
+						// keep refusing until a boot with a reachable
+						// quorum receipts it.
 						try {
-							this.emitStructuredLog('channel', 'startup_repair_receipted', {
-								frameSequence: String(repairTail)
+							this.emitStructuredLog('channel', 'startup_repair_unreceipted', {
+								reason: outcome.reason
 							});
 						} catch {
-							// Best effort.
+							// Reporting is best effort; the state holds.
 						}
-						// The transition proper: tail cleared and quarantine
-						// lifted TOGETHER, or neither (the stored tail is the
-						// retry marker, so it must never be lost while the
-						// node still reports pending).
-						try {
-							this.storage?.setRecoveryMeta?.(REPAIR_TAIL_KEY, '');
-							this.startupRepairPending = false;
-						} catch (err) {
-							this.startupRepairPending = true;
-							try {
-								this.emit('node:error', {
-									code: 'STARTUP_REPAIR_COMPLETION_FAILED',
-									message: `finishing the startup repair failed: ${
-										err instanceof Error ? err.message : String(err)
-									}; the node stays quarantined`,
-									timestamp: Date.now()
-								} as ILightningError);
-							} catch {
-								// Observer threw; quarantine already holds.
-							}
-							return;
-						}
-						try {
-							this.autoReconnectPeers();
-						} catch (err) {
-							// Readiness is guaranteed even when the reconnect
-							// pass or an error observer explodes: the repair
-							// IS receipted, and reporting must not undo that.
-							try {
-								this.emit('node:error', {
-									code: 'STARTUP_RECONNECT_FAILED',
-									message: `post-repair reconnect failed: ${
-										err instanceof Error ? err.message : String(err)
-									}`,
-									timestamp: Date.now()
-								} as ILightningError);
-							} catch {
-								// Observer threw; ready still fires below.
-							}
-							this.emitReady();
-						}
-					})
-					.catch((err) => {
-						// With the success path fully contained above, only a
-						// genuine whenReleased rejection can land here: REPORT
-						// it and keep the deterministic quarantined state (the
-						// stored tail retries next boot).
-						if (this._destroyed) return;
 						try {
 							this.emit('node:error', {
 								code: 'STARTUP_REPAIR_UNRECEIPTED',
-								message: `the startup repair wait failed: ${
-									err instanceof Error ? err.message : String(err)
-								}; the node stays quarantined`,
+								message:
+									`the startup repair frames were not accepted ` +
+									`by a guardian quorum (${outcome.reason}); the ` +
+									`node stays quarantined`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Observer threw; quarantine already holds.
 						}
-					});
-			}
-			// Auto-reconnect peers after crash recovery (Fix 2.1); deferred
-			// to the receipt callback while the repair quarantine holds.
-			if (!this.startupRepairPending) {
-				this.autoReconnectPeers();
-			}
+						return;
+					}
+					// Observers first, CONTAINED: reporting must never be
+					// able to corrupt the receipt transition itself.
+					try {
+						this.emitStructuredLog('channel', 'startup_repair_receipted', {
+							frameSequence: String(repairTail)
+						});
+					} catch {
+						// Best effort.
+					}
+					// The transition proper: tail cleared and quarantine
+					// lifted TOGETHER, or neither (the stored tail is the
+					// retry marker, so it must never be lost while the
+					// node still reports pending).
+					try {
+						this.storage?.setRecoveryMeta?.(REPAIR_TAIL_KEY, '');
+						this.startupRepairPending = false;
+					} catch (err) {
+						this.startupRepairPending = true;
+						try {
+							this.emit('node:error', {
+								code: 'STARTUP_REPAIR_COMPLETION_FAILED',
+								message: `finishing the startup repair failed: ${
+									err instanceof Error ? err.message : String(err)
+								}; the node stays quarantined`,
+								timestamp: Date.now()
+							});
+						} catch {
+							// Observer threw; quarantine already holds.
+						}
+						return;
+					}
+					try {
+						this.autoReconnectPeers();
+					} catch (err) {
+						// Readiness is guaranteed even when the reconnect
+						// pass or an error observer explodes: the repair
+						// IS receipted, and reporting must not undo that.
+						try {
+							this.emit('node:error', {
+								code: 'STARTUP_RECONNECT_FAILED',
+								message: `post-repair reconnect failed: ${
+									err instanceof Error ? err.message : String(err)
+								}`,
+								timestamp: Date.now()
+							});
+						} catch {
+							// Observer threw; ready still fires below.
+						}
+						this.emitReady();
+					}
+				})
+				.catch((err) => {
+					// With the success path fully contained above, only a
+					// genuine whenReleased rejection can land here: REPORT
+					// it and keep the deterministic quarantined state (the
+					// stored tail retries next boot).
+					if (this._destroyed) return;
+					try {
+						this.emit('node:error', {
+							code: 'STARTUP_REPAIR_UNRECEIPTED',
+							message: `the startup repair wait failed: ${
+								err instanceof Error ? err.message : String(err)
+							}; the node stays quarantined`,
+							timestamp: Date.now()
+						});
+					} catch {
+						// Observer threw; quarantine already holds.
+					}
+				});
+		}
+	}
+
+	/**
+	 * Dial the channel peers restore() brought back, then arm the timers and
+	 * the chain watcher.
+	 */
+	private start(): void {
+		// Auto-reconnect peers after crash recovery (Fix 2.1); deferred
+		// to the receipt callback while the repair quarantine holds.
+		if (this.storage && !this.startupRepairPending) {
+			this.autoReconnectPeers();
 		}
 
 		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
 		// before the first journaled transition still receive a current blob
 		// via sendPeerStorageOnConnect. It runs in its own task, just after
-		// this constructor returns (scheduleInitialCapsule).
+		// start() returns (scheduleInitialCapsule).
 		this.scheduleInitialCapsule();
 
 		this.startCleanupTimer();
 
 		// Start MPP cleanup timer if BASIC_MPP feature is enabled
-		if (localFeatures.hasFeature(Feature.BASIC_MPP)) {
+		if (this.localFeatures.hasFeature(Feature.BASIC_MPP)) {
 			this.mppCleanupTimer = setInterval(() => {
 				this.failTimedOutMppPayments();
 			}, 30_000);
@@ -2954,7 +2958,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 				}
 			}, 300_000);
@@ -2964,21 +2968,19 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Advisor execution timers -- both features are opt-in (enabled: true).
-		this.autoRebalanceConfig = config.autoRebalance ?? {};
-		this.autoTuneFeesConfig = config.autoTuneFees ?? {};
-		if (this.autoRebalanceConfig.enabled === true) {
+		if (this.autoRebalanceConfig.enabled) {
 			this.autoRebalanceTimer = setInterval(() => {
 				this.executeRebalanceRecommendations().catch((err) => {
 					this.emitStructuredLog('payment', 'auto_rebalance_failed', {
 						error: err instanceof Error ? err.message : String(err)
 					});
 				});
-			}, this.autoRebalanceConfig.intervalMs ?? 3_600_000);
+			}, this.autoRebalanceConfig.intervalMs);
 			if (this.autoRebalanceTimer.unref) {
 				this.autoRebalanceTimer.unref?.();
 			}
 		}
-		if (this.autoTuneFeesConfig.enabled === true) {
+		if (this.autoTuneFeesConfig.enabled) {
 			this.autoTuneFeesTimer = setInterval(() => {
 				try {
 					this.runFeeTuneOnce();
@@ -2987,7 +2989,7 @@ export class LightningNode extends EventEmitter {
 						error: err instanceof Error ? err.message : String(err)
 					});
 				}
-			}, this.autoTuneFeesConfig.intervalMs ?? 21_600_000);
+			}, this.autoTuneFeesConfig.intervalMs);
 			if (this.autoTuneFeesTimer.unref) {
 				this.autoTuneFeesTimer.unref?.();
 			}
@@ -3011,7 +3013,7 @@ export class LightningNode extends EventEmitter {
 						code: 'WAL_CHECKPOINT_FAILED',
 						message: `WAL checkpoint failed: ${(err as Error).message}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}, 1_800_000); // 30 minutes
 			if (this.walCheckpointTimer.unref) {
@@ -3026,7 +3028,7 @@ export class LightningNode extends EventEmitter {
 					code: 'CHAIN_WATCHER_START_FAILED',
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 		}
 	}
@@ -3063,9 +3065,12 @@ export class LightningNode extends EventEmitter {
 	 * the resumability this preflight polices, and none of which is
 	 * broadcastable, so wire safety is untouched.
 	 */
-	private assertQuorumCanCarryStoredV2Opens(alreadyQuorum: boolean): string[] {
+	private assertQuorumCanCarryStoredV2Opens(
+		storedChannels: StoredChannelRows,
+		alreadyQuorum: boolean
+	): string[] {
 		const carried: string[] = [];
-		for (const row of this.storage!.loadAllChannels()) {
+		for (const row of storedChannels) {
 			const state = row.state;
 			if (state.v2InFlight) continue;
 			// A row persisted mid-reestablish carries the state it will
@@ -3106,9 +3111,9 @@ export class LightningNode extends EventEmitter {
 		return carried;
 	}
 
-	private restoreFromStorage(): void {
+	private restoreFromStorage(storedChannels: StoredChannelRows): void {
 		if (!this.storage) return;
-		this.restoreFforVoucherIdentities();
+		this.restoreFforVoucherIdentities(storedChannels);
 
 		// Seed the per-channel key index from storage FIRST: restoreChannel
 		// advances it from each restored row, but a row removed below never
@@ -3182,11 +3187,8 @@ export class LightningNode extends EventEmitter {
 			!floorPersisted && (keyIndexTableEmpty || persistedFloor === 0);
 
 		// Restore channels — look up per-channel key index for each
-		for (const {
-			channelId,
-			state,
-			peerPubkey
-		} of this.storage.loadAllChannels()) {
+		const removedRows = new Set<string>();
+		for (const { channelId, state, peerPubkey } of storedChannels) {
 			// A CONDEMNED row's removal was already decided; the intent rides
 			// the row itself, so there is no separate store whose read can
 			// fail and silently resurrect it. Retry the deletion now; a row
@@ -3195,6 +3197,7 @@ export class LightningNode extends EventEmitter {
 			// exactly once, when the deletion lands.
 			if (state.condemned) {
 				if (this.deleteChannelDurably(channelId)) {
+					removedRows.add(channelId);
 					this.emitStructuredLog('channel', 'condemned_row_removed', {
 						channelId
 					});
@@ -3245,6 +3248,7 @@ export class LightningNode extends EventEmitter {
 			// the attempt up.
 			if (state.state === ChannelState.DUAL_FUNDING_V2) {
 				if (this.deleteChannelDurably(channelId)) {
+					removedRows.add(channelId);
 					this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
 						channelId
 					});
@@ -3314,7 +3318,10 @@ export class LightningNode extends EventEmitter {
 		// learned to register them. Without this, an existing announced channel stays
 		// unforwardable until it is reopened. registerChannelScid persists the mapping,
 		// so this is a one-time repair rather than work repeated every boot.
-		for (const { state } of this.storage.loadAllChannels()) {
+		// A row the loop above deleted is no channel at all. The others may
+		// have had their state rewritten there, but not the fields read here.
+		for (const { channelId, state } of storedChannels) {
+			if (removedRows.has(channelId)) continue;
 			const scid = state.shortChannelId;
 			if (!scid || !state.channelId) continue;
 			if (!this.shouldAcceptRealScid(state)) continue;
@@ -3550,7 +3557,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 
@@ -3619,7 +3626,7 @@ export class LightningNode extends EventEmitter {
 					restoredCommitment?.commitmentType ===
 						CommitmentType.THEIR_REVOKED_COMMITMENT
 				) {
-					channelState.state = ChannelState.FORCE_CLOSED;
+					channel.reopenForceCloseResolution();
 					this.dirtyMonitors.add(channelId);
 					this.persistChannel(Buffer.from(channelId, 'hex'));
 					this.emitStructuredLog('channel', 'resolution_reopened', {
@@ -3985,7 +3992,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `Failed to persist recovered channel: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 		return result.committed;
 	}
@@ -4006,15 +4013,9 @@ export class LightningNode extends EventEmitter {
 	 */
 	private persistChannelCommitted(channelId: Buffer): boolean {
 		if (!this.storage || !this.recovery) return true;
-		const request: IChannelPersistRequest = {
-			outbound: [],
-			// Answered by the commit itself. Anything that returns before it
-			// leaves this false, which is the fail-closed direction.
-			committed: false,
-			outboxIds: []
-		};
-		this.persistChannel(channelId, request);
-		return request.committed;
+		// An unresolvable channel never reaches the commit, and answers false,
+		// which is the fail-closed direction.
+		return this.persistChannel(channelId)?.committed === true;
 	}
 
 	/**
@@ -4025,33 +4026,73 @@ export class LightningNode extends EventEmitter {
 	 * it already resolved, because during a v2 open the id a channel answers
 	 * to and the id it will be keyed by are briefly different things.
 	 */
-	private persistChannel(
-		channelId: Buffer,
-		request?: IChannelPersistRequest
-	): void {
-		if (!this.storage || !this.recovery) return;
+	private persistChannel(channelId: Buffer): IChannelPersistResult | null {
+		if (!this.storage || !this.recovery) return null;
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return;
+		if (!channel) return null;
 		const peer = this.channelManager.getPeerForChannel(channelId);
-		if (!peer) return;
-		this.persistChannelState(channel, peer, channelId, request);
+		if (!peer) return null;
+		return this.persistChannelState(channel, peer, channelId);
 	}
 
+	/**
+	 * The ChannelManager's persistence: channel state, its key index, any
+	 * monitor delta this same action produced, and the wire bytes it
+	 * authorizes all commit in one transaction, and the manager releases the
+	 * sends only on the `committed` this returns.
+	 */
+	private persistForChannelManager(
+		request: IChannelPersistRequest
+	): IChannelPersistResult {
+		// The synchronous dispatch nests: an action earlier in this batch can
+		// have triggered a whole cascade that REMOVED this channel and deleted
+		// its row (a terminal abort handshake completing inside a send).
+		// Persisting now would resurrect a row nobody tracks. Report success
+		// so the batch finishes; any remaining sends address a negotiation the
+		// peer has already left, and its manager drops them against the
+		// missing channel.
+		if (
+			!this.channelManager.getChannel(request.channelId) &&
+			!(
+				this.channelManager as unknown as {
+					findChannelByChannelIdInTemp(id: Buffer): unknown;
+				}
+			).findChannelByChannelIdInTemp(request.channelId)
+		) {
+			return { committed: true, outboxIds: [] };
+		}
+		return this.persistChannelState(
+			request.channel,
+			request.peerPubkey,
+			request.channelId,
+			request.outbox
+		);
+	}
+
+	/**
+	 * Commit one channel's state. Only reaching recovery.commit answers
+	 * committed on a node with persistence; one with no storage at all
+	 * answers committed, having nothing to keep.
+	 */
 	private persistChannelState(
 		channel: Channel,
 		peer: string,
 		channelId: Buffer,
-		request?: IChannelPersistRequest
-	): void {
+		outbox?: IChannelPersistOutbox
+	): IChannelPersistResult {
+		const notCommitted: IChannelPersistResult = {
+			committed: false,
+			outboxIds: []
+		};
 		if (!this.storage) {
 			try {
 				this.captureInMemoryFforCustody(channelId.toString('hex'));
 			} catch {
-				if (request) request.committed = false;
+				return notCommitted;
 			}
-			return;
+			return { committed: true, outboxIds: [] };
 		}
-		if (!this.recovery) return;
+		if (!this.recovery) return { committed: true, outboxIds: [] };
 		const channelIdHex = channelId.toString('hex');
 		const keyIndex = channel.channelKeyIndex;
 		// Channel state persisted without its key index restores a channel that
@@ -4078,28 +4119,26 @@ export class LightningNode extends EventEmitter {
 					const records = archiveFforVouchers(channelIdHex, epoch);
 					this.fforVoucherIndex.assertAvailableAll(records);
 					for (const record of records) {
-						const previous = this.storage!.loadFforVoucher!(
-							fforVoucherArchiveId(record)
-						);
+						const previous =
+							this.fforArchivedVouchers.get(fforVoucherArchiveId(record)) ??
+							null;
 						const merged = mergeFforVoucherArchive(previous, record);
-						if (JSON.stringify(previous) !== JSON.stringify(merged)) {
+						if (merged !== previous) {
 							mutations.push({ type: 'ffor_voucher', record: merged });
 						}
 					}
 				}, 'prepare voucher custody')
 			) {
-				if (request) request.committed = false;
-				return;
+				return notCommitted;
 			}
 		} else if (isFforConcurrentVersion(epoch?.concurrentVersion)) {
-			if (request) request.committed = false;
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
 				message: 'Storage cannot preserve concurrent voucher custody',
 				timestamp: Date.now()
-			} as ILightningError);
-			return;
+			});
+			return notCommitted;
 		}
 		let settledSlots: { record: IFforEpochRecord; k: number }[] = [];
 		if (
@@ -4107,8 +4146,7 @@ export class LightningNode extends EventEmitter {
 				settledSlots = this.prepareFforSettlementMutations(channel, mutations);
 			}, 'prepare delegated settlement receipt')
 		) {
-			if (request) request.committed = false;
-			return;
+			return notCommitted;
 		}
 		if (keyIndex != null) {
 			mutations.push({
@@ -4124,17 +4162,16 @@ export class LightningNode extends EventEmitter {
 				this.dirtyMonitors.add(channelIdHex);
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
-			if (request) request.committed = false;
-			return;
+			return notCommitted;
 		}
 		// A peer-proven outbox supersede (its revoke_and_ack acknowledged the
 		// rows) deletes IN this same transaction: on rollback the rows survive
 		// alongside the pre-revoke state that still needs them.
-		if (request?.supersede) {
+		if (outbox?.supersede) {
 			mutations.push({
 				type: 'outbox_supersede',
 				channelId: channelIdHex,
-				messageTypes: request.supersede.messageTypes
+				messageTypes: outbox.supersede.messageTypes
 			});
 		}
 		// Whatever the caller staged for this transition (preimage before a
@@ -4157,17 +4194,10 @@ export class LightningNode extends EventEmitter {
 				: this.recovery.commit({
 						criticality: RecoveryCriticality.SafetyCritical,
 						mutations,
-						outboundMessages: request?.outbound ?? [],
+						outboundMessages: outbox?.outbound ?? [],
 						reportedByCaller: true
 				  });
 
-		if (request) {
-			request.committed = result.committed;
-			request.outboxIds = result.released.map((r) => r.id);
-			// The frame this transition landed in, which is what a Phase 6
-			// quorum barrier waits on before the batch's messages may go out.
-			request.frameSequence = result.frameSequence;
-		}
 		if (!result.committed) {
 			// Everything rolled back together: re-arm the monitor delta and put
 			// the staged mutations back rather than dropping writes the caller
@@ -4204,7 +4234,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `Failed to persist channel: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		} else {
 			for (const { record, k } of settledSlots)
 				record.slotStates[k - 1] = FforSlotState.SETTLED;
@@ -4215,6 +4245,13 @@ export class LightningNode extends EventEmitter {
 			}
 			this._failedTerminalPersists.delete(channelIdHex);
 		}
+		return {
+			committed: result.committed,
+			outboxIds: result.released.map((r) => r.id),
+			// The frame this transition landed in, which is what a Phase 6
+			// quorum barrier waits on before the batch's messages may go out.
+			frameSequence: result.frameSequence
+		};
 	}
 
 	/**
@@ -4327,10 +4364,10 @@ export class LightningNode extends EventEmitter {
 	 */
 	private dropUnencodable(mutations: RecoveryMutation[]): {
 		encodable: RecoveryMutation[];
-		dropped: ILightningError[];
+		dropped: ILightningError<NodeErrorCode>[];
 	} {
 		const encodable: RecoveryMutation[] = [];
-		const dropped: ILightningError[] = [];
+		const dropped: ILightningError<NodeErrorCode>[] = [];
 		for (const mutation of mutations) {
 			try {
 				assertMutationEncodable(mutation);
@@ -4341,7 +4378,7 @@ export class LightningNode extends EventEmitter {
 					code: 'PERSISTENCE_ERROR',
 					message: `Dropped a staged ${mutation.type} mutation that cannot be encoded: ${reason}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 		return { encodable, dropped };
@@ -4462,18 +4499,27 @@ export class LightningNode extends EventEmitter {
 			return true;
 		return this.safeStorage(() => {
 			const records = new Map(
-				[...this.fforArchivedVouchers].filter(
-					([, r]) => r.channelId === channelId
-				)
+				this.fforArchivedVouchersByChannel.get(channelId)
 			);
-			for (const mutation of mutations) {
-				if (mutation.type === 'ffor_voucher')
-					records.set(fforVoucherArchiveId(mutation.record), mutation.record);
-			}
-			for (const record of records.values()) {
+			const queued = new Map<string, number>();
+			mutations.forEach((mutation, i) => {
+				if (mutation.type !== 'ffor_voucher') return;
+				const id = fforVoucherArchiveId(mutation.record);
+				records.set(id, mutation.record);
+				queued.set(id, i);
+			});
+			for (const [id, record] of records) {
 				const next = archiveFforChainEvidence(record, monitor.state);
-				if (JSON.stringify(next) !== JSON.stringify(record))
-					mutations.push({ type: 'ffor_voucher', record: next });
+				if (next === record) continue;
+				// A slot this transaction already writes takes the extended
+				// record in place, so it is written once.
+				const i = queued.get(id);
+				const mutation: RecoveryMutation = {
+					type: 'ffor_voucher',
+					record: next
+				};
+				if (i === undefined) mutations.push(mutation);
+				else mutations[i] = mutation;
 			}
 		}, 'prepare voucher chain custody');
 	}
@@ -4504,7 +4550,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${label}: ${result.error?.message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 		return result.committed;
 	}
@@ -4578,7 +4624,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `persistInvoiceRecords: payment record missing: ${hashHex}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return;
 		}
 		mutations.push(payment);
@@ -4609,7 +4655,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${(err as Error).message}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return false;
 		}
 	}
@@ -4922,7 +4968,7 @@ export class LightningNode extends EventEmitter {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${failed} of ${writes.length} writes failed (${lastError})`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		}
 	}
 
@@ -5342,45 +5388,6 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		// Persist-before-send: channel state, its key index, any monitor delta
-		// this same action produced, and the wire bytes it authorizes all commit
-		// in one transaction; the sends are released only if it commits.
-		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
-			// The synchronous dispatch nests: an action earlier in this batch
-			// can have triggered a whole cascade that REMOVED this channel
-			// and deleted its row (a terminal abort handshake completing
-			// inside a send). Persisting now would resurrect a row nobody
-			// tracks. Report success so the batch finishes; any remaining
-			// sends address a negotiation the peer has already left, and its
-			// manager drops them against the missing channel.
-			if (
-				event.channelId &&
-				!this.channelManager.getChannel(event.channelId) &&
-				!(
-					this.channelManager as unknown as {
-						findChannelByChannelIdInTemp(id: Buffer): unknown;
-					}
-				).findChannelByChannelIdInTemp(event.channelId)
-			) {
-				return;
-			}
-			// A node that HAS persistence answers for itself. The request
-			// arrives committed:true, which is the right default only for a
-			// node that persists nothing at all; leaving it true here would
-			// let a listener that returned early, or an id that resolved to
-			// nothing, read as a successful commit and release the batch's
-			// sends. Only reaching recovery.commit may say committed.
-			if (event.request && this.storage && this.recovery) {
-				event.request.committed = false;
-			}
-			this.persistChannelState(
-				event.channel,
-				event.peerPubkey,
-				event.channelId,
-				event.request
-			);
-		});
-
 		// The manager abandoned an unfunded open outright (a v2 RBF
 		// renegotiation dropped on disconnect): its row must go with it, or
 		// the next restart restores a channel the manager already removed.
@@ -5665,7 +5672,7 @@ export class LightningNode extends EventEmitter {
 						'publishes a commitment the peer may already hold a ' +
 						'revocation for',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 
@@ -5712,7 +5719,7 @@ export class LightningNode extends EventEmitter {
 						`held messages were refused by the durability barrier (${reason}); ` +
 						'the channel resumes through reestablish once the quorum is reachable',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				if (reason === 'fenced') return;
 				setImmediate(() => {
 					this.requestPeerDisconnect(peerPubkey);
@@ -5747,7 +5754,7 @@ export class LightningNode extends EventEmitter {
 						`a released batch failed partway through dispatch (${reason}); ` +
 						'the connection is dropped so reestablish can replay from durable state',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				setImmediate(() => {
 					this.requestPeerDisconnect(peerPubkey);
 				});
@@ -5861,7 +5868,7 @@ export class LightningNode extends EventEmitter {
 
 		this.channelManager.on(
 			'error',
-			(channelId: Buffer | null, message: string) => {
+			(channelId: Buffer | null, message: string, code?: ChannelErrorCode) => {
 				// An open that failed is never funded, so the rate it asked for has
 				// nothing left to apply to. Drop it, and the max-funding flag with it,
 				// rather than hold them for a channel that no longer exists.
@@ -5869,12 +5876,13 @@ export class LightningNode extends EventEmitter {
 					this.requestedFundingFeeRates.delete(channelId.toString('hex'));
 					this.fundingMaxRequests.delete(channelId.toString('hex'));
 				}
-				const err: ILightningError = {
+				const err: ILightningError<NodeErrorCode> = {
 					code: 'CHANNEL_ERROR',
 					channelId: channelId ?? undefined,
 					message,
 					timestamp: Date.now()
 				};
+				if (code !== undefined) err.channelErrorCode = code;
 				this.emit('node:error', err);
 			}
 		);
@@ -5922,14 +5930,9 @@ export class LightningNode extends EventEmitter {
 			this.broadcastPendingFundingTx(txidHex);
 		});
 
-		this.channelManager.on(
-			'funding:broadcast-authorized',
-			(channelId: Buffer | null) => {
-				if (channelId) {
-					this.authorizedSpliceBroadcasts.add(channelId.toString('hex'));
-				}
-			}
-		);
+		this.channelManager.on('funding:broadcast-authorized', (_channelId, tx) => {
+			this.authorizedSpliceBroadcasts.add(tx.toString('hex'));
+		});
 
 		// Arm spend detection on the outpoints a splice has superseded, without
 		// touching the channel's own funding watch (issue #479). Reading state
@@ -6316,8 +6319,8 @@ export class LightningNode extends EventEmitter {
 					displayTxid,
 					blockHeight
 				);
-				// txIndex 0 is also what a failed lookup yields (backend swallows
-				// errors) — only treat a CONFLICTING position as a mismatch.
+				// A backend that cannot place the transaction may still report
+				// index 0, so only a CONFLICTING position counts as a mismatch.
 				if (proof.txIndex !== 0 && proof.txIndex !== txIndex) {
 					this.emitStructuredLog('channel', 'announcement_scid_mismatch', {
 						channelId: channelId.toString('hex'),
@@ -6354,10 +6357,7 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer
 	): (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer } {
 		return (data: Buffer): { nodeSig: Buffer; bitcoinSig: Buffer } => {
-			const hash = crypto
-				.createHash('sha256')
-				.update(crypto.createHash('sha256').update(data).digest())
-				.digest();
+			const hash = sha256(sha256(data));
 			const nodeSig = Buffer.from(ecc.sign(hash, this.nodePrivkey));
 			const signer = this.channelManager.getChannel(channelId)?.getSigner();
 			const bitcoinSig = signer
@@ -7611,7 +7611,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					})
 					.finally(() => {
 						this._pendingReconnects--;
@@ -7661,7 +7661,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			);
 		}
@@ -7774,8 +7774,7 @@ export class LightningNode extends EventEmitter {
 				builtTxHex = txHex;
 				builtTxidHex = txid.toString('hex');
 				// Set funding outpoint on state before signing (required for commitment building)
-				state.fundingTxid = txid;
-				state.fundingOutputIndex = outputIndex;
+				channel.setFundingOutpoint(txid, outputIndex);
 
 				// Sign the remote's initial commitment (use channel signer for per-channel keys)
 				const signer =
@@ -7800,7 +7799,7 @@ export class LightningNode extends EventEmitter {
 				// funding_signed carries the bytes beside the obligation and a
 				// guardian restore can actually discharge what it restores. The
 				// node's own map stays as the runtime index.
-				state.pendingFundingTxHex = txHex;
+				channel.retainFundingPayload(txHex);
 				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
 				// Send funding_created. The broadcast now waits for the
@@ -7817,7 +7816,7 @@ export class LightningNode extends EventEmitter {
 					code: 'AUTO_FUNDING_FAILED',
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				// The build succeeded but the open died before funding_created
 				// went out (the same boundary abortPendingOpen no-ops past):
 				// the peer never had anything to sign and nothing was
@@ -8064,9 +8063,10 @@ export class LightningNode extends EventEmitter {
 		// obligation; losing it costs nothing, since by then the funding is
 		// confirmed or the channel is gone.
 		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
-			delete state.pendingFundingTxHex;
+			if (channel.getFullState().fundingTxid?.toString('hex') !== txidHex) {
+				continue;
+			}
+			channel.clearRetainedFundingPayload();
 			break;
 		}
 		if (this.pendingFundingTxs.delete(txidHex)) {
@@ -8174,7 +8174,12 @@ export class LightningNode extends EventEmitter {
 	 * a fresh frame per retry window, buys nothing.
 	 */
 	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
-		if (!this._chainBackend) return;
+		// Without a backend, the consumer's broadcast:tx listener is the only
+		// broadcaster this node has.
+		if (!this._chainBackend) {
+			this.emit('broadcast:tx', Buffer.from(txHex, 'hex'));
+			return;
+		}
 		this._chainBackend.broadcastTransaction(txHex).catch((err) => {
 			const reason = (err as Error)?.message ?? String(err);
 			// Already in mempool or confirmed, or a backend hiccup. The watch
@@ -8207,7 +8212,7 @@ export class LightningNode extends EventEmitter {
 				retained: true,
 				message: `splice ${txid} refused by the chain backend: ${reason}; the node still holds the transaction and rebroadcasts it on every block until it confirms`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 	}
 
@@ -8308,6 +8313,7 @@ export class LightningNode extends EventEmitter {
 	 * funding watch reporting the transaction confirmed, never by the peer.
 	 */
 	private retryPendingSpliceBroadcasts(): void {
+		const stillOwed = new Set<string>();
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			const inflight = state.spliceInFlight;
@@ -8318,6 +8324,7 @@ export class LightningNode extends EventEmitter {
 			for (const entry of state.unconfirmedSpliceTxs ?? []) {
 				if (entry.txHex && !owed.includes(entry.txHex)) owed.push(entry.txHex);
 			}
+			for (const hex of owed) stillOwed.add(hex);
 			if (owed.length === 0) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) continue;
@@ -8327,9 +8334,14 @@ export class LightningNode extends EventEmitter {
 			// the same renewal as a funding one.
 			for (const hex of owed) this.renewTransactionPledges(hex);
 			// Already authorized in this process: rebroadcast without minting
-			// another frame. The barrier has answered for this splice.
-			if (this.authorizedSpliceBroadcasts.has(idHex)) {
-				for (const hex of owed) this.rebroadcastAuthorizedSplice(idHex, hex);
+			// another frame. The barrier has answered for these bytes, so they
+			// do not wait behind a later splice that is still being asked about.
+			for (const hex of owed) {
+				if (this.authorizedSpliceBroadcasts.has(hex)) {
+					this.rebroadcastAuthorizedSplice(idHex, hex);
+				}
+			}
+			if (owed.every((hex) => this.authorizedSpliceBroadcasts.has(hex))) {
 				continue;
 			}
 			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
@@ -8337,6 +8349,11 @@ export class LightningNode extends EventEmitter {
 			if (!this.channelManager.reauthorizeSpliceBroadcast(id)) {
 				this.reauthAttempts.delete(idHex);
 			}
+		}
+		// A splice the chain confirmed is never owed again, and the v2 funding
+		// broadcasts that share the event were never owed here at all.
+		for (const hex of this.authorizedSpliceBroadcasts) {
+			if (!stillOwed.has(hex)) this.authorizedSpliceBroadcasts.delete(hex);
 		}
 	}
 
@@ -8398,7 +8415,7 @@ export class LightningNode extends EventEmitter {
 					code: 'FUNDING_BROADCAST_FAILED',
 					message: `${message} (funding tx ${displayTxid}${of} retained; will retry)`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 	}
 
@@ -8898,7 +8915,7 @@ export class LightningNode extends EventEmitter {
 						code: 'PERSISTENCE_ERROR',
 						message: `saveRecoveryPeerAddress: ${message}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					continue;
 				}
 			}
@@ -8966,7 +8983,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -9851,7 +9868,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		});
 		this.chainWatcher.on('error', (err: Error) => {
@@ -9859,7 +9876,7 @@ export class LightningNode extends EventEmitter {
 				code: 'CHAIN_WATCHER_ERROR',
 				message: err.message,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 		// A close tx we registered reached the network: record it so
 		// closeStatus.broadcast can answer honestly before the spend is
@@ -9881,7 +9898,7 @@ export class LightningNode extends EventEmitter {
 				...about,
 				message: this._broadcastErrorMessage(err.message, about.retained),
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 		// The watcher's own retries ran out and it drops the transaction from
 		// its list (issue #756). The block-driven obligations (pending fundings,
@@ -9905,7 +9922,7 @@ export class LightningNode extends EventEmitter {
 					...about,
 					message: this._broadcastErrorMessage(err.message, about.retained),
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 		// Wire watch:output:requested — handle sweep output watching after force-close
@@ -9934,7 +9951,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				});
 			}
 		);
@@ -9976,7 +9993,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				this.disposeMissingFunding(channelId, txid);
 			}
 		);
@@ -10572,7 +10589,7 @@ export class LightningNode extends EventEmitter {
 					code: 'CHAIN_RESTORE_WATCH_FAILED',
 					message: `Failed to restore chain watches: ${(err as Error).message}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 			// destroy() during the restore must not let the rest of startup run:
 			// it would retry funding broadcasts and restart the reconnect monitor
@@ -10746,7 +10763,7 @@ export class LightningNode extends EventEmitter {
 								(err as Error).message
 							}`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 					}
 				}
 				continue;
@@ -10792,7 +10809,7 @@ export class LightningNode extends EventEmitter {
 							(err as Error).message
 						}`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -10979,15 +10996,7 @@ export class LightningNode extends EventEmitter {
 		outputIndex: number
 	): void {
 		const channel = this.channelManager.getChannel(channelId);
-		if (!channel) return;
-		const state = channel.getFullState();
-		const remaining = (state.preSpliceSpendWatches ?? []).filter(
-			(w) => !(w.txid === txid && w.outputIndex === outputIndex)
-		);
-		if (remaining.length === (state.preSpliceSpendWatches ?? []).length) {
-			return;
-		}
-		state.preSpliceSpendWatches = remaining.length ? remaining : undefined;
+		if (!channel?.retirePreSpliceSpendWatch(txid, outputIndex)) return;
 		this.persistChannel(channelId);
 	}
 
@@ -11042,7 +11051,7 @@ export class LightningNode extends EventEmitter {
 						leg.outputIndex
 					}: ${(err as Error).message}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 	}
@@ -11406,13 +11415,13 @@ export class LightningNode extends EventEmitter {
 				) {
 					return;
 				}
-				// Scoped to this open: the v2 funding failure by message, or
-				// any error that left the channel terminally ERRORED (a
-				// peer's synchronous rejection, a failed negotiation). A
-				// scoped diagnostic on a still-live channel (dispatch
-				// failures deliberately do not abort) keeps waiting.
+				// Scoped to this open: the v2 funding failure, or any error
+				// that left the channel terminally ERRORED (a peer's
+				// synchronous rejection, a failed negotiation). A scoped
+				// diagnostic on a still-live channel (dispatch failures
+				// deliberately do not abort) keeps waiting.
 				if (
-					/^v2 open not funded/.test(err.message) ||
+					err.channelErrorCode === ChannelErrorCode.OPEN_NOT_FUNDED ||
 					channel.getState() === ChannelState.ERRORED
 				) {
 					cleanup();
@@ -11538,7 +11547,7 @@ export class LightningNode extends EventEmitter {
 						(err as Error).message
 					}`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 		// Close storage to release WAL file handles
@@ -12332,7 +12341,7 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
 		this.channelManager.handleFundingConfirmed(channelId, confirmedTxidHex);
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
@@ -12463,7 +12472,7 @@ export class LightningNode extends EventEmitter {
 		acceptStaleStateRisk = false,
 		/** Record a payment to this destination instead of a wallet payout. */
 		externalDestination = false
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; code?: ChannelErrorCode } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const scriptErr = validateBufferMinMax(
@@ -12497,9 +12506,14 @@ export class LightningNode extends EventEmitter {
 				code: 'CLOSE_CHANNEL_FAILED',
 				channelId,
 				message: result.error!,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, error: result.error };
+				timestamp: Date.now(),
+				...(result.code ? { channelErrorCode: result.code } : {})
+			});
+			return {
+				ok: false,
+				error: result.error,
+				...(result.code ? { code: result.code } : {})
+			};
 		}
 		// initiateShutdown's own action batch carries no persist of the stamp,
 		// so commit it here.
@@ -12553,7 +12567,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true };
@@ -12610,7 +12624,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true, sendsWithheld: result.sendsWithheld === true };
@@ -12663,7 +12677,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		return { ok: true, sendsWithheld: result.sendsWithheld === true };
@@ -12770,7 +12784,7 @@ export class LightningNode extends EventEmitter {
 	updateChannelFee(
 		channelId: Buffer,
 		newFeeratePerKw: number
-	): { ok: boolean; error?: string } {
+	): { ok: boolean; error?: string; code?: ChannelErrorCode } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		if (!Number.isInteger(newFeeratePerKw) || newFeeratePerKw < 253) {
@@ -12787,9 +12801,14 @@ export class LightningNode extends EventEmitter {
 				code: 'UPDATE_FEE_FAILED',
 				channelId,
 				message: result.error!,
-				timestamp: Date.now()
-			} as ILightningError);
-			return { ok: false, error: result.error };
+				timestamp: Date.now(),
+				...(result.code ? { channelErrorCode: result.code } : {})
+			});
+			return {
+				ok: false,
+				error: result.error,
+				...(result.code ? { code: result.code } : {})
+			};
 		}
 		return { ok: true };
 	}
@@ -13386,7 +13405,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: revoked,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: revoked };
 		}
 		const result = this._forceCloseWithReason(
@@ -13401,7 +13420,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error: result.error };
 		}
 		// Extract commitment txid from BROADCAST_TX action
@@ -13900,7 +13919,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: directedError,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					return;
 				}
 				channel.setSpliceInInputs(inputs, changeScript);
@@ -13915,7 +13934,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: result.error ?? SPLICE_NOT_STARTED,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			})
 			.catch((err) => {
@@ -13924,7 +13943,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			})
 			// After initiateSplice above, so the reservation is only dropped once
 			// the channel itself holds the request.
@@ -14343,7 +14362,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: result.error!,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			})
 			.catch((err) => {
@@ -14352,7 +14371,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: (err as Error).message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			});
 		return { ok: true };
 	}
@@ -14601,7 +14620,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: refusal.error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, ...refusal };
 		}
 
@@ -14632,7 +14651,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return { ok: false, error, code: spliceRefusalCodeFor(result) };
 		}
 
@@ -15181,9 +15200,7 @@ export class LightningNode extends EventEmitter {
 	 * the one given, else the configured autoRebalance budget, else 1000 sats.
 	 */
 	rebalanceBudgetSatsPerDay(budgetSatsPerDay?: number): number {
-		return (
-			budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay ?? 1_000
-		);
+		return budgetSatsPerDay ?? this.autoRebalanceConfig.budgetSatsPerDay;
 	}
 
 	/**
@@ -15315,11 +15332,7 @@ export class LightningNode extends EventEmitter {
 	 * `now` is injectable for tests; the periodic timer passes the real clock.
 	 */
 	runFeeTuneOnce(now: number = Date.now()): IFeeTuneAdjustment[] {
-		const intervalMs = this.autoTuneFeesConfig.intervalMs ?? 21_600_000;
-		const floorPpm =
-			this.autoTuneFeesConfig.floorPpm ?? DEFAULT_FEE_TUNE_FLOOR_PPM;
-		const ceilPpm =
-			this.autoTuneFeesConfig.ceilPpm ?? DEFAULT_FEE_TUNE_CEIL_PPM;
+		const { intervalMs, floorPpm, ceilPpm } = this.autoTuneFeesConfig;
 		if (floorPpm < 0 || ceilPpm < floorPpm) {
 			throw new Error('autoTuneFees requires 0 <= floorPpm <= ceilPpm');
 		}
@@ -15803,12 +15816,13 @@ export class LightningNode extends EventEmitter {
 			// left our BOLT 12 offers unreachable to non-direct peers. Reuse the init
 			// feature set (large_channels is already in it when wumbo is enabled).
 			//
-			// option_ff_concurrent is the one exception. CONCURRENT-RECEIVE.md
-			// section 1.1 defines it for the init context only: it qualifies a
-			// connection, both peers read it from the current init exchange,
-			// and nothing may infer a profile from an advertisement seen
-			// elsewhere. So it stays out of gossip. A node that has not opted
-			// in takes the first branch and announces the bytes it always did.
+			// option_ff_concurrent is the one exception. Section 1.1 of
+			// docs/specs/CONCURRENT-RECEIVE.md defines it for the init context
+			// only: it qualifies a connection, both peers read it from the
+			// current init exchange, and nothing may infer a profile from an
+			// advertisement seen elsewhere. So it stays out of gossip. A node
+			// that has not opted in takes the first branch and announces the
+			// bytes it always did.
 			let announcedFeatures = this.localFeatures.toBuffer();
 			if (this.localFeatures.hasFeature(Feature.OPTION_FF_CONCURRENT)) {
 				const announced = FeatureFlags.fromBuffer(announcedFeatures);
@@ -16321,11 +16335,7 @@ export class LightningNode extends EventEmitter {
 
 			let path;
 			try {
-				path = constructBlindedPath(
-					crypto.randomBytes(32),
-					nodeIds,
-					hopDataList
-				);
+				path = constructBlindedPath(randomBytes(32), nodeIds, hopDataList);
 			} catch {
 				continue; // skip a channel whose key can't be blinded
 			}
@@ -16397,9 +16407,7 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 			try {
-				paths.push(
-					constructBlindedPath(crypto.randomBytes(32), nodeIds, hopDataList)
-				);
+				paths.push(constructBlindedPath(randomBytes(32), nodeIds, hopDataList));
 			} catch {
 				continue; // skip a channel whose key can't be blinded
 			}
@@ -17303,10 +17311,9 @@ export class LightningNode extends EventEmitter {
 		if (externalHash && this.paymentHashInUse(externalHash)) {
 			throw new Error('paymentHash is already in use by this node');
 		}
-		const preimage = externalHash ? undefined : crypto.randomBytes(32);
-		const paymentHash =
-			externalHash ?? crypto.createHash('sha256').update(preimage!).digest();
-		const paymentSecret = crypto.randomBytes(32);
+		const preimage = externalHash ? undefined : randomBytes(32);
+		const paymentHash = externalHash ?? sha256(preimage!);
+		const paymentSecret = randomBytes(32);
 
 		if (preimage) {
 			this.preimages.set(paymentHash.toString('hex'), preimage);
@@ -17341,7 +17348,7 @@ export class LightningNode extends EventEmitter {
 					message:
 						'Invoice created without routing hints despite having a channel with inbound liquidity (likely missing a usable SCID/alias). Payers may not find a route.',
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		}
 
@@ -18261,7 +18268,7 @@ export class LightningNode extends EventEmitter {
 		);
 
 		// Generate session key and compute shared secrets for failure decryption
-		const sessionKey = crypto.randomBytes(32);
+		const sessionKey = randomBytes(32);
 		const hopPubkeys = hops.map((h) => h.pubkey);
 		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 
@@ -18832,17 +18839,11 @@ export class LightningNode extends EventEmitter {
 			// dispatchKeysend refuses only a PENDING record, which a random
 			// preimage never meets again. A reused one would pay a second time
 			// under a hash the first payee already knows the preimage of.
-			this.assertHashUnpaid(
-				crypto.createHash('sha256').update(options.preimage).digest(),
-				'any-pending'
-			);
+			this.assertHashUnpaid(sha256(options.preimage), 'any-pending');
 		}
 		// A fresh preimage per call unless the caller picked one, so each
 		// keysend is its own payment.
-		return this.dispatchKeysend(
-			options,
-			options.preimage ?? crypto.randomBytes(32)
-		);
+		return this.dispatchKeysend(options, options.preimage ?? randomBytes(32));
 	}
 
 	/**
@@ -18891,7 +18892,7 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const paymentHash = sha256(preimage);
 		const hashHex = paymentHash.toString('hex');
 
 		// Payment deduplication
@@ -18966,7 +18967,7 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		const sessionKey = crypto.randomBytes(32);
+		const sessionKey = randomBytes(32);
 		const hopPubkeys = hops.map((h) => h.pubkey);
 		const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 		const onionPacket = constructOnionPacket(
@@ -19226,7 +19227,7 @@ export class LightningNode extends EventEmitter {
 				}
 			);
 
-			const sessionKey = crypto.randomBytes(32);
+			const sessionKey = randomBytes(32);
 			const hopPubkeys = hops.map((h) => h.pubkey);
 			const { sharedSecrets } = computeSharedSecrets(sessionKey, hopPubkeys);
 
@@ -19426,7 +19427,7 @@ export class LightningNode extends EventEmitter {
 					'hex'
 				)}: ${(err as Error).message || 'unknown'}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			// BOLT 4 route blinding: an HTLC that arrived with a blinding point is
 			// inside a blinded route, so even an unparseable onion must surface as
 			// invalid_onion_blinding via update_fail_malformed_htlc.
@@ -19434,7 +19435,7 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.failMalformedHtlc(
 					channelId,
 					htlcId,
-					crypto.createHash('sha256').update(onionBuf).digest(),
+					sha256(onionBuf),
 					INVALID_ONION_BLINDING
 				);
 				return;
@@ -19459,7 +19460,7 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.failMalformedHtlc(
 				channelId,
 				htlcId,
-				crypto.createHash('sha256').update(onionBuf).digest(),
+				sha256(onionBuf),
 				err instanceof OnionProcessingError
 					? err.failureCode
 					: INVALID_ONION_HMAC
@@ -19693,7 +19694,7 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
-	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
 
 	/**
 	 * S: settle or fail an upstream HTLC whose hash is in a voucher book of
@@ -20012,8 +20013,8 @@ export class LightningNode extends EventEmitter {
 			hashChain?: boolean;
 			/**
 			 * TLV 17: ask for concurrent receive version 1
-			 * (CONCURRENT-RECEIVE.md section 1.1). Refused unless both sides
-			 * advertised option_ff_concurrent; selected only by S's echo.
+			 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1). Refused unless both
+			 * sides advertised option_ff_concurrent; selected only by S's echo.
 			 */
 			concurrent?: boolean;
 			/** Exact signed profile request. Version 2 retains unresolved reserves. */
@@ -20077,7 +20078,7 @@ export class LightningNode extends EventEmitter {
 				actions: [],
 				error: 'FFOR preimage must be 32 bytes'
 			};
-		const hashHex = crypto.createHash('sha256').update(preimage).digest('hex');
+		const hashHex = sha256(preimage).toString('hex');
 		const live = this.channelManager.getFforEpoch(channelId);
 		if (!live?.paymentHashes.some((h) => h.toString('hex') === hashHex)) {
 			const archived = [...this.fforArchivedVouchers.values()].filter(
@@ -20120,7 +20121,7 @@ export class LightningNode extends EventEmitter {
 		}
 		const result = this.channelManager.fforAddPreimage(channelId, preimage);
 		if (result.ok) {
-			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const paymentHash = sha256(preimage);
 			this.preimages.set(hashHex, preimage);
 			this.commitMutations(
 				'savePreimage',
@@ -20166,9 +20167,9 @@ export class LightningNode extends EventEmitter {
 		const entries = channel.fforBookEntries();
 		if (!entries) throw new Error('no book to provision');
 		const witnessNodeId = Buffer.from(witnessNodeIdHex, 'hex');
-		const fetchPrivkey = crypto.randomBytes(32);
-		const encPrivkey = crypto.randomBytes(32);
-		const mailboxId = crypto.randomBytes(32);
+		const fetchPrivkey = randomBytes(32);
+		const encPrivkey = randomBytes(32);
+		const mailboxId = randomBytes(32);
 		const retentionUntil =
 			opts.retentionUntil ??
 			record.params.voucherExpiry + 2 * FF_WITNESS_RETENTION_MARGIN_BLOCKS;
@@ -20304,7 +20305,7 @@ export class LightningNode extends EventEmitter {
 					break;
 				}
 				const requestId = FforWitnessService.freshRequestId();
-				const nonce = crypto.randomBytes(32);
+				const nonce = randomBytes(32);
 				let body: Buffer;
 				try {
 					body = await this.sendFforWitnessRequest(
@@ -20537,7 +20538,7 @@ export class LightningNode extends EventEmitter {
 								hAct,
 								K,
 								settled,
-								crypto.randomBytes(32),
+								randomBytes(32),
 								w.fetchPrivkey
 							),
 							requestId,
@@ -20590,9 +20591,9 @@ export class LightningNode extends EventEmitter {
 				'FFOR epoch is in dispute after reestablish: no invoice is exposed'
 			);
 		}
-		// CONCURRENT-RECEIVE.md section 8: an incompatible reconnect holds new
-		// admission. S refuses to settle under the hold, so an invoice exposed
-		// now is one it would not honour.
+		// docs/specs/CONCURRENT-RECEIVE.md section 8: an incompatible reconnect
+		// holds new admission. S refuses to settle under the hold, so an invoice
+		// exposed now is one it would not honour.
 		const admissionHold = channel.fforAdmissionHold();
 		if (admissionHold) {
 			throw new Error(`FFOR: no invoice is exposed while ${admissionHold}`);
@@ -20776,20 +20777,22 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** Backfill retained books before restored channels can receive traffic or be pruned. */
-	private restoreFforVoucherIdentities(): void {
+	private restoreFforVoucherIdentities(
+		storedChannels: StoredChannelRows
+	): void {
 		if (!this.storage?.loadAllFforVouchers) return;
 		const candidate = new FforVoucherIndex();
 		for (const record of this.fforArchivedVouchers.values())
 			candidate.remember(record);
 		const mutations: RecoveryMutation[] = [];
-		for (const row of this.storage.loadAllChannels()) {
+		for (const row of storedChannels) {
 			if (!row.state.ffor) continue;
 			for (const record of archiveFforVouchers(row.channelId, row.state.ffor)) {
 				candidate.remember(record);
 				const previous =
 					this.fforArchivedVouchers.get(fforVoucherArchiveId(record)) ?? null;
 				const merged = mergeFforVoucherArchive(previous, record);
-				if (JSON.stringify(previous) !== JSON.stringify(merged))
+				if (merged !== previous)
 					mutations.push({ type: 'ffor_voucher', record: merged });
 			}
 		}
@@ -20813,6 +20816,12 @@ export class LightningNode extends EventEmitter {
 		const id = fforVoucherArchiveId(record);
 		const previous = this.fforArchivedVouchers.get(id);
 		this.fforArchivedVouchers.set(id, record);
+		let channel = this.fforArchivedVouchersByChannel.get(record.channelId);
+		if (!channel) {
+			channel = new Map();
+			this.fforArchivedVouchersByChannel.set(record.channelId, channel);
+		}
+		channel.set(id, record);
 		if (
 			previous &&
 			!previous.outcome &&
@@ -20850,13 +20859,13 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 		}
-		const records = [...this.fforArchivedVouchers].filter(
-			([, record]) => record.channelId === channelIdHex
-		);
+		const records = [
+			...(this.fforArchivedVouchersByChannel.get(channelIdHex)?.values() ?? [])
+		];
 		if (!records.length) return;
 		const monitor = this.channelManager.getMonitor(channelId)?.getFullState();
 		if (!monitor) return;
-		for (const [, record] of records) {
+		for (const record of records) {
 			this.rememberFforVoucher(archiveFforChainEvidence(record, monitor));
 		}
 	}
@@ -21492,10 +21501,7 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
 			}
-			const expectedHash = crypto
-				.createHash('sha256')
-				.update(keysendPreimage)
-				.digest();
+			const expectedHash = sha256(keysendPreimage);
 			if (!expectedHash.equals(paymentHash)) {
 				const reason = sharedSecret
 					? createFailureMessage(
@@ -21989,11 +21995,8 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** Finish notifying every listener before delivering a nested transition. */
-	private emitHoldInvoiceEvent(
-		name: 'hold:accepted' | 'hold:settled' | 'hold:cancelled',
-		event: IHoldInvoiceStateEvent | IHoldCancelledEvent
-	): void {
-		this.holdInvoiceEventQueue.push({ name, event });
+	private emitHoldInvoiceEvent(transition: THoldInvoiceEvent): void {
+		this.holdInvoiceEventQueue.push(transition);
 		if (this.emittingHoldInvoiceEvent) return;
 		this.emittingHoldInvoiceEvent = true;
 		let failure: { error: unknown } | undefined;
@@ -22001,7 +22004,8 @@ export class LightningNode extends EventEmitter {
 			for (let i = 0; i < this.holdInvoiceEventQueue.length; i++) {
 				const next = this.holdInvoiceEventQueue[i];
 				try {
-					this.emit(next.name, next.event);
+					if (next.name === 'hold:cancelled') this.emit(next.name, next.event);
+					else this.emit(next.name, next.event);
 				} catch (error) {
 					// A listener may resolve a hold and then throw. Deliver the
 					// queued transition before propagating the first failure.
@@ -22055,7 +22059,7 @@ export class LightningNode extends EventEmitter {
 					htlcCount: parked.length,
 					...this.heldSetExpiry(hashHex, parked)
 				};
-				this.emitHoldInvoiceEvent('hold:accepted', event);
+				this.emitHoldInvoiceEvent({ name: 'hold:accepted', event });
 			}
 		}
 		this.emitStructuredLog('htlc', 'held', {
@@ -22091,7 +22095,7 @@ export class LightningNode extends EventEmitter {
 		if (!pre) {
 			throw new Error('settleHeldHtlc: no preimage available for hold invoice');
 		}
-		const hash = crypto.createHash('sha256').update(pre).digest();
+		const hash = sha256(pre);
 		if (!hash.equals(paymentHash)) {
 			throw new Error('settleHeldHtlc: preimage does not match payment hash');
 		}
@@ -22188,7 +22192,7 @@ export class LightningNode extends EventEmitter {
 			htlcCount: settledSet.length,
 			...this.heldSetExpiry(hashHex, settledSet)
 		};
-		this.emitHoldInvoiceEvent('hold:settled', event);
+		this.emitHoldInvoiceEvent({ name: 'hold:settled', event });
 		return true;
 	}
 
@@ -22443,7 +22447,7 @@ export class LightningNode extends EventEmitter {
 			heldAmountMsat,
 			...expiry
 		};
-		this.emitHoldInvoiceEvent('hold:cancelled', event);
+		this.emitHoldInvoiceEvent({ name: 'hold:cancelled', event });
 	}
 
 	/**
@@ -22921,7 +22925,7 @@ export class LightningNode extends EventEmitter {
 				`no addressable channel with ${lspNodeIdHex} to register`
 			);
 		}
-		const nonce = crypto.randomBytes(32);
+		const nonce = randomBytes(32);
 		const request = encodeRegistrationRequest(
 			signRegistrationRequest(
 				{
@@ -23294,13 +23298,18 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Durable fact for the ledger: the parked inbound HTLC still exists and
-	 * is committed. False once it settled, failed, or its channel is gone.
+	 * is committed. False once it settled, failed, or its channel is gone or
+	 * fully resolved on chain.
 	 */
 	private heldForwardIncomingUnresolved(record: IHeldForwardRecord): boolean {
 		const channel = this.channelManager.getChannel(
 			Buffer.from(record.inChannelIdHex, 'hex')
 		);
 		if (!channel) return false;
+		// A CLOSED channel keeps its HTLC entries as they were at the close,
+		// but has nothing left to resolve. FORCE_CLOSED stays unresolved: its
+		// inbound HTLC is still live on chain.
+		if (channel.getState() === ChannelState.CLOSED) return false;
 		const htlc = channel
 			.getFullState()
 			.htlcs.get(`received-${record.inHtlcId}`);
@@ -23325,7 +23334,9 @@ export class LightningNode extends EventEmitter {
 		return this.jitReceiveManager;
 	}
 
-	private wireJitReceive(config: IJitReceiveConfig): void {
+	private wireJitReceive(
+		config: NonNullable<ResolvedNodeConfig['jitReceive']>
+	): void {
 		this.jitReceiveManager = new JitReceiveManager(
 			{
 				currentBlockHeight: () => this.currentBlockHeight,
@@ -23358,27 +23369,18 @@ export class LightningNode extends EventEmitter {
 				storage: this.storage ?? undefined,
 				failRestoredHtlc: (part) => this.failRestoredHeldHtlc(part)
 			},
-			{
-				...config,
-				// A hold must be revoked no later than the node's own expiring-HTLC
-				// scan would fail the same leg, or that scan refunds upstream while
-				// the engine still believes it may forward.
-				holdExpiryMarginBlocks:
-					config.holdExpiryMarginBlocks ??
-					Math.max(HELD_HTLC_EXPIRY_MARGIN, this.htlcSafetyMargin)
-			}
+			{ ...config }
 		);
-		for (const evt of [
-			'jit:intent',
-			'jit:intent-superseded',
-			'jit:intercepted',
-			'jit:funding',
-			'jit:forwarded',
-			'jit:failed',
-			'jit:restored-failed'
-		]) {
-			this.jitReceiveManager.on(evt, (data) => this.emit(evt, data));
-		}
+		const jit = this.jitReceiveManager;
+		jit.on('jit:intent', (e) => this.emit('jit:intent', e));
+		jit.on('jit:intent-superseded', (e) =>
+			this.emit('jit:intent-superseded', e)
+		);
+		jit.on('jit:intercepted', (e) => this.emit('jit:intercepted', e));
+		jit.on('jit:funding', (e) => this.emit('jit:funding', e));
+		jit.on('jit:forwarded', (e) => this.emit('jit:forwarded', e));
+		jit.on('jit:failed', (e) => this.emit('jit:failed', e));
+		jit.on('jit:restored-failed', (e) => this.emit('jit:restored-failed', e));
 		// Ride the ISOLATED custom-message dispatch (issue #546) rather than
 		// handling the subtype inline before it: a malformed authorization must
 		// not cost the peer its connection. Our own handler is additionally
@@ -23498,7 +23500,9 @@ export class LightningNode extends EventEmitter {
 		const reply = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				reject(new Error(timeoutMessage));
+				reject(
+					new JitReceiveError(JitReceiveErrorCode.TIMEOUT, timeoutMessage)
+				);
 			}, timeoutMs);
 			timer.unref?.();
 			const onMsg = (msg: {
@@ -23562,7 +23566,7 @@ export class LightningNode extends EventEmitter {
 		if (maxAmountMsat <= 0n) {
 			throw new Error('maxAmountMsat must be positive');
 		}
-		const requestId = crypto.randomBytes(8);
+		const requestId = randomBytes(8);
 		const { reply, cleanup } = this.awaitJitReply(
 			lspPubkeyHex,
 			BeignetCustomSubtype.JIT_RECEIVE_QUOTE_ACK,
@@ -23654,7 +23658,7 @@ export class LightningNode extends EventEmitter {
 		}
 		// Our own correlation id: the LSP mints the SCID, so until the ack
 		// arrives this is the only thing tying an answer to this request.
-		const requestId = crypto.randomBytes(8);
+		const requestId = randomBytes(8);
 
 		const { reply: ackPromise, cleanup } = this.awaitJitReply(
 			lspPubkeyHex,
@@ -23694,7 +23698,8 @@ export class LightningNode extends EventEmitter {
 
 		const ack = await ackPromise;
 		if (!ack.accepted) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.DECLINED,
 				`LSP declined the JIT receive intent: ${
 					ack.reason ?? 'no reason given'
 				}`
@@ -23703,12 +23708,16 @@ export class LightningNode extends EventEmitter {
 		// An accepted ack whose SCID is the refusal placeholder would produce a
 		// hint routing to nothing, so the invoice would simply be unpayable.
 		if (ack.interceptScid.every((b) => b === 0)) {
-			throw new Error('LSP accepted the intent without an intercept scid');
+			throw new JitReceiveError(
+				JitReceiveErrorCode.NO_INTERCEPT_SCID,
+				'LSP accepted the intent without an intercept scid'
+			);
 		}
 		const maxFlatFeeSat = params.maxFlatFeeSat ?? this.jitClientMaxFlatFeeSat;
 		const maxFeePpm = params.maxFeePpm ?? this.jitClientMaxFeePpm;
 		if (ack.flatFeeSat > maxFlatFeeSat || ack.feePpm > maxFeePpm) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.QUOTE_ABOVE_MAXIMUM,
 				`LSP quoted ${ack.flatFeeSat} sat + ${ack.feePpm} ppm, above the ` +
 					`accepted maximum of ${maxFlatFeeSat} sat + ${maxFeePpm} ppm`
 			);
@@ -23720,7 +23729,8 @@ export class LightningNode extends EventEmitter {
 		// the fee twice over: once on the sender through the hint and again
 		// off the forward. The LSP never answers that way; refuse if one does.
 		if (feeMode === 'hop' && params.acceptsSkimmedFee !== false) {
-			throw new Error(
+			throw new JitReceiveError(
+				JitReceiveErrorCode.FEE_MODE_MISMATCH,
 				'LSP answered a skim-accepting intent with hop-mode fee terms'
 			);
 		}
@@ -23802,7 +23812,8 @@ export class LightningNode extends EventEmitter {
 		if (!this.liveChannelWith(lspPubkeyHex)) {
 			const refusal = this.channelManager.newChannelRefusal();
 			if (refusal) {
-				throw new Error(
+				throw new JitReceiveError(
+					JitReceiveErrorCode.NEW_CHANNELS_REFUSED,
 					'JIT receive needs a new channel from the LSP, which this node ' +
 						`cannot accept right now: ${refusal}`
 				);
@@ -25467,7 +25478,7 @@ export class LightningNode extends EventEmitter {
 		preimage: Buffer
 	): void {
 		// Persist preimage immediately (proof of payment) before any message sends
-		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
+		const preimageHash = sha256(preimage);
 		this.preimages.set(preimageHash.toString('hex'), preimage);
 		this.commitMutations(
 			'savePreimage',
@@ -25511,7 +25522,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Hash preimage to find the payment
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const paymentHash = sha256(preimage);
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
 
@@ -26191,10 +26202,7 @@ export class LightningNode extends EventEmitter {
 			?.getFullState()
 			.htlcs.get(`received-${inHtlcId}`);
 		const sha256OfOnion = htlcEntry?.onionRoutingPacket
-			? crypto
-					.createHash('sha256')
-					.update(htlcEntry.onionRoutingPacket)
-					.digest()
+			? sha256(htlcEntry.onionRoutingPacket)
 			: Buffer.alloc(32);
 		const secret =
 			sharedSecret ?? this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
@@ -26330,9 +26338,7 @@ export class LightningNode extends EventEmitter {
 			.getChannel(outChannelId)
 			?.getFullState()
 			.htlcs.get(`offered-${outHtlcId}`)?.onionRoutingPacket;
-		const sha256OfOnion = onion
-			? crypto.createHash('sha256').update(onion).digest()
-			: Buffer.alloc(32);
+		const sha256OfOnion = onion ? sha256(onion) : Buffer.alloc(32);
 		return createFailureMessage(sharedSecret, code, sha256OfOnion);
 	}
 
@@ -27375,7 +27381,7 @@ export class LightningNode extends EventEmitter {
 				code: 'MESSAGE_TOO_LARGE',
 				message: `Message payload ${payload.length} bytes exceeds maximum ${MAX_MESSAGE_SIZE}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			return;
 		}
 		// Route gossip messages (including query types 261-265)
@@ -27626,7 +27632,7 @@ export class LightningNode extends EventEmitter {
 			channelId,
 			message: `splice ${spliceTxid} cannot confirm: input ${inputIndex} was spent by ${conflictTxid} at height ${height}; reverting to the pre-splice funding`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		try {
 			this.emit('splice:conflicted', {
 				channelId,
@@ -28309,7 +28315,7 @@ export class LightningNode extends EventEmitter {
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */
 	private wireDirectFunding(
-		config: IDirectFundingNodeConfig,
+		config: NonNullable<ResolvedNodeConfig['directFunding']>,
 		newFundingRefused?: () => string | null
 	): void {
 		const log = (action: string, data: Record<string, unknown>): void => {
@@ -28322,9 +28328,7 @@ export class LightningNode extends EventEmitter {
 			{
 				...(this.walletDataStore() ? { storage: this.walletDataStore()! } : {})
 			},
-			config.requestTtlMs !== undefined
-				? { requestTtlMs: config.requestTtlMs }
-				: {}
+			{ requestTtlMs: config.requestTtlMs }
 		);
 		const { registry, forwarder } = createDirectFundingTransports(
 			{
@@ -28536,21 +28540,25 @@ export class LightningNode extends EventEmitter {
 					: {})
 			}
 		);
-		for (const evt of [
-			'offer:accepted',
-			'offer:declined',
-			'offer:failed',
-			'offer:completed'
-		]) {
-			receiver.on(evt, (data) => this.emit(`direct-funding:${evt}`, data));
-		}
+		receiver.on('offer:accepted', (e) =>
+			this.emit('direct-funding:offer:accepted', e)
+		);
+		receiver.on('offer:declined', (e) =>
+			this.emit('direct-funding:offer:declined', e)
+		);
+		receiver.on('offer:failed', (e) =>
+			this.emit('direct-funding:offer:failed', e)
+		);
+		receiver.on('offer:completed', (e) =>
+			this.emit('direct-funding:offer:completed', e)
+		);
 		this.directFunding = {
 			requests,
 			registry,
 			forwarder,
 			receiver,
 			policy,
-			requestTtlMs: config.requestTtlMs ?? DF_DEFAULT_REQUEST_TTL_MS
+			requestTtlMs: config.requestTtlMs
 		};
 	}
 
@@ -28688,7 +28696,9 @@ export class LightningNode extends EventEmitter {
 		this.submarineSwapProvider?.stop();
 	}
 
-	private wireSwapProvider(config: ISwapNodeConfig): void {
+	private wireSwapProvider(
+		config: NonNullable<ResolvedNodeConfig['swaps']>
+	): void {
 		if (!this.swapLedger) return;
 		const chainSource = config.chainSource;
 		const resolverSource: ISwapChainSource = chainSource ?? {
@@ -28701,14 +28711,7 @@ export class LightningNode extends EventEmitter {
 			broadcastTransaction: (rawTxHex) =>
 				this.swapChain().broadcastTransaction(rawTxHex)
 		};
-		const confirmations = {
-			fundingConfirmations:
-				config.confirmations?.fundingConfirmations ??
-				REVERSE_SWAP_DEFAULTS.fundingConfirmations,
-			resolutionConfirmations:
-				config.confirmations?.resolutionConfirmations ??
-				REVERSE_SWAP_DEFAULTS.resolutionConfirmations
-		};
+		const confirmations = { ...config.confirmations };
 		const resolver = new SwapChainResolver(
 			resolverSource,
 			confirmations,
@@ -28852,10 +28855,7 @@ export class LightningNode extends EventEmitter {
 				...(config.fee?.feePpm !== undefined
 					? { feePpm: config.fee.feePpm }
 					: {}),
-				exposure: {
-					...REVERSE_SWAP_DEFAULT_EXPOSURE,
-					...(config.exposure ?? {})
-				},
+				exposure: { ...config.exposure },
 				...confirmations,
 				...(config.timeouts ?? {}),
 				// A hold must outlive the node's own expiring-HTLC scan, which
@@ -28933,10 +28933,7 @@ export class LightningNode extends EventEmitter {
 				...(config.fee?.feePpm !== undefined
 					? { feePpm: config.fee.feePpm }
 					: {}),
-				exposure: {
-					...REVERSE_SWAP_DEFAULT_EXPOSURE,
-					...(config.exposure ?? {})
-				},
+				exposure: { ...config.exposure },
 				...confirmations,
 				...(config.timeouts?.maxFeeRateSatPerVbyte !== undefined
 					? { maxFeeRateSatPerVbyte: config.timeouts.maxFeeRateSatPerVbyte }
@@ -29482,7 +29479,7 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				message: `channel failed (${reason}); unable to force-close: ${result.error}`,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 			this.emitStructuredLog('channel', 'errored_force_close_failed', {
 				channelId: channelId.toString('hex'),
 				reason,
@@ -29495,7 +29492,7 @@ export class LightningNode extends EventEmitter {
 			channelId,
 			message: `channel failed (${reason}); force-closing to resolve on chain`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 		this.emitStructuredLog('channel', 'errored_force_closing', {
 			channelId: channelId.toString('hex'),
 			reason
@@ -29644,7 +29641,7 @@ export class LightningNode extends EventEmitter {
 				`(CLI: channel forceclose --accept-stale-state-risk), which ` +
 				`publishes a commitment the peer may already hold a revocation for`,
 			timestamp: Date.now()
-		} as ILightningError);
+		});
 	}
 
 	/**
@@ -29786,15 +29783,6 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Blocks before an inbound HTLC's cltv_expiry at which, if we hold its
-	 * preimage but the off-chain fulfill has not been acked, we force-close the
-	 * inbound channel to claim on-chain. Must leave enough room for our
-	 * HTLC-success to confirm before the peer's HTLC-timeout becomes spendable at
-	 * cltv_expiry (LDK-style CLTV_CLAIM_BUFFER).
-	 */
-	private static readonly INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER = 18;
-
-	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
 	 * Auto-fail any that are within the safety margin. Separately, force-close to
 	 * claim any inbound HTLC we already hold the preimage for (or that is
@@ -29803,7 +29791,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private scanExpiringHtlcs(blockHeight: number): void {
 		const claimBuffer = Math.max(
-			LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
 			this.htlcSafetyMargin
 		);
 		const channels = this.channelManager.listChannels();
@@ -29947,7 +29935,7 @@ export class LightningNode extends EventEmitter {
 							? `inbound HTLC ${htlc.id} fulfilled but still in our commitment ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}), the peer has not signed it away; force-closing to claim via HTLC-success`
 							: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
@@ -30059,7 +30047,7 @@ export class LightningNode extends EventEmitter {
 							channelId,
 							message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
 							timestamp: Date.now()
-						} as ILightningError);
+						});
 						this._forceCloseWithReason(
 							channelId,
 							this.getSweepDestinationScript(),
@@ -30240,7 +30228,7 @@ export class LightningNode extends EventEmitter {
 					channelId,
 					message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 				this._forceCloseWithReason(
 					channelId,
 					this.getSweepDestinationScript(),
@@ -30391,70 +30379,43 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Static Factories ───────────────
 
 	/**
-	 * Create a LightningNode from a BIP39 mnemonic.
-	 * Derives all necessary keys automatically.
+	 * Build a node, restore it from storage and start it, in that order. The
+	 * constructor runs the same three steps until the next major release,
+	 * when it stops at building and this becomes the way to get a running
+	 * node.
+	 */
+	static async create(config: INodeConfig): Promise<LightningNode> {
+		constructingForCreate = true;
+		let node: LightningNode;
+		try {
+			node = new LightningNode(config);
+		} finally {
+			constructingForCreate = false;
+		}
+		// Synchronous for now, so nothing runs between the steps, as in the
+		// constructor. Async so that restore() can become async later.
+		node.restore();
+		node.start();
+		return node;
+	}
+
+	/**
+	 * Create a LightningNode from a BIP39 mnemonic. Derives every key from the
+	 * seed and takes every other INodeConfig option as given.
 	 */
 	static fromMnemonic(
 		mnemonic: string,
-		options?: {
-			passphrase?: string;
-			/**
-			 * The BIP39 seed of `mnemonic` and `passphrase`, for a caller that
-			 * already holds it: skips the PBKDF2 pass. It is not checked against
-			 * the mnemonic, so it must be that mnemonic's seed.
-			 */
-			seed?: Buffer;
-			coinType?: number;
-			network?: Network;
-			storage?: IStorageBackend;
-			enableNetworking?: boolean;
-			localFeatures?: FeatureFlags;
-			zeroReserve?: INodeConfig['zeroReserve'];
-			chainHashes?: Buffer[];
-			alias?: string;
-			announcedAddresses?: INodeAddress[];
-			fundingProvider?: IFundingProvider;
-			feeEstimator?: IFeeEstimator;
-			logger?: ILogger;
-			socks5Proxy?: { host: string; port: number };
-			socks5ProxyScope?: Socks5ProxyScope;
-			maxInboundPeers?: number;
-			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
-			iroh?: Omit<import('../transport/iroh').IIrohConfig, 'secretKey'>;
-			preferAnchors?: boolean;
-			largeChannels?: boolean;
-			chainBackend?: import('../chain/chain-watcher').IChainBackend;
-			autoReconnect?: boolean;
-			autoUpdateChannelFees?: boolean;
-			forwardingEnabled?: boolean;
-			forwardingFeeBaseMsat?: number;
-			forwardingFeePropMillionths?: number;
-			forwardingCltvDelta?: number;
-			jitReceive?: INodeConfig['jitReceive'];
-			jitReceiveClient?: INodeConfig['jitReceiveClient'];
-			directFunding?: INodeConfig['directFunding'];
-			swaps?: INodeConfig['swaps'];
-			fforSettle?: INodeConfig['fforSettle'];
-			fforConcurrent?: INodeConfig['fforConcurrent'];
-			fforWitness?: INodeConfig['fforWitness'];
-			fforIssuer?: INodeConfig['fforIssuer'];
-			leaseRates?: import('../gossip/types').ILeaseRates;
-			eagerGossipVerify?: boolean;
-			cooperativeGraphRestore?: boolean;
-			sweepDestinationScript?: Buffer;
-			peerStorageEnabled?: boolean;
-			autoRebalance?: IAutoRebalanceConfig;
-			autoTuneFees?: IAutoTuneFeesConfig;
-			watchtowers?: string[];
-			recovery?: INodeConfig['recovery'];
-			guardianHost?: INodeConfig['guardianHost'];
-			channelKeyDeriver?: (
-				channelIndex: number
-			) => import('../channel/channel-manager').IPerChannelKeys;
-			newChannelsRefused?: INodeConfig['newChannelsRefused'];
-		}
+		options?: LightningNodeSeedOptions
 	): LightningNode {
-		const coinType = options?.coinType ?? LnCoinType.REGTEST;
+		const {
+			passphrase,
+			seed: givenSeed,
+			coinType: givenCoinType,
+			iroh,
+			channelKeyDeriver: givenChannelKeyDeriver,
+			...config
+		} = options ?? {};
+		const coinType = givenCoinType ?? LnCoinType.REGTEST;
 		if (!bip39.validateMnemonic(mnemonic)) {
 			throw new Error('Invalid BIP39 mnemonic');
 		}
@@ -30462,8 +30423,7 @@ export class LightningNode extends EventEmitter {
 		// keys and the Iroh identity. The PBKDF2 pass behind the seed is the
 		// slow step (a phone runs it on the JS thread), so it runs at most
 		// once here, and not at all when the caller passes the seed.
-		const seed =
-			options?.seed ?? bip39.mnemonicToSeedSync(mnemonic, options?.passphrase);
+		const seed = givenSeed ?? bip39.mnemonicToSeedSync(mnemonic, passphrase);
 		const root = bip32RootFromSeed(seed);
 		const keys = deriveLightningKeys(root, coinType);
 
@@ -30474,7 +30434,7 @@ export class LightningNode extends EventEmitter {
 		// arithmetic runs in JavaScript, each derivation costs a sizeable
 		// fraction of a second. Every caller gets its own copies, so none can
 		// change what the next one is handed.
-		let channelKeyDeriver = options?.channelKeyDeriver;
+		let channelKeyDeriver = givenChannelKeyDeriver;
 		if (!channelKeyDeriver) {
 			const derived = new Map<number, ReturnType<typeof deriveChannelKeys>>();
 			channelKeyDeriver = (
@@ -30499,6 +30459,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		return new LightningNode({
+			...config,
 			nodePrivateKey: keys.nodePrivateKey,
 			channelBasepoints: keys.channelBasepoints,
 			perCommitmentSeed: keys.perCommitmentSeed,
@@ -30507,56 +30468,10 @@ export class LightningNode extends EventEmitter {
 			revocationBasepointSecret: keys.revocationBasepointSecret,
 			paymentBasepointSecret: keys.paymentBasepointSecret,
 			delayedPaymentBasepointSecret: keys.delayedPaymentBasepointSecret,
-			network: options?.network,
-			storage: options?.storage,
-			enableNetworking: options?.enableNetworking,
-			autoReconnect: options?.autoReconnect,
-			autoUpdateChannelFees: options?.autoUpdateChannelFees,
-			forwardingEnabled: options?.forwardingEnabled,
-			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
-			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
-			forwardingCltvDelta: options?.forwardingCltvDelta,
-			jitReceive: options?.jitReceive,
-			jitReceiveClient: options?.jitReceiveClient,
-			directFunding: options?.directFunding,
-			swaps: options?.swaps,
-			fforSettle: options?.fforSettle,
-			fforConcurrent: options?.fforConcurrent,
-			fforWitness: options?.fforWitness,
-			fforIssuer: options?.fforIssuer,
-			leaseRates: options?.leaseRates,
-			eagerGossipVerify: options?.eagerGossipVerify,
-			cooperativeGraphRestore: options?.cooperativeGraphRestore,
-			localFeatures: options?.localFeatures,
-			zeroReserve: options?.zeroReserve,
-			chainHashes: options?.chainHashes,
-			alias: options?.alias,
-			announcedAddresses: options?.announcedAddresses,
-			fundingProvider: options?.fundingProvider,
-			feeEstimator: options?.feeEstimator,
-			logger: options?.logger,
-			socks5Proxy: options?.socks5Proxy,
-			socks5ProxyScope: options?.socks5ProxyScope,
-			maxInboundPeers: options?.maxInboundPeers,
-			webSocketImpl: options?.webSocketImpl,
-			iroh: options?.iroh
-				? {
-						...options.iroh,
-						secretKey: deriveIrohSecretKey(seed)
-				  }
+			iroh: iroh
+				? { ...iroh, secretKey: deriveIrohSecretKey(seed) }
 				: undefined,
-			preferAnchors: options?.preferAnchors,
-			largeChannels: options?.largeChannels,
-			chainBackend: options?.chainBackend,
-			sweepDestinationScript: options?.sweepDestinationScript,
-			peerStorageEnabled: options?.peerStorageEnabled,
-			autoRebalance: options?.autoRebalance,
-			autoTuneFees: options?.autoTuneFees,
-			watchtowers: options?.watchtowers,
-			recovery: options?.recovery,
-			guardianHost: options?.guardianHost,
-			channelKeyDeriver,
-			newChannelsRefused: options?.newChannelsRefused
+			channelKeyDeriver
 		});
 	}
 
@@ -30598,7 +30513,7 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
-		// FFOR Variant D (specs/ffor-offline-receive.md section 5): both the
+		// FFOR Variant D (docs/specs/ffor-offline-receive.md section 5): both the
 		// recipient and the settlement-peer roles are implemented.
 		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		flags.setOptional(Feature.OPTION_FF_CONCURRENT);
@@ -30678,7 +30593,7 @@ export class LightningNode extends EventEmitter {
 					code: 'ONION_MESSAGE_ERROR',
 					message: err.message,
 					timestamp: Date.now()
-				} as ILightningError);
+				});
 			}
 		);
 	}
@@ -30810,7 +30725,7 @@ export class LightningNode extends EventEmitter {
 		}
 	): { offer: IOffer; encoded: string } {
 		const issuer = Buffer.from(issuerNodeIdHex, 'hex');
-		const path = constructBlindedPath(crypto.randomBytes(32), [issuer], [{}]);
+		const path = constructBlindedPath(randomBytes(32), [issuer], [{}]);
 		return this.offerManager.createOffer({
 			description: opts.description,
 			...(opts.amountMsat !== undefined ? { amount: opts.amountMsat } : {}),
@@ -30941,7 +30856,7 @@ export class LightningNode extends EventEmitter {
 			encodeIssuerStatus(
 				requestId,
 				witness.mailboxId,
-				crypto.randomBytes(32),
+				randomBytes(32),
 				witness.fetchPrivkey
 			),
 			requestId,
@@ -31044,7 +30959,7 @@ export class LightningNode extends EventEmitter {
 			// node's offer to carry reachable paths, because an external payer
 			// cannot deliver an invoice_request to a node id that is in no
 			// public graph (issue #544 review).
-			const pathId = crypto.randomBytes(32);
+			const pathId = randomBytes(32);
 			const paths = this.buildBlindedMessagePaths(
 				createOpts.asyncHold ? 3 : 2,
 				pathId
@@ -31248,7 +31163,10 @@ export class LightningNode extends EventEmitter {
 						'Route fee exceeds maximum'
 					);
 				}
-				throw new Error('No route to BOLT 12 blinded path introduction node');
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'No route to BOLT 12 blinded path introduction node'
+				);
 			}
 			return this.dispatchBolt12Route(
 				blindedRoute,
@@ -31277,7 +31195,10 @@ export class LightningNode extends EventEmitter {
 			policyOverrides
 		);
 		if (!route) {
-			throw new Error('No route found to BOLT 12 invoice destination');
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'No route found to BOLT 12 invoice destination'
+			);
 		}
 		if (maxFeeMsat !== undefined && route.totalFeeMsat > maxFeeMsat) {
 			throw new LightningPaymentError(
@@ -31453,7 +31374,7 @@ export class LightningNode extends EventEmitter {
 				code: 'BOLT12_INVOICE_ERROR',
 				message: error.error,
 				timestamp: Date.now()
-			} as ILightningError);
+			});
 		});
 	}
 
@@ -31731,7 +31652,7 @@ export class LightningNode extends EventEmitter {
 						channelId,
 						message: `offered HTLC ${htlc.id} still active ${graceBlocks} blocks past expiry (${htlc.cltvExpiry}); force-closing to claim via timeout path`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
@@ -32731,9 +32652,7 @@ export class LightningNode extends EventEmitter {
 					: state.state;
 			if (effectiveState === ChannelState.AWAITING_FUNDING_CONFIRMED) {
 				// Stamp broadcast height on first observation (lazy init for channels created before this field)
-				if (state.fundingBroadcastHeight === 0 && blockHeight > 0) {
-					state.fundingBroadcastHeight = blockHeight;
-				}
+				channel.stampFundingBroadcastHeight(blockHeight);
 				// If channel has been waiting for funding confirmation for > 2016 blocks
 				if (
 					state.fundingBroadcastHeight > 0 &&
@@ -32746,7 +32665,7 @@ export class LightningNode extends EventEmitter {
 							'hex'
 						)} stuck in AWAITING_FUNDING_CONFIRMED for > 2016 blocks`,
 						timestamp: Date.now()
-					} as ILightningError);
+					});
 				}
 			}
 
@@ -32797,7 +32716,7 @@ export class LightningNode extends EventEmitter {
 									this.reestablishTimeoutBlocks
 								} blocks, force-closing`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Ignore force-close errors
 						}
@@ -32854,7 +32773,7 @@ export class LightningNode extends EventEmitter {
 										this.reestablishTimeoutBlocks
 									} blocks with no close from the peer; force-closing to recover funds`,
 									timestamp: Date.now()
-								} as ILightningError);
+								});
 							} catch {
 								// Ignore force-close errors
 							}
@@ -32906,7 +32825,7 @@ export class LightningNode extends EventEmitter {
 									state.state
 								} for > 10 blocks, force-closing`,
 								timestamp: Date.now()
-							} as ILightningError);
+							});
 						} catch {
 							// Ignore force-close errors
 						}

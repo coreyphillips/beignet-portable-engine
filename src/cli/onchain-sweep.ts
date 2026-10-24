@@ -1,7 +1,12 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import type { Wallet } from '../wallet';
+import { liveWalletData } from '../wallet/live-data';
 import type { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import type { IWalletDataStorage } from '../lightning/storage/types';
+import type { BeignetErrorCodeValue } from './errors';
 import { BeignetError } from './errors';
+import type { TxidHex } from '../utils/identifiers';
+import { txidToDisplayHex } from '../utils/identifiers';
 
 export const ONCHAIN_SWEEPS_KEY = 'daemon:onchain-sweeps:v1';
 
@@ -9,7 +14,7 @@ export interface OnchainSweepRequest {
 	requestId: string;
 	address: string;
 	satsPerVbyte: number;
-	inputOutpoints: Array<{ txid: string; vout: number }>;
+	inputOutpoints: Array<{ txid: TxidHex; vout: number }>;
 	debitSats: number;
 	maxFeeSats: number;
 }
@@ -28,7 +33,7 @@ export interface OnchainSweepInfo {
 	amountSats?: number;
 	feeSats?: number;
 	satsPerVbyte?: number;
-	txid?: string;
+	txid?: TxidHex;
 	createdAt: number;
 	broadcastAccepted?: boolean;
 	error?: string;
@@ -39,7 +44,7 @@ interface SweepRecord extends OnchainSweepInfo {
 	hex?: string;
 }
 
-type SweepStorage = Pick<SqliteStorage, 'loadWalletData' | 'saveWalletData'>;
+type SweepStorage = IWalletDataStorage;
 type SweepWallet = Pick<
 	Wallet,
 	| 'data'
@@ -54,7 +59,7 @@ type SweepWallet = Pick<
 	| 'resetSendTransaction'
 >;
 
-function refuse(code: string, message: string): never {
+function refuse(code: BeignetErrorCodeValue, message: string): never {
 	throw new BeignetError(code, message);
 }
 
@@ -332,7 +337,7 @@ export class OnchainSweeps {
 	private resolveInputs(record: SweepRecord) {
 		const wallet = this.deps.wallet;
 		return record.request.inputOutpoints.map((point) => {
-			const input = wallet.data.utxos.find(
+			const input = liveWalletData(wallet).utxos.find(
 				(coin) => coin.tx_hash === point.txid && coin.tx_pos === point.vout
 			);
 			if (!input)
@@ -359,7 +364,7 @@ export class OnchainSweeps {
 		for (const point of record.request.inputOutpoints) {
 			const result = await this.deps.wallet.freezeUtxoIfUnfrozen({
 				txid: point.txid,
-				index: point.vout,
+				vout: point.vout,
 				tag: this.tag(record.requestId)
 			});
 			if (result.isErr()) refuse('SWEEP_NOT_PERSISTED', result.error.message);
@@ -372,7 +377,7 @@ export class OnchainSweeps {
 		for (const point of record.request.inputOutpoints) {
 			const result = await this.deps.wallet.unfreezeUtxoIfTagged({
 				txid: point.txid,
-				index: point.vout,
+				vout: point.vout,
 				tag: this.tag(record.requestId)
 			});
 			if (result.isErr()) refuse('SWEEP_NOT_PERSISTED', result.error.message);
@@ -387,10 +392,7 @@ export class OnchainSweeps {
 			.map((point) => `${point.txid}:${point.vout}`)
 			.sort();
 		const actual = tx.ins
-			.map(
-				(input) =>
-					`${Buffer.from(input.hash).reverse().toString('hex')}:${input.index}`
-			)
+			.map((input) => `${txidToDisplayHex(input.hash)}:${input.index}`)
 			.sort();
 		const script = bitcoin.address.toOutputScript(
 			record.address,

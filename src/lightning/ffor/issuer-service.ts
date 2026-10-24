@@ -10,18 +10,18 @@
  * exist, not whether issuance has ended.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { getPublicKey } from '../crypto/ecdh';
 import { deriveBlindedPrivkey } from '../onion/blinded-path';
 import { decodeOfferTlv, getTlvRecords } from '../offer/tlv';
 import { computeOfferId } from '../offer/merkle';
-import { IOffer } from '../offer/types';
-import {
+import type { IOffer } from '../offer/types';
+import type {
 	IIssuanceContext,
 	IssuanceAnswer,
 	IssuancePolicy
 } from '../offer/offer-manager';
-import { FforWitnessLedger } from './witness-ledger';
+import type { FforWitnessLedger } from './witness-ledger';
 import {
 	FF_ISSUER_ACK_TYPE,
 	FF_ISSUER_PROVISION_TYPE,
@@ -29,11 +29,11 @@ import {
 	FF_ISSUER_STATUS_TYPE,
 	FF_WITNESS_REQUEST_ID_LEN
 } from './witness-types';
+import type { IFforIssuerHop } from './issuer-messages';
 import {
 	FF_ISSUER_ATTESTATION_TLV,
 	FF_ISSUER_MANIFEST_VERSION,
 	FF_ISSUER_REFUSAL,
-	IFforIssuerHop,
 	decodeIssuerProvision,
 	decodeIssuerStatus,
 	encodeAttestationTlvValue,
@@ -42,12 +42,12 @@ import {
 	verifyAttestation,
 	verifyIssuerStatus
 } from './issuer-messages';
-import {
+import type {
 	FforIssuerLedger,
 	IFforIssuerHopRow,
-	IFforIssuerManifestRecord,
-	slotId
+	IFforIssuerManifestRecord
 } from './issuer-ledger';
+import { slotId } from './issuer-ledger';
 import {
 	buildIssuerPaymentPath,
 	conservativeExpirySeconds
@@ -58,6 +58,24 @@ export interface IFforIssuerConfig {
 	enabled: boolean;
 }
 
+/** The delegated BOLT 12 issuer's events (section 9.7), relayed by LightningNode. */
+export interface FforIssuerEvents {
+	/** Issuer role: a receiver delegated an offer and provisioned its slots. */
+	'ffor:issuer-provisioned': (data: {
+		mailboxId: Buffer;
+		offerId: Buffer;
+		slots: number;
+	}) => void;
+	/** Issuer role: an invoice was issued against slot `k` to a payer. */
+	'ffor:issuer-issued': (data: {
+		mailboxId: Buffer;
+		k: number;
+		payerId: Buffer;
+	}) => void;
+	/** Issuer role: a delegated offer stopped issuing, with the reason. */
+	'ffor:issuer-retired': (data: { mailboxId: Buffer; reason: string }) => void;
+}
+
 export interface IFforIssuerDeps {
 	ledger: FforIssuerLedger;
 	witnessLedger: FforWitnessLedger;
@@ -66,7 +84,10 @@ export interface IFforIssuerDeps {
 	currentHeight: () => number;
 	send: (peer: string, type: number, payload: Buffer) => void;
 	log: (action: string, data: Record<string, unknown>) => void;
-	emit: (event: string, data: unknown) => void;
+	emit: <K extends keyof FforIssuerEvents>(
+		event: K,
+		...args: Parameters<FforIssuerEvents[K]>
+	) => void;
 	offers: {
 		registerDelegatedOffer(offer: IOffer, policy: IssuancePolicy): string;
 		unregisterDelegatedOffer(offerIdHex: string): void;
@@ -325,10 +346,9 @@ export class FforIssuerService {
 		if (requested === undefined || requested <= 0n) return refusal;
 		if (!ctx.blindingPoint) return refusal; // not over a signed path
 		const payerIdHex = ctx.request.payerKey.toString('hex');
-		const metadataHashHex = crypto
-			.createHash('sha256')
-			.update(ctx.request.metadata ?? Buffer.alloc(0))
-			.digest('hex');
+		const metadataHashHex = sha256(
+			ctx.request.metadata ?? Buffer.alloc(0)
+		).toString('hex');
 		// Identical metadata from the same payer: the same invoice, byte for
 		// byte, or the same slot again when the crash came before the store.
 		let slot = this.deps.ledger.issuedFor(

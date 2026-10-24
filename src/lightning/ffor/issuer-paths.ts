@@ -5,14 +5,14 @@
  * bound on an invoice's expiry (section 7.5.6).
  */
 
-import crypto from 'crypto';
-import {
+import { randomBytes } from '../crypto/provider';
+import type {
 	IBlindedHopData,
-	IBlindedPaymentPath,
-	constructBlindedPath
+	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { IBlindedPayInfo } from '../offer/types';
-import { IFforIssuerHop } from './issuer-messages';
+import { constructBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPayInfo } from '../offer/types';
+import type { IFforIssuerHop } from './issuer-messages';
 
 /**
  * Fold relay terms upstream-first into one blinded_payinfo, the way the
@@ -80,7 +80,7 @@ export function buildIssuerPaymentPath(
 	}));
 	hopData.push({ paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n } });
 	const path = constructBlindedPath(
-		crypto.randomBytes(32),
+		randomBytes(32),
 		hops.map((h) => h.nodeId),
 		hopData
 	);

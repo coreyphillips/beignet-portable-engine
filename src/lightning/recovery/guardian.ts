@@ -23,13 +23,12 @@
  * specification wins and this module has a bug.
  */
 
-import { createHash } from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { ecc } from '../../utils/ecc';
+import type { GuardianState, LogHead } from './guardian-wire';
 import {
 	CRASH_V1_PROFILE,
 	GUARDIAN_PROTOCOL_VERSION,
-	GuardianState,
-	LogHead,
 	acquireTranscriptHash,
 	computeGuardianSetId,
 	isGenesisLogHead,
@@ -47,15 +46,13 @@ import {
 	rotateTranscriptHash,
 	rotationEvidenceProblem
 } from './guardian-wire';
-import {
-	GuardianStore,
+import type {
 	IGuardianEpochRow,
 	IGuardianNamespaceRow,
 	IGuardianOrphanRow,
-	IGuardianRecordRow,
-	readU64be,
-	u64be
+	IGuardianRecordRow
 } from './guardian-store';
+import { GuardianStore, readU64be, u64be } from './guardian-store';
 import {
 	decodeRotateSetRequest,
 	encodeRotateSetRequest
@@ -372,10 +369,6 @@ const MAX_CIPHERTEXT_PROTOCOL_CAP = 16 * 1024 * 1024;
 const MAX_RECORDS_PER_GET_PROTOCOL_CAP = 256;
 const U64_MAX = 0xffffffffffffffffn;
 const ZERO32 = Buffer.alloc(32);
-
-function sha256(data: Buffer): Buffer {
-	return createHash('sha256').update(data).digest();
-}
 
 function validU64(value: bigint): boolean {
 	return typeof value === 'bigint' && value >= 0n && value <= U64_MAX;

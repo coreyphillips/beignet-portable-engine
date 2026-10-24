@@ -13,7 +13,7 @@ const root = path.join(__dirname, '..');
 const aliases = {
 	crypto: 'crypto', fs: 'fs', net: 'net', tls: 'tls', dns: 'unsupported',
 	http: 'unsupported', https: 'rgs-https', os: 'unsupported', zlib: 'zlib',
-	'better-sqlite3': 'sqlite'
+	'better-sqlite3': 'better-sqlite3'
 };
 for (const name in aliases) aliases[name] = path.join(root, 'portable', aliases[name] + '.ts');
 aliases.path = require.resolve('path-browserify');

@@ -1,3 +1,33 @@
+# Portable engine validation, 2026-10-23 addendum for 0.32.1
+
+The fork tracks Beignet **0.32.1** at `daed636187e42bfbd156e5f5b74fda9c7a6379cd`, npm's `gitHead` for the release. Its `src/` is the same as `82c9170d` (#1848), the source of 0.32.0, whose published `gitHead` is `33f5e8eb`. 0.32.1 adds only #1851, which moves the `@noble/hashes` and `@noble/secp256k1` pins. This addendum supersedes the baseline statement of the 0.31.1 addendum below. The patch reapplies with 14 hunks merged by hand, one rework and three portable changes. The tree's change is upstream's own, line for line, apart from those (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 225 of 225 pass. That is the 224 before plus one new test: the engine's crypto provider running over `portable/crypto.ts`.
+  - Without the ChaCha20 `final()` fix, that test fails with `The platform's chacha20 failed its self-test`, and the ChaCha20 stream test with `Cipher already finalized`.
+  - Without `portable/better-sqlite3.ts`, all eight `sqlite-surface` tests fail.
+  - Without the test persistence, all twelve `private-home-channel` tests fail.
+- `npm run check:types` passes.
+- A full `tsc --noEmit -p .` reports 19 errors, down from the 0.31.1 tree's 27.
+  - Ten are gone: the transport typing errors in `peer.ts`, `peer-manager.ts`, `websocket-server.ts` and `beignet-node.ts`, which upstream's `IDuplexTransport.write` widening (#1836) fixes.
+  - Two are new, of kinds the baseline already had: a `Buffer<ArrayBufferLike>` assignment in `src/lightning/onion/construct.ts`, and the missing better-sqlite3 types in the new `src/lightning/storage/sqlite-binding.ts`. Neither file is patched.
+- The built bundle reports `0.32.1-portable`. The build prints no esbuild warnings (the 0.31.1 tree's eight are gone with upstream's lazy `require` calls).
+- The published `beignet@0.32.1` tarball matches npm's integrity hash, and its `dist/` is byte-identical to a local `tsc` build of `daed6361`.
+- Upstream's offline suites, run in an upstream `82c9170d` tree with this fork's `src/` in place of its own:
+  - `test:lightning`: 9941 passing and 6 failing.
+  - `test:cli`: 2374 passing and 1 failing.
+  - Rerun alone, pristine upstream passes the six that can run outside a git checkout. They break down as follows:
+    - Three in `agent-review.test.ts` expect a channel the node opens to be public. The fork keeps a wallet's new channels private, and the 0.31.1 fork fails the same three.
+    - Two are `doc-tables.test.ts` README checks, which the fork's added options make stale.
+    - One is `comment-paths.test.ts`, which runs `git ls-files` and so fails in any tree that is not a git checkout. It passes in upstream's CI.
+    - One is `daemon-http-limits.test.ts`, which timed out under the parallel run and passes alone.
+- `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - It ran against the local Bitcoin and Electrum containers, with the primary built from upstream `33f5e8eb` through `BEIGNET_SOURCE_DIR` and `@noble/hashes` 1.8.0 and `@noble/secp256k1` 1.7.2 installed.
+  - The relay was a local stand-in for `beignet-relay`: a WebSocket byte relay with the same `beignet.v1` and `auth.<token>` handshake and fixed `/electrum` and `/peer` upstreams. The shared client was wallet-core `cc544e6`, the commit Chicory pins.
+- `scripts/regtest-send-max.cjs` passes six of its seven cases against the same primary, with 69 PASS lines: jit, the three address types, unconfirmed address and phone.
+
+Not run: the `cln` send-max case, `smoke-regtest.cjs`, `test:regtest:channelize` and the FFOR regtests (this machine has no CLN on 19846), and a device start.
+
 # Portable engine validation, 2026-10-21 addendum for 0.31.1
 
 The fork tracks Beignet **0.31.1** at `04a2d925b720540a433aebb1dd4f28d6de69a8e0`, npm's `gitHead` for the release. Its `src/` is the same as `514d5680` (#1784), two commits after 0.31.0, whose published `gitHead` is `9288fa9a`. This addendum supersedes the baseline statement of the 0.31.0 addendum below; the rest of that addendum still describes the code this resync did not touch. The patch reapplies with no rejection, fuzz or offset, and the tree's change is upstream's own, line for line (see `PATCHES.md`).

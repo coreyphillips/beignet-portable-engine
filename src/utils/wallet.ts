@@ -1,8 +1,6 @@
 import { defaultWalletData } from '../shapes';
 import cloneDeep from 'lodash.clonedeep';
-import {
-	EAddressType,
-	EAvailableNetworks,
+import type {
 	IAddress,
 	IAddresses,
 	IIndexes,
@@ -16,22 +14,26 @@ import {
 	TGapLimitOptions,
 	TGetData,
 	TKeyDerivationPurpose,
-	TVin
+	TVin,
+	TWalletDataKeys,
+	TWalletStorageKey
 } from '../types';
-import { err, ok, Result } from './result';
+import { EAddressType } from '../types';
+import { Network } from '../network';
+import type { Result } from './result';
+import { err, ok } from './result';
 import {
 	getAddressTypeFromPath,
 	getKeyDerivationPathObject,
 	getKeyDerivationPathString
 } from './derivation-path';
-import { bech32m } from 'bech32';
 import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import {
 	BITKIT_WALLET_SEED_HASH_PREFIX,
 	WALLET_ID_PREFIX
 } from '../wallet/constants';
-import { getAddressIndexDiff } from './helpers';
+import { getAddressIndexDiff } from './common';
 import { getDustThreshold } from './transaction';
 
 /**
@@ -76,7 +78,7 @@ export const objectKeys = Object.keys as <Type extends object>(
  * @param {TKeyDerivationPurpose | string} [purpose]
  * @param {boolean} [changeAddress]
  * @param {string} [addressIndex]
- * @param {EAvailableNetworks} [network]
+ * @param {Network} [network]
  * @returns {Result<{IKeyDerivationPathData}>} Derivation Path Data
  */
 export const formatKeyDerivationPath = ({
@@ -89,7 +91,7 @@ export const formatKeyDerivationPath = ({
 }: {
 	path: IKeyDerivationPath | string;
 	purpose?: TKeyDerivationPurpose;
-	network: EAvailableNetworks;
+	network: Network;
 	changeAddress?: boolean;
 	index?: string;
 	addressType?: EAddressType;
@@ -104,7 +106,7 @@ export const formatKeyDerivationPath = ({
 				index
 			});
 			if (derivationPathResponse.isErr()) {
-				return err(derivationPathResponse.error.message);
+				return err(derivationPathResponse.error);
 			}
 			path = derivationPathResponse.value;
 		}
@@ -119,7 +121,7 @@ export const formatKeyDerivationPath = ({
 			index
 		});
 		if (pathStringResponse.isErr()) {
-			return err(pathStringResponse.error.message);
+			return err(pathStringResponse.error);
 		}
 		const pathString = pathStringResponse.value;
 		return ok({ pathObject, pathString });
@@ -179,87 +181,6 @@ export const getHighestUsedIndexFromTxHashes = ({
 		};
 
 		return ok(data);
-	} catch (e) {
-		return err(e);
-	}
-};
-
-/**
- * Returns if the provided string is a valid Bech32m encoded string (taproot/p2tr address).
- * @param {string} address
- * @returns { isValid: boolean; network: EAvailableNetworks }
- */
-export const isValidBech32mEncodedString = (
-	address: string
-): { isValid: boolean; network: EAvailableNetworks } => {
-	const invalid = {
-		isValid: false,
-		network: EAvailableNetworks.bitcoin
-	};
-	try {
-		const decoded = bech32m.decode(address);
-		// BIP-350: a well-formed checksum is not enough — bech32m addresses
-		// carry a witness version (word 0) in 1..16 and a program of 2..40
-		// bytes, and taproot (v1) is exactly 32. A bare checksum check accepted
-		// junk like "bc1p...<any length>".
-		const version = decoded.words[0];
-		if (version === undefined || version < 1 || version > 16) return invalid;
-		const program = bech32m.fromWords(decoded.words.slice(1));
-		if (program.length < 2 || program.length > 40) return invalid;
-		if (version === 1 && program.length !== 32) return invalid;
-		switch (decoded.prefix) {
-			case 'bc':
-				return { isValid: true, network: EAvailableNetworks.bitcoin };
-			case 'tb':
-				// 'tb' is shared by testnet and signet; beignet models signet
-				// under the testnet params, so it is reported as testnet.
-				return { isValid: true, network: EAvailableNetworks.bitcoinTestnet };
-			case 'bcrt':
-				return { isValid: true, network: EAvailableNetworks.bitcoinRegtest };
-			default:
-				return invalid;
-		}
-	} catch (error) {
-		return invalid;
-	}
-};
-
-/**
- * Returns an array of all available networks from the networks object.
- * @returns {EAvailableNetworks[]}
- */
-export const availableNetworks = (): EAvailableNetworks[] =>
-	Object.values(EAvailableNetworks);
-
-/**
- * Sum a specific value in an array of objects.
- * @param {T[]} arr
- * @param {keyof T} value
- * @returns {Result<number>}
- */
-export const reduceValue = <T>({
-	arr,
-	value
-}: {
-	arr: T[];
-	value: keyof T;
-}): Result<number> => {
-	try {
-		if (!value) {
-			return err('No value specified.');
-		}
-		const total = arr.reduce((acc, cur) => {
-			return acc + Number(cur[value]);
-		}, 0);
-		// The trailing `|| 0` this replaces turned a NaN total, which one missing
-		// or non-numeric entry produces, into a clean 0. Zero is a legitimate
-		// total here, so the failure was indistinguishable from an empty set.
-		if (!Number.isFinite(total)) {
-			return err(
-				`Non-numeric value encountered while summing "${String(value)}".`
-			);
-		}
-		return ok(total);
 	} catch (e) {
 		return err(e);
 	}
@@ -376,23 +297,26 @@ export const generateWalletId = (seed: Buffer): string => {
 		.toString('hex');
 };
 
-export const getWalletDataStorageKey = (
+export const getWalletDataStorageKey = <K extends TWalletDataKeys>(
 	name: string,
-	network: EAvailableNetworks,
-	key: keyof IWalletData,
+	network: Network,
+	key: K,
 	account = 0
-): string => {
+): TWalletStorageKey<K> => {
 	// Account 0 keeps the legacy key format so existing stored wallets keep
 	// loading. Non-zero accounts get their own namespace so two Wallet
 	// instances over the same mnemonic and storage never collide.
-	if (account > 0) return `${name}-${network}-acct${account}-${key}`;
-	return `${name}-${network}-${key}`;
+	const storageKey =
+		account > 0
+			? `${name}-${network}-acct${account}-${key}`
+			: `${name}-${network}-${key}`;
+	return storageKey as TWalletStorageKey<K>;
 };
 
 // The network is spelled out rather than matched as any segment: the name may
 // contain hyphens, and a generic segment would read "acct1" as the network.
 const STORAGE_KEY_PATTERN = new RegExp(
-	`^(.*)-(${[...new Set(Object.values(EAvailableNetworks))].join('|')})` +
+	`^(.*)-(${Object.values(Network).join('|')})` +
 		'(?:-acct([1-9]\\d*))?-([^-]+)$'
 );
 
@@ -406,7 +330,7 @@ export const getStorageKeyValues = (
 ):
 	| {
 			walletName: string;
-			network: EAvailableNetworks;
+			network: Network;
 			account: number;
 			value: keyof IWalletData;
 	  }
@@ -419,7 +343,7 @@ export const getStorageKeyValues = (
 	}
 	return {
 		walletName,
-		network: network as EAvailableNetworks,
+		network: network as Network,
 		account: account === undefined ? 0 : Number(account),
 		value: value as keyof IWalletData
 	};

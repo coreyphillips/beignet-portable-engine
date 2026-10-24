@@ -1,5 +1,5 @@
-import { createHash } from 'crypto';
-import { IFforEpochRecord } from './types';
+import { sha256 } from '../crypto/provider';
+import type { IFforEpochRecord } from './types';
 import { IRREVOCABLE_DEPTH } from '../chain/types';
 
 /** Observed spend identity. Its presence alone never establishes final value. */
@@ -105,9 +105,8 @@ export function validateFforVoucherArchive(
 	if (
 		record.preimage !== undefined &&
 		(!hex(record.preimage) ||
-			createHash('sha256')
-				.update(Buffer.from(record.preimage, 'hex'))
-				.digest('hex') !== record.paymentHash)
+			sha256(Buffer.from(record.preimage, 'hex')).toString('hex') !==
+				record.paymentHash)
 	) {
 		throw new Error('Invalid FFOR voucher archive preimage');
 	}
@@ -135,9 +134,8 @@ export function validateFforVoucherArchive(
 				r.outputIndex > 0xffffffff ||
 				(r.preimage !== undefined &&
 					(!hex(r.preimage) ||
-						createHash('sha256')
-							.update(Buffer.from(r.preimage, 'hex'))
-							.digest('hex') !== record.paymentHash))
+						sha256(Buffer.from(r.preimage, 'hex')).toString('hex') !==
+							record.paymentHash))
 			) {
 				throw new Error('Invalid FFOR voucher chain observation');
 			}
@@ -176,7 +174,11 @@ export function validateFforVoucherArchive(
 	return record;
 }
 
-/** Merge only additional evidence. Neither identity nor a terminal outcome can change. */
+/**
+ * Merge only additional evidence. Neither identity nor a terminal outcome can
+ * change. Returns `previous` itself when `incoming` adds nothing, so callers
+ * can tell whether a write is needed by comparing references.
+ */
 export function mergeFforVoucherArchive(
 	previous: IFforVoucherArchive | null,
 	incoming: IFforVoucherArchive
@@ -233,6 +235,14 @@ export function mergeFforVoucherArchive(
 		previous.creditedReceiptId !== incoming.creditedReceiptId
 	)
 		throw new Error('FFOR voucher credit source changed');
+	if (
+		chainResolutions.length === (previous.chainResolutions?.length ?? 0) &&
+		chainObservations.length === (previous.chainObservations?.length ?? 0) &&
+		(!incoming.preimage || previous.preimage) &&
+		(!incoming.outcome || previous.outcome) &&
+		(!incoming.creditedReceiptId || previous.creditedReceiptId)
+	)
+		return previous;
 	return validateFforVoucherArchive({
 		...incoming,
 		...(previous.preimage ? { preimage: previous.preimage } : {}),

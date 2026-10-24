@@ -1,17 +1,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { Network } from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
+import type { Network as BitcoinJsNetwork } from 'bitcoinjs-lib';
+import type { BIP32Interface } from 'bip32';
 import { bip32 } from '../utils/ecc-apis';
 import cloneDeep from 'lodash.clonedeep';
 
-import {
-	EAddressType,
-	EAvailableNetworks,
-	EBoostType,
-	ECoinSelectPreference,
-	EFeeId,
-	EPaymentType,
-	EScanningStrategy,
+import type {
 	IAddress,
 	IAddresses,
 	IBalanceBreakdown,
@@ -24,6 +17,7 @@ import {
 	IBuildPsbtResponse,
 	IImportSignedPsbtResponse,
 	ICanBoostResponse,
+	ICreateSignedTransactionArgs,
 	ICustomGetAddress,
 	ICustomGetScriptHash,
 	IExportDescriptorsResponse,
@@ -42,18 +36,21 @@ import {
 	IGetNextAvailableAddressResponse,
 	IGetUtxosResponse,
 	IHeader,
+	IIndexedOutpoint,
 	IKeyDerivationPath,
 	IMultisigCosigner,
 	IMultisigOptions,
 	IMultisigWallet,
 	InputData,
 	IOnchainFees,
+	IOutpoint,
 	IOutput,
 	IPrivateKeyInfo,
 	IRbfData,
 	ISendTransaction,
 	ISendTx,
 	ISetupTransaction,
+	ISignedTransaction,
 	ISweepPrivateKey,
 	ISweepPrivateKeyRes,
 	ITransaction,
@@ -68,7 +65,6 @@ import {
 	TAddressLabels,
 	TAddressScan,
 	TAddressTypeContent,
-	TAvailableNetworks,
 	TFeeEstimationSource,
 	TGapLimitOptions,
 	TGetData,
@@ -79,13 +75,26 @@ import {
 	TProcessUnconfirmedTransactions,
 	TServer,
 	TSetData,
+	TSetTransactionChanges,
 	TSetupTransactionResponse,
+	TTransactionChanges,
 	TTransactionMessage,
 	TTxDetails,
 	TTxResult,
 	TUnspentAddressScriptHashData,
-	TWalletDataKeys
+	TWalletDataKeys,
+	TWalletStorageKey
 } from '../types';
+import {
+	EAddressType,
+	EBoostType,
+	ECoinSelectPreference,
+	EFeeId,
+	EPaymentType,
+	EScanningStrategy
+} from '../types';
+import { Network, toBitcoinJsNetwork, toElectrumNetwork } from '../network';
+import type { IKeyOrigin, Result } from '../utils';
 import {
 	appendDescriptorChecksum,
 	BoostError,
@@ -94,6 +103,7 @@ import {
 	createOpReturnScript,
 	decodeOpReturnMessage,
 	err,
+	EWalletErrorCode,
 	filterAddressesObjForGapLimit,
 	formatKeyDerivationPath,
 	generateWalletId,
@@ -105,8 +115,6 @@ import {
 	getDefaultWalletData,
 	getDefaultWalletDataKeys,
 	getDustThreshold,
-	getBitcoinJsNetwork,
-	getElectrumNetwork,
 	getHighestUsedIndexFromTxHashes,
 	getKeyDerivationPath,
 	getKeyDerivationPathObject,
@@ -115,7 +123,6 @@ import {
 	getSeed,
 	getWalletDataStorageKey,
 	hasUntrimmedInputs,
-	IKeyOrigin,
 	isPositive,
 	MultisigSpendError,
 	normalizeKeyOrigin,
@@ -125,7 +132,6 @@ import {
 	parseBip48Path,
 	parseExtendedPublicKey,
 	removeDustUtxos,
-	Result,
 	shuffleArray,
 	trimInputs,
 	validateAddress,
@@ -136,6 +142,7 @@ import {
 import {
 	addressTypes,
 	defaultFeesShape,
+	defaultWalletData,
 	getAddressTypeContent,
 	getAddressTypes,
 	getDefaultSendTransaction
@@ -143,6 +150,7 @@ import {
 import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
 import {
+	COINBASE_MATURITY,
 	GAP_LIMIT,
 	GAP_LIMIT_CHANGE,
 	MAX_CACHED_BRANCHES,
@@ -153,7 +161,10 @@ import {
 } from './constants';
 import { btcToSats } from '../utils/conversion';
 import { derivePathCached } from '../utils/derive-path-cached';
-import { ILogger, createConsoleLogger } from '../logger';
+import type { ILogger } from '../logger';
+import { createConsoleLogger } from '../logger';
+import { registerLiveWalletData } from './live-data';
+import { CoinControl } from './coin-control';
 
 type TAddressLookup = {
 	maps: (IAddresses | undefined)[];
@@ -170,8 +181,79 @@ type TCosigner = {
 	branches: Map<string, BIP32Interface>;
 };
 
+// Each BTC field of a formatted transaction and the sats field beside it.
+const SATS_FIELDS = [
+	['totalInputValue', 'totalInputSats'],
+	['matchedInputValue', 'matchedInputSats'],
+	['totalOutputValue', 'totalOutputSats'],
+	['matchedOutputValue', 'matchedOutputSats'],
+	['fee', 'feeSats'],
+	['value', 'valueSats']
+] as const;
+
+/**
+ * Whether a coinbase output confirmed at `height` can be spent in the block
+ * after `tip`, the earliest one a transaction sent now can confirm in.
+ */
+const coinbaseSpendable = (height: number, tip: number): boolean =>
+	tip + 1 - height >= COINBASE_MATURITY;
+
+/**
+ * Freezes value and every plain object and array it holds, and returns it.
+ * Class instances such as key pairs are left as they are: they cache derived
+ * keys on themselves, and frozen they would throw doing it.
+ */
+const deepFreeze = <T>(value: T): T => {
+	if (typeof value !== 'object' || value === null || Object.isFrozen(value)) {
+		return value;
+	}
+	const proto: unknown = Object.getPrototypeOf(value);
+	if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) {
+		return value;
+	}
+	Object.freeze(value);
+	for (const child of Object.values(value)) deepFreeze(child);
+	return value;
+};
+
+/**
+ * What one queued write stores: a whole value, or, for the transaction map on
+ * an adapter with setTransactionChanges, the records changed since the write
+ * before it.
+ */
+type TWalletWrite =
+	| { data: IWalletData[keyof IWalletData] }
+	| { changes: TTransactionChanges };
+
+/** The one write that leaves storage as `older` and then `newer` would. */
+const mergeWrites = (
+	older: TWalletWrite,
+	newer: TWalletWrite
+): TWalletWrite => {
+	if ('data' in newer) return newer;
+	const { set, deleted } = newer.changes;
+	if ('data' in older) {
+		// Only the transaction map is ever written as changes.
+		const data: IFormattedTransactions = {
+			...(older.data as IFormattedTransactions),
+			...set
+		};
+		for (const txid of deleted) delete data[txid];
+		return { data };
+	}
+	const merged: TTransactionChanges = {
+		set: { ...older.changes.set, ...set },
+		deleted: older.changes.deleted.filter((txid) => !(txid in set))
+	};
+	for (const txid of deleted) {
+		delete merged.set[txid];
+		if (!merged.deleted.includes(txid)) merged.deleted.push(txid);
+	}
+	return { changes: merged };
+};
+
 export class Wallet {
-	private _network: EAvailableNetworks;
+	private _network: Network;
 	private readonly _mnemonic?: string;
 	private readonly _passphrase: string;
 	private readonly _seed?: Buffer;
@@ -196,6 +278,7 @@ export class Wallet {
 	private _data: IWalletData;
 	private _getData: TGetData;
 	private _setData?: TSetData;
+	private _setTransactionChanges?: TSetTransactionChanges;
 	private _customGetAddress?: (
 		data: ICustomGetAddress
 	) => Promise<Result<IGetAddressResponse>>; // For use with Bitkit.
@@ -230,15 +313,25 @@ export class Wallet {
 	// against the count it was taken from.
 	private readonly _spentOutpoints: Map<string, number> = new Map();
 	private _spendSeq = 0;
-	// The mark every getUtxos query still in flight was issued at. A record can
-	// only be dropped once the oldest of them has landed: drop it sooner and the
-	// older scan's stale answer has nothing left to filter against.
+	// The mark every refreshUtxos query still in flight was issued at. A record
+	// can only be dropped once the oldest of them has landed: drop it sooner
+	// and the older scan's stale answer has nothing left to filter against.
 	private readonly _scanMarks: number[] = [];
-	// Every getUtxos query is numbered when issued, and the number of the newest
-	// one whose answer was written is kept. Each answer replaces the whole set,
-	// so without this an older query landing last would undo a newer one.
+	// Every refreshUtxos query is numbered when issued, and the number of the
+	// newest one whose answer was written is kept. Each answer replaces the
+	// whole set, so without this an older query landing last would undo a
+	// newer one.
 	private _scanSeq = 0;
 	private _appliedScanSeq = 0;
+	// The coinbase outputs the last applied scan left out of the UTXO set and
+	// balance because the next block cannot spend them. Later scans list their
+	// addresses, which may have left the gap window by the time they mature.
+	// Memory only.
+	private _immatureUtxos: IUtxo[] = [];
+	// Whether each young coin's transaction is a coinbase, by txid, so a coin
+	// is looked up once rather than on every scan. Kept to the young coins of
+	// the last lookup.
+	private readonly _coinbaseTxids: Map<string, boolean> = new Map();
 	// This wallet's tip at the first check a node without a txindex answered
 	// "no such mempool transaction" for a record the rule of issue #871 kept,
 	// by txid, or the highest tip it held if that was higher. A miss that
@@ -295,10 +388,15 @@ export class Wallet {
 	private readonly _birthdayHeightOption?: number;
 	// A failed storage read counts as a missing key instead of failing the load.
 	private readonly _resetOnReadFailure: boolean;
+	// Not readonly: switchNetwork rebuilds it, as it does transaction and
+	// electrum.
+	private _coinControl: CoinControl;
 
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
 	public readonly isWatchOnly: boolean;
+	// Set by IWallet.remainOffline: Electrum refuses every connect and request.
+	public readonly remainOffline: boolean;
 	public isRefreshing: boolean;
 	public isSwitchingNetworks: boolean;
 	public readonly id: string;
@@ -331,7 +429,7 @@ export class Wallet {
 		passphrase,
 		seed,
 		name,
-		network = EAvailableNetworks.mainnet,
+		network = Network.bitcoin,
 		addressType,
 		account = 0,
 		birthdayHeight,
@@ -339,6 +437,7 @@ export class Wallet {
 		storage,
 		resetOnReadFailure = false,
 		electrumOptions,
+		remainOffline = false,
 		onMessage = (): null => null,
 		customGetAddress,
 		customGetScriptHash,
@@ -452,8 +551,10 @@ export class Wallet {
 		}
 		this.logger = logger ?? createConsoleLogger('info');
 		this._data = getDefaultWalletData();
+		registerLiveWalletData(this, () => this._data);
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
+		this._setTransactionChanges = storage?.setTransactionChanges;
 		this._resetOnReadFailure = resetOnReadFailure;
 		this._quietUntilFirstRefresh = disableMessagesOnCreate;
 		this._disableRefreshOnCreate = disableRefreshOnCreate;
@@ -464,6 +565,7 @@ export class Wallet {
 		this.transaction = new Transaction({
 			wallet: this
 		});
+		this._coinControl = new CoinControl({ wallet: this });
 		this.feeEstimates = cloneDeep(defaultFeesShape);
 		this.disableMessages = disableMessages;
 		this.sendMessage = <K extends keyof TMessageDataMap>(
@@ -475,6 +577,7 @@ export class Wallet {
 			onMessage(key, data);
 		};
 		this.electrumOptions = electrumOptions;
+		this.remainOffline = remainOffline;
 		this.electrum = new Electrum({
 			wallet: this,
 			network: this.network,
@@ -511,8 +614,70 @@ export class Wallet {
 		};
 	}
 
-	public get data(): IWalletData {
-		return this._data;
+	/**
+	 * A frozen copy of the wallet's data as it is now. It does not follow
+	 * later changes, and writing to it throws: change data with updateData.
+	 * Each read copies the whole history, so code that reads one field often
+	 * should use the getter for that field (balance, utxos, transactions).
+	 */
+	public get data(): Readonly<IWalletData> {
+		return deepFreeze(cloneDeep(this._data));
+	}
+
+	/**
+	 * Replaces the given fields of the wallet's data and saves each one. The
+	 * fields change at once, and each save queues behind the writes already
+	 * made to its field, as the wallet's own saves do. The values are copied,
+	 * so changing them afterwards does not reach the wallet. Nothing derived
+	 * from a field is recalculated: new utxos leave balance as it was.
+	 *
+	 * A patch with blacklistedUtxos first waits for any freeze or unfreeze in
+	 * flight, as those wait for each other. A patch with addressIndex counts
+	 * as a move of the receive index, so getAddress saves it again before
+	 * handing it out if storage refused it here.
+	 * @param {Partial<IWalletData>} patch
+	 * @returns {Promise<Result<string>>} Err when storage refused a field.
+	 * Each refusal also reaches onMessage as storageWriteFailed.
+	 */
+	public async updateData(
+		patch: Partial<IWalletData>
+	): Promise<Result<string>> {
+		const keys = objectKeys(patch).filter((key) => patch[key] !== undefined);
+		const unknown = keys.filter(
+			(key) => !Object.prototype.hasOwnProperty.call(defaultWalletData, key)
+		);
+		if (unknown.length) {
+			return err(`Unknown wallet data fields: ${unknown.join(', ')}.`);
+		}
+		const update = async (): Promise<Result<string>> => {
+			const { addressIndex } = patch;
+			if (
+				addressIndex &&
+				Object.values(EAddressType).some(
+					(type) =>
+						addressIndex[type]?.index !== this._data.addressIndex[type]?.index
+				)
+			) {
+				this.receiveIndexMoves++;
+			}
+			const data = this._data as Record<TWalletDataKeys, unknown>;
+			for (const key of keys) data[key] = cloneDeep(patch[key]);
+			const saved = await Promise.all(
+				keys.map((key) =>
+					key === 'addressIndex'
+						? this.saveReceiveIndex()
+						: this.saveWalletData(key, this._data[key])
+				)
+			);
+			const refused = saved.flatMap((res) =>
+				res.isErr() ? [res.error.message] : []
+			);
+			if (refused.length) return err(refused.join(' '));
+			return ok('Wallet data updated.');
+		};
+		return keys.includes('blacklistedUtxos')
+			? this._coinControl.runBlacklistWrite(update)
+			: update();
 	}
 
 	public get transactions(): IFormattedTransactions {
@@ -538,7 +703,17 @@ export class Wallet {
 		return this._refreshFailed;
 	}
 
-	public get network(): EAvailableNetworks {
+	/** Whether a coinbase output the last scan held back as immature can be
+	 *  spent in the next block. The next block refreshes in full while it is
+	 *  set, which puts the coin in the UTXO set. */
+	public get coinbaseMatured(): boolean {
+		const tip = this._data.header?.height ?? 0;
+		return this._immatureUtxos.some((utxo) =>
+			coinbaseSpendable(utxo.height, tip)
+		);
+	}
+
+	public get network(): Network {
 		return this._network;
 	}
 
@@ -583,7 +758,7 @@ export class Wallet {
 			const res = await wallet.setWalletData();
 			if (res.isErr()) {
 				await wallet._abandonFailedCreate();
-				return err(res.error.message);
+				return err(res.error);
 			}
 			wallet.electrum.startConnectionPolling();
 			void wallet.updateFeeEstimates(true);
@@ -717,7 +892,7 @@ export class Wallet {
 		for (const cosigner of cosigners ?? []) addCosigner(cosigner);
 		if (this._root) {
 			// We are a cosigner: derive our BIP 48 account xpub and include it.
-			const coinType = this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+			const coinType = this._network === Network.bitcoin ? '0' : '1';
 			const ourNode = this._root
 				.derivePath(`m/48'/${coinType}'/${this._account}'/2'`)
 				.neutered();
@@ -785,10 +960,9 @@ export class Wallet {
 				return err('This wallet is not a multisig wallet.');
 			}
 			const parsed = parseBip48Path(path);
-			if (parsed.isErr()) return err(parsed.error.message);
+			if (parsed.isErr()) return err(parsed.error);
 			const { coinType, account, change, index } = parsed.value;
-			const expectedCoin =
-				this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+			const expectedCoin = this._network === Network.bitcoin ? '0' : '1';
 			if (coinType !== expectedCoin || account !== this._account) {
 				return err(
 					`Path ${path} does not match this wallet (expected m/48'/${expectedCoin}'/${this._account}'/2'/change/index).`
@@ -803,7 +977,7 @@ export class Wallet {
 				publicKeys: childKeys,
 				network: this.getBitcoinNetwork()
 			});
-			if (payment.isErr()) return err(payment.error.message);
+			if (payment.isErr()) return err(payment.error);
 			const perCosigner = this._multisig.cosigners
 				.map((c, i) => {
 					let masterFingerprint: Buffer;
@@ -893,6 +1067,7 @@ export class Wallet {
 				this.disableMessages = true;
 				// disable saving to storage
 				this._setData = undefined;
+				this._setTransactionChanges = undefined;
 				// Nothing checks again here, and a new wallet counts afresh.
 				this._noTxindexMisses.clear();
 				// disconnect from Electrum
@@ -997,12 +1172,12 @@ export class Wallet {
 	 * meanwhile runs on the new network once the switch is done (#1636). Like
 	 * the wallet's own send methods, a switch called from inside a withSendLock
 	 * session waits on the lock that session holds and never settles.
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @param {TServer | TServer[]} [servers]
 	 * @returns {Promise<Result<Wallet>>}
 	 */
 	public async switchNetwork(
-		network: EAvailableNetworks,
+		network: Network,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
 		if (this._multisig) {
@@ -1023,7 +1198,7 @@ export class Wallet {
 	}
 
 	private async switchNetworkLocked(
-		network: EAvailableNetworks,
+		network: Network,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
 		this.isSwitchingNetworks = true;
@@ -1042,7 +1217,8 @@ export class Wallet {
 			},
 			storage: {
 				getData: this._getData,
-				setData: this._setData
+				setData: this._setData,
+				setTransactionChanges: this._setTransactionChanges
 			},
 			resetOnReadFailure: this._resetOnReadFailure,
 			// The constructor reads the public option names, not the private
@@ -1050,7 +1226,6 @@ export class Wallet {
 			// this wallet below.
 			disableMessagesOnCreate: this._quietUntilFirstRefresh,
 			disableRefreshOnCreate: this._disableRefreshOnCreate,
-			data: getDefaultWalletData(),
 			onMessage: this.sendMessage
 		};
 		try {
@@ -1062,7 +1237,7 @@ export class Wallet {
 			// the read below, and is adopted once that read is installed.
 			this.landedReceiveIndex = {};
 			const res = await next.setWalletData();
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) return err(res.error);
 			await this.electrum.disconnect();
 			// Its arrow methods and sendMessage close over it, so this wallet
 			// keeps its own. So does the refresh bookkeeping: a refresh still
@@ -1112,10 +1287,11 @@ export class Wallet {
 			// read was out is already in storage, and only needs adopting here.
 			this.receiveIndexMovesSaved = this.receiveIndexMoves;
 			this.adoptLandedReceiveIndex();
-			// Both point back at the wallet that constructed them. Nothing is
+			// Each points back at the wallet that constructed it. Nothing is
 			// staged on the Transaction replaced here: the send lock this switch
 			// holds is what every staging call runs under.
 			this.transaction = new Transaction({ wallet: this });
+			this._coinControl = new CoinControl({ wallet: this });
 			this.electrum = new Electrum({
 				wallet: this,
 				network,
@@ -1262,7 +1438,7 @@ export class Wallet {
 		const stopped = 'Wallet stopped.';
 		const r0 = await this.setZeroIndexAddresses();
 		if (r0.isErr()) {
-			return err(r0.error.message);
+			return err(r0.error);
 		}
 		if (this._stopped) return err(stopped);
 		const electrum = this.electrum;
@@ -1275,21 +1451,21 @@ export class Wallet {
 		};
 		const r1 = await this.updateAddressIndexes(scan);
 		if (r1.isErr()) {
-			return err(r1.error.message);
+			return err(r1.error);
 		}
 		if (this._stopped) return err(stopped);
-		const r2 = await this.getUtxos({
+		const r2 = await this.refreshUtxos({
 			scanningStrategy: scanAllAddresses ? EScanningStrategy.all : undefined,
 			additionalAddresses,
 			additionalScriptHashes: scan.utxoAddresses
 		});
 		if (r2.isErr()) {
-			return err(r2.error.message);
+			return err(r2.error);
 		}
 		if (this._stopped) return err(stopped);
 		const r3 = await this.updateTransactions({ scanAllAddresses, scan });
 		if (r3.isErr()) {
-			return err(r3.error.message);
+			return err(r3.error);
 		}
 		if (this._stopped) return err(stopped);
 		await this.subscribeWindows();
@@ -1328,15 +1504,13 @@ export class Wallet {
 	private async setWalletData(): Promise<Result<boolean>> {
 		try {
 			const storageIdCheckRes = await this.storageIdCheck(this.id);
-			if (storageIdCheckRes.isErr())
-				return err(storageIdCheckRes.error.message);
+			if (storageIdCheckRes.isErr()) return err(storageIdCheckRes.error);
 			this._data = getDefaultWalletData();
 			const walletDataResponse = await this.getWalletData();
-			if (walletDataResponse.isErr())
-				return err(walletDataResponse.error.message);
+			if (walletDataResponse.isErr()) return err(walletDataResponse.error);
 			this._data = walletDataResponse.value;
 			await this._scrubStoredSendTransaction();
-			await this._trimStoredTransactionInputs();
+			await this._upgradeStoredTransactions();
 			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
@@ -1362,26 +1536,33 @@ export class Wallet {
 	}
 
 	/**
-	 * Records formatted before inputs were trimmed still carry every input's
-	 * scriptSig and witness, which each later save of their map writes again.
-	 * Trims them once, writing only a map that held such a record. After a
-	 * refused write the next load trims them again.
+	 * Brings records stored by older versions to the current shape once,
+	 * writing only a map that held such a record. After a refused write the
+	 * next load does it again. Records formatted before inputs were trimmed
+	 * still carry every input's scriptSig and witness, which each later save
+	 * of their map writes again. Records formatted before the sats fields
+	 * existed get them from their BTC fields.
 	 * @private
 	 * @async
 	 * @returns {Promise<void>}
 	 */
-	private async _trimStoredTransactionInputs(): Promise<void> {
+	private async _upgradeStoredTransactions(): Promise<void> {
 		for (const key of ['transactions', 'unconfirmedTransactions'] as const) {
 			const records = this._data[key];
-			let trimmed = false;
+			let changed = false;
 			for (const record of Object.values(records)) {
-				if (!Array.isArray(record?.vin) || !hasUntrimmedInputs(record.vin)) {
-					continue;
+				if (!record) continue;
+				if (Array.isArray(record.vin) && hasUntrimmedInputs(record.vin)) {
+					record.vin = trimInputs(record.vin);
+					changed = true;
 				}
-				record.vin = trimInputs(record.vin);
-				trimmed = true;
+				for (const [btc, sats] of SATS_FIELDS) {
+					if (typeof record[sats] === 'number') continue;
+					record[sats] = btcToSats(record[btc]);
+					changed = true;
+				}
 			}
-			if (trimmed) await this.saveWalletData(key, records);
+			if (changed) await this.saveWalletData(key, records);
 		}
 	}
 
@@ -1394,7 +1575,7 @@ export class Wallet {
 	 */
 	private async storageIdCheck(id: string): Promise<Result<string>> {
 		const res = await this._readStoredValue('id');
-		if (res.isErr()) return err(res.error.message);
+		if (res.isErr()) return err(res.error);
 		// No id found, it is safe to save to storage.
 		if (!res.value) {
 			// Save id to storage. Without it the next wallet created under this
@@ -1402,7 +1583,11 @@ export class Wallet {
 			this._data.id = id;
 			const saved = await this.saveWalletData('id', id);
 			if (saved.isErr()) {
-				return err(`Unable to save the wallet id: ${saved.error.message}`);
+				return err(
+					saved.error.code,
+					`Unable to save the wallet id: ${saved.error.message}`,
+					saved.error
+				);
 			}
 			return ok('Saved ID to storage.');
 		}
@@ -1421,7 +1606,9 @@ export class Wallet {
 	 * @returns {string}
 	 * @param key
 	 */
-	public getWalletDataKey(key: keyof IWalletData): string {
+	public getWalletDataKey<K extends TWalletDataKeys>(
+		key: K
+	): TWalletStorageKey<K> {
 		return getWalletDataStorageKey(
 			this.name,
 			this._network,
@@ -1462,7 +1649,7 @@ export class Wallet {
 	private async _readStoredValue<K extends keyof IWalletData>(
 		key: K
 	): Promise<Result<IWalletData[K] | undefined>> {
-		let res: Result<IWalletData[K]>;
+		let res: Result<IWalletData[K] | undefined>;
 		try {
 			res = await this._getData<K>(this.getWalletDataKey(key));
 		} catch (e) {
@@ -1560,12 +1747,12 @@ export class Wallet {
 
 	/**
 	 * Returns the Network object of the currently selected network (bitcoin or testnet).
-	 * @param {TAvailableNetworks} [network]
-	 * @returns {Network}
+	 * @param {Network} [network]
+	 * @returns {BitcoinJsNetwork}
 	 */
-	private getBitcoinNetwork(network?: TAvailableNetworks): Network {
+	private getBitcoinNetwork(network?: Network): BitcoinJsNetwork {
 		if (!network) network = this._network;
-		return getBitcoinJsNetwork(network);
+		return toBitcoinJsNetwork(network);
 	}
 
 	/**
@@ -1718,7 +1905,7 @@ export class Wallet {
 					);
 				}
 				const payment = this.getMultisigPayment(path);
-				if (payment.isErr()) return err(payment.error.message);
+				if (payment.isErr()) return err(payment.error);
 				return ok({
 					address: payment.value.address,
 					publicKey: payment.value.publicKey,
@@ -1729,10 +1916,10 @@ export class Wallet {
 				const data = {
 					path,
 					type: addressType,
-					selectedNetwork: getElectrumNetwork(this._network)
+					selectedNetwork: toElectrumNetwork(this._network)
 				};
 				const res = await this._customGetAddress(data);
-				if (res.isErr()) return err(res.error.message);
+				if (res.isErr()) return err(res.error);
 				return ok(res.value);
 			}
 			const keyPair = this._derivePathKeyPair(path);
@@ -1742,7 +1929,7 @@ export class Wallet {
 				addressType,
 				network
 			});
-			if (addressInfo.isErr()) return err(addressInfo.error.message);
+			if (addressInfo.isErr()) return err(addressInfo.error);
 			return ok({
 				...addressInfo.value,
 				path
@@ -1767,7 +1954,7 @@ export class Wallet {
 	}: IGetAddress = {}): Promise<string> {
 		try {
 			if (index === undefined) {
-				const addressIndex = this.data.addressIndex[addressType];
+				const addressIndex = this._data.addressIndex[addressType];
 				index = addressIndex.index >= 0 ? String(addressIndex.index) : '0';
 			}
 			const pathRes = getKeyDerivationPathString({
@@ -1804,7 +1991,7 @@ export class Wallet {
 		}
 		if (!addressType) {
 			const res = getAddressTypeFromPath(path);
-			if (res.isErr()) return err(res.error.message);
+			if (res.isErr()) return err(res.error);
 			addressType = res.value;
 		}
 		try {
@@ -1824,6 +2011,9 @@ export class Wallet {
 	public async connectToElectrum(
 		servers?: TServer | TServer[]
 	): Promise<Result<string>> {
+		if (this.remainOffline) {
+			return err('The wallet was created with remainOffline.');
+		}
 		const res = await this.electrum.connectToElectrum({
 			network: this._network,
 			servers: servers ?? this.electrumOptions?.servers
@@ -1838,11 +2028,11 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the address balance for the specified address.
+	 * Asks Electrum for the balance of the specified address.
 	 * @param {string} address
 	 * @returns {Promise<Result<IGetAddressBalanceRes>>}
 	 */
-	public async getAddressBalance(
+	public async fetchAddressBalance(
 		address: string
 	): Promise<Result<IGetAddressBalanceRes>> {
 		const scriptHash = await this.getScriptHash({
@@ -1855,12 +2045,12 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns combined balance of provided addresses.
+	 * Asks Electrum for the combined balance of the provided addresses.
 	 * @async
 	 * @param {string[]} addresses
 	 * @returns {Promise<Result<number>>}
 	 */
-	public async getAddressesBalance(
+	public async fetchAddressesBalance(
 		addresses: string[] = []
 	): Promise<Result<number>> {
 		try {
@@ -1892,7 +2082,7 @@ export class Wallet {
 	/**
 	 * Get scriptHash for a given address
 	 * @param {string} address
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<string>}
 	 */
 	public async getScriptHash({
@@ -1900,10 +2090,10 @@ export class Wallet {
 		network
 	}: {
 		address: string;
-		network: EAvailableNetworks;
+		network: Network;
 	}): Promise<string> {
 		if (this._customGetScriptHash) {
-			const selectedNetwork = getElectrumNetwork(network);
+			const selectedNetwork = toElectrumNetwork(network);
 			return await this._customGetScriptHash({ address, selectedNetwork });
 		}
 		return getScriptHash({ address, network });
@@ -1921,11 +2111,11 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the balance for the specified scriptHash.
+	 * Asks Electrum for the balance of the specified scriptHash.
 	 * @param {string} scriptHash
 	 * @returns {Promise<Result<IGetAddressBalanceRes>>}
 	 */
-	public async getScriptHashBalance(
+	public async fetchScriptHashBalance(
 		scriptHash: string
 	): Promise<Result<IGetAddressBalanceRes>> {
 		const res = await this.electrum.getAddressBalance(scriptHash);
@@ -1938,7 +2128,7 @@ export class Wallet {
 	 * @returns {number}
 	 */
 	public getBalance(): number {
-		return this?.data?.balance ?? 0;
+		return this._data.balance ?? 0;
 	}
 
 	/**
@@ -1970,7 +2160,7 @@ export class Wallet {
 					addressType
 				});
 				if (keyDerivationPathResponse.isErr())
-					return err(keyDerivationPathResponse.error.message);
+					return err(keyDerivationPathResponse.error);
 				keyDerivationPath = keyDerivationPathResponse.value;
 				keyDerivationPath.account = this._account;
 			}
@@ -2083,7 +2273,8 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the next available address for the given addresstype.
+	 * Scans Electrum for the given address type's first unused receive and
+	 * change addresses.
 	 * @param {EAddressType} addressType
 	 * @param {TAddressScan} [scan] A refresh's scan, which collects the history
 	 * answered and leaves the UTXOs to the refresh's own scan. Without one,
@@ -2091,7 +2282,7 @@ export class Wallet {
 	 * this returns.
 	 * @returns {Promise<Result<IGetNextAvailableAddressResponse>>}
 	 */
-	public async getNextAvailableAddress(
+	public async fetchNextAvailableAddress(
 		addressType?: EAddressType,
 		scan?: TAddressScan
 	): Promise<Result<IGetNextAvailableAddressResponse>> {
@@ -2103,7 +2294,7 @@ export class Wallet {
 		};
 		const res = await this.scanNextAvailableAddress(addressType, own);
 		if (Object.keys(own.utxoAddresses).length) {
-			await this.getUtxos({
+			await this.refreshUtxos({
 				addressTypesToCheck: [],
 				additionalScriptHashes: own.utxoAddresses
 			});
@@ -2112,7 +2303,7 @@ export class Wallet {
 	}
 
 	/**
-	 * The gap-limit scan behind getNextAvailableAddress.
+	 * The gap-limit scan behind fetchNextAvailableAddress.
 	 * @private
 	 * @param {EAddressType} [addressType]
 	 * @param {TAddressScan} scan
@@ -2123,16 +2314,16 @@ export class Wallet {
 		scan: TAddressScan
 	): Promise<Result<IGetNextAvailableAddressResponse>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
+		if (checkRes.isErr()) return err(checkRes.error);
 		try {
 			const network = this._network;
 			addressType = addressType ?? this.addressType;
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const { path } = addressTypes[addressType]; // Assuming addressTypes is globally defined.
 			const result = formatKeyDerivationPath({ path, network });
 
 			if (result.isErr()) {
-				return err(result.error.message);
+				return err(result.error);
 			}
 
 			const { pathObject: keyDerivationPath } = result.value;
@@ -2149,21 +2340,31 @@ export class Wallet {
 			// A call that gets here before the first refresh has stored any
 			// addresses finds a chain with none. That chain reads as -1, so its
 			// first window is derived below.
-			const highestIndex = (stored: IAddresses): number =>
-				Object.values(stored).reduce(
-					(highest, { index }) => Math.max(highest, index),
-					-1
-				);
+			const highestIndex = (stored: IAddress[]): number =>
+				stored.reduce((highest, { index }) => Math.max(highest, index), -1);
 			// Read from the map, not from what addAddresses answered: a refresh
 			// running beside this call may have stored the same window first, and
 			// addAddresses answers only the addresses it added itself.
 			const lowestAddress = (stored: IAddresses): IAddress | undefined =>
 				Object.values(stored).sort((a, b) => a.index - b.index)[0];
+			const storedAbove = (
+				stored: IAddresses,
+				checked: number,
+				through: number
+			): IAddresses => {
+				const found: IAddresses = {};
+				for (const address of Object.values(stored)) {
+					if (address.index > checked && address.index <= through) {
+						found[address.scriptHash] = address;
+					}
+				}
+				return found;
+			};
 			const originalHighestStoredIndex = highestIndex(
-				currentWallet.addresses[addressType]
+				Object.values(currentWallet.addresses[addressType])
 			);
 			const originalHighestStoredChangeIndex = highestIndex(
-				currentWallet.changeAddresses[addressType]
+				Object.values(currentWallet.changeAddresses[addressType])
 			);
 
 			const addressIndexDiff = getAddressIndexDiff(
@@ -2258,13 +2459,19 @@ export class Wallet {
 			let addressHasBeenUsed = false;
 			let changeAddressHasBeenUsed = false;
 
-			// If an error occurs, return last known/available indexes.
-			const lastKnownIndexes = ok({
+			// If an error occurs, return last known/available indexes. Not once
+			// the scan has found an address at or past them used: they would
+			// answer that used address.
+			const known = ok({
 				addressIndex,
 				lastUsedAddressIndex,
 				changeAddressIndex,
 				lastUsedChangeAddressIndex
 			});
+			const lastKnownIndexes = (
+				error: Error | string
+			): Result<IGetNextAvailableAddressResponse> =>
+				addressHasBeenUsed || changeAddressHasBeenUsed ? err(error) : known;
 
 			while (!foundLastUsedAddress || !foundLastUsedChangeAddress) {
 				//Check if transactions are pending in the mempool.
@@ -2275,7 +2482,7 @@ export class Wallet {
 
 				if (addressHistory.isErr()) {
 					this.logger.warn(addressHistory.error.message);
-					return lastKnownIndexes;
+					return lastKnownIndexes(addressHistory.error);
 				}
 
 				const txHashes = addressHistory.value;
@@ -2290,7 +2497,7 @@ export class Wallet {
 
 				if (highestUsedIndex.isErr()) {
 					this.logger.warn(highestUsedIndex.error.message);
-					return lastKnownIndexes;
+					return lastKnownIndexes(highestUsedIndex.error);
 				}
 
 				if (highestUsedIndex.value.foundAddressIndex) {
@@ -2305,29 +2512,32 @@ export class Wallet {
 					changeAddressHasBeenUsed = true;
 				}
 
-				const highestStoredIndex = this.getHighestStoredAddressIndex({
-					addressType
-				});
-
-				if (highestStoredIndex.isErr()) {
-					this.logger.warn(highestStoredIndex.error.message);
-					return lastKnownIndexes;
+				// A script hash the server failed is left out of the history, just
+				// as an unused one is, and only the answered ones are added to
+				// scan.history. Counted toward the gap, it could hide a used address.
+				if (
+					combinedAddressesToScan.some(
+						({ scriptHash }) => !scan.history.has(scriptHash)
+					)
+				) {
+					const unanswered =
+						'Electrum did not answer the history of every address checked.';
+					this.logger.warn(unanswered);
+					return lastKnownIndexes(unanswered);
 				}
 
 				const {
 					addressIndex: highestUsedAddressIndex,
 					changeAddressIndex: highestUsedChangeAddressIndex
 				} = highestUsedIndex.value;
-				const {
-					addressIndex: highestStoredAddressIndex,
-					changeAddressIndex: highestStoredChangeAddressIndex
-				} = highestStoredIndex.value;
+				// Only history this scan was answered proves a gap. The stored maps
+				// can run past it, as when a refresh beside this call extends them.
+				const checkedIndex = highestIndex(allAddresses);
+				const checkedChangeIndex = highestIndex(allChangeAddresses);
 
 				if (
-					getAddressIndexDiff(
-						highestUsedAddressIndex.index,
-						highestStoredAddressIndex.index
-					) >= this.gapLimitOptions.lookAhead
+					getAddressIndexDiff(highestUsedAddressIndex.index, checkedIndex) >=
+					this.gapLimitOptions.lookAhead
 				) {
 					foundLastUsedAddress = true;
 				}
@@ -2335,7 +2545,7 @@ export class Wallet {
 				if (
 					getAddressIndexDiff(
 						highestUsedChangeAddressIndex.index,
-						highestStoredChangeAddressIndex.index
+						checkedChangeIndex
 					) >= this.gapLimitOptions.lookAheadChange
 				) {
 					foundLastUsedChangeAddress = true;
@@ -2376,7 +2586,9 @@ export class Wallet {
 						allChangeAddresses
 					).find(({ index }) => index === newChangeAddressIndex);
 					if (!nextAvailableAddress || !nextAvailableChangeAddress) {
-						return lastKnownIndexes;
+						return lastKnownIndexes(
+							'Unable to find the next available address.'
+						);
 					}
 					await this.saveGrownAddressMaps();
 					return ok({
@@ -2387,27 +2599,30 @@ export class Wallet {
 					});
 				}
 
+				// Each round checks the addresses after the last one checked, read
+				// from the map as the first window was. A round that cannot store
+				// them would check nothing new and repeat forever.
 				//Create receiving addresses for the next round
 				if (!foundLastUsedAddress) {
 					const addressAmount =
 						this.gapLimitOptions.lookAhead -
-						getAddressIndexDiff(
-							highestUsedAddressIndex.index,
-							highestStoredAddressIndex.index
-						);
+						getAddressIndexDiff(highestUsedAddressIndex.index, checkedIndex);
 					const newAddresses = await this.addAddresses({
 						addressAmount,
 						changeAddressAmount: 0,
-						addressIndex: highestStoredIndex.value.addressIndex.index + 1,
+						addressIndex: checkedIndex + 1,
 						changeAddressIndex: 0,
 						keyDerivationPath,
 						addressType,
 						saveAddresses: false
 					});
-					if (newAddresses.isOk()) {
-						this.markGrownAddressMaps(newAddresses.value);
-						addresses = newAddresses.value.addresses || {};
-					}
+					if (newAddresses.isErr()) return err(newAddresses.error);
+					this.markGrownAddressMaps(newAddresses.value);
+					addresses = storedAbove(
+						this._data.addresses[addressType],
+						checkedIndex,
+						checkedIndex + addressAmount
+					);
 				}
 				//Create change addresses for the next round
 				if (!foundLastUsedChangeAddress) {
@@ -2415,22 +2630,26 @@ export class Wallet {
 						this.gapLimitOptions.lookAheadChange -
 						getAddressIndexDiff(
 							highestUsedChangeAddressIndex.index,
-							highestStoredChangeAddressIndex.index
+							checkedChangeIndex
 						);
 					const newChangeAddresses = await this.addAddresses({
 						addressAmount: 0,
 						changeAddressAmount,
 						addressIndex: 0,
-						changeAddressIndex:
-							highestStoredIndex.value.changeAddressIndex.index + 1,
+						changeAddressIndex: checkedChangeIndex + 1,
 						keyDerivationPath,
 						addressType,
 						saveAddresses: false
 					});
-					if (newChangeAddresses.isOk()) {
-						this.markGrownAddressMaps(newChangeAddresses.value);
-						changeAddresses = newChangeAddresses.value.changeAddresses || {};
+					if (newChangeAddresses.isErr()) {
+						return err(newChangeAddresses.error);
 					}
+					this.markGrownAddressMaps(newChangeAddresses.value);
+					changeAddresses = storedAbove(
+						this._data.changeAddresses[addressType],
+						checkedChangeIndex,
+						checkedChangeIndex + changeAddressAmount
+					);
 				}
 
 				// Store newly created addresses to scan in the next round.
@@ -2458,14 +2677,14 @@ export class Wallet {
 
 			await this.saveGrownAddressMaps();
 
-			return lastKnownIndexes;
+			return lastKnownIndexes('Unable to find the next available address.');
 		} catch (e) {
 			return err(e);
 		}
 	}
 
 	// The address maps storage may hold an older copy of: grown by
-	// getNextAvailableAddress and not saved yet, or whose last write failed.
+	// fetchNextAvailableAddress and not saved yet, or whose last write failed.
 	// Each map holds every address type, so saving one that is not marked
 	// only writes storage the bytes it already has.
 	private unsavedAddressMaps = new Set<'addresses' | 'changeAddresses'>();
@@ -2532,7 +2751,7 @@ export class Wallet {
 		changeAddressIndex: IAddress;
 	}> {
 		try {
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const addresses = Object.values(currentWallet.addresses[addressType]);
 			const changeAddresses = Object.values(
 				currentWallet.changeAddresses[addressType]
@@ -2586,7 +2805,7 @@ export class Wallet {
 				network
 			});
 			if (keyDerivationPathResponse.isErr()) {
-				return err(keyDerivationPathResponse.error.message);
+				return err(keyDerivationPathResponse.error);
 			}
 			keyDerivationPath = keyDerivationPathResponse.value;
 			keyDerivationPath.account = this._account;
@@ -2608,7 +2827,7 @@ export class Wallet {
 			changeAddresses: generatedAddresses.value.changeAddresses
 		});
 		if (removeDuplicateResponse.isErr()) {
-			return err(removeDuplicateResponse.error.message);
+			return err(removeDuplicateResponse.error);
 		}
 		// switchNetwork replaces the Electrum instance along with the data, so
 		// addresses derived before it would be filed under the network that
@@ -2626,14 +2845,14 @@ export class Wallet {
 		const grown: ('addresses' | 'changeAddresses')[] = [];
 		if (Object.keys(addresses).length) {
 			this._data.addresses[addressType] = {
-				...this.data.addresses[addressType],
+				...this._data.addresses[addressType],
 				...addresses
 			};
 			grown.push('addresses');
 		}
 		if (Object.keys(changeAddresses).length) {
 			this._data.changeAddresses[addressType] = {
-				...this.data.changeAddresses[addressType],
+				...this._data.changeAddresses[addressType],
 				...changeAddresses
 			};
 			grown.push('changeAddresses');
@@ -2661,7 +2880,7 @@ export class Wallet {
 		changeAddresses?: IAddresses;
 	}): Promise<Result<IGenerateAddressesResponse>> {
 		try {
-			const currentWallet: IWalletData = this.data;
+			const currentWallet: IWalletData = this._data;
 			const currentAddressTypeContent: TAddressTypeContent<IAddresses> =
 				currentWallet.addresses;
 			const currentChangeAddressTypeContent: TAddressTypeContent<IAddresses> =
@@ -2707,8 +2926,8 @@ export class Wallet {
 		scan: TAddressScan
 	): Promise<Result<string>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
-		const currentWallet = this.data;
+		if (checkRes.isErr()) return err(checkRes.error);
+		const currentWallet = this._data;
 		// switchNetwork replaces the Electrum instance along with the data, so
 		// a scan answered after it has looked up the network the wallet left,
 		// and what it found would be written as this network's indexes (#1636).
@@ -2720,7 +2939,10 @@ export class Wallet {
 		let updated = false;
 
 		const promises = this.addressTypesToMonitor.map(async (addressTypeKey) => {
-			const response = await this.getNextAvailableAddress(addressTypeKey, scan);
+			const response = await this.fetchNextAvailableAddress(
+				addressTypeKey,
+				scan
+			);
 			if (response.isErr()) {
 				throw response.error;
 			}
@@ -2771,7 +2993,7 @@ export class Wallet {
 						addressIndex: newIndex
 					});
 					if (_addressIndex.isErr()) {
-						return err(_addressIndex.error.message);
+						return err(_addressIndex.error);
 					}
 					addressIndex = Object.values(_addressIndex.value.addresses)[0];
 				}
@@ -2798,7 +3020,7 @@ export class Wallet {
 						changeAddressIndex: newIndex
 					});
 					if (_changeAddressIndex.isErr()) {
-						return err(_changeAddressIndex.error.message);
+						return err(_changeAddressIndex.error);
 					}
 					changeAddressIndex = Object.values(
 						_changeAddressIndex.value.changeAddresses
@@ -2845,7 +3067,6 @@ export class Wallet {
 
 	/**
 	 * Resets address indexes back to the app's default/original state.
-	 * @private
 	 * @returns {void}
 	 */
 	public async resetAddressIndexes(): Promise<void> {
@@ -2888,15 +3109,15 @@ export class Wallet {
 	} = {}): Promise<Result<IAddress>> {
 		try {
 			const network = this._network;
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 
-			const getGapLimitResponse = this.getGapLimit({
+			const getAddressGapResponse = this.getAddressGap({
 				addressType
 			});
-			if (getGapLimitResponse.isErr()) {
-				return err(getGapLimitResponse.error.message);
+			if (getAddressGapResponse.isErr()) {
+				return err(getAddressGapResponse.error);
 			}
-			const { addressDelta } = getGapLimitResponse.value;
+			const { addressDelta } = getAddressGapResponse.value;
 
 			// If the address delta exceeds the default gap limit, only return the current address index.
 			if (
@@ -2913,7 +3134,7 @@ export class Wallet {
 					path
 				});
 				if (keyDerivationPathResponse.isErr()) {
-					return err(keyDerivationPathResponse.error.message);
+					return err(keyDerivationPathResponse.error);
 				}
 				keyDerivationPath = keyDerivationPathResponse.value;
 				keyDerivationPath.account = this._account;
@@ -2940,11 +3161,11 @@ export class Wallet {
 				addressType
 			});
 			if (addAddressesRes.isErr()) {
-				return err(addAddressesRes.error.message);
+				return err(addAddressesRes.error);
 			}
-			const addressIndex = Object.values(this.data.addresses[addressType]).find(
-				(addr) => addr.index === currentAddressIndex + 1
-			);
+			const addressIndex = Object.values(
+				this._data.addresses[addressType]
+			).find((addr) => addr.index === currentAddressIndex + 1);
 
 			// If for any reason we're unable to generate the new address, return error.
 			if (!addressIndex) {
@@ -3102,25 +3323,28 @@ export class Wallet {
 		const saved = await this.saveReceiveIndex();
 		if (saved.isErr()) {
 			return err(
-				`Failed to persist the receive address index: ${saved.error.message}`
+				saved.error.code,
+				`Failed to persist the receive address index: ${saved.error.message}`,
+				saved.error
 			);
 		}
 		return ok(current);
 	}
 
 	/**
-	 * Returns the difference between the current address index and the last used address index.
-	 * @private
+	 * Returns how far the current receive and change indexes are past the
+	 * last used ones, from the stored indexes. This is the current gap, which
+	 * generateNewReceiveAddress holds within gapLimitOptions.
 	 * @param {EAddressType} [addressType]
 	 * @returns {Result<{ addressDelta: number; changeAddressDelta: number }>}
 	 */
-	public getGapLimit({
+	public getAddressGap({
 		addressType = this.addressType
 	}: {
 		addressType?: EAddressType;
 	}): Result<{ addressDelta: number; changeAddressDelta: number }> {
 		try {
-			const currentWallet = this.data;
+			const currentWallet = this._data;
 			const addressIndex = currentWallet.addressIndex[addressType].index;
 			const lastUsedAddressIndex =
 				currentWallet.lastUsedAddressIndex[addressType].index;
@@ -3143,7 +3367,10 @@ export class Wallet {
 	}
 
 	/**
-	 * Retrieves and sets UTXO's for the current wallet from Electrum.
+	 * Scans Electrum for the wallet's UTXOs, and saves the set and balance.
+	 * listUtxos reads what the last scan saved. Dust and coinbase outputs the
+	 * next block cannot spend yet are left out of both (see
+	 * listImmatureUtxos).
 	 * @param {EScanningStrategy} [scanningStrategy]
 	 * @param {number} addressIndex
 	 * @param {number} changeAddressIndex
@@ -3153,11 +3380,12 @@ export class Wallet {
 	 * @returns {Promise<Result<IGetUtxosResponse>>} The pair the scan applied
 	 * to memory, or, when a newer scan already landed, memory's pair as it
 	 * stands, applied and written by that scan instead. Err, with nothing
-	 * applied, when the wallet switched networks while the query was out. A
-	 * write that storage refuses is logged, not returned: the scan itself
-	 * succeeded.
+	 * applied, when the wallet switched networks while the query was out, or
+	 * when Electrum did not return the tip or the transaction of a coin young
+	 * enough to be an immature coinbase. A write that storage refuses is
+	 * logged, not returned: the scan itself succeeded.
 	 */
-	public async getUtxos({
+	public async refreshUtxos({
 		scanningStrategy = EScanningStrategy.gapLimit,
 		addressIndex,
 		changeAddressIndex,
@@ -3173,7 +3401,7 @@ export class Wallet {
 		additionalScriptHashes?: IAddresses;
 	}): Promise<Result<IGetUtxosResponse>> {
 		const checkRes = await this.checkElectrumConnection();
-		if (checkRes.isErr()) return err(checkRes.error.message);
+		if (checkRes.isErr()) return err(checkRes.error);
 		// Read before the query so a broadcast landing while it is in flight is
 		// known to be newer than the answer it returns.
 		const spendMark = this._spendSeq;
@@ -3188,25 +3416,53 @@ export class Wallet {
 		// numbers, so an answer from the one this query went to is another
 		// network's coins and its number means nothing to the new count.
 		const electrum = this.electrum;
+		// The set does not hold these, so nothing else keeps their addresses in
+		// the scan once the strategy's window has moved past them.
+		const heldBack: IAddresses = {};
+		for (const { index, path, address, scriptHash, publicKey } of this
+			._immatureUtxos) {
+			heldBack[scriptHash] = { index, path, address, scriptHash, publicKey };
+		}
+		// The held-back list is memory only, and a stored record names just one
+		// of the addresses its transaction paid. So until a scan has applied
+		// since the wallet loaded, a stored coinbase makes the scan list every
+		// address.
+		const strategy =
+			!this._appliedScanSeq &&
+			Object.values(this._data.transactions).some(
+				(record) => record.vin?.some((input) => 'coinbase' in input)
+			)
+				? EScanningStrategy.all
+				: scanningStrategy;
 		let getUtxosRes: Result<IGetUtxosResponse>;
+		let coinbases: Result<Set<string>> = ok(new Set());
 		try {
 			getUtxosRes = await electrum.getUtxos({
-				scanningStrategy,
+				scanningStrategy: strategy,
 				addressIndex,
 				changeAddressIndex,
 				addressTypesToCheck,
 				additionalAddresses,
-				additionalScriptHashes
+				additionalScriptHashes: { ...heldBack, ...additionalScriptHashes }
 			});
+			if (getUtxosRes.isOk()) {
+				coinbases = await this.findImmatureCoinbases(
+					electrum,
+					getUtxosRes.value?.utxos ?? []
+				);
+			}
 		} finally {
 			const at = scanMarks.indexOf(spendMark);
 			if (at !== -1) scanMarks.splice(at, 1);
 		}
 		if (getUtxosRes.isErr()) {
-			return err(getUtxosRes.error.message);
+			return err(getUtxosRes.error);
 		}
 		if (this.electrum !== electrum) {
 			return err('The wallet switched networks while the UTXO scan ran.');
+		}
+		if (coinbases.isErr()) {
+			return err(coinbases.error);
 		}
 		if (scanSeq < this._appliedScanSeq) {
 			return ok({ utxos: this._data.utxos, balance: this._data.balance });
@@ -3216,7 +3472,12 @@ export class Wallet {
 			getUtxosRes.value?.utxos ?? [],
 			spendMark
 		);
-		const utxos = removeDustUtxos(scanned.utxos);
+		const kept = removeDustUtxos(scanned.utxos);
+		const immatureTxids = coinbases.value;
+		const immature = kept.filter((utxo) => immatureTxids.has(utxo.tx_hash));
+		const utxos = immature.length
+			? kept.filter((utxo) => !immatureTxids.has(utxo.tx_hash))
+			: kept;
 		// No send path can select a coin the set leaves out, so the balance does
 		// not count it either.
 		const droppedValue =
@@ -3226,6 +3487,7 @@ export class Wallet {
 			(getUtxosRes.value?.balance ?? 0) - scanned.spentValue - droppedValue;
 		this._data.utxos = utxos;
 		this._data.balance = balance;
+		this._immatureUtxos = immature;
 		// A refused write is logged and left to the next scan, which writes both
 		// again and which the next block now owes. An Err here would stop
 		// refreshWallet before updateTransactions and subscribeToAddresses, and
@@ -3235,11 +3497,88 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the current wallet's UTXO's from storage.
+	 * Returns the UTXOs the last scan saved, without asking Electrum.
 	 * @returns {IUtxo[]}
 	 */
 	listUtxos(): IUtxo[] {
-		return this.data.utxos;
+		return this._data.utxos;
+	}
+
+	/**
+	 * Returns the coinbase outputs the last scan left out of listUtxos and the
+	 * balance because they have not matured: a transaction in the next block
+	 * cannot spend them yet. Each one is listed again once a later scan finds
+	 * it mature. Memory only, so empty until the first scan after a restart.
+	 * @returns {IUtxo[]}
+	 */
+	listImmatureUtxos(): IUtxo[] {
+		return this._immatureUtxos;
+	}
+
+	/**
+	 * The txids among `utxos` of coinbase transactions whose outputs the block
+	 * after the tip cannot spend. Electrum lists a coinbase output like any
+	 * other coin, so for each coin young enough to be one, the inputs of its
+	 * transaction are read from the stored history, or looked up when the
+	 * history has no record of them.
+	 * @param {Electrum} electrum The instance the scan went to.
+	 * @param {IUtxo[]} utxos
+	 * @returns {Promise<Result<Set<string>>>} Err when the tip or a
+	 * transaction it needed was not returned.
+	 */
+	private async findImmatureCoinbases(
+		electrum: Electrum,
+		utxos: IUtxo[]
+	): Promise<Result<Set<string>>> {
+		const confirmed = utxos.filter((utxo) => utxo.height > 0);
+		if (!confirmed.length) return ok(new Set());
+		// A first scan can finish before the header subscription its connect
+		// started has answered. This one waits behind it.
+		if (!this._data.header?.height) await electrum.subscribeToHeader();
+		const tip = this._data.header?.height ?? 0;
+		if (!tip) {
+			return err('Unable to get the tip to check coinbase outputs against.');
+		}
+		const young = new Set(
+			confirmed
+				.filter((utxo) => !coinbaseSpendable(utxo.height, tip))
+				.map((utxo) => utxo.tx_hash)
+		);
+		for (const txid of this._coinbaseTxids.keys()) {
+			if (!young.has(txid)) this._coinbaseTxids.delete(txid);
+		}
+		for (const txid of young) {
+			const vin = this._data.transactions[txid]?.vin;
+			if (!this._coinbaseTxids.has(txid) && vin?.length) {
+				this._coinbaseTxids.set(
+					txid,
+					vin.some((input) => 'coinbase' in input)
+				);
+			}
+		}
+		const unknown = [...young].filter((txid) => !this._coinbaseTxids.has(txid));
+		if (unknown.length) {
+			const res = await electrum.getTransactions({
+				txHashes: unknown.map((tx_hash) => ({ tx_hash }))
+			});
+			if (res.isErr()) return err(res.error);
+			for (const { result } of res.value.data) {
+				if (!young.has(result?.txid) || !Array.isArray(result.vin)) continue;
+				this._coinbaseTxids.set(
+					result.txid,
+					result.vin.some((vin) => 'coinbase' in vin)
+				);
+			}
+			const missing = unknown.filter((txid) => !this._coinbaseTxids.has(txid));
+			if (missing.length) {
+				return err(
+					`Unable to look up ${missing.length} transaction(s) to check for immature coinbase outputs.`
+				);
+			}
+		}
+		return ok(
+			new Set([...young].filter((txid) => this._coinbaseTxids.get(txid)))
+		);
 	}
 
 	/**
@@ -3360,30 +3699,17 @@ export class Wallet {
 
 	/**
 	 * Returns true when the given outpoint is currently frozen (blacklisted).
-	 * @param {string} txid
-	 * @param {number} index
+	 * @param {IOutpoint} outpoint
 	 * @returns {boolean}
 	 */
-	public isUtxoFrozen(txid: string, index: number): boolean {
-		return this.data.blacklistedUtxos.some(
-			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === index
-		);
-	}
-
+	public isUtxoFrozen(outpoint: IOutpoint): boolean;
 	/**
-	 * Serializes blacklist mutations. Both freezeUtxo and unfreezeUtxo publish
-	 * their change to the in-memory list before the storage write that may
-	 * force them to roll it back, so a second caller landing in that window
-	 * would read a provisional entry: it would answer "already frozen" for a
-	 * freeze that then vanished, or "not frozen" for one that came back.
-	 * Queueing the mutations means every caller decides against a settled list.
+	 * @deprecated Pass an {@link IOutpoint}, `{ txid, vout }`. Removed in the
+	 * next major release.
 	 */
-	private blacklistLock: Promise<unknown> = Promise.resolve();
-
-	private runBlacklistWrite<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.blacklistLock.then(fn, fn);
-		this.blacklistLock = run.catch(() => undefined);
-		return run;
+	public isUtxoFrozen(txid: string, index: number): boolean;
+	public isUtxoFrozen(outpoint: IOutpoint | string, index?: number): boolean {
+		return this._coinControl.isUtxoFrozen(outpoint, index);
 	}
 
 	/**
@@ -3396,26 +3722,19 @@ export class Wallet {
 	 * A freeze that storage refuses is rolled back and reported as an error:
 	 * callers that reserve a coin for an in-flight funding need to know the
 	 * reservation would not survive a restart.
-	 * @param {string} txid
-	 * @param {number} index
+	 * @param {IOutpoint} params The coin. The deprecated `{ txid, index }`
+	 * form is still read.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async freezeUtxo(params: {
-		txid: string;
-		index: number;
-		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
-		 *  entry so automated freezers can recognize, and recover, their own
-		 *  freezes after a restart without touching user-frozen coins. */
-		tag?: string;
-	}): Promise<Result<string>> {
-		const res = await this.freezeUtxoIfUnfrozen(params);
-		if (res.isErr()) return err(res.error);
-		const outpoint = `${params.txid}:${params.index}`;
-		return ok(
-			res.value.created
-				? `UTXO ${outpoint} frozen.`
-				: `UTXO ${outpoint} is already frozen.`
-		);
+	public freezeUtxo(
+		params: (IOutpoint | IIndexedOutpoint) & {
+			/** Optional origin marker (e.g. 'funding-pledge') persisted with the
+			 *  entry so automated freezers can recognize, and recover, their own
+			 *  freezes after a restart without touching user-frozen coins. */
+			tag?: string;
+		}
+	): Promise<Result<string>> {
+		return this._coinControl.freezeUtxo(params);
 	}
 
 	/**
@@ -3428,160 +3747,27 @@ export class Wallet {
 	 * An untagged call on a coin an automated freezer tagged takes that freeze
 	 * over: the tag is cleared and created is true, because the freeze is now
 	 * the caller's and the tagged owner must not lift it.
-	 * @param {string} txid
-	 * @param {number} index
+	 * @param {IOutpoint} params The coin, as freezeUtxo takes it.
 	 * @returns {Promise<Result<{ created: boolean }>>}
 	 */
-	public async freezeUtxoIfUnfrozen(params: {
-		txid: string;
-		index: number;
-		tag?: string;
-	}): Promise<Result<{ created: boolean }>> {
-		return this.runBlacklistWrite(() => this.freezeUtxoLocked(params));
-	}
-
-	private async freezeUtxoLocked({
-		txid,
-		index,
-		tag
-	}: {
-		txid: string;
-		index: number;
-		tag?: string;
-	}): Promise<Result<{ created: boolean }>> {
-		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
-			return err('txid must be a 64-character hex string.');
-		}
-		if (!Number.isInteger(index) || index < 0) {
-			return err('index must be a non-negative integer.');
-		}
-		const utxo = this.data.utxos.find(
-			(u) => u.tx_hash === txid && u.tx_pos === index
-		);
-		if (!utxo) {
-			return err(`UTXO ${txid}:${index} is not known to this wallet.`);
-		}
-		if (this.isUtxoFrozen(txid, index)) {
-			return tag === undefined
-				? this.untagFrozenUtxo(txid, index)
-				: ok({ created: false });
-		}
-		// keyPair must never be persisted with the frozen entry.
-		const { keyPair, ...frozen } = utxo;
-		void keyPair;
-		const entry = {
-			...frozen,
-			...(tag !== undefined ? { freezeTag: tag, frozenAt: Date.now() } : {})
-		};
-		this._data.blacklistedUtxos.push(entry);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			// The row never reached storage, so the freeze dies with this
-			// process: the next run hands the coin back to coin selection while
-			// whatever reserved it (a funding pledge) believes it is held. Drop
-			// the in-memory entry so memory and storage agree, and let the
-			// caller decide whether it can proceed without the reservation.
-			const at = this._data.blacklistedUtxos.indexOf(entry);
-			if (at !== -1) this._data.blacklistedUtxos.splice(at, 1);
-			return err(
-				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
-			);
-		}
-		return ok({ created: true });
-	}
-
-	/**
-	 * Clears the tag on a frozen outpoint's entries. Automated freezers
-	 * recognize their own freezes by the tag, so an entry that kept it would
-	 * be lifted when that freezer lets go, taking the caller's freeze with it.
-	 */
-	private async untagFrozenUtxo(
-		txid: string,
-		index: number
+	public freezeUtxoIfUnfrozen(
+		params: (IOutpoint | IIndexedOutpoint) & { tag?: string }
 	): Promise<Result<{ created: boolean }>> {
-		const tagged = this._data.blacklistedUtxos.filter(
-			(frozen) =>
-				frozen.tx_hash === txid &&
-				frozen.tx_pos === index &&
-				frozen.freezeTag !== undefined
-		);
-		if (tagged.length === 0) return ok({ created: false });
-		const untagged = tagged.map((frozen) => {
-			const entry = { ...frozen };
-			delete entry.freezeTag;
-			delete entry.frozenAt;
-			return entry;
-		});
-		const swap = (from: IUtxo[], to: IUtxo[]): void => {
-			this._data.blacklistedUtxos = this._data.blacklistedUtxos.map(
-				(frozen) => to[from.indexOf(frozen)] ?? frozen
-			);
-		};
-		swap(tagged, untagged);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			swap(untagged, tagged);
-			return err(
-				`Failed to persist the freeze for UTXO ${txid}:${index}: ${saved.error.message}`
-			);
-		}
-		return ok({ created: true });
+		return this._coinControl.freezeUtxoIfUnfrozen(params);
 	}
 
 	/**
 	 * Unfreezes a previously frozen UTXO, making it spendable again. Like
 	 * freezeUtxo, a write storage refuses is rolled back and reported: the
 	 * persisted blacklist still holds the coin, so a restart re-freezes it.
-	 * @param {string} txid
-	 * @param {number} index
+	 * @param {IOutpoint} params The coin. The deprecated `{ txid, index }`
+	 * form is still read.
 	 * @returns {Promise<Result<string>>}
 	 */
-	public async unfreezeUtxo(params: {
-		txid: string;
-		index: number;
-	}): Promise<Result<string>> {
-		return this.runBlacklistWrite(() => this.unfreezeUtxoLocked(params));
-	}
-
-	private async unfreezeUtxoLocked({
-		txid,
-		index
-	}: {
-		txid: string;
-		index: number;
-	}): Promise<Result<string>> {
-		const removed = this._data.blacklistedUtxos.filter(
-			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === index
-		);
-		if (removed.length === 0) {
-			return err(`UTXO ${txid}:${index} is not frozen.`);
-		}
-		this._data.blacklistedUtxos = this._data.blacklistedUtxos.filter(
-			(frozen) => !(frozen.tx_hash === txid && frozen.tx_pos === index)
-		);
-		const saved = await this.saveWalletData(
-			'blacklistedUtxos',
-			this._data.blacklistedUtxos
-		);
-		if (saved.isErr()) {
-			// Storage still holds the freeze, so a restart would restore it.
-			// Put the entry back rather than report a release the wallet will
-			// take away again, unless a freeze landed while the write was in
-			// flight and already owns the outpoint.
-			if (!this.isUtxoFrozen(txid, index)) {
-				this._data.blacklistedUtxos.push(...removed);
-			}
-			return err(
-				`Failed to persist the unfreeze for UTXO ${txid}:${index}: ${saved.error.message}`
-			);
-		}
-		return ok(`UTXO ${txid}:${index} unfrozen.`);
+	public unfreezeUtxo(
+		params: IOutpoint | IIndexedOutpoint
+	): Promise<Result<string>> {
+		return this._coinControl.unfreezeUtxo(params);
 	}
 
 	/**
@@ -3591,30 +3777,14 @@ export class Wallet {
 	 * nothing is left to lift. The check runs under the blacklist lock, so a
 	 * freeze that took the entry over, or one whose write then rolls back, has
 	 * settled before it is read. An error is a refused write: the entry stands.
-	 * @param {string} txid
-	 * @param {number} index
-	 * @param {string} tag
+	 * @param {IOutpoint} params The coin, as unfreezeUtxo takes it.
+	 * @param {string} params.tag
 	 * @returns {Promise<Result<{ unfrozen: boolean }>>}
 	 */
-	public async unfreezeUtxoIfTagged(params: {
-		txid: string;
-		index: number;
-		tag: string;
-	}): Promise<Result<{ unfrozen: boolean }>> {
-		return this.runBlacklistWrite(async () => {
-			const entries = this._data.blacklistedUtxos.filter(
-				(frozen) =>
-					frozen.tx_hash === params.txid && frozen.tx_pos === params.index
-			);
-			if (entries.length === 0) return ok({ unfrozen: true });
-			const heldByOther = entries.some(
-				(frozen) => frozen.freezeTag !== params.tag
-			);
-			if (heldByOther) return ok({ unfrozen: false });
-			const res = await this.unfreezeUtxoLocked(params);
-			if (res.isErr()) return err(res.error);
-			return ok({ unfrozen: true });
-		});
+	public unfreezeUtxoIfTagged(
+		params: (IOutpoint | IIndexedOutpoint) & { tag: string }
+	): Promise<Result<{ unfrozen: boolean }>> {
+		return this._coinControl.unfreezeUtxoIfTagged(params);
 	}
 
 	/**
@@ -3624,7 +3794,7 @@ export class Wallet {
 	 * @returns {IUtxo[]}
 	 */
 	public listFrozenUtxos(): IUtxo[] {
-		return this.data.blacklistedUtxos;
+		return this._coinControl.listFrozenUtxos();
 	}
 
 	/**
@@ -3633,13 +3803,7 @@ export class Wallet {
 	 * @returns {IBalanceBreakdown}
 	 */
 	public getBalanceBreakdown(): IBalanceBreakdown {
-		const total = this.getBalance();
-		const frozen = this.data.utxos.reduce((acc, utxo) => {
-			return this.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)
-				? acc + utxo.value
-				: acc;
-		}, 0);
-		return { total, spendable: total - frozen, frozen };
+		return this._coinControl.getBalanceBreakdown();
 	}
 
 	/**
@@ -3672,7 +3836,7 @@ export class Wallet {
 			'addressLabels',
 			this._data.addressLabels
 		);
-		if (saved.isErr()) return err(saved.error.message);
+		if (saved.isErr()) return err(saved.error);
 		return ok(label === '' ? 'Label removed.' : 'Label saved.');
 	}
 
@@ -3682,7 +3846,7 @@ export class Wallet {
 	 * @returns {string | undefined}
 	 */
 	public getAddressLabel(address: string): string | undefined {
-		return this.data.addressLabels[address];
+		return this._data.addressLabels[address];
 	}
 
 	/**
@@ -3690,7 +3854,7 @@ export class Wallet {
 	 * @returns {TAddressLabels}
 	 */
 	public listAddressLabels(): TAddressLabels {
-		return { ...this.data.addressLabels };
+		return { ...this._data.addressLabels };
 	}
 
 	/**
@@ -3729,8 +3893,7 @@ export class Wallet {
 				// origin (master fingerprint + BIP 48 path); cosigners known only
 				// as xpubs carry a fingerprint-only origin (the account key's
 				// parent fingerprint, the watch-only single-sig convention).
-				const coinType =
-					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+				const coinType = this._network === Network.bitcoin ? '0' : '1';
 				const keyExpr = (chain: 0 | 1): string => {
 					const keys = this._multisig!.cosigners.map((cosigner) => {
 						const xpub = this._toStandardBase58(cosigner.node);
@@ -3780,8 +3943,7 @@ export class Wallet {
 				});
 			} else {
 				if (!this._root) return err('Wallet root is unavailable.');
-				const coinType =
-					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+				const coinType = this._network === Network.bitcoin ? '0' : '1';
 				// p2wsh is multisig-only and has no single-key descriptor.
 				const singleSigTypes = Object.values(EAddressType).filter(
 					(type) => type !== EAddressType.p2wsh
@@ -3791,7 +3953,7 @@ export class Wallet {
 						path: addressTypes[addressType].path,
 						network: this._network
 					});
-					if (pathRes.isErr()) return err(pathRes.error.message);
+					if (pathRes.isErr()) return err(pathRes.error);
 					const purpose = pathRes.value.purpose;
 					const accountPath = `m/${purpose}'/${coinType}'/${this._account}'`;
 					// neutered(): the exported node carries public material only.
@@ -3844,7 +4006,7 @@ export class Wallet {
 			Object.getPrototypeOf(node),
 			Object.getOwnPropertyDescriptors(node)
 		) as BIP32Interface;
-		(clone as { network: Network }).network = standard;
+		(clone as { network: BitcoinJsNetwork }).network = standard;
 		return clone.toBase58();
 	}
 
@@ -3853,12 +4015,20 @@ export class Wallet {
 	// never rejects.
 	private savingOperations: Record<string, Promise<Result<string>>> = {};
 
-	// What the newest write queued for each key will store, while that write
+	// What each write queued for a key will store, oldest first, while it
 	// still waits for the one ahead of it.
 	private waitingWrites: Record<
 		string,
-		{ walletDataKey: string; data: IWalletData[keyof IWalletData] }
+		{ walletDataKey: TWalletStorageKey; write: TWalletWrite }[]
 	> = {};
+
+	// Refused writes of the transaction map, by storage key, until the next
+	// write of that map carries them. An adapter that takes changes is never
+	// handed the whole map again, so a change it refused would otherwise
+	// never reach it. switchNetwork drops them along with the data they came
+	// from: switching back reads that data from storage again.
+	private refusedTransactionWrites: Map<TWalletStorageKey, TWalletWrite> =
+		new Map();
 
 	/**
 	 * Saves the wallet data object to storage if able.
@@ -3880,7 +4050,6 @@ export class Wallet {
 	 * Never rejects: an adapter that throws, before or after returning its
 	 * promise, answers Err, and so does a write stop() dropped while it waited
 	 * its turn (#946).
-	 * @private
 	 * @async
 	 * @param {TWalletDataKeys} key
 	 * @param {IWalletData[K]} data
@@ -3907,29 +4076,84 @@ export class Wallet {
 	 */
 	private async saveWalletDataAt<K extends keyof IWalletData>(
 		key: TWalletDataKeys,
-		walletDataKey: string,
+		walletDataKey: TWalletStorageKey,
 		data: IWalletData[K]
 	): Promise<Result<string>> {
+		return this.queueWrite(key, walletDataKey, { data });
+	}
+
+	/**
+	 * Saves the records of the given transactions. On an adapter that takes
+	 * changes only those records are written, and a txid the map no longer
+	 * holds is written as deleted. Otherwise the whole map is.
+	 * @private
+	 * @param {Iterable<string>} txids
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async saveTransactions(
+		txids: Iterable<string>
+	): Promise<Result<string>> {
+		const transactions = this._data.transactions;
+		if (!this._setTransactionChanges) {
+			return this.saveWalletData('transactions', transactions);
+		}
+		const changes: TTransactionChanges = { set: {}, deleted: [] };
+		for (const txid of new Set(txids)) {
+			const record = transactions[txid];
+			if (record) changes.set[txid] = record;
+			else changes.deleted.push(txid);
+		}
+		return this.queueWrite(
+			'transactions',
+			this.getWalletDataKey('transactions'),
+			{ changes }
+		);
+	}
+
+	/**
+	 * The queue behind saveWalletData and saveTransactions.
+	 * @private
+	 * @param {TWalletDataKeys} key
+	 * @param {string} walletDataKey The storage key, from getWalletDataKey.
+	 * @param {TWalletWrite} write
+	 * @returns {Promise<Result<string>>}
+	 */
+	private async queueWrite(
+		key: TWalletDataKeys,
+		walletDataKey: TWalletStorageKey,
+		write: TWalletWrite
+	): Promise<Result<string>> {
 		if (!this._setData) return ok('No setData method has been provided');
-		const waiting = this.waitingWrites[key];
+		const refused =
+			key === 'transactions'
+				? this.refusedTransactionWrites.get(walletDataKey)
+				: undefined;
+		if (refused) {
+			this.refusedTransactionWrites.delete(walletDataKey);
+			write = mergeWrites(refused, write);
+		}
+		const queued = this.waitingWrites[key];
+		const waiting = queued?.[queued.length - 1];
 		let operation: Promise<Result<string>>;
 		if (waiting?.walletDataKey === walletDataKey) {
 			// The newest queued write has not started, so it can carry this
 			// value. A write to another network's key cannot, and queues below.
-			waiting.data = data;
+			waiting.write = mergeWrites(waiting.write, write);
 			operation = this.savingOperations[key];
 		} else if (key in this.savingOperations) {
-			const next = { walletDataKey, data };
-			this.waitingWrites[key] = next;
+			const next = { walletDataKey, write };
+			(this.waitingWrites[key] ??= []).push(next);
 			operation = this.savingOperations[key].then(() => {
-				if (this.waitingWrites[key] === next) delete this.waitingWrites[key];
-				return this.writeWalletData(key, next.walletDataKey, next.data);
+				// Writes start in the order they queued, so this one is first.
+				this.waitingWrites[key].shift();
+				if (!this.waitingWrites[key].length) delete this.waitingWrites[key];
+				return this.writeWalletData(key, next.walletDataKey, next.write);
 			});
 			this.savingOperations[key] = operation;
 		} else {
 			// With nothing queued for the key the write is issued in this same
 			// tick, so a stop() that follows the call cannot get in ahead of it.
-			operation = this.writeWalletData(key, walletDataKey, data);
+			operation = this.writeWalletData(key, walletDataKey, write);
 			this.savingOperations[key] = operation;
 		}
 		const saved = await operation;
@@ -3950,13 +4174,13 @@ export class Wallet {
 	 * @private
 	 * @param {TWalletDataKeys} key
 	 * @param {string} walletDataKey The storage key, fixed when the write was issued.
-	 * @param {IWalletData[K]} data
+	 * @param {TWalletWrite} write
 	 * @returns {Promise<Result<string>>}
 	 */
-	private async writeWalletData<K extends keyof IWalletData>(
+	private async writeWalletData(
 		key: TWalletDataKeys,
-		walletDataKey: string,
-		data: IWalletData[K]
+		walletDataKey: TWalletStorageKey,
+		write: TWalletWrite
 	): Promise<Result<string>> {
 		let cause: string;
 		try {
@@ -3968,7 +4192,15 @@ export class Wallet {
 					`Wallet stopped before the queued write of ${walletDataKey} could run; it was not saved.`
 				);
 			}
-			const res = await this._setData(walletDataKey, data);
+			// Changes are only queued with setTransactionChanges set, and stop()
+			// clears it along with setData.
+			const res =
+				'changes' in write
+					? await this._setTransactionChanges!(
+							walletDataKey as TWalletStorageKey<'transactions'>,
+							write.changes
+					  )
+					: await this._setData(walletDataKey, write.data);
 			// Adapters written in JS may resolve something that is not a
 			// Result at all; only an explicit Err counts as a failure.
 			if (!(typeof res?.isErr === 'function' && res.isErr())) {
@@ -3982,6 +4214,9 @@ export class Wallet {
 		// has registered this write. A listener that saves again has to find it
 		// registered, or its write skips the queue and can land after a newer one.
 		await Promise.resolve();
+		if (key === 'transactions') {
+			this.keepRefusedTransactions(walletDataKey, write);
+		}
 		try {
 			this.sendMessage('storageWriteFailed', {
 				key,
@@ -3994,22 +4229,31 @@ export class Wallet {
 		return err(`Error saving wallet data for ${walletDataKey}: ${cause}`);
 	}
 
-	//TODO: Implement this as a way to better update and save state so we can consolidate this.data[key] updates.
-	// @ts-ignore
-	private async updateAndSaveWalletData(
-		key: TWalletDataKeys,
-		data: IWalletData,
-		addressType?: EAddressType
-	): Promise<void> {
-		if (addressType) {
-			// @ts-ignore
-			this.data[key][addressType] = data;
-			await this.saveWalletData(key, this._data[key]);
-		} else {
-			// @ts-ignore
-			this.data[key] = data;
-			await this.saveWalletData(key, this._data[key]);
+	/**
+	 * Hands a refused write of the transaction map to the next write of it:
+	 * the first one waiting its turn behind this one, or else the next one
+	 * issued. A write to another network's key may have queued after that
+	 * first one, so it need not be the newest.
+	 * @private
+	 * @param {string} walletDataKey
+	 * @param {TWalletWrite} write
+	 */
+	private keepRefusedTransactions(
+		walletDataKey: TWalletStorageKey,
+		write: TWalletWrite
+	): void {
+		const waiting = this.waitingWrites.transactions?.find(
+			(queued) => queued.walletDataKey === walletDataKey
+		);
+		if (waiting) {
+			waiting.write = mergeWrites(write, waiting.write);
+			return;
 		}
+		const older = this.refusedTransactionWrites.get(walletDataKey);
+		this.refusedTransactionWrites.set(
+			walletDataKey,
+			older ? mergeWrites(older, write) : write
+		);
 	}
 
 	/**
@@ -4061,7 +4305,7 @@ export class Wallet {
 			answered: scan?.current() ? scan.history : undefined
 		});
 		if (history.isErr()) {
-			return err(history.error.message);
+			return err(history.error);
 		}
 		if (!history.value.length) {
 			return ok(undefined);
@@ -4077,21 +4321,21 @@ export class Wallet {
 		let filteredTxHashes = [...byTxHash.values()];
 		if (!replaceStoredTransactions) {
 			filteredTxHashes = filteredTxHashes.filter((tx) => {
-				return !((this.data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
+				return !((this._data.transactions[tx.tx_hash]?.height ?? 0) >= 6);
 			});
 		}
 		const getTransactionsResponse = await electrum.getTransactions({
 			txHashes: filteredTxHashes
 		});
 		if (getTransactionsResponse.isErr()) {
-			return err(getTransactionsResponse.error.message);
+			return err(getTransactionsResponse.error);
 		}
 
 		const formatTransactionsResponse = await this.formatTransactions({
 			transactions: getTransactionsResponse.value.data
 		});
 		if (formatTransactionsResponse.isErr()) {
-			return err(formatTransactionsResponse.error.message);
+			return err(formatTransactionsResponse.error);
 		}
 		// A transaction whose batch or entry failed, or whose inputs could not
 		// all be looked up, is left out of the answer rather than failing it,
@@ -4151,7 +4395,7 @@ export class Wallet {
 		const formattedTransactions: IFormattedTransactions = {};
 
 		let notificationTxid: string | undefined;
-		const storedTransactions = this.data.transactions;
+		const storedTransactions = this._data.transactions;
 		const confirmedTxs: TTransactionMessage[] = [];
 		const receivedTxs: TTransactionMessage[] = [];
 		const sentTxs: TTransactionMessage[] = [];
@@ -4213,7 +4457,7 @@ export class Wallet {
 			...this._data.transactions,
 			...formattedTransactions
 		};
-		await this.saveWalletData('transactions', this._data.transactions);
+		await this.saveTransactions(Object.keys(formattedTransactions));
 
 		confirmedTxs.forEach((tx) => {
 			this.sendMessage('transactionConfirmed', tx);
@@ -4223,9 +4467,9 @@ export class Wallet {
 			this.sendMessage('transactionSent', tx);
 		});
 
-		const addresses = this.data.addresses;
+		const addresses = this._data.addresses;
 		const utxoScriptHashes = new Set(
-			this.data.utxos.map((utxo) => utxo.scriptHash)
+			this._data.utxos.map((utxo) => utxo.scriptHash)
 		);
 		const outsideGapLimitAddresses: {
 			[key: string]: number[];
@@ -4239,7 +4483,7 @@ export class Wallet {
 					const address = addressData[tx.transaction.scriptHash];
 					const index = address.index;
 					const currentIndex =
-						this.data.addressIndex[addressType as EAddressType].index;
+						this._data.addressIndex[addressType as EAddressType].index;
 					const diff = getAddressIndexDiff(index, currentIndex);
 					if (diff > this.gapLimitOptions.lookBehind) {
 						outsideGapLimitAddresses[addressType] = [
@@ -4258,7 +4502,7 @@ export class Wallet {
 				if (indexes.length <= 0) continue;
 				const lowestIndex = Math.min(...indexes);
 				const addressType = type as EAddressType;
-				await this.getUtxos({
+				await this.refreshUtxos({
 					scanningStrategy: EScanningStrategy.startingIndex,
 					addressIndex: lowestIndex - this.gapLimitOptions.lookBehind,
 					changeAddressIndex:
@@ -4279,7 +4523,6 @@ export class Wallet {
 	 * Checks existing unconfirmed transactions that have been received and removes any that have >= 6 confirmations.
 	 * If the tx is reorg'd or bumped from the mempool and no longer exists, the transaction
 	 * will be removed from the store and updated in the activity list.
-	 * @private
 	 * @async
 	 * @returns {Promise<Result<string>>}
 	 */
@@ -4298,7 +4541,7 @@ export class Wallet {
 				'The wallet switched networks while the unconfirmed transactions were checked.';
 			const processRes = await this.processUnconfirmedTransactions();
 			if (processRes.isErr()) {
-				return err(processRes.error.message);
+				return err(processRes.error);
 			}
 			if (this.electrum !== electrum) return err(switched);
 
@@ -4320,7 +4563,7 @@ export class Wallet {
 				// memory is right either way and lands with the next write of the
 				// transactions map, and a restart before then reads the lost block
 				// from the stored record itself (issue #870).
-				if (updated.isErr()) return err(updated.error.message);
+				if (updated.isErr()) return err(updated.error);
 				// That write was keyed to the network checked, but everything below
 				// writes to whichever network is live once it lands.
 				if (this.electrum !== electrum) return err(switched);
@@ -4333,7 +4576,7 @@ export class Wallet {
 					unconfirmedTxs,
 					observed
 				});
-				if (updated.isErr()) return err(updated.error.message);
+				if (updated.isErr()) return err(updated.error);
 			} else {
 				// As on the ghost path, an entry a refresh added while this check
 				// waited is kept (issue #944).
@@ -4346,7 +4589,7 @@ export class Wallet {
 					this._data.unconfirmedTransactions
 				);
 				// Already in memory, so the next check writes it again.
-				if (saved.isErr()) return err(saved.error.message);
+				if (saved.isErr()) return err(saved.error);
 			}
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
@@ -4382,7 +4625,7 @@ export class Wallet {
 			);
 			// A header that lands while the lookup is in flight is newer than the
 			// answer, so the rule of issue #935 below judges by this one.
-			const tipBeforeLookup = this.data.header?.height ?? 0;
+			const tipBeforeLookup = this._data.header?.height ?? 0;
 			const txs = await this.electrum.getTransactions({
 				txHashes: tx_hashes
 			});
@@ -4394,7 +4637,7 @@ export class Wallet {
 			const outdatedTxs: IUtxo[] = []; //Transactions that have been pushed back into the mempool due to a reorg. We need to update the height.
 			const ghostTxs: string[] = []; //Transactions that have been removed from the mempool and are no longer in the blockchain.
 			const answered = new Set<string>();
-			const tipHeight = this.data.header?.height ?? 0;
+			const tipHeight = this._data.header?.height ?? 0;
 			txs.value.data.forEach((txData: ITransaction<IUtxo>) => {
 				answered.add(txData.data.tx_hash);
 				// The block this wallet last saw the transaction in, zero for none.
@@ -4403,7 +4646,7 @@ export class Wallet {
 				// observed here may already read zero (issue #870).
 				const oldHeight = Math.max(
 					oldUnconfirmedTxs[txData.data.tx_hash]?.height ?? 0,
-					this.data.transactions[txData.data.tx_hash]?.height ?? 0
+					this._data.transactions[txData.data.tx_hash]?.height ?? 0
 				);
 				// Check if the transaction has been removed from the mempool/still exists.
 				if (
@@ -4529,7 +4772,7 @@ export class Wallet {
 	 * @returns {Promise<Result<IFormattedTransactions>>}
 	 */
 	public getUnconfirmedTransactions(): IFormattedTransactions {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		return currentWallet?.unconfirmedTransactions ?? {};
 	}
 
@@ -4537,7 +4780,7 @@ export class Wallet {
 	 * Returns the block height for a given number of confirmations from storage.
 	 * @param {number} confirmations
 	 * @param {number} [currentHeight]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {number}
 	 */
 	public confirmationsToBlockHeight({
@@ -4548,7 +4791,7 @@ export class Wallet {
 		currentHeight?: number;
 	}): number {
 		if (!currentHeight) {
-			const header = this.data.header;
+			const header = this._data.header;
 			currentHeight = header.height;
 		}
 		if (confirmations > currentHeight) {
@@ -4623,7 +4866,7 @@ export class Wallet {
 			const electrum = this.electrum;
 			const switched =
 				'The wallet switched networks while the ghost transactions were removed.';
-			const transactions = this.data.transactions;
+			const transactions = this._data.transactions;
 			txIds.forEach((txId) => {
 				if (txId in transactions) {
 					transactions[txId]['exists'] = false;
@@ -4645,14 +4888,16 @@ export class Wallet {
 				}
 			});
 			this._data.transactions = transactions;
-			const saved = await this.saveWalletData('transactions', transactions);
+			const saved = await this.saveTransactions(
+				txIds.filter((txId) => txId in transactions)
+			);
 			// Dropping the unconfirmed copy is what stops this transaction being
 			// looked up again, so it may only happen once the repaired record is
 			// durable. Otherwise a failed write leaves it stored as confirmed at a
 			// lost block, and unwatched. The rescan waits for it too: its forced
 			// refresh runs this check again, and a ghost still observed would
 			// come straight back here (issue #870).
-			if (saved.isErr()) return err(saved.error.message);
+			if (saved.isErr()) return err(saved.error);
 			if (this.electrum !== electrum) return err(switched);
 
 			// The check's own map rather than the old one less these ghosts: a
@@ -4668,8 +4913,8 @@ export class Wallet {
 			// (issue #945). A refresh whose lookup went out before these
 			// clearings leaves them be (issue #964).
 			for (const txId of txIds) {
-				const live = this.data.unconfirmedTransactions[txId];
-				const record = this.data.transactions[txId];
+				const live = this._data.unconfirmedTransactions[txId];
+				const record = this._data.transactions[txId];
 				if (live && record && record.exists !== false) next[txId] = live;
 			}
 			this._data.unconfirmedTransactions = next;
@@ -4693,7 +4938,7 @@ export class Wallet {
 			// Reported only after the rescan. Memory no longer observes these
 			// ghosts, so nothing in this session would rescan for them again,
 			// and a copy still on disk only repeats this repair after a restart.
-			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
+			if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error);
 			return ok('Successfully deleted transactions.');
 		} catch (e) {
 			return err(e);
@@ -4704,7 +4949,9 @@ export class Wallet {
 	 * This method will clear the utxo array for each address type and reset the
 	 * address indexes back to the original/default app values. Once cleared & reset
 	 * the app will rescan the wallet's addresses from index zero at the standard gap
-	 * limit or higher (if previously set higher by the user).
+	 * limit or higher (if previously set higher by the user). Stops with an Err,
+	 * leaving the network switched to untouched, if the wallet switches networks
+	 * partway.
 	 * @async
 	 * @param {boolean} [shouldClearAddresses] - Clears and re-generates all addresses when true.
 	 * @param shouldClearTransactions
@@ -4717,6 +4964,13 @@ export class Wallet {
 		shouldClearAddresses?: boolean;
 		shouldClearTransactions?: boolean;
 	}): Promise<Result<IWalletData>> {
+		// switchNetwork replaces the Electrum instance along with the data, and
+		// each step below resets whichever network is live when it starts. One
+		// started after a switch would rewind the receive index of the network
+		// switched to, and reissue its addresses (#1807).
+		const electrum = this.electrum;
+		const switched =
+			'The wallet switched networks while its addresses were rescanned.';
 		// If the gap limit settings are less than the standard, ensure we set the standard gap limit before rescanning.
 		const currentGapLimitOptions = this.gapLimitOptions;
 		if (
@@ -4744,23 +4998,31 @@ export class Wallet {
 						: currentGapLimitOptions.lookAheadChange
 			});
 		}
-		if (shouldClearAddresses) {
-			await this.clearAddresses();
+		try {
+			if (shouldClearAddresses) {
+				await this.clearAddresses();
+				if (this.electrum !== electrum) return err(switched);
+			}
+			if (shouldClearTransactions) {
+				await this.clearTransactions();
+				if (this.electrum !== electrum) return err(switched);
+			}
+			await this.clearUtxos();
+			if (this.electrum !== electrum) return err(switched);
+			await this.resetAddressIndexes();
+			if (this.electrum !== electrum) return err(switched);
+			// Wait to generate our zero index addresses.
+			await this.setZeroIndexAddresses();
+			if (this.electrum !== electrum) return err(switched);
+			return await this.refreshWallet({
+				scanAllAddresses: true,
+				force: true
+			});
+		} finally {
+			// Revert gap limit options to the original settings. They carry
+			// across a switch, so this runs on every return.
+			this.updateGapLimit(currentGapLimitOptions);
 		}
-		if (shouldClearTransactions) {
-			await this.clearTransactions();
-		}
-		await this.clearUtxos();
-		await this.resetAddressIndexes();
-		// Wait to generate our zero index addresses.
-		await this.setZeroIndexAddresses();
-		const refreshWalletRes = await this.refreshWallet({
-			scanAllAddresses: true,
-			force: true
-		});
-		// Revert gap limit options to the original settings.
-		this.updateGapLimit(currentGapLimitOptions);
-		return refreshWalletRes;
 	}
 
 	/**
@@ -4773,8 +5035,23 @@ export class Wallet {
 	public async clearUtxos(): Promise<string> {
 		this._data.balance = 0;
 		this._data.utxos = [];
+		this._immatureUtxos = [];
 		await this.saveUtxoState();
 		return "Successfully cleared UTXO's.";
+	}
+
+	/**
+	 * What a send answers when the UTXO set is empty.
+	 * @returns {string}
+	 */
+	private noUtxosError(): string {
+		const immature = this._immatureUtxos.reduce(
+			(sum, utxo) => sum + utxo.value,
+			0
+		);
+		return immature
+			? `No spendable UTXOs available. ${immature} sats in coinbase outputs have not matured.`
+			: 'No UTXOs available.';
 	}
 
 	/**
@@ -4814,8 +5091,8 @@ export class Wallet {
 	private async updateTransactionHeights(
 		txs: IUtxo[]
 	): Promise<Result<string>> {
-		let needsSave = false;
-		const transactions = this.data.transactions;
+		const updated: string[] = [];
+		const transactions = this._data.transactions;
 		txs.forEach((tx) => {
 			const txId = tx.tx_hash;
 			if (txId in transactions) {
@@ -4827,12 +5104,12 @@ export class Wallet {
 				delete transactions[txId].blockhash;
 				delete transactions[txId].confirmTimestamp;
 				this._recordRepairs += 1;
-				needsSave = true;
+				updated.push(txId);
 			}
 		});
-		if (needsSave) {
-			const saved = await this.saveWalletData('transactions', transactions);
-			if (saved.isErr()) return err(saved.error.message);
+		if (updated.length) {
+			const saved = await this.saveTransactions(updated);
+			if (saved.isErr()) return err(saved.error);
 		}
 		return ok('Successfully updated reorg transactions.');
 	}
@@ -4865,7 +5142,7 @@ export class Wallet {
 			}
 
 			this._data.unconfirmedTransactions = {
-				...this.data.unconfirmedTransactions,
+				...this._data.unconfirmedTransactions,
 				...unconfirmedTransactions
 			};
 
@@ -4873,7 +5150,7 @@ export class Wallet {
 				'unconfirmedTransactions',
 				this._data.unconfirmedTransactions
 			);
-			if (saved.isErr()) return err(saved.error.message);
+			if (saved.isErr()) return err(saved.error);
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
 			this.logger.error('Failed to update unconfirmed transactions.', e);
@@ -4926,7 +5203,7 @@ export class Wallet {
 		if (transactions.length < 1) {
 			return ok({});
 		}
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 
 		// Batch and pre-fetch input data.
 		const inputs: { tx_hash: string; vout: number }[] = [];
@@ -4992,6 +5269,12 @@ export class Wallet {
 			let matchedInputValue = 0; // Total value of all inputs with addresses that belong to this wallet.
 			let totalOutputValue = 0; // Total value of all outputs.
 			let matchedOutputValue = 0; // Total value of all outputs with addresses that belong to this wallet.
+			// The same four in sats, summed per input and output so no rounding
+			// of the BTC sums reaches them.
+			let totalInputSats = 0;
+			let matchedInputSats = 0;
+			let totalOutputSats = 0;
+			let matchedOutputSats = 0;
 			let messages: string[] = []; // Array of OP_RETURN messages.
 
 			//Iterate over each input
@@ -5030,10 +5313,13 @@ export class Wallet {
 				const key = `${vin.txid}${vin.vout}`;
 				if (key in inputData) {
 					const { addresses: _addresses, value } = inputData[key];
+					const sats = btcToSats(value);
 					totalInputValue = totalInputValue + value;
+					totalInputSats += sats;
 					_addresses.map((address) => {
 						if (ownAddresses.has(address)) {
 							matchedInputValue = matchedInputValue + value;
+							matchedInputSats += sats;
 						}
 					});
 				}
@@ -5046,10 +5332,13 @@ export class Wallet {
 					: scriptPubKey.address
 					? [scriptPubKey.address]
 					: [];
+				const sats = btcToSats(value);
 				totalOutputValue = totalOutputValue + value;
+				totalOutputSats += sats;
 				_addresses.map((address) => {
 					if (ownAddresses.has(address)) {
 						matchedOutputValue = matchedOutputValue + value;
+						matchedOutputSats += sats;
 					}
 				});
 			});
@@ -5069,8 +5358,11 @@ export class Wallet {
 			// collects the block's fees.
 			const totalValue = isCoinbase ? 0 : totalInputValue - totalOutputValue;
 			const fee = Number(Math.abs(totalValue).toFixed(8));
+			const feeSats = isCoinbase
+				? 0
+				: Math.abs(totalInputSats - totalOutputSats);
 			const vsize = result.vsize;
-			const satsPerByte = Math.round(btcToSats(fee) / vsize);
+			const satsPerByte = Math.round(feeSats / vsize);
 			const { address, height, scriptHash } = data;
 			let timestamp = Date.now();
 			let confirmTimestamp: number | undefined;
@@ -5090,13 +5382,19 @@ export class Wallet {
 				height,
 				scriptHash,
 				totalInputValue,
+				totalInputSats,
 				matchedInputValue,
+				matchedInputSats,
 				totalOutputValue,
+				totalOutputSats,
 				matchedOutputValue,
+				matchedOutputSats,
 				fee,
+				feeSats,
 				satsPerByte,
 				type,
 				value,
+				valueSats: matchedOutputSats - matchedInputSats,
 				txid,
 				messages,
 				timestamp,
@@ -5119,22 +5417,25 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns formatted input data from the inputs array.
+	 * Asks Electrum for the previous output each outpoint names. The result is
+	 * keyed `${txid}${vout}`.
 	 *
 	 * An input whose previous output could not be looked up, even on a retry,
 	 * is missing from the result. formatTransactions holds back a transaction
 	 * with such an input rather than format it from a partial answer (issue
 	 * #965).
 	 * @async
-	 * @param {{tx_hash: string, vout: number}[]} inputs
+	 * @param {IOutpoint[]} inputs
 	 * @returns {Promise<Result<InputData>>}
 	 */
-	public async getInputData({
+	public async fetchInputData({
 		inputs
 	}: {
-		inputs: { tx_hash: string; vout: number }[];
+		inputs: IOutpoint[];
 	}): Promise<Result<InputData>> {
-		const res = await this._getInputData({ inputs });
+		const res = await this._getInputData({
+			inputs: inputs.map(({ txid, vout }) => ({ tx_hash: txid, vout }))
+		});
 		if (res.isErr()) return err(res.error);
 		return ok(res.value.inputData);
 	}
@@ -5319,7 +5620,7 @@ export class Wallet {
 	}
 
 	/*
-	 * Logs an error message when getInputData fails to retrieve getTransactionsFromInputs data.
+	 * Logs an error message when fetchInputData fails to retrieve getTransactionsFromInputs data.
 	 * @private
 	 * @param { code?: number; message?: string } error
 	 * @param { tx_hash: string; vout: number } data
@@ -5357,7 +5658,7 @@ export class Wallet {
 	public async getChangeAddress(
 		addressType = this.addressType
 	): Promise<Result<IAddress>> {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 
 		const changeAddressIndexContent =
 			currentWallet.changeAddressIndex[addressType];
@@ -5395,7 +5696,7 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the current fee estimates for the provided network, honoring
+	 * Fetches fee estimates for the provided network, honoring
 	 * feeEstimationSource ('electrum' | 'http' | 'auto'):
 	 * - 'electrum': connected Electrum server only; on failure the previous
 	 *   estimates are returned rather than leaking the request to clearnet HTTP.
@@ -5406,12 +5707,14 @@ export class Wallet {
 	 * @async
 	 * @returns {Promise<IOnchainFees>}
 	 */
-	public async getFeeEstimates(network = this._network): Promise<IOnchainFees> {
-		if (network === EAvailableNetworks.bitcoinRegtest) {
+	public async fetchFeeEstimates(
+		network = this._network
+	): Promise<IOnchainFees> {
+		if (network === Network.regtest) {
 			return { ...defaultFeesShape, timestamp: Date.now() };
 		}
 		if (this.feeEstimationSource !== 'http') {
-			const electrumFees = await this.getFeeEstimatesFromElectrum();
+			const electrumFees = await this.fetchFeeEstimatesFromElectrum();
 			if (electrumFees.isOk()) {
 				return electrumFees.value;
 			}
@@ -5419,7 +5722,7 @@ export class Wallet {
 				return this.feeEstimates;
 			}
 		}
-		return this.getFeeEstimatesFromHttp(network);
+		return this.fetchFeeEstimatesFromHttp(network);
 	}
 
 	/**
@@ -5429,7 +5732,7 @@ export class Wallet {
 	 * @async
 	 * @returns {Promise<Result<IOnchainFees>>}
 	 */
-	public async getFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>> {
+	public async fetchFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>> {
 		if (!this.electrum.connectedToElectrum) {
 			return err('Not connected to an Electrum server.');
 		}
@@ -5455,22 +5758,22 @@ export class Wallet {
 	 * Fetches fee estimates over HTTP from mempool.space, falling back to
 	 * blocktank if mempool.space is down.
 	 * @async
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<IOnchainFees>}
 	 */
-	public async getFeeEstimatesFromHttp(
+	public async fetchFeeEstimatesFromHttp(
 		network = this._network
 	): Promise<IOnchainFees> {
+		if (this.remainOffline) return this.feeEstimates;
 		try {
 			let urlModifier = '';
-			if (network !== EAvailableNetworks.bitcoinMainnet) {
-				urlModifier =
-					network === EAvailableNetworks.bitcoinSignet ? 'signet/' : 'testnet/';
+			if (network !== Network.bitcoin) {
+				urlModifier = network === Network.signet ? 'signet/' : 'testnet/';
 			}
 			const response = await fetch(
 				`https://mempool.space/${urlModifier}api/v1/fees/recommended`
 			);
-			const res: IGetFeeEstimatesResponse = await response.json();
+			const res = (await response.json()) as IGetFeeEstimatesResponse;
 			const fast = clampFeeRate(res.fastestFee);
 			const normal = clampFeeRate(res.halfHourFee);
 			const slow = clampFeeRate(res.hourFee);
@@ -5489,25 +5792,26 @@ export class Wallet {
 			};
 		} catch {
 			// Falls back to using blocktank for fee estimates if mempool.space is down.
-			return this.getFallbackFeeEstimates(network);
+			return this.fetchFallbackFeeEstimates(network);
 		}
 	}
 
 	/**
 	 * Fallback method to use blocktank for fee estimates if mempool.space is down.
-	 * @param {EAvailableNetworks} network
+	 * @param {Network} network
 	 * @returns {Promise<IOnchainFees>}
 	 */
-	public async getFallbackFeeEstimates(
+	public async fetchFallbackFeeEstimates(
 		network = this._network
 	): Promise<IOnchainFees> {
+		if (this.remainOffline) return this.feeEstimates;
 		try {
-			if (network !== EAvailableNetworks.bitcoinMainnet) {
+			if (network !== Network.bitcoin) {
 				return defaultFeesShape;
 			}
 			const url = 'https://api1.blocktank.to/api/info';
 			const response = await fetch(url);
-			const res: IBtInfo = await response.json();
+			const res = (await response.json()) as IBtInfo;
 			// check the response for the expected properties
 			if (
 				!(
@@ -5582,15 +5886,15 @@ export class Wallet {
 	}
 
 	/**
-	 * Serializes send, sendMany, sendMax, buildPsbt, sweepPrivateKey and boost.
-	 * They share one staged transaction, and the coins a broadcast spends leave
-	 * the UTXO set only when it returns. Two overlapping calls would stage the
-	 * same coins, and under RBF the later broadcast replaces the earlier one
-	 * after both have reported a txid. Staging a recipient overwrites only its
-	 * own index, so an overlapping call with fewer recipients would also pay
-	 * the other call's trailing ones (#1464). A sweep or a boost resets the
-	 * staged transaction on the way in, wiping whatever a send had staged
-	 * (#1597).
+	 * Serializes send, sendMany, sendMax, createSignedTransaction, buildPsbt,
+	 * sweepPrivateKey and boost. They share one staged transaction, and the
+	 * coins a broadcast spends leave the UTXO set only when it returns. Two
+	 * overlapping calls would stage the same coins, and under RBF the later
+	 * broadcast replaces the earlier one after both have reported a txid.
+	 * Staging a recipient overwrites only its own index, so an overlapping
+	 * call with fewer recipients would also pay the other call's trailing
+	 * ones (#1464). A sweep or a boost resets the staged transaction on the
+	 * way in, wiping whatever a send had staged (#1597).
 	 */
 	private sendLock: Promise<unknown> = Promise.resolve();
 
@@ -5603,15 +5907,20 @@ export class Wallet {
 	/**
 	 * Runs fn under the send lock, for a caller whose send is more than one
 	 * call: reading what it staged, broadcasting the hex, resetting the staged
-	 * transaction. fn gets send, sendMax and buildPsbt without the queue, since
-	 * fn already holds the lock. Once fn settles the lock is gone, so each of
-	 * them returns an Err from then on instead of staging on the shared
-	 * transaction unlocked (#1638). The wallet's own send methods, and
-	 * switchNetwork, called from fn, wait on the lock fn holds and never
-	 * settle.
+	 * transaction. fn gets send, sendMax, createSignedTransaction and
+	 * buildPsbt without the queue, since fn already holds the lock. Once fn
+	 * settles the lock is gone, so each of them returns an Err from then on
+	 * instead of staging on the shared transaction unlocked (#1638). The
+	 * wallet's own send methods, and switchNetwork, called from fn, wait on
+	 * the lock fn holds and never settle.
 	 */
 	public withSendLock<T>(
-		fn: (locked: Pick<Wallet, 'send' | 'sendMax' | 'buildPsbt'>) => Promise<T>
+		fn: (
+			locked: Pick<
+				Wallet,
+				'send' | 'sendMax' | 'createSignedTransaction' | 'buildPsbt'
+			>
+		) => Promise<T>
 	): Promise<T> {
 		return this.runSend(async () => {
 			let settled = false;
@@ -5630,6 +5939,9 @@ export class Wallet {
 						})
 					),
 					sendMax: guard((options) => this.sendMaxLocked(options)),
+					createSignedTransaction: guard((args) =>
+						this.createSignedTransactionLocked(args)
+					),
 					buildPsbt: guard((args) => this.buildPsbtLocked(args))
 				});
 			} finally {
@@ -5639,18 +5951,23 @@ export class Wallet {
 	}
 
 	/**
-	 * Sets up and creates a transaction to multiple outputs.
+	 * Sets up, signs and broadcasts a transaction to multiple outputs.
 	 * @param {ISendTx[]} txs
 	 * @param {number} [satsPerByte]
 	 * @param {boolean} [rbf]
-	 * @param {false} [broadcast]
+	 * @param {boolean} [broadcast]
 	 * @param {boolean} [shuffleOutputs]
-	 * @returns {Promise<Result<string>>}
+	 * @returns {Promise<Result<string>>} The txid, or the signed hex when
+	 * broadcast is false.
 	 */
 	public async sendMany(params: {
 		txs: ISendTx[];
 		satsPerByte?: number;
 		rbf?: boolean;
+		/**
+		 * @deprecated Use createSignedTransaction to build without
+		 * broadcasting. Removed in the next major release.
+		 */
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
@@ -5669,8 +5986,8 @@ export class Wallet {
 	}: Parameters<Wallet['sendMany']>[0]): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
-		if (!this.data.utxos.length) {
-			return err('No UTXOs available.');
+		if (!this._data.utxos.length) {
+			return err(this.noUtxosError());
 		}
 		// The staged send is a per-call working area, held only in memory. It
 		// starts empty, so nothing an earlier call staged rides along (#1002),
@@ -5680,7 +5997,7 @@ export class Wallet {
 			rbf
 		});
 		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
+			return err(setupTransactionRes.error);
 		}
 
 		if (!Array.isArray(txs)) txs = [txs];
@@ -5695,23 +6012,29 @@ export class Wallet {
 				}
 			});
 			if (updateSendTransactionRes.isErr())
-				return err(updateSendTransactionRes.error.message);
+				return err(updateSendTransactionRes.error);
 			index++;
 		}
 
 		const updateFeeRes = this.transaction.updateFee({ satsPerByte });
 		if (updateFeeRes.isErr()) {
-			if (updateFeeRes.error.message.includes('Unable to increase the fee')) {
+			const { code } = updateFeeRes.error;
+			if (
+				code === EWalletErrorCode.FEE_EXCEEDS_HALF_INPUTS ||
+				code === EWalletErrorCode.FEE_EXCEEDS_HALF_OUTPUTS
+			) {
 				const feeInfo = this.getFeeInfo({ satsPerByte: 1 });
 				if (feeInfo.isOk()) {
 					return err(
-						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
+						code,
+						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`,
+						updateFeeRes.error
 					);
 				}
 			}
 			// The fee probe above only refines the message. Either way the fee
 			// was never updated, so never fall through to build and broadcast.
-			return err(updateFeeRes.error.message);
+			return err(updateFeeRes.error);
 		}
 
 		// updateFee priced only the coins the wallet's coinSelectPreference
@@ -5721,13 +6044,13 @@ export class Wallet {
 			shuffleOutputs,
 			runCoinSelect: true
 		});
-		if (createRes.isErr()) return err(createRes.error.message);
+		if (createRes.isErr()) return err(createRes.error);
 		const hex = createRes.value.hex;
 		if (broadcast) {
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			if (broadcastRes.isErr()) return err(broadcastRes.error);
 			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
@@ -5745,7 +6068,7 @@ export class Wallet {
 	private unfrozenSignedHex(hex: string): Result<string> {
 		for (const { hash, index } of bitcoin.Transaction.fromHex(hex).ins) {
 			const txid = Buffer.from(hash).reverse().toString('hex');
-			if (this.isUtxoFrozen(txid, index)) {
+			if (this.isUtxoFrozen({ txid, vout: index })) {
 				return err(`Staged input ${txid}:${index} is frozen.`);
 			}
 		}
@@ -5758,13 +6081,18 @@ export class Wallet {
 	 * @param {number} satsPerByte
 	 * @param [rbf]
 	 * @param {boolean} [broadcast]
-	 * @returns {Promise<Result<string>>}
+	 * @returns {Promise<Result<string>>} The txid, or the signed hex when
+	 * broadcast is false.
 	 */
 	public async sendMax(
 		params: {
 			address?: string;
 			satsPerByte?: number;
 			rbf?: boolean;
+			/**
+			 * @deprecated Use createSignedTransaction with max to build
+			 * without broadcasting. Removed in the next major release.
+			 */
 			broadcast?: boolean;
 		} = {}
 	): Promise<Result<string>> {
@@ -5780,8 +6108,8 @@ export class Wallet {
 	}: Parameters<Wallet['sendMax']>[0] = {}): Promise<Result<string>> {
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
-		if (!this.data.utxos.length) {
-			return err('No UTXOs available.');
+		if (!this._data.utxos.length) {
+			return err(this.noUtxosError());
 		}
 		// Same working-area rule as sendMany: empty on entry, readable until
 		// the next call.
@@ -5792,7 +6120,7 @@ export class Wallet {
 			rbf
 		});
 		if (setupTransactionRes.isErr()) {
-			return err(setupTransactionRes.error.message);
+			return err(setupTransactionRes.error);
 		}
 		const sendMaxRes = await this.transaction.sendMax({
 			address,
@@ -5801,26 +6129,26 @@ export class Wallet {
 		});
 
 		if (sendMaxRes.isErr()) {
-			return err(sendMaxRes.error.message);
+			return err(sendMaxRes.error);
 		}
 
 		const createRes = await this.transaction.createTransaction({
 			shuffleOutputs: true
 		});
-		if (createRes.isErr()) return err(createRes.error.message);
+		if (createRes.isErr()) return err(createRes.error);
 		const hex = createRes.value.hex;
 		if (broadcast) {
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
-			if (broadcastRes.isErr()) return err(broadcastRes.error.message);
+			if (broadcastRes.isErr()) return err(broadcastRes.error);
 			return ok(broadcastRes.value);
 		}
 		return this.unfrozenSignedHex(hex);
 	}
 
 	/**
-	 * Sets up and creates a transaction to a single output/recipient.
+	 * Sets up, signs and broadcasts a transaction to a single output/recipient.
 	 * @async
 	 * @param {string} address
 	 * @param {number} amount
@@ -5829,7 +6157,8 @@ export class Wallet {
 	 * @param {boolean} [rbf]
 	 * @param {boolean} [broadcast]
 	 * @param {boolean} [shuffleOutputs]
-	 * @returns {Promise<Result<string>>}
+	 * @returns {Promise<Result<string>>} The txid, or the signed hex when
+	 * broadcast is false.
 	 */
 	public async send({
 		address,
@@ -5845,6 +6174,10 @@ export class Wallet {
 		message?: string;
 		satsPerByte?: number;
 		rbf?: boolean;
+		/**
+		 * @deprecated Use createSignedTransaction to build without
+		 * broadcasting. Removed in the next major release.
+		 */
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
@@ -5854,6 +6187,63 @@ export class Wallet {
 			rbf,
 			broadcast,
 			shuffleOutputs
+		});
+	}
+
+	/**
+	 * Builds and signs a transaction without broadcasting it, through the
+	 * same setup, coin selection and fee logic as send, sendMany and sendMax.
+	 * Pass txs, or address and amount, to pay; pass max and address to spend
+	 * every unfrozen coin. Broadcast the hex with broadcastTransaction. What
+	 * was staged (fee, inputs) stays readable until the next send resets it.
+	 * @param {ICreateSignedTransactionArgs} args
+	 * @returns {Promise<Result<ISignedTransaction>>}
+	 */
+	public async createSignedTransaction(
+		args: ICreateSignedTransactionArgs
+	): Promise<Result<ISignedTransaction>> {
+		const options = { ...args };
+		return this.runSend(() => this.createSignedTransactionLocked(options));
+	}
+
+	private async createSignedTransactionLocked({
+		max = false,
+		txs,
+		address,
+		amount,
+		message = '',
+		...options
+	}: ICreateSignedTransactionArgs): Promise<Result<ISignedTransaction>> {
+		let signed: Result<string>;
+		if (max) {
+			if (txs?.length || amount !== undefined) {
+				return err('max spends every unfrozen coin: pass no amount or txs.');
+			}
+			if (!address) return err('max needs the address to send to.');
+			signed = await this.sendMaxLocked({
+				address,
+				satsPerByte: options.satsPerByte,
+				rbf: options.rbf,
+				broadcast: false
+			});
+		} else {
+			let sendTxs: ISendTx[] = txs ?? [];
+			if (!sendTxs.length) {
+				if (!address || !amount) {
+					return err('No outputs provided. Specify txs or address and amount.');
+				}
+				sendTxs = [{ address, amount, message }];
+			}
+			signed = await this.sendManyLocked({
+				txs: sendTxs,
+				...options,
+				broadcast: false
+			});
+		}
+		if (signed.isErr()) return err(signed.error);
+		return ok({
+			txHex: signed.value,
+			txid: bitcoin.Transaction.fromHex(signed.value).getId()
 		});
 	}
 
@@ -5893,8 +6283,8 @@ export class Wallet {
 				}
 				sendTxs = [{ address, amount, message }];
 			}
-			if (!this.data.utxos.length) {
-				return err('No UTXOs available.');
+			if (!this._data.utxos.length) {
+				return err(this.noUtxosError());
 			}
 			await this.resetSendTransaction();
 			const setupTransactionRes = await this.transaction.setupTransaction({
@@ -5902,7 +6292,7 @@ export class Wallet {
 				satsPerByte
 			});
 			if (setupTransactionRes.isErr()) {
-				return err(setupTransactionRes.error.message);
+				return err(setupTransactionRes.error);
 			}
 			let index = 0;
 			for (const tx of sendTxs) {
@@ -5915,12 +6305,12 @@ export class Wallet {
 					}
 				);
 				if (updateSendTransactionRes.isErr()) {
-					return err(updateSendTransactionRes.error.message);
+					return err(updateSendTransactionRes.error);
 				}
 				index++;
 			}
 			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
-			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			if (updateFeeRes.isErr()) return err(updateFeeRes.error);
 			// updateFee priced only the coins the wallet's coinSelectPreference
 			// selects, so build from those coins, as sendMany does.
 			const staged = this.transaction.data;
@@ -5932,7 +6322,7 @@ export class Wallet {
 				message: staged.message,
 				coinSelectPreference: this.coinSelectPreference
 			});
-			if (coinSelectRes.isErr()) return err(coinSelectRes.error.message);
+			if (coinSelectRes.isErr()) return err(coinSelectRes.error);
 			// A local copy, not applyAutoCoinSelect: narrowing the shared staged
 			// inputs would shrink the pool a concurrent build is still pricing,
 			// and that build could restage the shared copy while this one awaits.
@@ -5941,7 +6331,7 @@ export class Wallet {
 				transactionData: txData,
 				shuffleOutputs
 			});
-			if (psbtRes.isErr()) return err(psbtRes.error.message);
+			if (psbtRes.isErr()) return err(psbtRes.error);
 			psbt = psbtRes.value;
 			const inputValue = this.transaction.getTransactionInputValue({
 				inputs: txData.inputs
@@ -5991,7 +6381,7 @@ export class Wallet {
 		// sit between this check and return.
 		for (const { hash, index } of psbt.txInputs) {
 			const txid = Buffer.from(hash).reverse().toString('hex');
-			if (this.isUtxoFrozen(txid, index)) {
+			if (this.isUtxoFrozen({ txid, vout: index })) {
 				return err(`Staged input ${txid}:${index} is frozen.`);
 			}
 		}
@@ -6027,10 +6417,10 @@ export class Wallet {
 			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
 			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
 			const buildRes = this._checkAgainstBuild(psbt, unsignedPsbtBase64);
-			if (buildRes.isErr()) return err(buildRes.error.message);
+			if (buildRes.isErr()) return err(buildRes.error);
 			for (let i = 0; i < psbt.inputCount; i++) {
 				const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
-				if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+				if (prevOutCheck.isErr()) return err(prevOutCheck.error);
 				const input = psbt.data.inputs[i];
 				if (input.finalScriptSig || input.finalScriptWitness) {
 					return err(
@@ -6045,7 +6435,7 @@ export class Wallet {
 					return err(`Input ${i} is missing a signature.`);
 				}
 				const multisigCheck = this._enforceMultisigThreshold(psbt, i);
-				if (multisigCheck.isErr()) return err(multisigCheck.error.message);
+				if (multisigCheck.isErr()) return err(multisigCheck.error);
 				let valid = false;
 				try {
 					valid = psbt.validateSignaturesOfInput(i, validatePsbtSignature);
@@ -6280,7 +6670,7 @@ export class Wallet {
 					);
 					if (!alreadySigned) {
 						const prevOutCheck = this._checkPsbtPrevOut(psbt, i);
-						if (prevOutCheck.isErr()) return err(prevOutCheck.error.message);
+						if (prevOutCheck.isErr()) return err(prevOutCheck.error);
 						psbt.signInput(i, keyPair);
 					}
 					break;
@@ -6331,7 +6721,7 @@ export class Wallet {
 		if (witnessUtxo) {
 			records.push({ source: 'its witnessUtxo', ...witnessUtxo });
 		}
-		const utxo = this.data.utxos.find(
+		const utxo = this._data.utxos.find(
 			(u) => u.tx_hash.toLowerCase() === txid && u.tx_pos === index
 		);
 		if (utxo) {
@@ -6457,7 +6847,7 @@ export class Wallet {
 	 * @returns {Promise<Result<string>>}
 	 */
 	private async setZeroIndexAddresses(): Promise<Result<string>> {
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		// switchNetwork replaces the Electrum instance along with the data. An
 		// address derived before it is for the network the wallet left, and an
 		// index read before it is that network's, so neither is written into
@@ -6548,9 +6938,9 @@ export class Wallet {
 		// Ensure we have addresses to pull from.
 		let addresses = {};
 		if (indexToUpdate === 'addressIndex') {
-			addresses = this.data.addresses[addressType];
+			addresses = this._data.addresses[addressType];
 		} else {
-			addresses = this.data.changeAddresses[addressType];
+			addresses = this._data.changeAddresses[addressType];
 		}
 		if (!Object.keys(addresses).length) {
 			await this.addAddresses({
@@ -6574,7 +6964,7 @@ export class Wallet {
 	 */
 	public getAddressIndexInfo(): TAddressIndexInfo {
 		const addressType = this.addressType;
-		const currentWallet = this.data;
+		const currentWallet = this._data;
 		const addressIndex = currentWallet.addressIndex[addressType];
 		const changeAddressIndex = currentWallet.addressIndex[addressType];
 		const lastUsedAddressIndex =
@@ -6600,11 +6990,11 @@ export class Wallet {
 		addressType?: EAddressType;
 	}): Promise<Result<string>> => {
 		try {
-			const wallet = this.data;
+			const wallet = this._data;
 			const addressIndex = wallet.addressIndex;
 			if (addressIndex[addressType].address) {
 				const saved = await this.savedReceiveAddress(addressType);
-				if (saved.isErr()) return err(saved.error.message);
+				if (saved.isErr()) return err(saved.error);
 				return ok(saved.value.address);
 			}
 			const addresses = wallet?.addresses[addressType];
@@ -6638,21 +7028,21 @@ export class Wallet {
 	};
 
 	/**
-	 * Using a tx_hash this method will return the necessary data to create a
-	 * replace-by-fee transaction for any 0-conf, RBF-enabled tx.
-	 * @param {ITxHash} txHash
+	 * Asks Electrum for what a replace-by-fee transaction for the given
+	 * 0-conf, RBF-enabled transaction needs.
+	 * @param {string} txid
 	 * @returns {Promise<Result<IRbfData>>}
 	 */
-	public async getRbfData({
-		txHash
+	public async fetchRbfData({
+		txid
 	}: {
-		txHash: ITxHash;
+		txid: string;
 	}): Promise<Result<IRbfData>> {
 		const txResponse = await this.electrum.getTransactions({
-			txHashes: [txHash]
+			txHashes: [{ tx_hash: txid }]
 		});
 		if (txResponse.isErr()) {
-			return err(txResponse.error.message);
+			return err(txResponse.error);
 		}
 		const txData = txResponse.value.data;
 		// canBoost only reads the height stored at the last refresh. A replacement
@@ -6696,7 +7086,7 @@ export class Wallet {
 			].map((tx_hash) => ({ tx_hash }))
 		});
 		if (parentsRes.isErr()) {
-			return err(parentsRes.error.message);
+			return err(parentsRes.error);
 		}
 		const parents = new Map(
 			parentsRes.value.data.map(({ data, result }) => [data?.tx_hash, result])
@@ -6880,12 +7270,12 @@ export class Wallet {
 		if (txid in transactions) {
 			delete transactions[txid];
 		}
-		const saved = await this.saveWalletData('transactions', transactions);
+		const saved = await this.saveTransactions([txid]);
 		// Storage still holds the record, so it must keep the unconfirmed copy
 		// that watches it as well, and so must memory, which the next check
 		// writes over the stored copy. Without that copy the record is back
 		// after a restart and nothing checks it again (#940, #1735).
-		if (saved.isErr()) return err(saved.error.message);
+		if (saved.isErr()) return err(saved.error);
 		// Read after the write, since a check may have replaced the map.
 		const unconfirmed = this._data.unconfirmedTransactions;
 		if (txid in unconfirmed) {
@@ -6897,7 +7287,7 @@ export class Wallet {
 			'unconfirmedTransactions',
 			unconfirmed
 		);
-		if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error.message);
+		if (savedUnconfirmed.isErr()) return err(savedUnconfirmed.error);
 		return ok(`Deleted transaction ${txid}.`);
 	}
 
@@ -6914,16 +7304,14 @@ export class Wallet {
 	}: {
 		txid: string;
 	}): Promise<Result<string>> {
-		if (txid in this._data.transactions) {
+		const held = txid in this._data.transactions;
+		if (held) {
 			this._data.transactions[txid].exists = false;
 			this._ghostClearings.set(txid, (this._ghostClearings.get(txid) ?? 0) + 1);
 			this._recordRepairs += 1;
 		}
-		const saved = await this.saveWalletData(
-			'transactions',
-			this._data.transactions
-		);
-		if (saved.isErr()) return err(saved.error.message);
+		const saved = await this.saveTransactions(held ? [txid] : []);
+		if (saved.isErr()) return err(saved.error);
 		return ok(`Marked transaction ${txid} as gone.`);
 	}
 
@@ -6954,14 +7342,18 @@ export class Wallet {
 					? await this.transaction.setupRbf({ txid })
 					: await this.transaction.setupCpfp({ txid, satsPerByte });
 			if (setup.isErr()) {
-				return err(new BoostError('NOT_BOOSTABLE', setup.error.message));
+				return err(
+					new BoostError('NOT_BOOSTABLE', setup.error.message, setup.error)
+				);
 			}
 			// setupRbf stages the fast rate. updateFee applies a requested one
 			// with the fee-overpayment guards.
 			if (type === EBoostType.rbf && satsPerByte !== undefined) {
 				const feeRes = this.transaction.updateFee({ satsPerByte });
 				if (feeRes.isErr()) {
-					return err(new BoostError('INVALID_FEE', feeRes.error.message));
+					return err(
+						new BoostError('INVALID_FEE', feeRes.error.message, feeRes.error)
+					);
 				}
 			}
 			const fee = this.transaction.data.fee;
@@ -6969,8 +7361,8 @@ export class Wallet {
 				// BIP 125: a replacement that does not pay more than the original
 				// is rejected by every node.
 				const original =
-					this.data.unconfirmedTransactions[txid] ??
-					this.data.transactions[txid];
+					this._data.unconfirmedTransactions[txid] ??
+					this._data.transactions[txid];
 				const originalFee = original ? btcToSats(original.fee) : 0;
 				if (fee <= originalFee) {
 					return err(
@@ -6983,14 +7375,26 @@ export class Wallet {
 			}
 			const createRes = await this.transaction.createTransaction();
 			if (createRes.isErr()) {
-				return err(new BoostError('SEND_FAILED', createRes.error.message));
+				return err(
+					new BoostError(
+						'SEND_FAILED',
+						createRes.error.message,
+						createRes.error
+					)
+				);
 			}
 			const { id, hex } = createRes.value;
 			const broadcastRes = await this.electrum.broadcastTransaction({
 				rawTx: hex
 			});
 			if (broadcastRes.isErr()) {
-				return err(new BoostError('SEND_FAILED', broadcastRes.error.message));
+				return err(
+					new BoostError(
+						'SEND_FAILED',
+						broadcastRes.error.message,
+						broadcastRes.error
+					)
+				);
 			}
 			// The boost is on the network, so failing to record it must not report
 			// it as failed.
@@ -7031,7 +7435,7 @@ export class Wallet {
 		fee: number;
 	}): Promise<Result<IBoostedTransaction>> {
 		try {
-			const boostedTransactions = this.data.boostedTransactions;
+			const boostedTransactions = this._data.boostedTransactions;
 			const parentTransactions = this.getBoostedTransactionParents({
 				txid: oldTxId,
 				boostedTransactions
@@ -7047,7 +7451,7 @@ export class Wallet {
 				[oldTxId]: boostedTx
 			};
 			this._data.boostedTransactions = {
-				...this.data.boostedTransactions,
+				...this._data.boostedTransactions,
 				...boostedTransaction
 			};
 
@@ -7061,8 +7465,8 @@ export class Wallet {
 				'boostedTransactions',
 				this._data.boostedTransactions
 			);
-			if (deleted?.isErr()) return err(deleted.error.message);
-			if (saved.isErr()) return err(saved.error.message);
+			if (deleted?.isErr()) return err(deleted.error);
+			if (saved.isErr()) return err(saved.error);
 			return ok(boostedTx);
 		} catch (e) {
 			return err(e);
@@ -7097,7 +7501,7 @@ export class Wallet {
 	 * @returns {IBoostedTransactions}
 	 */
 	getBoostedTransactions = (): IBoostedTransactions => {
-		return this.data.boostedTransactions;
+		return this._data.boostedTransactions;
 	};
 
 	/**
@@ -7118,7 +7522,7 @@ export class Wallet {
 	} {
 		const cpfp: IFormattedTransaction[] = [];
 		const rbf: IFormattedTransaction[] = [];
-		Object.values(this.data.unconfirmedTransactions).map((tx) => {
+		Object.values(this._data.unconfirmedTransactions).map((tx) => {
 			if (tx.rbf) rbf.push(tx);
 			cpfp.push(tx); // All unconfirmed transactions can be cpfp'd.
 		});
@@ -7138,7 +7542,7 @@ export class Wallet {
 			const root = bip32.fromPrivateKey(
 				Buffer.from(this._root.privateKey!),
 				Buffer.from(this._root.chainCode),
-				getBitcoinJsNetwork(this._network)
+				toBitcoinJsNetwork(this._network)
 			);
 			return ok(root);
 		} catch (e) {
@@ -7164,7 +7568,7 @@ export class Wallet {
 					inputs: newInputs
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to add transaction input.', e);
@@ -7189,7 +7593,7 @@ export class Wallet {
 					inputs: newInputs
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to remove transaction input.', e);
@@ -7213,7 +7617,7 @@ export class Wallet {
 					tags
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok('Tag successfully added');
 		} catch (e) {
 			this.logger.error('Failed to add transaction tag.', e);
@@ -7238,7 +7642,7 @@ export class Wallet {
 					tags: newTags
 				}
 			});
-			if (updateRes.isErr()) return err(updateRes.error.message);
+			if (updateRes.isErr()) return err(updateRes.error);
 			return ok('Tag successfully removed');
 		} catch (e) {
 			this.logger.error('Failed to remove transaction tag.', e);
@@ -7276,7 +7680,7 @@ export class Wallet {
 			});
 			if (res.isErr()) {
 				this.logger.warn(res.error.message);
-				return err(res.error.message);
+				return err(res.error);
 			}
 
 			return ok('Fee has been changed successfully');
@@ -7322,7 +7726,7 @@ export class Wallet {
 		if (!forceUpdate && difference < 60) {
 			return ok(this.feeEstimates);
 		}
-		const feeEstimates = await this.getFeeEstimates();
+		const feeEstimates = await this.fetchFeeEstimates();
 		this.feeEstimates = feeEstimates;
 		await this.saveWalletData('feeEstimates', feeEstimates);
 		return ok(feeEstimates);
@@ -7352,18 +7756,19 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the balance, utxos, and keyPair info for a given private key.
+	 * Asks Electrum for the balance and UTXOs of a given private key's
+	 * addresses, and returns them with its key pair.
 	 * @async
 	 * @param {string} privateKey
 	 * @returns {Promise<Result<IPrivateKeyInfo>>}
 	 */
-	public async getPrivateKeyInfo(
+	public async fetchPrivateKeyInfo(
 		privateKey: string
 	): Promise<Result<IPrivateKeyInfo>> {
 		if (!privateKey) return err('No private key provided.');
 		const addressesRes = this.getAddressesFromPrivateKey(privateKey);
 		if (addressesRes.isErr()) {
-			return err(addressesRes.error.message);
+			return err(addressesRes.error);
 		}
 		const { addresses, keyPair } = addressesRes.value;
 		const addressData: TUnspentAddressScriptHashData = {};
@@ -7382,7 +7787,7 @@ export class Wallet {
 			addresses: addressData
 		});
 		if (getUtxoRes.isErr()) {
-			return err(getUtxoRes.error.message);
+			return err(getUtxoRes.error);
 		}
 		const { balance, utxos } = getUtxoRes.value;
 		return ok({ balance, utxos, keyPair, addresses });
@@ -7416,9 +7821,9 @@ export class Wallet {
 		// requires the wallet's own keys even for an externally provided key.
 		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
-		const privateKeyInfo = await this.getPrivateKeyInfo(privateKey);
+		const privateKeyInfo = await this.fetchPrivateKeyInfo(privateKey);
 		if (privateKeyInfo.isErr()) {
-			return err(privateKeyInfo.error.message);
+			return err(privateKeyInfo.error);
 		}
 		const { keyPair } = privateKeyInfo.value;
 		if (!privateKeyInfo.value.utxos.length) {
@@ -7439,7 +7844,7 @@ export class Wallet {
 			// setupTransaction only drops frozen coins it gathers itself, not an
 			// explicit utxos list.
 			const walletUtxos = this.transaction.removeBlackListedUtxos(
-				this.data.utxos
+				this._data.utxos
 			);
 			utxos = [...walletUtxos, ...utxos];
 		}
@@ -7461,11 +7866,11 @@ export class Wallet {
 				}
 			});
 			if (sendMaxRes.isErr()) {
-				return err(sendMaxRes.error.message);
+				return err(sendMaxRes.error);
 			}
 			const createRes = await this.transaction.createTransaction({});
 			if (createRes.isErr()) {
-				return err(createRes.error.message);
+				return err(createRes.error);
 			}
 			const response = {
 				...createRes.value,
@@ -7479,7 +7884,7 @@ export class Wallet {
 				subscribeToOutputAddress: false
 			});
 			if (broadcastResponse.isErr()) {
-				return err(broadcastResponse.error.message);
+				return err(broadcastResponse.error);
 			}
 			response.id = broadcastResponse.value;
 			return ok(response);
@@ -7495,7 +7900,7 @@ export class Wallet {
 		address: IAddress;
 		addressType: EAddressType;
 	}> {
-		const addresses = this.data.addresses;
+		const addresses = this._data.addresses;
 		let address: { address: IAddress; addressType: EAddressType } | undefined;
 		for (const addressType in addresses) {
 			if (scriptHash in addresses[addressType as EAddressType]) {
@@ -7533,11 +7938,12 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns an array of tx_hashes and their height for a given address.
+	 * Asks Electrum for the tx_hashes and heights of a given address's
+	 * history.
 	 * @param {string} address
 	 * @returns {Promise<Result<TTxResult[]>>}
 	 */
-	public async getAddressHistory(
+	public async fetchAddressHistory(
 		address: string
 	): Promise<Result<TTxResult[]>> {
 		try {
@@ -7546,7 +7952,7 @@ export class Wallet {
 				scriptHash
 			]);
 			if (response.isErr()) {
-				return err(response.error.message);
+				return err(response.error);
 			}
 			if (response.value.data[0].error?.message) {
 				return err(response.value.data[0].error.message);
@@ -7558,19 +7964,19 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the transaction details for a given tx_hash.
-	 * @param {string} tx_hash
+	 * Asks Electrum for the details of a given transaction.
+	 * @param {string} txid
 	 * @returns {Promise<Result<TTxDetails>>}
 	 */
-	public async getTransactionDetails(
-		tx_hash: string
+	public async fetchTransactionDetails(
+		txid: string
 	): Promise<Result<TTxDetails>> {
 		try {
 			const details = await this.electrum.getTransactions({
-				txHashes: [{ tx_hash }]
+				txHashes: [{ tx_hash: txid }]
 			});
 			if (details.isErr()) {
-				return err(details.error.message);
+				return err(details.error);
 			}
 			if (details.value.data[0]?.error?.message) {
 				return err(details.value.data[0].error.message);
@@ -7628,5 +8034,113 @@ export class Wallet {
 		} catch (e) {
 			return failure;
 		}
+	}
+
+	// The names below were renamed so a name says whether the call asks the
+	// network (docs/API-CONVENTIONS.md). Each forwards to its replacement and
+	// is removed in the next major release.
+
+	/** @deprecated Use {@link Wallet.refreshUtxos}. */
+	public getUtxos(
+		params: Parameters<Wallet['refreshUtxos']>[0]
+	): Promise<Result<IGetUtxosResponse>> {
+		return this.refreshUtxos(params);
+	}
+
+	/**
+	 * @deprecated Use {@link Wallet.getAddressGap}: the value is the current
+	 * gap, not the gap limit.
+	 */
+	public getGapLimit(
+		params: Parameters<Wallet['getAddressGap']>[0]
+	): Result<{ addressDelta: number; changeAddressDelta: number }> {
+		return this.getAddressGap(params);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchNextAvailableAddress}. */
+	public getNextAvailableAddress(
+		addressType?: EAddressType,
+		scan?: TAddressScan
+	): Promise<Result<IGetNextAvailableAddressResponse>> {
+		return this.fetchNextAvailableAddress(addressType, scan);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchAddressBalance}. */
+	public getAddressBalance(
+		address: string
+	): Promise<Result<IGetAddressBalanceRes>> {
+		return this.fetchAddressBalance(address);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchAddressesBalance}. */
+	public getAddressesBalance(addresses?: string[]): Promise<Result<number>> {
+		return this.fetchAddressesBalance(addresses);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchScriptHashBalance}. */
+	public getScriptHashBalance(
+		scriptHash: string
+	): Promise<Result<IGetAddressBalanceRes>> {
+		return this.fetchScriptHashBalance(scriptHash);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchAddressHistory}. */
+	public getAddressHistory(address: string): Promise<Result<TTxResult[]>> {
+		return this.fetchAddressHistory(address);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchTransactionDetails}. */
+	public getTransactionDetails(tx_hash: string): Promise<Result<TTxDetails>> {
+		return this.fetchTransactionDetails(tx_hash);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchFeeEstimates}. */
+	public getFeeEstimates(network?: Network): Promise<IOnchainFees> {
+		return this.fetchFeeEstimates(network);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchFeeEstimatesFromElectrum}. */
+	public getFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>> {
+		return this.fetchFeeEstimatesFromElectrum();
+	}
+
+	/** @deprecated Use {@link Wallet.fetchFeeEstimatesFromHttp}. */
+	public getFeeEstimatesFromHttp(network?: Network): Promise<IOnchainFees> {
+		return this.fetchFeeEstimatesFromHttp(network);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchFallbackFeeEstimates}. */
+	public getFallbackFeeEstimates(network?: Network): Promise<IOnchainFees> {
+		return this.fetchFallbackFeeEstimates(network);
+	}
+
+	/** @deprecated Use {@link Wallet.fetchPrivateKeyInfo}. */
+	public getPrivateKeyInfo(
+		privateKey: string
+	): Promise<Result<IPrivateKeyInfo>> {
+		return this.fetchPrivateKeyInfo(privateKey);
+	}
+
+	/**
+	 * @deprecated Use {@link Wallet.fetchInputData}, which takes
+	 * `{ txid, vout }` outpoints.
+	 */
+	public getInputData({
+		inputs
+	}: {
+		inputs: { tx_hash: string; vout: number }[];
+	}): Promise<Result<InputData>> {
+		return this.fetchInputData({
+			inputs: inputs.map(({ tx_hash, vout }) => ({ txid: tx_hash, vout }))
+		});
+	}
+
+	/** @deprecated Use {@link Wallet.fetchRbfData}, which takes `{ txid }`. */
+	public getRbfData({
+		txHash
+	}: {
+		txHash: ITxHash;
+	}): Promise<Result<IRbfData>> {
+		return this.fetchRbfData({ txid: txHash.tx_hash });
 	}
 }

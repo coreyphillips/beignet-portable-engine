@@ -15,17 +15,18 @@
  * builds keep using the native WebSocket.
  */
 
-import net from 'net';
-import tls from 'tls';
-import crypto from 'crypto';
-import { IWebSocketLike, parseWebSocketUrl } from './websocket';
+import type net from 'net';
+import { nodeNet, nodeTls } from '../../utils/node-builtins';
+import { randomBytes } from '../crypto/provider';
+import type { IWebSocketLike } from './websocket';
+import { parseWebSocketUrl } from './websocket';
 import { computeWebSocketAccept } from './websocket-server';
+import type { IWsFrame } from './websocket-frame';
 import {
 	WsFrameParser,
 	WsProtocolError,
 	WsOpcode,
 	WsCloseCode,
-	IWsFrame,
 	encodeWsFrame,
 	encodeWsClosePayload,
 	DEFAULT_MAX_WS_PAYLOAD_BYTES
@@ -72,7 +73,7 @@ export class NodeWebSocket implements IWebSocketLike {
 
 	constructor(url: string) {
 		const { host, port, secure } = parseWebSocketUrl(url);
-		const key = crypto.randomBytes(16).toString('base64');
+		const key = randomBytes(16).toString('base64');
 		const parsedPath = ((): string => {
 			try {
 				const u = new URL(url);
@@ -96,8 +97,8 @@ export class NodeWebSocket implements IWebSocketLike {
 		};
 
 		const socket = secure
-			? tls.connect({ host, port, servername: host }, onConnect)
-			: net.connect({ host, port }, onConnect);
+			? nodeTls().connect({ host, port, servername: host }, onConnect)
+			: nodeNet().connect({ host, port }, onConnect);
 		this.socket = socket;
 		socket.setNoDelay(true);
 
@@ -142,7 +143,7 @@ export class NodeWebSocket implements IWebSocketLike {
 			encodeWsFrame({
 				opcode: WsOpcode.BINARY,
 				payload,
-				maskKey: crypto.randomBytes(4) // client frames MUST be masked
+				maskKey: randomBytes(4) // client frames MUST be masked
 			})
 		);
 	}
@@ -274,7 +275,7 @@ export class NodeWebSocket implements IWebSocketLike {
 						encodeWsFrame({
 							opcode: WsOpcode.PONG,
 							payload: frame.payload,
-							maskKey: crypto.randomBytes(4)
+							maskKey: randomBytes(4)
 						})
 					);
 				}
@@ -344,7 +345,7 @@ export class NodeWebSocket implements IWebSocketLike {
 				encodeWsFrame({
 					opcode: WsOpcode.CLOSE,
 					payload: encodeWsClosePayload(code, reason),
-					maskKey: crypto.randomBytes(4)
+					maskKey: randomBytes(4)
 				})
 			);
 		} catch {

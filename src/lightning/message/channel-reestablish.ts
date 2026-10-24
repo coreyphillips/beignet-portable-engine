@@ -16,12 +16,14 @@
  *     (Decode also accepts legacy type 0 = bare 32-byte txid.)
  */
 
-import { encodeTlvStream, decodeTlvStream, ITlvRecord } from './tlv';
+import type { ITlvRecord } from './tlv';
+import { encodeTlvStream, decodeTlvStream } from './tlv';
 import {
 	decodeFforReestablishTlv,
 	encodeFforReestablishTlv
 } from '../ffor/messages';
-import { FF_REESTABLISH_TLV_TYPE, IFforReestablishTlv } from '../ffor/types';
+import type { IFforReestablishTlv } from '../ffor/types';
+import { FF_REESTABLISH_TLV_TYPE } from '../ffor/types';
 
 export interface IChannelReestablishMessage {
 	channelId: Buffer;
@@ -45,7 +47,7 @@ export interface IChannelReestablishMessage {
 	 */
 	nextLocalNonce?: Buffer;
 	/**
-	 * FFOR (specs/ffor-offline-receive.md section 11.1): TLV 55001, the
+	 * FFOR (docs/specs/ffor-offline-receive.md section 11.1): TLV 55001, the
 	 * epoch id, lifecycle state, last_seq and H_act of the channel's epoch.
 	 * Odd, so a peer without the feature ignores it.
 	 */

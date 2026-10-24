@@ -1,20 +1,21 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
-import { Network } from 'bitcoinjs-lib';
+import type { BIP32Interface } from 'bip32';
+import type { Network } from 'bitcoinjs-lib';
 
-import { err, ok, Result } from './result';
+import { CodedError } from './errors';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Typed error returned when a direct spend (send/sendMany/sendMax/sweep) is
  * attempted on a multisig wallet. Multisig spends MUST go through the PSBT
  * flow so every cosigner can contribute a signature.
  */
-export class MultisigSpendError extends Error {
-	public readonly code = 'MULTISIG_REQUIRES_PSBT';
+export class MultisigSpendError extends CodedError<'MULTISIG_REQUIRES_PSBT'> {
 	constructor(
 		message = 'Multisig wallets spend via the PSBT flow: buildPsbt -> signPsbtWithOurKey (each cosigner) -> combinePsbts -> importSignedPsbt -> broadcastTransaction.'
 	) {
-		super(message);
+		super('MULTISIG_REQUIRES_PSBT', message);
 		this.name = 'MultisigSpendError';
 	}
 }

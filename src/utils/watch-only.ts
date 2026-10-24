@@ -1,18 +1,20 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { BIP32Interface } from 'bip32';
+import type { BIP32Interface } from 'bip32';
 import { bip32 } from './ecc-apis';
 
-import { EAddressType, EAvailableNetworks } from '../types';
-import { err, ok, Result } from './result';
+import { EAddressType } from '../types';
+import { Network } from '../network';
+import { CodedError } from './errors';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Typed error thrown/returned whenever a watch-only wallet is asked to
  * perform an operation that requires private keys.
  */
-export class WatchOnlySigningError extends Error {
-	public readonly code = 'WATCH_ONLY_CANNOT_SIGN';
+export class WatchOnlySigningError extends CodedError<'WATCH_ONLY_CANNOT_SIGN'> {
 	constructor(message = 'watch-only wallet cannot sign') {
-		super(message);
+		super('WATCH_ONLY_CANNOT_SIGN', message);
 		this.name = 'WatchOnlySigningError';
 	}
 }
@@ -98,12 +100,12 @@ export interface IParsedExtendedPublicKey {
  * and normalizes its version bytes to the provided network. The key is
  * assumed to be the ACCOUNT node (depth 3, m/purpose'/coin'/account').
  * @param {string} extendedKey
- * @param {EAvailableNetworks} network
+ * @param {Network} network
  * @returns {Result<IParsedExtendedPublicKey>}
  */
 export const parseExtendedPublicKey = (
 	extendedKey: string,
-	network: EAvailableNetworks
+	network: Network
 ): Result<IParsedExtendedPublicKey> => {
 	try {
 		if (!extendedKey) return err('No extended public key provided.');
@@ -121,7 +123,7 @@ export const parseExtendedPublicKey = (
 				).join(', ')}.`
 			);
 		}
-		const isMainnet = network === EAvailableNetworks.bitcoin;
+		const isMainnet = network === Network.bitcoin;
 		if (entry.mainnet !== isMainnet) {
 			return err(
 				`Extended public key prefix ${prefix} does not match the ${network} network.`

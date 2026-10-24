@@ -6,8 +6,10 @@
  * Channel state machine to the actual transport layer.
  */
 
-import { EventEmitter } from 'events';
-import crypto from 'crypto';
+import { TypedEmitter } from '../../utils/typed-emitter';
+import type { TxidHex } from '../../utils/identifiers';
+import type { ChannelManagerEvents } from './events';
+import { randomBytes, sha256 } from '../crypto/provider';
 import { MessageType } from '../message/types';
 import {
 	decodeOpenChannelMessage,
@@ -30,14 +32,14 @@ import {
 	decodeCommitmentSignedMessage,
 	decodeRevokeAndAckMessage
 } from '../message/channel-commitment';
+import type { IClosingCompleteMessage } from '../message/channel-close';
 import {
 	decodeShutdownMessage,
 	encodeShutdownMessage,
 	decodeClosingSignedMessage,
 	decodeClosingCompleteMessage,
 	decodeClosingSigMessage,
-	ClosingSigVariant,
-	IClosingCompleteMessage
+	ClosingSigVariant
 } from '../message/channel-close';
 import {
 	canScopeWireError,
@@ -54,27 +56,33 @@ import {
 	decodeSpliceLockedMessage,
 	decodeStartBatchMessage
 } from '../message/splice';
-import {
+import type {
 	ChannelAction,
-	ChannelActionType,
 	IBroadcastTxAction,
-	IChannelPersistEvent,
-	IChannelPersistRequest,
+	IChannelPersistence,
+	IChannelPersistOutbox,
+	IChannelPersistResult,
 	IErrorAction,
 	ISendMessageAction,
-	IWireDurabilityBarrier,
+	IWireDurabilityBarrier
+} from './channel-actions';
+import {
+	ChannelActionType,
+	ChannelErrorCode,
 	QUORUM_BARRIER_MESSAGE_TYPES,
 	RETRANSMITTABLE_MESSAGE_TYPES,
 	SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
 } from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChainMonitor } from '../chain/chain-monitor';
-import {
+import type {
 	ChainAction,
+	IFeeBumpAndBroadcastChainAction,
+	IFundingSpendScan
+} from '../chain/types';
+import {
 	ChainActionType,
 	CommitmentType,
-	IFeeBumpAndBroadcastChainAction,
-	IFundingSpendScan,
 	IRREVOCABLE_DEPTH,
 	OutputType,
 	satPerVbyteToSatPerKw
@@ -96,7 +104,8 @@ import {
 	verifyDirectedSelection
 } from '../node/funding-selection';
 import type { IDualFundingSelection } from '../node/funding-selection';
-import { ChannelSigner, ISigner, SignerFactory } from '../keys/signer';
+import type { ISigner, SignerFactory } from '../keys/signer';
+import { ChannelSigner } from '../keys/signer';
 import {
 	signRemoteCommitment,
 	signRemoteCommitmentPartial,
@@ -115,21 +124,18 @@ import {
 } from '../script/funding-taproot';
 import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import { ecc } from '../../utils/ecc';
-import { Channel, ISpliceWalletInput, ITaprootClosingCache } from './channel';
-import {
-	createOpenerState,
-	createAcceptorState,
-	IChannelState
-} from './channel-state';
+import type { ISpliceWalletInput, ITaprootClosingCache } from './channel';
+import { Channel } from './channel';
+import type { IChannelState } from './channel-state';
+import { createOpenerState, createAcceptorState } from './channel-state';
 import {
 	deriveChannelId,
 	deriveV2TemporaryChannelId,
 	isValidShutdownScript
 } from './validation';
+import type { IChannelConfig, ChannelResult } from './types';
 import {
-	IChannelConfig,
 	DEFAULT_CHANNEL_CONFIG,
-	ChannelResult,
 	ChannelState,
 	ChannelRole,
 	HtlcDirection,
@@ -142,20 +148,22 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS
 } from './types';
+import type { IChannelBasepoints } from '../keys/derivation';
 import {
-	IChannelBasepoints,
 	perCommitmentPointFromSecret,
 	derivePublicKey,
 	derivePrivateKey
 } from '../keys/derivation';
 import { getPublicKey } from '../crypto/ecdh';
 import { generateFromSeed } from '../keys/shachain';
-import { PeerManager } from '../transport/peer-manager';
+import type { PeerManager } from '../transport/peer-manager';
+import { PeerError, PeerErrorCode } from '../transport/peer-manager';
 import { ZeroConfManager } from './zero-conf';
 import {
 	decodeOpenChannel2Message,
 	decodeAcceptChannel2Message
 } from '../message/dual-funding';
+import type { ITxAddInputMessage } from '../message/interactive-tx';
 import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
@@ -165,15 +173,11 @@ import {
 	decodeTxSignaturesMessage,
 	decodeTxInitRbfMessage,
 	decodeTxAckRbfMessage,
-	decodeTxAbortMessage,
-	ITxAddInputMessage
+	decodeTxAbortMessage
 } from '../message/interactive-tx';
-import {
-	DualFundingSession,
-	DualFundingState,
-	IDualFundingParams
-} from './dual-funding';
-import { ILeaseRates } from '../gossip/types';
+import type { DualFundingSession, IDualFundingParams } from './dual-funding';
+import { DualFundingState } from './dual-funding';
+import type { ILeaseRates } from '../gossip/types';
 import {
 	LEASE_DURATION_BLOCKS,
 	signWillFund,
@@ -183,18 +187,20 @@ import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
 import { sign as signWithNodeKey } from '../crypto/ecdh';
 import { decodeFforHeader } from '../ffor/messages';
-import {
+import type {
 	IFforSettlePolicy,
+	FforSlotState,
+	IFforBookEntry,
+	IFforEpochRecord
+} from '../ffor/types';
+import {
 	FF_ACTIVATION_TIMEOUT_MS,
 	FforAbortReason,
-	FforSlotState,
 	FforState,
-	IFforBookEntry,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from '../ffor/types';
-import { IFforWitnessProvision } from '../ffor/witness-types';
-import { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { IFforWitnessProvision } from '../ffor/witness-types';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 
 /**
  * The outpoints a raw transaction spends, txid in display-order hex (the
@@ -277,6 +283,41 @@ function newDispatchProgress(): IActionDispatchProgress {
 	};
 }
 
+/** One run of a batch through `_dispatchActions`, and what it has learned. */
+interface IDispatchContext {
+	peerPubkey: string;
+	channel: Channel;
+	actions: ChannelAction[];
+	/**
+	 * What the batch's persist authorizes, or null when its answer gates
+	 * nothing (no permanent channel id yet, or a run with no persist ahead).
+	 */
+	outbox: IChannelPersistOutbox | null;
+	/** The persistence's answer for an `outbox`, once the persist ran. */
+	persisted: IChannelPersistResult | null;
+	/**
+	 * The channel id the batch started under. The barrier queue and the
+	 * withheld-send record are keyed by it, whatever a nested dispatch does
+	 * to the channel meanwhile.
+	 */
+	channelIdHex: string | null;
+	/** Index the run starts from; a held suffix resumes past its persist. */
+	startIndex: number;
+	/** The batch's one persist already ran before this run started. */
+	persistAlreadySeen: boolean;
+	/**
+	 * Nothing the persist authorized may leave: it failed, or the suffix is
+	 * being run for its internal effects only.
+	 */
+	sendsBlocked: boolean;
+	/**
+	 * A live batch, whose persist may park its remainder behind the quorum
+	 * barrier. A resumed or terminal run is never held again.
+	 */
+	holdable: boolean;
+	progress?: IActionDispatchProgress;
+}
+
 /** Why a new channel is refused once the recovery namespace is finished. */
 const NAMESPACE_LOST_REFUSAL =
 	'recovery: this namespace lost its guardian backfill, so a new channel ' +
@@ -304,6 +345,13 @@ interface IBarrierQueue {
 }
 
 export interface IChannelManagerConfig {
+	/**
+	 * Where each batch's PERSIST_STATE commits before the sends it authorizes
+	 * leave (Recovery Protocol 5.1). Required, and the constructor throws
+	 * without it: the answer `persist` returns is the only thing that releases
+	 * those sends. LightningNode supplies one backed by its storage.
+	 */
+	persistence: IChannelPersistence;
 	zeroReserve?: import('./zero-reserve').IZeroReserveConfig;
 	/** Durable book lookup supplied by the node's voucher custody index. */
 	fforVoucherLookup?: (paymentHash: string) => IFforVoucherArchive | undefined;
@@ -484,45 +532,6 @@ export interface IChannelManagerConfig {
 }
 
 /**
- * Manages multiple channels, dispatching messages between PeerManager
- * and Channel instances.
- *
- * Events:
- * - 'channel:opened' (channelId: Buffer)
- * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
- * - 'channel:ready' (channelId: Buffer)
- * - 'channel:restore-ready' (channelId: Buffer) — a channel RESTORED FROM
- *   PERSISTENCE this process has completed reestablishment; fires at most
- *   once per channel and never for a channel that stayed live
- * - 'channel:reestablished' (channelId: Buffer) — a channel completed
- *   reestablishment back to NORMAL; fires on EVERY reconnect, so listeners
- *   must gate on durable facts, never on in-memory state having been lost
- * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
- * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
- * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
- * - 'channel:closed' (channelId: Buffer)
- * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
- * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
- * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer,
- *   malformedCode?: number): malformedCode is set only for
- *   update_fail_malformed_htlc
- * - 'htlc:claimed-onchain' (channelId: Buffer, paymentHash: Buffer, preimage: Buffer,
- *   claimTxid: string): a confirmed spend of a received HTLC output revealed
- *   its preimage; repeats when the spend is re-reported
- * - 'quiescence:ended' (channelIdHex: string) — the channel left quiescence;
- *   parked HTLC dispositions may resume
- * - 'quiescence:timeout' (channelIdHex: string, peerPubkey: string) — BOLT 2's
- *   60-second quiescence window elapsed with HTLCs pending; the peer must be
- *   disconnected
- * - 'reestablish:held' (peerPubkey: string, channelId: Buffer, expiresAt: number):
- *   a peer's channel_reestablish for a channel we have no record of was parked
- *   rather than failed, because this node may still be an incomplete restore
- *   target (issue #462); the operator has until expiresAt to install the state
- *   that answers it
- * - 'error' (channelId: Buffer | null, message: string)
- */
-
-/**
  * Blocks to wait between re-CPFP attempts on a stuck anchor force-close commitment
  * package (matches the ChainMonitor sweep rebroadcast cadence).
  */
@@ -619,6 +628,16 @@ export const CHANNEL_INDEX_FLOOR_STRIDE = 128;
  */
 export const CHANNEL_INDEX_FLOOR_MAX = 0x7fffffff - 2 ** 20;
 
+/** A refusal's message, and its code when the refusing arm set one. */
+function refusalFields(action: IErrorAction): {
+	error: string;
+	code?: ChannelErrorCode;
+} {
+	return action.code
+		? { error: action.message, code: action.code }
+		: { error: action.message };
+}
+
 /**
  * `reason` as wire bytes, clamped to what the length prefix can carry.
  *
@@ -692,7 +711,12 @@ class CountedMap<K, V> extends Map<K, V> {
 	}
 }
 
-export class ChannelManager extends EventEmitter {
+/**
+ * Manages multiple channels, dispatching messages between PeerManager
+ * and Channel instances. Its events and their listener signatures are
+ * ChannelManagerEvents (./events.ts).
+ */
+export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private config: IChannelManagerConfig;
 	private channels: CountedMap<string, Channel> = new CountedMap();
 	private tempChannels: CountedMap<string, Channel> = new CountedMap();
@@ -894,10 +918,21 @@ export class ChannelManager extends EventEmitter {
 	 * only a persist that lands clears it.
 	 */
 	private readonly persistFailed = new Set<string>();
+	private readonly persistence: IChannelPersistence;
 
 	constructor(config: IChannelManagerConfig) {
 		super();
+		// No default. The one a manager used to fall back on answered
+		// committed for every write, so a consumer that wired no storage sent
+		// commitment signatures nothing would remember after a restart.
+		if (typeof config?.persistence?.persist !== 'function') {
+			throw new TypeError(
+				'ChannelManager requires config.persistence: channel state must ' +
+					'be committed before the messages it authorizes are sent'
+			);
+		}
 		this.config = config;
+		this.persistence = config.persistence;
 	}
 
 	/**
@@ -1223,7 +1258,7 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
-			// FFOR Variant D (specs/ffor-offline-receive.md section 14).
+			// FFOR Variant D (docs/specs/ffor-offline-receive.md section 14).
 			MessageType.FF_INIT,
 			MessageType.FF_ACCEPT,
 			MessageType.FF_INVOICES,
@@ -1354,7 +1389,7 @@ export class ChannelManager extends EventEmitter {
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -1414,7 +1449,10 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
-			throw new Error(`Not connected to peer ${peerPubkey}`);
+			throw new PeerError(
+				PeerErrorCode.NOT_CONNECTED,
+				`Not connected to peer ${peerPubkey}`
+			);
 		}
 		this._assertNamespaceCanRecordANewChannel();
 		if (opts?.trusted && !this.zeroConfManager.canOpenZeroConfTo(peerPubkey)) {
@@ -1425,7 +1463,7 @@ export class ChannelManager extends EventEmitter {
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -1572,9 +1610,8 @@ export class ChannelManager extends EventEmitter {
 		// initial commitment (#0). Mirrors the acceptor-side signing in
 		// handleFundingCreated above. Falls back to the passed signature only if
 		// the remote's per-commitment point isn't available yet.
+		channel.setFundingOutpoint(fundingTxid, fundingOutputIndex);
 		const fundingState = channel.getFullState();
-		fundingState.fundingTxid = fundingTxid;
-		fundingState.fundingOutputIndex = fundingOutputIndex;
 		let initialSignature = signature;
 		let partialSignatureWithNonce: Buffer | undefined;
 		if (fundingState.remoteCurrentPerCommitmentPoint) {
@@ -1677,7 +1714,7 @@ export class ChannelManager extends EventEmitter {
 		}
 		const signingNonce = generateNonce({
 			publicKey: state.localBasepoints.fundingPubkey,
-			sessionId: crypto.randomBytes(32)
+			sessionId: randomBytes(32)
 		});
 		const partial = signRemoteCommitmentPartial(
 			state,
@@ -1707,7 +1744,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -1786,7 +1823,7 @@ export class ChannelManager extends EventEmitter {
 		// settle path that forgets is covered here, making the C4 class of bug
 		// (preimage learned but never wired to the monitor → on-chain loss)
 		// structurally impossible rather than relying on every caller.
-		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
+		const preimageHash = sha256(preimage);
 		this.recordPreimage(preimageHash, preimage);
 
 		// BOLT 2 quiescence: no update messages after stfu (issue 430). The
@@ -2154,18 +2191,7 @@ export class ChannelManager extends EventEmitter {
 			!progress.sendsHeld &&
 			!progress.attemptedMessageTypes.has(MessageType.SHUTDOWN)
 		) {
-			const current = channel.getFullState();
-			if (current.state === ChannelState.SHUTTING_DOWN)
-				current.state = previous.state;
-			else if (
-				current.state === ChannelState.AWAITING_REESTABLISH &&
-				current.preReestablishState === ChannelState.SHUTTING_DOWN
-			)
-				current.preReestablishState = previous.state;
-			current.localShutdownScript = previous.localShutdownScript;
-			current.externalClose = previous.externalClose;
-			current.staleCloseRiskAccepted = previous.staleCloseRiskAccepted;
-			current.simpleClose = previous.simpleClose;
+			channel.rollbackShutdown(previous);
 			return {
 				ok: false,
 				actions: [],
@@ -2177,7 +2203,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		this.emit('channel:pending-close', channelId, 'local');
@@ -2205,7 +2231,7 @@ export class ChannelManager extends EventEmitter {
 		// BOLT 2 quiescence: update_fee is an update message too. Dropped, not
 		// deferred: fee refresh is periodic and idempotent, the next cycle
 		// re-proposes once the session ends.
-		if (typeof channel.isQuiescing === 'function' && channel.isQuiescing()) {
+		if (channel.isQuiescing()) {
 			return {
 				ok: false,
 				actions: [],
@@ -2221,7 +2247,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 
@@ -2281,7 +2307,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -2349,7 +2375,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return {
@@ -2411,7 +2437,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return {
@@ -2508,7 +2534,7 @@ export class ChannelManager extends EventEmitter {
 				this.txSignaturesDropped.delete(channelIdHex);
 				this.emit(
 					'channel:abandoned',
-					channel.getChannelId(),
+					channel.getChannelId()!,
 					'dead unfunded v2 open removed on disconnect'
 				);
 				this.releaseAbandonedV2Pledges(channel);
@@ -2564,7 +2590,7 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 
-			channel.getFullState().state = ChannelState.ERRORED;
+			channel.failOpenOnDisconnect();
 			this.tempChannels.delete(tempId);
 			this.channelPeers.delete(tempId);
 			this.emit(
@@ -2966,7 +2992,7 @@ export class ChannelManager extends EventEmitter {
 	 * depth when the watcher tracks several (post-signatures RBF); omitted
 	 * means the channel's current funding tx.
 	 */
-	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: string): void {
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void {
 		const channel = this.channels.get(channelId.toString('hex'));
 		if (!channel) return;
 
@@ -3270,11 +3296,7 @@ export class ChannelManager extends EventEmitter {
 			// may not flip, so the persist cannot ride 'channel:closed'.
 			const peerPubkey = this.findPeerForChannel(owner);
 			if (peerPubkey) {
-				this.emit('channel:persist', {
-					channel: owner,
-					peerPubkey,
-					channelId
-				} as IChannelPersistEvent);
+				this.persistence.persist({ channel: owner, peerPubkey, channelId });
 			}
 		}
 
@@ -3576,9 +3598,7 @@ export class ChannelManager extends EventEmitter {
 			const paymentHash = output?.paymentHash;
 			if (!paymentHash) continue;
 			const preimage = (input.witness ?? []).find(
-				(el) =>
-					el.length === 32 &&
-					crypto.createHash('sha256').update(el).digest().equals(paymentHash)
+				(el) => el.length === 32 && sha256(el).equals(paymentHash)
 			);
 			if (!preimage) continue;
 			this.emit(
@@ -4234,7 +4254,7 @@ export class ChannelManager extends EventEmitter {
 			// ONLY when the opener explicitly proposed the zero_conf channel type:
 			// membership alone must not change how ordinary opens validate.
 			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-				channel.getFullState().trustedPeer = true;
+				channel.setTrustedPeer();
 			}
 
 			actions = channel.handleOpenChannel(msg);
@@ -4336,9 +4356,8 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		// Set funding outpoint on state before signing (handleFundingCreated also sets these)
+		channel.setFundingOutpoint(msg.fundingTxid, msg.fundingOutputIndex);
 		const channelState = channel.getFullState();
-		channelState.fundingTxid = msg.fundingTxid;
-		channelState.fundingOutputIndex = msg.fundingOutputIndex;
 
 		// Sign the remote's initial commitment transaction with the channel's signer
 		const signer = this.signerFor(channel, true);
@@ -4969,7 +4988,7 @@ export class ChannelManager extends EventEmitter {
 				// the lie. Roll it back to NEGOTIATING_CLOSING and persist THAT, so
 				// every recovery path (retry, reconnect with fresh session, operator
 				// force close) stays open.
-				channel.getFullState().state = ChannelState.NEGOTIATING_CLOSING;
+				channel.markNegotiatingClosing();
 				this.emit(
 					'error',
 					msg.channelId,
@@ -5851,7 +5870,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: (errorAction as { message: string }).message
+				...refusalFields(errorAction as IErrorAction)
 			};
 		}
 		return { ok: true, actions };
@@ -6180,16 +6199,12 @@ export class ChannelManager extends EventEmitter {
 			if (channel.getState() === ChannelState.ERRORED) return;
 		}
 
-		// FFOR concurrent receive (CONCURRENT-RECEIVE.md section 8): before a
-		// concurrent epoch resumes new ordinary adds or new delegated
+		// FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md section 8):
+		// before a concurrent epoch resumes new ordinary adds or new delegated
 		// admissions, the CURRENT init exchange must advertise the base and
 		// concurrent capabilities on both sides. Judged here, on every
 		// reestablish, and handed to the channel before it runs.
-		if (typeof channel.setFforCapabilities === 'function') {
-			channel.setFforCapabilities(
-				this.peerNegotiatedFforConcurrent(peerPubkey)
-			);
-		}
+		channel.setFforCapabilities(this.peerNegotiatedFforConcurrent(peerPubkey));
 		const actions = channel.handleReestablish(msg);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -6388,7 +6403,7 @@ export class ChannelManager extends EventEmitter {
 		};
 	}
 
-	// ─────────────── FFOR Variant D (specs/ffor-offline-receive.md) ───────────────
+	// ─────────── FFOR Variant D (docs/specs/ffor-offline-receive.md) ───────────
 
 	/** Last FFOR state reported per channel, for the ffor:state event. */
 	private _fforLastState = new Map<string, FforState | null>();
@@ -6434,8 +6449,8 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Whether the current init exchange negotiated concurrent receive
-	 * (CONCURRENT-RECEIVE.md section 1.1): each side advertised either bit
-	 * of option_ff_receive (560/561) and either bit of option_ff_concurrent
+	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): each side advertised either
+	 * bit of option_ff_receive (560/561) and either bit of option_ff_concurrent
 	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
 	 * is unknown: an advertisement that was not seen selects nothing, and
 	 * the reconnect check of section 8 must not pass on a guess.
@@ -6469,8 +6484,6 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private _fforEnsureContext(peerPubkey: string, channel: Channel): void {
-		// Recovery suites drive dispatch with channel-shaped stubs.
-		if (typeof channel.setFforContext !== 'function') return;
 		if (!/^[0-9a-f]{66}$/i.test(peerPubkey)) return;
 		const nodeKey = this.config.nodePrivateKey ?? null;
 		channel.setFforContext({
@@ -6486,7 +6499,6 @@ export class ChannelManager extends EventEmitter {
 
 	/** Emit 'ffor:state' (channelId, state, record) when the state moved. */
 	private _fforEmitStateChange(channel: Channel): void {
-		if (typeof channel.getFforEpoch !== 'function') return;
 		const channelId = channel.getChannelId();
 		if (!channelId) return;
 		const hex = channelId.toString('hex');
@@ -6646,11 +6658,7 @@ export class ChannelManager extends EventEmitter {
 		// way a blocked transition does, so an HTLC the node holds the
 		// preimage for is settled after one reconnect instead of riding to
 		// its on-chain deadline. A failed write has already asked.
-		if (
-			typeof channel.fforTakeReconnectRequest === 'function' &&
-			channel.fforTakeReconnectRequest() &&
-			!progress.sendsWithheld
-		) {
+		if (channel.fforTakeReconnectRequest() && !progress.sendsWithheld) {
 			this.emit('transition:blocked', peerPubkey, channelId);
 		}
 		if (progress.sendsWithheld) {
@@ -7121,7 +7129,7 @@ export class ChannelManager extends EventEmitter {
 			return {
 				ok: false,
 				actions,
-				error: errorAction.message,
+				...refusalFields(errorAction),
 				transient: errorAction.transient
 			};
 		}
@@ -7287,7 +7295,7 @@ export class ChannelManager extends EventEmitter {
 			ok: !errorAction,
 			actions,
 			...(errorAction
-				? { error: errorAction.message, transient: errorAction.transient }
+				? { ...refusalFields(errorAction), transient: errorAction.transient }
 				: {})
 		};
 	}
@@ -7315,7 +7323,7 @@ export class ChannelManager extends EventEmitter {
 		return {
 			ok: !errorAction,
 			actions,
-			...(errorAction ? { error: errorAction.message } : {})
+			...(errorAction ? refusalFields(errorAction) : {})
 		};
 	}
 
@@ -7469,7 +7477,10 @@ export class ChannelManager extends EventEmitter {
 		if (this.peerManager) {
 			const peer = this.peerManager.getPeer(peerPubkey);
 			if (!peer) {
-				throw new Error(`Not connected to peer ${peerPubkey}`);
+				throw new PeerError(
+					PeerErrorCode.NOT_CONNECTED,
+					`Not connected to peer ${peerPubkey}`
+				);
 			}
 			const remoteInit = peer.getRemoteInit();
 			if (!remoteInit) {
@@ -7538,7 +7549,7 @@ export class ChannelManager extends EventEmitter {
 		this._assertNamespaceCanRecordANewChannel();
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
-			temporaryChannelId: crypto.randomBytes(32),
+			temporaryChannelId: randomBytes(32),
 			fundingSatoshis: params.fundingSatoshis,
 			pushMsat: 0n,
 			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
@@ -7935,7 +7946,7 @@ export class ChannelManager extends EventEmitter {
 			// semantics when (and only when) the opener proposed the zero_conf
 			// channel type. Mirrors the v1 acceptor path.
 			if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-				state.trustedPeer = true;
+				channel.setTrustedPeer();
 			}
 
 			// Generate per-commitment points for local params
@@ -8280,7 +8291,8 @@ export class ChannelManager extends EventEmitter {
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					'v2 open not funded: fundingUtxos requires a funding provider that can select wallet inputs'
+					'v2 open not funded: fundingUtxos requires a funding provider that can select wallet inputs',
+					ChannelErrorCode.OPEN_NOT_FUNDED
 				);
 				if (!isCurrentOpen()) return;
 				const abortActions = channel.abortDualFunding(
@@ -8359,7 +8371,8 @@ export class ChannelManager extends EventEmitter {
 							this.emitContained(
 								'error',
 								channel.getChannelId() ?? channel.getTemporaryChannelId(),
-								`v2 open not funded: ${directedError}`
+								`v2 open not funded: ${directedError}`,
+								ChannelErrorCode.OPEN_NOT_FUNDED
 							);
 							if (!isCurrentOpen()) return;
 							const abortActions = channel.abortDualFunding(
@@ -8396,7 +8409,8 @@ export class ChannelManager extends EventEmitter {
 					this.emitContained(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						`v2 open not funded: ${reason}`
+						`v2 open not funded: ${reason}`,
+						ChannelErrorCode.OPEN_NOT_FUNDED
 					);
 					// The diagnostic observer can synchronously remove or replace the
 					// open, so check ownership again before changing channel state.
@@ -9140,15 +9154,22 @@ export class ChannelManager extends EventEmitter {
 		if (!channel.markErrored()) return;
 		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
 		// A channel with no resolvable peer has nothing to write: the peer is
-		// half of the channel_state mutation. The listener used to discover
-		// that for itself and return; the resolution simply moved here.
+		// half of the channel_state mutation.
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (peerPubkey) {
-			this.emit('channel:persist', {
-				channel,
-				peerPubkey,
-				channelId
-			} as IChannelPersistEvent);
+			try {
+				this.persistence.persist({ channel, peerPubkey, channelId });
+			} catch (err) {
+				// Escaping here would skip the close request for good: markErrored
+				// has latched, so every later error returns above. Contained, so
+				// an error listener cannot skip it either.
+				const thrown = err instanceof Error ? err.message : String(err);
+				this.emitContained(
+					'error',
+					channelId,
+					`Channel state write threw: ${thrown}`
+				);
+			}
 		}
 		this.emit('channel:errored', channelId, reason);
 	}
@@ -9495,8 +9516,6 @@ export class ChannelManager extends EventEmitter {
 	 * timing out when the session is already over.
 	 */
 	private _syncQuiescenceWatchdog(channel: Channel): void {
-		// Tolerate partial channel doubles in tests and recovery shims.
-		if (typeof channel.isQuiescing !== 'function') return;
 		const channelIdHex = channel.getChannelId()?.toString('hex');
 		if (!channelIdHex) return;
 		const timer = this.quiescenceTimers.get(channelIdHex);
@@ -9541,9 +9560,7 @@ export class ChannelManager extends EventEmitter {
 					failureCode: number;
 			  }
 	): boolean {
-		if (typeof channel.isQuiescing !== 'function' || !channel.isQuiescing()) {
-			return false;
-		}
+		if (!channel.isQuiescing()) return false;
 		const list = this.pendingQuiescentSettles.get(channelIdHex) ?? [];
 		list.push(op);
 		this.pendingQuiescentSettles.set(channelIdHex, list);
@@ -9650,10 +9667,7 @@ export class ChannelManager extends EventEmitter {
 		// releases them in order behind the chain. The rest of the batch (its
 		// persist, its events) runs now. The state did commit and the wire
 		// is owed in order, which is what sendsHeld reports.
-		const actions =
-			typeof channel.fforHoldStream === 'function'
-				? channel.fforHoldStream(produced)
-				: produced;
+		const actions = channel.fforHoldStream(produced);
 		if (actions !== produced) dispatchProgress.sendsHeld = true;
 		const errorIndex = actions.findIndex(
 			(action) => action.type === ChannelActionType.ERROR
@@ -9689,7 +9703,8 @@ export class ChannelManager extends EventEmitter {
 				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					errorAction.message
+					errorAction.message,
+					errorAction.code
 				);
 			}
 			// FFOR state is announced only from a batch whose own durable write
@@ -9728,15 +9743,15 @@ export class ChannelManager extends EventEmitter {
 		// ── Structural persist-before-send (Recovery Protocol 5.1/5.2) ──
 		// Every retransmittable SEND_MESSAGE that FOLLOWS the batch's
 		// PERSIST_STATE is authorized by the state that persist writes, so its
-		// exact wire bytes are handed to the persist listener and committed in
-		// the SAME transaction. Ordering safety no longer rests on each handler
+		// exact wire bytes are handed to the persistence and committed in the
+		// SAME transaction. Ordering safety no longer rests on each handler
 		// happening to place PERSIST_STATE before its sends: a send whose
 		// justifying state failed to commit is withheld outright.
 		const batchChannelId = channel.getChannelId();
 		const persistIndex = actions.findIndex(
 			(a) => a.type === ChannelActionType.PERSIST_STATE
 		);
-		const persistRequest: IChannelPersistRequest | null =
+		const outbox: IChannelPersistOutbox | null =
 			persistIndex >= 0 && batchChannelId
 				? {
 						outbound: actions
@@ -9756,35 +9771,31 @@ export class ChannelManager extends EventEmitter {
 								messageType: a.messageType,
 								wireMessage: a.payload,
 								disposition: 'pending_send' as const
-							})),
-						committed: true,
-						outboxIds: []
+							}))
 				  }
 				: null;
-		// Fold a staged revoke supersede into this batch's persist request so
-		// the row deletions ride the same transaction as the channel state.
-		// Cleared unconditionally: it was staged for exactly this batch, and a
-		// batch it cannot ride with must not delete anything (rows are only
-		// ever retired by a transition that actually committed).
+		// Fold a staged revoke supersede into this batch's persist so the row
+		// deletions ride the same transaction as the channel state. Cleared
+		// unconditionally: it was staged for exactly this batch, and a batch it
+		// cannot ride with must not delete anything (rows are only ever retired
+		// by a transition that actually committed).
 		const pendingSupersede = this._pendingOutboxSupersede;
 		this._pendingOutboxSupersede = null;
 		if (
 			pendingSupersede &&
-			persistRequest &&
+			outbox &&
 			batchChannelId &&
 			pendingSupersede.channelIdHex === batchChannelId.toString('hex')
 		) {
-			persistRequest.supersede = {
+			outbox.supersede = {
 				messageTypes: pendingSupersede.messageTypes
 			};
 		}
-		// Set once a persist fails: nothing that persist authorized may go out.
-		let sendsBlocked = false;
 
 		// ── Quorum durability barrier (Recovery Protocol 5.8, Phase 6) ──
-		// Outside quorum mode `shouldHold` is a constant false and the whole
-		// batch dispatches synchronously exactly as before. Inside it, a batch
-		// carrying a barrier-class message whose frame is not yet quorum
+		// Outside quorum mode `_shouldHoldBatch` is a constant false and the
+		// whole batch dispatches synchronously exactly as before. Inside it, a
+		// batch carrying a barrier-class message whose frame is not yet quorum
 		// durable stops after its persist and the REMAINDER of the action list
 		// is held, so the peer sees nothing the guardians do not already hold.
 		const channelIdHex = batchChannelId?.toString('hex') ?? null;
@@ -9832,41 +9843,25 @@ export class ChannelManager extends EventEmitter {
 			return;
 		}
 
+		const ctx: IDispatchContext = {
+			peerPubkey,
+			channel,
+			actions,
+			outbox,
+			persisted: null,
+			channelIdHex,
+			startIndex: 0,
+			persistAlreadySeen: false,
+			sendsBlocked: false,
+			holdable: true,
+			progress
+		};
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			heldFrom = this._dispatchActions(
-				peerPubkey,
-				channel,
-				actions,
-				persistRequest,
-				() => sendsBlocked,
-				(blocked: boolean) => {
-					sendsBlocked = blocked;
-					if (blocked) {
-						progress.sendsWithheld = true;
-						// Recorded now rather than at the tail: a re-entrant
-						// listener later in this batch can already auto-sign.
-						if (channelIdHex) this.sendsWithheldOnConnection.add(channelIdHex);
-					}
-				},
-				0,
-				false,
-				(): boolean =>
-					this._shouldHoldBatch(
-						channelIdHex,
-						actions,
-						persistIndex,
-						persistRequest
-					),
-				progress
-			);
-			if (
-				heldFrom < 0 &&
-				!sendsBlocked &&
-				persistRequest &&
-				persistRequest.outboxIds.length
-			) {
-				this.emit('outbox:sent', persistRequest.outboxIds);
+			heldFrom = this._dispatchActions(ctx);
+			const sentIds = ctx.persisted?.outboxIds ?? [];
+			if (heldFrom < 0 && !ctx.sendsBlocked && sentIds.length) {
+				this.emit('outbox:sent', sentIds);
 			}
 		} finally {
 			this.emitContained('transition:end', channelIdHex);
@@ -9876,9 +9871,9 @@ export class ChannelManager extends EventEmitter {
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
 				actions,
 				from: heldFrom,
-				frameSequence: persistRequest?.frameSequence ?? null,
+				frameSequence: ctx.persisted?.frameSequence ?? null,
 				requiresDurability: this._carriesBarrierMessage(actions, heldFrom),
-				outboxIds: persistRequest ? [...persistRequest.outboxIds] : []
+				outboxIds: [...(ctx.persisted?.outboxIds ?? [])]
 			});
 		}
 		// A failed persist withheld this batch's sends. The messages are gone
@@ -9887,7 +9882,7 @@ export class ChannelManager extends EventEmitter {
 		// retries the persist. Surface that so the node can force the
 		// disconnect instead of deadlocking a live connection on a peer
 		// timeout we do not control.
-		if (sendsBlocked) {
+		if (ctx.sendsBlocked) {
 			progress.sendsWithheld = true;
 			this.emit('transition:blocked', peerPubkey, batchChannelId);
 		}
@@ -9899,7 +9894,7 @@ export class ChannelManager extends EventEmitter {
 		// stash is left intact so the batch that does commit releases them.
 		// Cheap when nothing is staged, and this is the one path every
 		// dispatch-driven rollback funnels through.
-		if (!sendsBlocked && heldFrom < 0) {
+		if (!ctx.sendsBlocked && heldFrom < 0) {
 			this.releaseDanglingV2Pledges(channel);
 		}
 	}
@@ -9917,24 +9912,15 @@ export class ChannelManager extends EventEmitter {
 	 * transaction on the network before the peer saw the message authorizing
 	 * it.
 	 *
-	 * `startIndex` and `persistAlreadySeen` exist so a held suffix resumes
-	 * through this same code, keeping one implementation of every action's
-	 * meaning and preserving the one-persist-per-batch rule across the wait.
+	 * `ctx.startIndex` and `ctx.persistAlreadySeen` exist so a held suffix
+	 * resumes through this same code, keeping one implementation of every
+	 * action's meaning and preserving the one-persist-per-batch rule across
+	 * the wait.
 	 */
-	private _dispatchActions(
-		peerPubkey: string,
-		channel: Channel,
-		actions: ChannelAction[],
-		persistRequest: IChannelPersistRequest | null,
-		sendsBlocked: () => boolean,
-		setSendsBlocked: (blocked: boolean) => void,
-		startIndex = 0,
-		persistAlreadySeen = false,
-		shouldHold?: () => boolean,
-		progress?: IActionDispatchProgress
-	): number {
-		let persistSeen = persistAlreadySeen;
-		for (let index = startIndex; index < actions.length; index++) {
+	private _dispatchActions(ctx: IDispatchContext): number {
+		const { peerPubkey, channel, actions, progress } = ctx;
+		let persistSeen = ctx.persistAlreadySeen;
+		for (let index = ctx.startIndex; index < actions.length; index++) {
 			// How far the run got. A re-entrant handler can throw out of this
 			// loop, and the actions AFTER the thrower are then untouched: their
 			// committed edge-triggered effects are still owed, so the caller
@@ -9945,7 +9931,7 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.SEND_MESSAGE:
 					// A message the failed persist authorized must not reach the
 					// peer: the state that justifies it is not on disk.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						if (progress) progress.sendsWithheld = true;
 						break;
 					}
@@ -9954,10 +9940,7 @@ export class ChannelManager extends EventEmitter {
 					// R can take what a concurrent S originates from here on.
 					// Told to the channel before the transport call, so an
 					// answer the peer returns on this stack already finds it.
-					if (
-						action.messageType === MessageType.FF_ACTIVATE_ACK &&
-						typeof channel.fforNoteActivateAckSent === 'function'
-					) {
+					if (action.messageType === MessageType.FF_ACTIVATE_ACK) {
 						channel.fforNoteActivateAckSent();
 					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
@@ -10008,7 +9991,8 @@ export class ChannelManager extends EventEmitter {
 					this.emit(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						action.message
+						action.message,
+						action.code
 					);
 					break;
 				}
@@ -10019,7 +10003,7 @@ export class ChannelManager extends EventEmitter {
 					try {
 						this.emit(
 							'htlc:forwarded',
-							channel.getChannelId(),
+							channel.getChannelId()!,
 							action.htlcId,
 							action.amountMsat,
 							action.paymentHash
@@ -10037,7 +10021,7 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.HTLC_FULFILLED:
 					this.emit(
 						'htlc:fulfilled',
-						channel.getChannelId(),
+						channel.getChannelId()!,
 						action.htlcId,
 						action.paymentPreimage
 					);
@@ -10045,7 +10029,7 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.HTLC_FAILED:
 					this.emit(
 						'htlc:failed',
-						channel.getChannelId(),
+						channel.getChannelId()!,
 						action.htlcId,
 						action.reason,
 						action.malformedCode
@@ -10090,7 +10074,7 @@ export class ChannelManager extends EventEmitter {
 					// Same guard and the same reason as BROADCAST_TX below: a
 					// funding transaction whose channel state never reached
 					// disk is a 2-of-2 no restored node can enumerate.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('funding:authorized', action.fundingTxid);
@@ -10101,13 +10085,23 @@ export class ChannelManager extends EventEmitter {
 					// justifying state never hit disk is exactly the "network saw
 					// a tx we have no record of" crash the persist-first comments
 					// at the producers promise to prevent.
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('broadcast:tx', action.tx);
+					// Reaching here, a held suffix included, means the persist and
+					// the barrier both cleared. Announced after the broadcast so a
+					// throwing listener cannot withhold it.
+					if (action.fundingCritical) {
+						this.emit(
+							'funding:broadcast-authorized',
+							channel.getChannelId(),
+							action.tx
+						);
+					}
 					break;
 				case ChannelActionType.FORCE_CLOSE:
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit('force:close', action.channelId, action.commitmentTx);
@@ -10134,7 +10128,7 @@ export class ChannelManager extends EventEmitter {
 					// received, which the peer rejects. Suppress instead; the
 					// reconnect that follows re-arms the reminder
 					// (markForReestablish).
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit(
@@ -10153,7 +10147,7 @@ export class ChannelManager extends EventEmitter {
 					// marker withholds, ahead of a splice commitment_signed the
 					// peer never received. The reconnect re-arms the reminder
 					// (markForReestablish).
-					if (persistSeen && sendsBlocked()) {
+					if (persistSeen && ctx.sendsBlocked) {
 						break;
 					}
 					this.emit(
@@ -10183,55 +10177,20 @@ export class ChannelManager extends EventEmitter {
 						break;
 					}
 					persistSeen = true;
-					this.emit('channel:persist', {
-						channel,
-						peerPubkey,
-						channelId:
-							channel.getChannelId() ?? channel.getTemporaryChannelId(),
-						request: persistRequest ?? undefined
-					} as IChannelPersistEvent);
-					// No listener (or no storage) leaves committed true, which is
-					// the pre-outbox behavior for a node that persists nothing.
-					if (persistRequest && !persistRequest.committed) {
-						if (typeof channel.fforNoteStateWritten === 'function') {
-							channel.fforNoteStateWritten(false);
-						}
-						this.persistFailed.add(channel.getChannelId()!.toString('hex'));
-						setSendsBlocked(true);
+					if (!this._persistBatch(ctx)) {
 						break;
-					}
-					if (persistRequest) {
-						this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
-					}
-					// The channel learns that its state is on disk: what it
-					// still owed to storage (an observed capability hold of a
-					// concurrent FFOR epoch) is no longer owed.
-					if (typeof channel.fforNoteStateWritten === 'function') {
-						channel.fforNoteStateWritten(true);
-					}
-					// The FFOR state this write made durable, captured HERE: a
-					// nested dispatch may move the in-memory record before this
-					// batch's tail announces anything.
-					if (typeof channel.getFforEpoch === 'function') {
-						const durableId = channel.getChannelId();
-						if (durableId) {
-							this._fforDurableState.set(
-								durableId.toString('hex'),
-								channel.getFforEpoch()?.state ?? null
-							);
-						}
 					}
 					// The frame this transition landed in is only known now, so
 					// the barrier question is asked here and nowhere else. A
 					// failed persist takes precedence: there is nothing durable
 					// to wait for.
-					if (shouldHold?.()) {
+					if (ctx.holdable && this._shouldHoldBatch(ctx, index)) {
 						if (progress) progress.completedIndex = index;
 						return index + 1;
 					}
 					break;
 				case ChannelActionType.SPLICE_COMPLETE:
-					this.emit('splice:complete', channel.getChannelId());
+					this.emit('splice:complete', channel.getChannelId()!);
 					break;
 				case ChannelActionType.SPLICE_ABORTED:
 					// The channel's newly-aborted signal (issue #581): the ONE
@@ -10263,6 +10222,79 @@ export class ChannelManager extends EventEmitter {
 		return -1;
 	}
 
+	/**
+	 * Commit the batch's state through the injected persistence, which
+	 * answers in its return value rather than by editing what it was handed.
+	 *
+	 * Returns false when a write with an outbox did not commit: the caller
+	 * then withholds every send, broadcast and force close after it. Only an
+	 * explicit `committed: true` releases them, so an implementation that
+	 * answers nothing, or throws, has written nothing.
+	 */
+	private _persistBatch(ctx: IDispatchContext): boolean {
+		const { channel, outbox } = ctx;
+		let result: IChannelPersistResult | undefined;
+		let thrown: string | undefined;
+		try {
+			result = this.persistence.persist({
+				channel,
+				peerPubkey: ctx.peerPubkey,
+				channelId: channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				...(outbox ? { outbox } : {})
+			});
+		} catch (err) {
+			// Escaping here would skip the fence below and the batch's
+			// transition:blocked, leaving the next auto-sign free to cover the
+			// update this batch withholds. A write without an outbox gates
+			// nothing, so its throw still goes up.
+			if (!outbox) throw err;
+			thrown = err instanceof Error ? err.message : String(err);
+		}
+		if (outbox) {
+			ctx.persisted = {
+				committed: result?.committed === true,
+				outboxIds: result?.outboxIds ?? [],
+				frameSequence: result?.frameSequence
+			};
+			if (!ctx.persisted.committed) {
+				channel.fforNoteStateWritten(false);
+				this.persistFailed.add(channel.getChannelId()!.toString('hex'));
+				ctx.sendsBlocked = true;
+				if (ctx.progress) ctx.progress.sendsWithheld = true;
+				// Recorded now rather than at the tail: a re-entrant listener
+				// later in this batch can already auto-sign.
+				if (ctx.channelIdHex) {
+					this.sendsWithheldOnConnection.add(ctx.channelIdHex);
+				}
+				// Only after the fence: an error listener can re-enter and sign.
+				if (thrown !== undefined) {
+					this.emitContained(
+						'error',
+						channel.getChannelId(),
+						`Channel state write threw: ${thrown}`
+					);
+				}
+				return false;
+			}
+			this.persistFailed.delete(channel.getChannelId()!.toString('hex'));
+		}
+		// The channel learns that its state is on disk: what it still owed to
+		// storage (an observed capability hold of a concurrent FFOR epoch) is
+		// no longer owed.
+		channel.fforNoteStateWritten(true);
+		// The FFOR state this write made durable, captured HERE: a nested
+		// dispatch may move the in-memory record before this batch's tail
+		// announces anything.
+		const durableId = channel.getChannelId();
+		if (durableId) {
+			this._fforDurableState.set(
+				durableId.toString('hex'),
+				channel.getFforEpoch()?.state ?? null
+			);
+		}
+		return true;
+	}
+
 	// ─────────── Quorum durability barrier (Recovery 5.8, Phase 6) ───────────
 
 	/**
@@ -10275,16 +10307,17 @@ export class ChannelManager extends EventEmitter {
 	 * message overtake a held one would reorder the channel's wire stream.
 	 */
 	private _shouldHoldBatch(
-		channelIdHex: string | null,
-		actions: ChannelAction[],
-		persistIndex: number,
-		persistRequest: IChannelPersistRequest | null
+		ctx: IDispatchContext,
+		persistIndex: number
 	): boolean {
 		const barrier = this.config.durabilityBarrier;
+		const { channelIdHex } = ctx;
 		if (!barrier || !barrier.enforcing || !channelIdHex) return false;
 		if (this.barrierQueues.has(channelIdHex)) return true;
-		if (!this._carriesBarrierMessage(actions, persistIndex + 1)) return false;
-		return !barrier.isReleased(persistRequest?.frameSequence ?? null);
+		if (!this._carriesBarrierMessage(ctx.actions, persistIndex + 1)) {
+			return false;
+		}
+		return !barrier.isReleased(ctx.persisted?.frameSequence ?? null);
 	}
 
 	/**
@@ -10668,16 +10701,18 @@ export class ChannelManager extends EventEmitter {
 		// already ran holding an open transition that never closes.
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
+			this._dispatchActions({
 				peerPubkey,
 				channel,
-				held.actions,
-				null,
-				() => true,
-				() => undefined,
-				held.from,
-				true
-			);
+				actions: held.actions,
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: held.from,
+				persistAlreadySeen: true,
+				sendsBlocked: true,
+				holdable: false
+			});
 		} catch {
 			// One batch's internal effects failing must not strand the rest.
 		} finally {
@@ -10687,7 +10722,6 @@ export class ChannelManager extends EventEmitter {
 
 	/** Run a released suffix through the ordinary dispatch path. */
 	private _dispatchHeld(queue: IBarrierQueue, held: IHeldBatch): void {
-		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
 		const progress: IActionDispatchProgress = {
 			...newDispatchProgress(),
@@ -10699,20 +10733,19 @@ export class ChannelManager extends EventEmitter {
 		// committing as a frame of its own.
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
-				queue.peerPubkey,
-				queue.channel,
-				held.actions,
-				null,
-				() => blocked,
-				(value: boolean) => {
-					blocked = value;
-				},
-				held.from,
-				true,
-				undefined,
+			this._dispatchActions({
+				peerPubkey: queue.peerPubkey,
+				channel: queue.channel,
+				actions: held.actions,
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: held.from,
+				persistAlreadySeen: true,
+				sendsBlocked: false,
+				holdable: false,
 				progress
-			);
+			});
 		} catch (error) {
 			// The action at progress.index threw and everything after it is
 			// untouched. Those actions still owe their committed edge-triggered
@@ -10883,7 +10916,10 @@ export class ChannelManager extends EventEmitter {
 	 * emit, for the terminal teardown paths, where a throwing listener must
 	 * not propagate. Everything these announce has already happened.
 	 */
-	private emitContained(event: string, ...args: unknown[]): void {
+	private emitContained<K extends keyof ChannelManagerEvents & string>(
+		event: K,
+		...args: Parameters<ChannelManagerEvents[K]>
+	): void {
 		try {
 			this.emit(event, ...args);
 		} catch {
@@ -10922,14 +10958,18 @@ export class ChannelManager extends EventEmitter {
 		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
 		this.emitContained('transition:begin', channelIdHex);
 		try {
-			this._dispatchActions(
+			this._dispatchActions({
 				peerPubkey,
 				channel,
 				actions,
-				null,
-				() => false,
-				() => undefined
-			);
+				outbox: null,
+				persisted: null,
+				channelIdHex,
+				startIndex: 0,
+				persistAlreadySeen: false,
+				sendsBlocked: false,
+				holdable: false
+			});
 		} finally {
 			this.emitContained('transition:end', channelIdHex);
 		}
@@ -11722,9 +11762,13 @@ export class ChannelManager extends EventEmitter {
 		if (this.peerManager) {
 			try {
 				this.peerManager.sendToPeer(peerPubkey, type, payload);
-			} catch {
-				// Peer not connected; emit for external handling
-				this.emit('message:outbound', peerPubkey, type, payload);
+			} catch (err) {
+				// A gate's refusal is deliberate, so the message must not leave by
+				// the host's transport either. An unconnected peer, or a socket
+				// that threw, falls back to it.
+				const refused =
+					err instanceof PeerError && err.code !== PeerErrorCode.NOT_CONNECTED;
+				if (!refused) this.emit('message:outbound', peerPubkey, type, payload);
 			}
 		} else {
 			this.emit('message:outbound', peerPubkey, type, payload);

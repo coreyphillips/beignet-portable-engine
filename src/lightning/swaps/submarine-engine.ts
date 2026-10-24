@@ -42,9 +42,9 @@
  * a status answer before the attempt marker is written.
  */
 
-import { EventEmitter } from 'events';
-import crypto from 'crypto';
-import * as bitcoin from 'bitcoinjs-lib';
+import { TypedEmitter } from '../../utils/typed-emitter';
+import { sha256 } from '../crypto/provider';
+import type * as bitcoin from 'bitcoinjs-lib';
 import { getPublicKey } from '../crypto/ecdh';
 import { decode as decodeInvoice } from '../invoice/decode';
 import {
@@ -59,28 +59,22 @@ import type {
 } from '../direct-funding/transport/types';
 import type { IOutgoingPaymentResolution, IPaymentInfo } from '../node/types';
 import { PeerRateLimiter } from '../node/rate-limiter';
-import { buildSwapHtlc, ISwapHtlc } from './htlc';
+import type { ISwapHtlc } from './htlc';
+import { buildSwapHtlc } from './htlc';
 import { buildSwapClaimTx } from './transactions';
 import { validateSubmarineSwapAdmission } from './policy';
 import { deriveSwapId } from './keys';
-import {
-	ISwapRecord,
-	ISwapResolutionRecord,
-	SwapLedger,
-	SwapState,
-	isTerminalSwapState
-} from './ledger';
-import {
+import type { ISwapRecord, ISwapResolutionRecord, SwapState } from './ledger';
+import { SwapLedger, isTerminalSwapState } from './ledger';
+import type {
 	ISwapChainObservation,
 	ISwapFundingCandidate,
 	ISwapSpendObservation,
 	SwapChainResolver
 } from './chain-resolver';
-import {
-	ISwapExposurePolicy,
-	evaluateSwapExposure,
-	validateSwapExposurePolicy
-} from './exposure';
+import type { ISwapExposurePolicy } from './exposure';
+import { evaluateSwapExposure, validateSwapExposurePolicy } from './exposure';
+import type { ISwapEvent } from './engine-common';
 import {
 	SWAP_DUST_FLOOR_SAT,
 	exposureRefusal,
@@ -89,13 +83,15 @@ import {
 	swapWireResolution,
 	swapWireState
 } from './engine-common';
-import {
+import type {
 	ISwapQuote,
 	ISwapQuoteRequest,
 	ISwapStatus,
 	ISwapStatusRequest,
 	ISwapSubmarineCreate,
-	ISwapSubmarineCreateAck,
+	ISwapSubmarineCreateAck
+} from './messages';
+import {
 	SwapMessageError,
 	SwapRefusalReason,
 	SwapWireDirection,
@@ -314,6 +310,10 @@ export const SUBMARINE_SWAP_EVENTS: readonly SubmarineSwapEventName[] = [
 	'swap:failed'
 ];
 
+export type SubmarineSwapEvents = {
+	[K in SubmarineSwapEventName]: (event: ISwapEvent) => void;
+};
+
 /** Rows a cancel may still end: nothing has been paid. */
 const CANCELLABLE_STATES: readonly SwapState[] = [
 	'CREATED',
@@ -357,7 +357,7 @@ interface IInvoiceFacts {
 	expiresAt: number;
 }
 
-export class SubmarineSwapProvider extends EventEmitter {
+export class SubmarineSwapProvider extends TypedEmitter<SubmarineSwapEvents> {
 	readonly config: ISubmarineSwapProviderConfig;
 	private readonly unsubscribe: Array<() => void> = [];
 	private readonly requestBudget: PeerRateLimiter;
@@ -1742,13 +1742,7 @@ export class SubmarineSwapProvider extends EventEmitter {
 		let current: ISwapRecord | undefined = this.deps.ledger.get(record.id);
 		if (!current) return undefined;
 		if (view.preimage) {
-			if (
-				!crypto
-					.createHash('sha256')
-					.update(view.preimage)
-					.digest()
-					.equals(paymentHash)
-			) {
+			if (!sha256(view.preimage).equals(paymentHash)) {
 				this.deps.log('swap_preimage_hash_mismatch', {
 					swapId: current.id,
 					trigger

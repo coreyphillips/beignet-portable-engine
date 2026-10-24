@@ -5,21 +5,13 @@
  * its response.
  */
 
-import crypto from 'crypto';
+import { sha256 as sha256Digest } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
-import { IFforBookEntry } from './types';
+import type { IFforBookEntry } from './types';
 import { Reader, splitFixed, u16, u32, u64, u8 } from './messages';
 import { decodeTlvStream, encodeTlvStream } from '../message/tlv';
 import { encodeBookEntry } from './transcript';
-import {
-	FF_TERMS_TAG,
-	FF_WITNESS_BODY_LEN,
-	FF_WITNESS_CLOSE_TAG,
-	FF_WITNESS_FETCH_TAG,
-	FF_WITNESS_MANIFEST_TAG,
-	FF_WITNESS_RECORD_HEADER_LEN,
-	FF_WITNESS_RECORD_TAG,
-	FF_WITNESS_REQUEST_ID_LEN,
+import type {
 	IFforWitnessAckMessage,
 	IFforWitnessBody,
 	IFforWitnessCloseAckMessage,
@@ -29,16 +21,27 @@ import {
 	IFforWitnessManifest,
 	IFforWitnessProvisionMessage,
 	IFforWitnessRecord,
-	IFforWitnessRecordHeader,
+	IFforWitnessRecordHeader
+} from './witness-types';
+import {
+	FF_TERMS_TAG,
+	FF_WITNESS_BODY_LEN,
+	FF_WITNESS_CLOSE_TAG,
+	FF_WITNESS_FETCH_TAG,
+	FF_WITNESS_MANIFEST_TAG,
+	FF_WITNESS_RECORD_HEADER_LEN,
+	FF_WITNESS_RECORD_TAG,
+	FF_WITNESS_REQUEST_ID_LEN,
 	FF_WITNESS_FETCH_AFTER_K_TLV,
 	FF_WITNESS_FETCH_NEXT_TLV
 } from './witness-types';
 
 function sha256(...parts: (Buffer | string)[]): Buffer {
-	const h = crypto.createHash('sha256');
-	for (const p of parts)
-		h.update(typeof p === 'string' ? Buffer.from(p, 'ascii') : p);
-	return h.digest();
+	return sha256Digest(
+		Buffer.concat(
+			parts.map((p) => (typeof p === 'string' ? Buffer.from(p, 'ascii') : p))
+		)
+	);
 }
 
 function need32(b: Buffer, name: string): void {
@@ -614,7 +617,7 @@ export { splitFixed };
 
 import { getPublicKey } from '../crypto/ecdh';
 import { openRecordBody } from './witness-crypto';
-import { IFforWitnessProvision } from './witness-types';
+import type { IFforWitnessProvision } from './witness-types';
 
 export interface IFforWitnessVerification {
 	ok: boolean;

@@ -5,9 +5,9 @@
  * Handles construction, processing, forwarding, and rate limiting.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { EventEmitter } from 'events';
-import {
+import type {
 	IOnionMessage,
 	IOnionMessagePayload,
 	ISendOnionMessageOptions,
@@ -19,7 +19,8 @@ import {
 } from './codec';
 import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
-import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
+import type { IBlindedPath } from '../onion/blinded-path';
+import { constructBlindedPath } from '../onion/blinded-path';
 
 /** TLV type handler callback */
 type TlvHandler = (
@@ -151,7 +152,7 @@ export class OnionMessageManager extends EventEmitter {
 				? { pathId: options.pathId }
 				: {}
 		);
-		const path = constructBlindedPath(crypto.randomBytes(32), nodeIds, hopData);
+		const path = constructBlindedPath(randomBytes(32), nodeIds, hopData);
 		const msg = constructReplyOnionMessage(
 			path,
 			messageData,

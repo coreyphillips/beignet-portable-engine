@@ -14,16 +14,16 @@
 
 import { EventEmitter } from 'events';
 import http from 'http';
-import net from 'net';
+import type net from 'net';
 import crypto from 'crypto';
-import { IDuplexTransport } from './duplex-transport';
+import type { IDuplexTransport } from './duplex-transport';
 import { BufferedDataEmitter } from './websocket';
+import type { IWsFrame } from './websocket-frame';
 import {
 	WsFrameParser,
 	WsProtocolError,
 	WsOpcode,
 	WsCloseCode,
-	IWsFrame,
 	encodeWsFrame,
 	encodeWsClosePayload,
 	DEFAULT_MAX_WS_PAYLOAD_BYTES
@@ -131,7 +131,7 @@ export class WebSocketServerTransport
 		return this.socket.remotePort;
 	}
 
-	write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean {
+	write(data: Uint8Array | string, cb?: (err?: Error | null) => void): boolean {
 		const payload =
 			typeof data === 'string'
 				? Buffer.from(data, 'utf8')

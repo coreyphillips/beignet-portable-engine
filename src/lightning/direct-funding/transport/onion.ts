@@ -39,35 +39,37 @@
  * in config with a stated reason.
  */
 
-import crypto from 'crypto';
-import { OnionMessageManager } from '../../onion-message/manager';
-import { IBlindedPath, constructBlindedPath } from '../../onion/blinded-path';
+import { randomBytes } from '../../crypto/provider';
+import type { OnionMessageManager } from '../../onion-message/manager';
+import type { IBlindedPath } from '../../onion/blinded-path';
+import { constructBlindedPath } from '../../onion/blinded-path';
 import { BEIGNET_CUSTOM_MESSAGE_TYPE } from '../../message/custom';
 import { decodeSealedFrame } from '../frames';
+import type { DfTransportDescriptor, IDfOnionTransport } from '../types';
 import {
 	DF_PATH_SECRET_BYTES,
-	DfTransportDescriptor,
 	DfTransportType,
 	DirectFundingError,
 	DirectFundingErrorCode,
-	IDfOnionTransport,
 	malformed
 } from '../types';
 import { deliverIsolated } from './lane-table';
-import {
-	DF_FRAME_SUBTYPES,
-	DF_LOG_FRAME_DROPPED,
-	DF_MAX_FRAME_BYTES,
-	DfDropReason,
+import type {
 	DfFrameHandler,
 	DfTransportLog,
-	establishPeer,
 	IDfInboundFrame,
 	IDfLaneFactory,
 	IDfLaneSender,
 	IDfOpenContext,
 	IDfPeerMessaging,
 	IDfTransport
+} from './types';
+import {
+	DF_FRAME_SUBTYPES,
+	DF_LOG_FRAME_DROPPED,
+	DF_MAX_FRAME_BYTES,
+	DfDropReason,
+	establishPeer
 } from './types';
 
 /**
@@ -115,7 +117,7 @@ export function mintDfBlindedPath(
 	pathId: Buffer
 ): IBlindedPath {
 	return constructBlindedPath(
-		crypto.randomBytes(32),
+		randomBytes(32),
 		[viaNodeId, selfNodeId],
 		[{ nextNodeId: selfNodeId }, { pathId }]
 	);
@@ -196,7 +198,7 @@ export class DfOnionLaneFactory implements IDfLaneFactory {
 		}
 		// Minted per lane, never derived from anything the receiver holds: this
 		// is the id the RECEIVER's answers come back on, and it is ours alone.
-		const localPathId = crypto.randomBytes(DF_PATH_SECRET_BYTES);
+		const localPathId = randomBytes(DF_PATH_SECRET_BYTES);
 		let replyPath: IBlindedPath;
 		try {
 			replyPath = mintDfBlindedPath(

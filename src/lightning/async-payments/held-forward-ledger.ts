@@ -44,14 +44,14 @@
  * cannot see total_msat inside a blinded final payload.
  */
 
-import crypto from 'crypto';
-import {
-	DurableLedger,
+import { randomBytes } from '../crypto/provider';
+import type {
 	IDurableLedgerStore,
 	ILedgerCodec,
 	ILedgerRecord,
 	ILedgerTransitionResult
 } from '../storage/durable-ledger';
+import { DurableLedger } from '../storage/durable-ledger';
 
 export type HeldForwardState =
 	| 'HELD'
@@ -251,7 +251,7 @@ export class HeldForwardLedger {
 		if (existing) return { record: existing, created: false };
 		const record: IHeldForwardRecord = {
 			...fields,
-			id: crypto.randomBytes(32).toString('hex'),
+			id: randomBytes(32).toString('hex'),
 			state: 'HELD',
 			createdAt: Date.now()
 		};

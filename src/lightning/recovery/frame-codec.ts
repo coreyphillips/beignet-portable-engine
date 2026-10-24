@@ -14,28 +14,28 @@
  * module keeps fixed, so hashing the encoded bytes is stable.
  */
 
-import {
-	IFforVoucherArchive,
-	validateFforVoucherArchive
-} from '../ffor/voucher-archive';
-import { createHash } from 'crypto';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import { validateFforVoucherArchive } from '../ffor/voucher-archive';
+import { sha256 } from '../crypto/provider';
+import type {
+	ISerializedChannelState,
+	ISerializedPaymentInfo
+} from '../storage/serialization';
 import {
 	serializeChannelState,
 	deserializeChannelState,
 	serializeChainMonitorState,
 	deserializeChainMonitorState,
 	serializePaymentInfo,
-	deserializePaymentInfo,
-	ISerializedChannelState,
-	ISerializedPaymentInfo
+	deserializePaymentInfo
 } from '../storage/serialization';
 import { usesCompactHtlcHistory } from '../storage/htlc-history';
-import {
+import type {
 	IForwardingEvent,
 	IInvoiceInfo,
 	IRecoveryOutboxMessage
 } from '../storage/types';
-import {
+import type {
 	RecoveryDurability,
 	RecoveryFrame,
 	RecoveryMutation,
@@ -705,5 +705,5 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 
 /** SHA-256 over the plaintext frame bytes: the hash the chain links. */
 export function hashFrame(plaintext: Buffer): Buffer {
-	return createHash('sha256').update(plaintext).digest();
+	return sha256(plaintext);
 }

@@ -9,11 +9,15 @@
  * ones, so probing learns nothing.
  */
 
-import crypto from 'crypto';
+import { randomBytes, sha256 } from '../crypto/provider';
 import { Channel } from '../channel/channel';
 import { sign } from '../crypto/ecdh';
 import { computeHAct, computeHBook, decodeVoucherBook } from './transcript';
 import { sealRecordBody } from './witness-crypto';
+import type {
+	IFforWitnessRecord,
+	IFforWitnessRecordHeader
+} from './witness-types';
 import {
 	FF_WITNESS_ACK_TYPE,
 	FF_WITNESS_BARRIER_MS,
@@ -27,8 +31,6 @@ import {
 	FF_WITNESS_REQUEST_ID_LEN,
 	FF_WITNESS_RETENTION_MARGIN_BLOCKS,
 	FF_WITNESS_VERSION,
-	IFforWitnessRecord,
-	IFforWitnessRecordHeader,
 	FF_WITNESS_FETCH_PAGE_BYTES
 } from './witness-types';
 import {
@@ -49,12 +51,12 @@ import {
 	verifyWitnessClose,
 	verifyWitnessFetch
 } from './witness-messages';
-import {
-	FF_WITNESS_RECORD_RESERVE_BYTES,
+import type {
 	FforWitnessLedger,
 	IFforWitnessEntry,
 	IFforWitnessMailboxRecord
 } from './witness-ledger';
+import { FF_WITNESS_RECORD_RESERVE_BYTES } from './witness-ledger';
 
 export interface IFforWitnessConfig {
 	enabled: boolean;
@@ -92,6 +94,37 @@ export interface IFforWitnessFulfil {
 
 export type FforWitnessIntercept = 'none' | 'recorded' | 'held';
 
+/** The receipt witness's events (section 9.6), relayed by LightningNode. */
+export interface FforWitnessEvents {
+	/** Witness role: a receiver provisioned a mailbox on this node. */
+	'ffor:witness-provisioned': (data: {
+		mailboxId: Buffer;
+		slots: number;
+		retentionUntil: number;
+		peer: string;
+	}) => void;
+	/** Witness role: a provision was refused with the reason. */
+	'ffor:witness-refused': (data: { peer: string; reason: string }) => void;
+	/** Witness role: a delegated preimage's record was stored; `unbarriered` when the fulfil had already gone out at the deadline. */
+	'ffor:witness-recorded': (data: {
+		mailboxId: Buffer;
+		k: number;
+		outKey: string;
+		unbarriered: boolean;
+	}) => void;
+	/** Witness role: a held fulfil was propagated, once recorded or at its CLTV deadline. */
+	'ffor:witness-released': (data: {
+		outKey: string;
+		mailboxId: Buffer;
+		k: number;
+		reason: 'recorded' | 'deadline';
+	}) => void;
+	/** Witness role: the receiver closed its mailbox; `held` records remain. */
+	'ffor:witness-closed': (data: { mailboxId: Buffer; held: number }) => void;
+	/** Witness role: a mailbox passed its retention and expired. */
+	'ffor:witness-expired': (data: { mailboxId: Buffer }) => void;
+}
+
 export interface IFforWitnessDeps {
 	ledger: FforWitnessLedger;
 	nodePrivkey: Buffer;
@@ -99,7 +132,10 @@ export interface IFforWitnessDeps {
 	currentHeight: () => number;
 	send: (peer: string, type: number, payload: Buffer) => void;
 	log: (action: string, data: Record<string, unknown>) => void;
-	emit: (event: string, data: unknown) => void;
+	emit: <K extends keyof FforWitnessEvents>(
+		event: K,
+		...args: Parameters<FforWitnessEvents[K]>
+	) => void;
 	/**
 	 * Propagate a fulfil the service held (section 9.6.5 step 5): the node
 	 * settles the forward upstream now, whatever the record's state.
@@ -177,7 +213,7 @@ export class FforWitnessService {
 		const hashHex = fulfil.paymentHash.toString('hex');
 		const hit = this.deps.ledger.byHash(hashHex);
 		if (!hit || hit.mailbox.state === 'CLOSED') return 'none';
-		const t = crypto.createHash('sha256').update(fulfil.preimage).digest();
+		const t = sha256(fulfil.preimage);
 		if (!t.equals(fulfil.paymentHash)) return 'none';
 		const already = this.pending.get(fulfil.outKey);
 		if (already && !already.released) return 'held';
@@ -301,7 +337,7 @@ export class FforWitnessService {
 			version: FF_WITNESS_VERSION,
 			profile: FF_WITNESS_PROFILE_DR,
 			mailboxId: Buffer.from(mailbox.id, 'hex'),
-			recordId: crypto.randomBytes(32),
+			recordId: randomBytes(32),
 			k,
 			hAct: Buffer.from(mailbox.hActHex, 'hex'),
 			termsHash: Buffer.from(entry.termsHashHex, 'hex'),
@@ -316,10 +352,7 @@ export class FforWitnessService {
 			recordAad(header),
 			body
 		);
-		header.ciphertextHash = crypto
-			.createHash('sha256')
-			.update(ciphertext)
-			.digest();
+		header.ciphertextHash = sha256(ciphertext);
 		const record: IFforWitnessRecord = {
 			header,
 			witnessSig: sign(
@@ -754,6 +787,6 @@ export class FforWitnessService {
 	}
 
 	static freshRequestId(): Buffer {
-		return crypto.randomBytes(FF_WITNESS_REQUEST_ID_LEN);
+		return randomBytes(FF_WITNESS_REQUEST_ID_LEN);
 	}
 }
