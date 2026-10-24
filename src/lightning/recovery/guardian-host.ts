@@ -40,14 +40,16 @@
  * writes.
  */
 
-import * as fs from 'fs';
+import { nodeFs } from '../../utils/node-builtins';
 import * as path from 'path';
+import type {
+	IGuardianInfoResponse,
+	IGuardianRegisterNodeRequest
+} from './guardian';
 import {
 	GUARDIAN_RECORD_OVERHEAD_BYTES,
 	GUARDIAN_REGISTRATION_BYTES,
 	GuardianStatus,
-	IGuardianInfoResponse,
-	IGuardianRegisterNodeRequest,
 	ReferenceGuardian,
 	registrationAdmissionProblem
 } from './guardian';
@@ -67,16 +69,12 @@ import {
 	decodeSyncEpochRequest,
 	decodeSyncRecordRequest
 } from './guardian-proto';
-import {
-	GuardianVerbName,
-	IGuardianVerbOutcome,
-	encodeGuardianVerbRefusal,
-	runGuardianVerb
-} from './guardian-http';
+import type { GuardianVerbName, IGuardianVerbOutcome } from './guardian-http';
+import { encodeGuardianVerbRefusal, runGuardianVerb } from './guardian-http';
+import type { IGuardianResolver } from './guardian-bolt8';
 import {
 	GuardianBolt8FrameError,
 	GuardianBolt8Responder,
-	IGuardianResolver,
 	bolt8BearerAuthenticator
 } from './guardian-bolt8';
 
@@ -202,6 +200,7 @@ export class GuardianHost implements IGuardianResolver {
 	private closed = false;
 
 	constructor(config: IGuardianHostConfig) {
+		const fs = nodeFs();
 		this.config = config;
 		this.guardianId = xOnlyFromSecret(config.guardianSecret);
 		this.authenticate =
@@ -457,6 +456,7 @@ export class GuardianHost implements IGuardianResolver {
 		request: IGuardianRegisterNodeRequest,
 		body: Buffer
 	): Buffer {
+		const fs = nodeFs();
 		const key = setId.toString('hex');
 		const refuse = (status: GuardianStatus, detail: string): Buffer =>
 			encodeGuardianVerbRefusal('register_node', status, detail);
@@ -559,6 +559,7 @@ export class GuardianHost implements IGuardianResolver {
 
 	/** Close a store that will not be served; remove it if this attempt made it. */
 	private discardSet(served: IServedSet, created: boolean): void {
+		const fs = nodeFs();
 		served.guardian.close();
 		if (!created) return;
 		for (const suffix of STORE_SUFFIXES) {
@@ -571,6 +572,7 @@ export class GuardianHost implements IGuardianResolver {
 	}
 
 	private diskBytesOf(set: IServedSet): number {
+		const fs = nodeFs();
 		let total = 0;
 		for (const suffix of STORE_SUFFIXES) {
 			try {
@@ -587,6 +589,7 @@ export class GuardianHost implements IGuardianResolver {
 	}
 
 	private loadIndex(): void {
+		const fs = nodeFs();
 		let raw: string;
 		try {
 			raw = fs.readFileSync(this.indexPath(), 'utf8');
@@ -642,6 +645,7 @@ export class GuardianHost implements IGuardianResolver {
 	}
 
 	private saveIndex(): void {
+		const fs = nodeFs();
 		const index: IIndexFile = { version: 1, sets: {} };
 		for (const [key, set] of this.sets) {
 			index.sets[key] = {

@@ -7,17 +7,19 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
-import {
+import { sha256 } from '../crypto/provider';
+import type {
 	ChainAction,
+	ITrackedOutput,
+	ICommitmentBroadcast,
+	IFundingSpendScan
+} from './types';
+import {
 	ChainActionType,
 	MonitorState,
 	CommitmentType,
 	OutputStatus,
 	OutputType,
-	ITrackedOutput,
-	ICommitmentBroadcast,
-	IFundingSpendScan,
 	IRREVOCABLE_DEPTH
 } from './types';
 import {
@@ -32,7 +34,7 @@ import {
 	selectTheirPerCommitmentPoint
 } from './output-resolver';
 import { csvFromToLocalScript } from '../script/commitment';
-import { IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
 /** Number of blocks before re-broadcasting unconfirmed sweeps */
@@ -1124,13 +1126,7 @@ export class ChainMonitor {
 				)
 					continue;
 				const preimage = witness.find(
-					(el) =>
-						el.length === 32 &&
-						crypto
-							.createHash('sha256')
-							.update(el)
-							.digest()
-							.equals(spent.paymentHash!)
+					(el) => el.length === 32 && sha256(el).equals(spent.paymentHash!)
 				);
 				spent.receivedHtlcSpend = {
 					txid: spendingTx.getId(),
@@ -1482,7 +1478,7 @@ export class ChainMonitor {
 			if (!input.witness) continue;
 			for (const el of input.witness) {
 				if (el.length !== 32) continue;
-				const hash = crypto.createHash('sha256').update(el).digest();
+				const hash = sha256(el);
 				const hashHex = hash.toString('hex');
 				if (!wantedHashes.has(hashHex)) continue;
 				if (this._knownPreimages.has(hashHex)) continue;

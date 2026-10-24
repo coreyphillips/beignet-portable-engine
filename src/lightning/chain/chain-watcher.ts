@@ -7,14 +7,17 @@
  */
 
 import { EventEmitter } from 'events';
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import { ChannelManager } from '../channel/channel-manager';
+import type { Channel } from '../channel/channel';
+import type { ChannelManagerEvents } from '../channel/events';
+import type { TxidHex } from '../../utils/identifiers';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel } from '../channel/types';
 import { decodeShortChannelId } from '../gossip/types';
+import type { IFundingSpendScan } from './types';
 import { IRREVOCABLE_DEPTH } from './types';
 import { isDuplicateBroadcastRejection } from './broadcast-rejection';
 
@@ -51,7 +54,11 @@ export interface IChainBackend {
 	getTransaction(txid: string): Promise<Buffer>;
 	/** Broadcast a raw transaction hex. Returns txid on success. */
 	broadcastTransaction(rawTxHex: string): Promise<string>;
-	/** Get transaction position in a block. Returns { blockHeight, txIndex }. Optional — returns null if not supported. */
+	/**
+	 * Get transaction position in a block. Returns { blockHeight, txIndex }.
+	 * Optional. Rejects when the position is unknown rather than reporting a
+	 * default, since index 0 is the coinbase.
+	 */
 	getTransactionMerkleProof?(
 		txid: string,
 		height: number
@@ -318,9 +325,50 @@ function spliceInputWatchKey(
 	return `${channelId.toString('hex')}:${spliceTxid}:${inputIndex}`;
 }
 
+/**
+ * The part of ChannelManager the watcher drives, so the chain layer does not
+ * depend on the concrete manager. ChannelManager satisfies it.
+ */
+export interface IChainWatcherChannelManager {
+	on<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+		event: K,
+		listener: ChannelManagerEvents[K]
+	): void;
+	off<K extends 'watch:funding' | 'broadcast:tx' | 'watch:output'>(
+		event: K,
+		listener: ChannelManagerEvents[K]
+	): void;
+	listChannels(): Channel[];
+	handleNewBlock(blockHeight: number): void;
+	handleFundingConfirmed(channelId: Buffer, confirmedTxidHex?: TxidHex): void;
+	handleFundingSpent(
+		channelId: Buffer,
+		spendingTx: bitcoin.Transaction,
+		blockHeight: number,
+		destinationScript: Buffer,
+		feeRatePerVbyte?: number,
+		revocationBasepointSecret?: Buffer,
+		paymentPrivkey?: Buffer,
+		network?: bitcoin.Network,
+		spentOutpoint?: { txid: string; outputIndex: number }
+	): void;
+	handleFundingSpendAbsent(
+		channelId: Buffer,
+		scan?: IFundingSpendScan,
+		feeRatePerVbyte?: number
+	): boolean;
+	handleOutputSpent(
+		txid: string,
+		outputIndex: number,
+		spendingTx: bitcoin.Transaction,
+		blockHeight: number
+	): void;
+	handleOutputUnspent(txid: string, outputIndex: number): void;
+}
+
 export interface IChainWatcherConfig {
 	backend: IChainBackend;
-	channelManager: ChannelManager;
+	channelManager: IChainWatcherChannelManager;
 	/** Destination script for sweep outputs (P2WPKH). Falls back to zeros if not set. */
 	destinationScript?: Buffer;
 	/**
@@ -355,7 +403,7 @@ const DEFAULT_MISSING_DEBOUNCE_MS = 30_000;
  * SHA256(scriptPubkey) with bytes reversed (little-endian hex).
  */
 export function computeScriptHash(scriptPubkey: Buffer): string {
-	const hash = crypto.createHash('sha256').update(scriptPubkey).digest();
+	const hash = sha256(scriptPubkey);
 	return Buffer.from(hash).reverse().toString('hex');
 }
 
@@ -479,8 +527,8 @@ export async function classifyAnnouncedChannelFunding(
 		} catch {
 			return 'unavailable';
 		}
-		// ElectrumBackend reports a failed proof as index 0, so index 0 (the
-		// coinbase) can never prove a position.
+		// A backend that cannot place a transaction may still report index 0
+		// (the coinbase), so index 0 can never prove a position.
 		if (txIndex !== 0 && txIndex === scid.txIndex) return 'proven';
 	}
 	// The right output in a transaction at another index proves nothing
@@ -644,7 +692,7 @@ interface IChannelSpendScan {
 
 export class ChainWatcher extends EventEmitter {
 	private backend: IChainBackend;
-	private channelManager: ChannelManager;
+	private channelManager: IChainWatcherChannelManager;
 	private watchedFundings: Map<string, IWatchedFunding> = new Map(); // channelIdHex → funding
 	/**
 	 * Spend-scan arbitration, per CHANNEL (issues #468, #479).
@@ -1904,10 +1952,20 @@ export class ChainWatcher extends EventEmitter {
 		const generation = this.lifecycleGeneration;
 		let txIndex = 0;
 		if (this.backend.getTransactionMerkleProof) {
-			const proof = await this.backend.getTransactionMerkleProof(
-				watched.txid,
-				watched.confirmationHeight
-			);
+			let proof: { blockHeight: number; txIndex: number };
+			try {
+				proof = await this.backend.getTransactionMerkleProof(
+					watched.txid,
+					watched.confirmationHeight
+				);
+			} catch (err) {
+				// The SCID is built from this position, so there is nothing to
+				// announce without it. Re-armed, the next block asks again.
+				if (this.isCurrentGeneration(generation)) {
+					watched.announcementTriggered = false;
+				}
+				throw err;
+			}
 			if (!this.isCurrentGeneration(generation)) return;
 			txIndex = proof.txIndex;
 		}
@@ -2786,7 +2844,7 @@ export class ChainWatcher extends EventEmitter {
 	private findChannelByFunding(
 		txidHex: string,
 		outputIndex: number
-	): import('../channel/channel').Channel | undefined {
+	): Channel | undefined {
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			// Match the current funding outpoint.

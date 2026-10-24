@@ -11,17 +11,18 @@ import {
 } from '../transport/iroh';
 import { parseWebSocketUrl } from '../transport/websocket';
 import type { IPeerTransportOptions } from '../transport/duplex-transport';
+import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
-	IFforVoucherArchive,
 	fforVoucherArchiveId,
 	mergeFforVoucherArchive,
 	validateFforVoucherArchive
 } from '../ffor/voucher-archive';
-import Database from 'better-sqlite3';
-import { createHmac } from 'crypto';
-import * as fs from 'fs';
+import type Database from 'better-sqlite3';
+import { loadBetterSqlite3 } from './sqlite-binding';
+import { hmacSha256 } from '../crypto/provider';
+import { nodeFs } from '../../utils/node-builtins';
 import { ReconstructableBatch } from './reconstructable-batch';
-import {
+import type {
 	IStorageBackend,
 	IGossipRowPage,
 	IInvoiceInfo,
@@ -33,21 +34,24 @@ import {
 	IRecoveryOutboxStoredMessage,
 	IStoredRecoveryFrame,
 	IStoredRecoveryFrameHeader,
-	CorruptRecoveryRowError,
 	RecoveryOutboxDisposition
 } from './types';
-import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
-import { IChannelState } from '../channel/channel-state';
-import { IHtlcSnapshotEntry } from '../channel/types';
+import { CorruptRecoveryRowError } from './types';
+import type {
+	IWatchtowerSession,
+	IWatchtowerUpdate
+} from '../watchtower/types';
+import type { IChannelState } from '../channel/channel-state';
+import type { IHtlcSnapshotEntry } from '../channel/types';
 import {
-	markRevokedHtlcSnapshotsSaved,
+	attachStoredRevokedHtlcSnapshots,
 	unsavedRevokedHtlcSnapshots
 } from '../channel/htlc-snapshots';
-import { IPaymentInfo } from '../node/types';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { IPaymentInfo } from '../node/payment-types';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { ISerializedChannelState } from './serialization';
 import {
-	ISerializedChannelState,
 	serializeChannelState,
 	deserializeChannelState,
 	serializeHtlcSnapshotEntries,
@@ -59,7 +63,9 @@ import {
 	serializeGraphChannel,
 	deserializeGraphChannel,
 	serializeGraphNode,
-	deserializeGraphNode
+	deserializeGraphNode,
+	serializeInvoiceInfo,
+	deserializeInvoiceInfo
 } from './serialization';
 import {
 	ENC_PREFIX,
@@ -110,6 +116,7 @@ export interface IPaymentRowMatch {
  * leave the file as it is.
  */
 function restrictFileMode(filePath: string): void {
+	const fs = nodeFs();
 	try {
 		const current = fs.statSync(filePath).mode & 0o777;
 		if ((current & ~OWNER_ONLY_FILE_MODE) !== 0) {
@@ -207,6 +214,8 @@ export class SqliteStorage implements IStorageBackend {
 	private readonly metadataTagKey: Buffer;
 	private corruptRowsSeen = 0;
 	private gossipBatch?: ReconstructableBatch;
+	/** Prepared statements by SQL text, filled by _stmt. */
+	private readonly statements = new Map<string, Database.Statement>();
 
 	/**
 	 * @param dbPath Path to the SQLite database file (or ':memory:').
@@ -224,7 +233,8 @@ export class SqliteStorage implements IStorageBackend {
 		onCorruptRow?: (error: unknown) => void,
 		opts?: { encryptionKey?: Buffer }
 	) {
-		this.db = new Database(dbPath);
+		const Sqlite = loadBetterSqlite3();
+		this.db = new Sqlite(dbPath);
 		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
@@ -326,6 +336,23 @@ export class SqliteStorage implements IStorageBackend {
 		return decryptValue(this.encryptionKey, value);
 	}
 
+	/**
+	 * The statement for a fixed SQL string, prepared on first use. better-
+	 * sqlite3 does not cache, so prepare() parses and plans the SQL on every
+	 * call. SQL built from per-call filters or IN lists, and the passes
+	 * open() runs once, go to db.prepare, so the map stays bounded. Nothing
+	 * iterate()s a cached statement: an iterator left unfinished keeps it
+	 * busy, and every later call on it throws.
+	 */
+	private _stmt(sql: string): Database.Statement {
+		let statement = this.statements.get(sql);
+		if (!statement) {
+			statement = this.db.prepare(sql);
+			this.statements.set(sql, statement);
+		}
+		return statement;
+	}
+
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
 		this.db.pragma('journal_mode = WAL');
 		this.db.pragma(`synchronous = ${opts?.synchronous ?? 'FULL'}`);
@@ -356,6 +383,7 @@ export class SqliteStorage implements IStorageBackend {
 	close(): void {
 		this.gossipBatch?.flush();
 		this.db.close();
+		this.statements.clear();
 	}
 
 	/**
@@ -639,9 +667,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	private _metadataTag(key: string, value?: string): string {
-		return createHmac('sha256', this.metadataTagKey)
-			.update(JSON.stringify(value === undefined ? [key] : [key, value]))
-			.digest('hex')
+		return hmacSha256(
+			this.metadataTagKey,
+			Buffer.from(JSON.stringify(value === undefined ? [key] : [key, value]))
+		)
+			.toString('hex')
 			.slice(0, METADATA_TAG_HEX);
 	}
 
@@ -912,13 +942,11 @@ export class SqliteStorage implements IStorageBackend {
 		);
 		const history = unsavedRevokedHtlcSnapshots(state, this);
 		this.db.transaction(() => {
-			this.db
-				.prepare(
-					'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
-				)
-				.run(id, this._enc(json), peerPubkey);
+			this._stmt(
+				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
+			).run(id, this._enc(json), peerPubkey);
 			if (!history?.size) return;
-			const insert = this.db.prepare(
+			const insert = this._stmt(
 				'INSERT OR REPLACE INTO revoked_htlc_snapshots ' +
 					'(channel_id, commitment_number, htlcs_json) VALUES (?, ?, ?)'
 			);
@@ -940,23 +968,19 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null {
-		const row = this.db
-			.prepare(
-				'SELECT state_json, peer_pubkey FROM channels WHERE channel_id = ?'
-			)
-			.get(id) as { state_json: string; peer_pubkey: string } | undefined;
+		const row = this._stmt(
+			'SELECT state_json, peer_pubkey FROM channels WHERE channel_id = ?'
+		).get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
 		const state = deserializeChannelState(
 			JSON.parse(this._dec(row.state_json))
 		);
 		const history = this._readRevokedHtlcSnapshots(
-			this.db
-				.prepare(
-					'SELECT channel_id, commitment_number, htlcs_json ' +
-						'FROM revoked_htlc_snapshots WHERE channel_id = ? ' +
-						'ORDER BY length(commitment_number), commitment_number'
-				)
-				.all(id) as IRevokedHtlcSnapshotRow[]
+			this._stmt(
+				'SELECT channel_id, commitment_number, htlcs_json ' +
+					'FROM revoked_htlc_snapshots WHERE channel_id = ? ' +
+					'ORDER BY length(commitment_number), commitment_number'
+			).all(id) as IRevokedHtlcSnapshotRow[]
 		);
 		this._attachRevokedHtlcSnapshots(state, history.get(id));
 		return { state, peerPubkey: row.peer_pubkey };
@@ -967,21 +991,19 @@ export class SqliteStorage implements IStorageBackend {
 		state: IChannelState;
 		peerPubkey: string;
 	}> {
-		const rows = this.db
-			.prepare('SELECT channel_id, state_json, peer_pubkey FROM channels')
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT channel_id, state_json, peer_pubkey FROM channels'
+		).all() as Array<{
 			channel_id: string;
 			state_json: string;
 			peer_pubkey: string;
 		}>;
 		const history = this._readRevokedHtlcSnapshots(
-			this.db
-				.prepare(
-					'SELECT channel_id, commitment_number, htlcs_json ' +
-						'FROM revoked_htlc_snapshots ' +
-						'ORDER BY channel_id, length(commitment_number), commitment_number'
-				)
-				.all() as IRevokedHtlcSnapshotRow[]
+			this._stmt(
+				'SELECT channel_id, commitment_number, htlcs_json ' +
+					'FROM revoked_htlc_snapshots ' +
+					'ORDER BY channel_id, length(commitment_number), commitment_number'
+			).all() as IRevokedHtlcSnapshotRow[]
 		);
 		const results: Array<{
 			channelId: string;
@@ -1038,55 +1060,44 @@ export class SqliteStorage implements IStorageBackend {
 
 	/**
 	 * Give a loaded channel its stored snapshots. A row the 18->19 migration
-	 * could not read still carries its own; they are kept, and stay unsaved so
-	 * the channel's next save moves them into the table. Rows read inside an
-	 * open transaction may still roll back, so that state is left untracked
-	 * and its next save writes its whole history.
+	 * could not read still carries its own, which attaching keeps.
 	 */
 	private _attachRevokedHtlcSnapshots(
 		state: IChannelState,
 		stored: Map<string, IHtlcSnapshotEntry[]> | undefined
 	): void {
-		let history = stored;
-		if (state.revokedHtlcSnapshots?.size) {
-			history = new Map(stored);
-			for (const [key, entries] of state.revokedHtlcSnapshots) {
-				if (entries.length > 0 && !history.has(key)) history.set(key, entries);
-			}
-		}
-		state.revokedHtlcSnapshots = history?.size ? history : undefined;
-		if (this.db.inTransaction) return;
-		markRevokedHtlcSnapshotsSaved(state, this, stored?.keys() ?? []);
+		attachStoredRevokedHtlcSnapshots(
+			state,
+			stored,
+			this,
+			!this.db.inTransaction
+		);
 	}
 
 	deleteChannel(id: string): void {
 		// Drop the channel's retained outbound bytes and HTLC snapshots with
 		// it: retransmission and penalties both need the channel row too.
 		this.db.transaction(() => {
-			this.db.prepare('DELETE FROM channels WHERE channel_id = ?').run(id);
-			this.db
-				.prepare('DELETE FROM revoked_htlc_snapshots WHERE channel_id = ?')
-				.run(id);
-			this.db
-				.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
-				.run(id);
+			this._stmt('DELETE FROM channels WHERE channel_id = ?').run(id);
+			this._stmt('DELETE FROM revoked_htlc_snapshots WHERE channel_id = ?').run(
+				id
+			);
+			this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(id);
 		})();
 	}
 
 	saveFforVoucher(record: IFforVoucherArchive): void {
 		const id = fforVoucherArchiveId(record);
 		const merged = mergeFforVoucherArchive(this.loadFforVoucher(id), record);
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO ffor_vouchers (id, record_json) VALUES (?, ?)'
-			)
-			.run(id, this._enc(JSON.stringify(merged)));
+		this._stmt(
+			'INSERT OR REPLACE INTO ffor_vouchers (id, record_json) VALUES (?, ?)'
+		).run(id, this._enc(JSON.stringify(merged)));
 	}
 
 	loadFforVoucher(id: string): IFforVoucherArchive | null {
-		const row = this.db
-			.prepare('SELECT record_json FROM ffor_vouchers WHERE id = ?')
-			.get(id) as { record_json: string } | undefined;
+		const row = this._stmt(
+			'SELECT record_json FROM ffor_vouchers WHERE id = ?'
+		).get(id) as { record_json: string } | undefined;
 		if (!row) return null;
 		const record = validateFforVoucherArchive(
 			JSON.parse(this._dec(row.record_json))
@@ -1097,9 +1108,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllFforVouchers(): IFforVoucherArchive[] {
-		const rows = this.db
-			.prepare('SELECT id, record_json FROM ffor_vouchers ORDER BY id')
-			.all() as { id: string; record_json: string }[];
+		const rows = this._stmt(
+			'SELECT id, record_json FROM ffor_vouchers ORDER BY id'
+		).all() as { id: string; record_json: string }[];
 		return rows.map((row) => {
 			const record = validateFforVoucherArchive(
 				JSON.parse(this._dec(row.record_json))
@@ -1115,31 +1126,25 @@ export class SqliteStorage implements IStorageBackend {
 	savePayment(paymentHash: string, payment: IPaymentInfo): void {
 		const serialized = serializePaymentInfo(payment);
 		const json = JSON.stringify(serialized);
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO payments (payment_hash, payment_json, ' +
-					'created_at, status, direction, metadata_tags) ' +
-					'VALUES (?, ?, ?, ?, ?, ?)'
-			)
-			.run(
-				paymentHash,
-				this._enc(json),
-				...this._paymentLookupColumns(payment)
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO payments (payment_hash, payment_json, ' +
+				'created_at, status, direction, metadata_tags) ' +
+				'VALUES (?, ?, ?, ?, ?, ?)'
+		).run(paymentHash, this._enc(json), ...this._paymentLookupColumns(payment));
 	}
 
 	loadPayment(paymentHash: string): IPaymentInfo | null {
-		const row = this.db
-			.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
-			.get(paymentHash) as { payment_json: string } | undefined;
+		const row = this._stmt(
+			'SELECT payment_json FROM payments WHERE payment_hash = ?'
+		).get(paymentHash) as { payment_json: string } | undefined;
 		if (!row) return null;
 		return deserializePaymentInfo(JSON.parse(this._dec(row.payment_json)));
 	}
 
 	loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo }> {
-		const rows = this.db
-			.prepare('SELECT payment_hash, payment_json FROM payments')
-			.all() as Array<{ payment_hash: string; payment_json: string }>;
+		const rows = this._stmt(
+			'SELECT payment_hash, payment_json FROM payments'
+		).all() as Array<{ payment_hash: string; payment_json: string }>;
 		const results: Array<{ paymentHash: string; payment: IPaymentInfo }> = [];
 		for (const row of rows) {
 			try {
@@ -1172,9 +1177,9 @@ export class SqliteStorage implements IStorageBackend {
 		match: IPaymentRowMatch = {}
 	): Generator<IStoredPaymentRef> {
 		const load = (paymentHash: string): IPaymentInfo | null => {
-			const row = this.db
-				.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
-				.get(paymentHash) as { payment_json: string } | undefined;
+			const row = this._stmt(
+				'SELECT payment_json FROM payments WHERE payment_hash = ?'
+			).get(paymentHash) as { payment_json: string } | undefined;
 			if (!row) return null;
 			try {
 				return deserializePaymentInfo(JSON.parse(this._dec(row.payment_json)));
@@ -1243,43 +1248,38 @@ export class SqliteStorage implements IStorageBackend {
 	 * loadAll* readers skip it.
 	 */
 	paymentHashesWith(match: { status: string; direction: string }): Set<string> {
-		const hashes = this.db
-			.prepare(
-				'SELECT payment_hash FROM payments WHERE status = ? AND direction = ?'
-			)
+		const hashes = this._stmt(
+			'SELECT payment_hash FROM payments WHERE status = ? AND direction = ?'
+		)
 			.pluck()
 			.all(match.status, match.direction) as string[];
 		return new Set(hashes);
 	}
 
 	deletePayment(paymentHash: string): void {
-		this.db
-			.prepare('DELETE FROM payments WHERE payment_hash = ?')
-			.run(paymentHash);
+		this._stmt('DELETE FROM payments WHERE payment_hash = ?').run(paymentHash);
 	}
 
 	// ─── Preimages ───
 
 	savePreimage(paymentHash: string, preimage: Buffer): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO preimages (payment_hash, preimage) VALUES (?, ?)'
-			)
-			.run(paymentHash, this._enc(preimage.toString('hex')));
+		this._stmt(
+			'INSERT OR REPLACE INTO preimages (payment_hash, preimage) VALUES (?, ?)'
+		).run(paymentHash, this._enc(preimage.toString('hex')));
 	}
 
 	loadPreimage(paymentHash: string): Buffer | null {
-		const row = this.db
-			.prepare('SELECT preimage FROM preimages WHERE payment_hash = ?')
-			.get(paymentHash) as { preimage: string } | undefined;
+		const row = this._stmt(
+			'SELECT preimage FROM preimages WHERE payment_hash = ?'
+		).get(paymentHash) as { preimage: string } | undefined;
 		if (!row) return null;
 		return Buffer.from(this._dec(row.preimage), 'hex');
 	}
 
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT payment_hash, preimage FROM preimages')
-			.all() as Array<{ payment_hash: string; preimage: string }>;
+		const rows = this._stmt(
+			'SELECT payment_hash, preimage FROM preimages'
+		).all() as Array<{ payment_hash: string; preimage: string }>;
 		const results: Array<{ paymentHash: string; preimage: Buffer }> = [];
 		for (const row of rows) {
 			try {
@@ -1299,25 +1299,21 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deletePreimage(paymentHash: string): void {
-		this.db
-			.prepare('DELETE FROM preimages WHERE payment_hash = ?')
-			.run(paymentHash);
+		this._stmt('DELETE FROM preimages WHERE payment_hash = ?').run(paymentHash);
 	}
 
 	// ─── SCID Mappings ───
 
 	saveScidMapping(scidHex: string, channelId: Buffer): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO scid_mappings (scid_hex, channel_id) VALUES (?, ?)'
-			)
-			.run(scidHex, channelId.toString('hex'));
+		this._stmt(
+			'INSERT OR REPLACE INTO scid_mappings (scid_hex, channel_id) VALUES (?, ?)'
+		).run(scidHex, channelId.toString('hex'));
 	}
 
 	loadAllScidMappings(): Array<{ scidHex: string; channelId: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT scid_hex, channel_id FROM scid_mappings')
-			.all() as Array<{ scid_hex: string; channel_id: string }>;
+		const rows = this._stmt(
+			'SELECT scid_hex, channel_id FROM scid_mappings'
+		).all() as Array<{ scid_hex: string; channel_id: string }>;
 		const results: Array<{ scidHex: string; channelId: Buffer }> = [];
 		for (const row of rows) {
 			try {
@@ -1339,17 +1335,15 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── HTLC Payment Map ───
 
 	saveHtlcPaymentMapping(key: string, paymentHashHex: string): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO htlc_payment_map (htlc_key, payment_hash_hex) VALUES (?, ?)'
-			)
-			.run(key, this._enc(paymentHashHex));
+		this._stmt(
+			'INSERT OR REPLACE INTO htlc_payment_map (htlc_key, payment_hash_hex) VALUES (?, ?)'
+		).run(key, this._enc(paymentHashHex));
 	}
 
 	loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string }> {
-		const rows = this.db
-			.prepare('SELECT htlc_key, payment_hash_hex FROM htlc_payment_map')
-			.all() as Array<{ htlc_key: string; payment_hash_hex: string }>;
+		const rows = this._stmt(
+			'SELECT htlc_key, payment_hash_hex FROM htlc_payment_map'
+		).all() as Array<{ htlc_key: string; payment_hash_hex: string }>;
 		const results: Array<{ key: string; paymentHashHex: string }> = [];
 		for (const row of rows) {
 			try {
@@ -1366,7 +1360,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteHtlcPaymentMapping(key: string): void {
-		this.db.prepare('DELETE FROM htlc_payment_map WHERE htlc_key = ?').run(key);
+		this._stmt('DELETE FROM htlc_payment_map WHERE htlc_key = ?').run(key);
 	}
 
 	// ─── Forwarded HTLCs ───
@@ -1376,15 +1370,13 @@ export class SqliteStorage implements IStorageBackend {
 		inChannelId: Buffer,
 		inHtlcId: bigint
 	): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO forwarded_htlcs (out_key, in_channel_id, in_htlc_id) VALUES (?, ?, ?)'
-			)
-			.run(
-				outKey,
-				this._enc(inChannelId.toString('hex')),
-				this._enc(inHtlcId.toString())
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO forwarded_htlcs (out_key, in_channel_id, in_htlc_id) VALUES (?, ?, ?)'
+		).run(
+			outKey,
+			this._enc(inChannelId.toString('hex')),
+			this._enc(inHtlcId.toString())
+		);
 	}
 
 	loadAllForwardedHtlcs(): Array<{
@@ -1392,9 +1384,9 @@ export class SqliteStorage implements IStorageBackend {
 		inChannelId: Buffer;
 		inHtlcId: bigint;
 	}> {
-		const rows = this.db
-			.prepare('SELECT out_key, in_channel_id, in_htlc_id FROM forwarded_htlcs')
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT out_key, in_channel_id, in_htlc_id FROM forwarded_htlcs'
+		).all() as Array<{
 			out_key: string;
 			in_channel_id: string;
 			in_htlc_id: string;
@@ -1423,26 +1415,22 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteForwardedHtlc(outKey: string): void {
-		this.db
-			.prepare('DELETE FROM forwarded_htlcs WHERE out_key = ?')
-			.run(outKey);
+		this._stmt('DELETE FROM forwarded_htlcs WHERE out_key = ?').run(outKey);
 	}
 
 	// ─── Chain Monitors ───
 
 	saveChainMonitor(channelId: string, state: IChainMonitorState): void {
 		const json = serializeChainMonitorState(state);
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO chain_monitors (channel_id, state_json) VALUES (?, ?)'
-			)
-			.run(channelId, this._enc(json));
+		this._stmt(
+			'INSERT OR REPLACE INTO chain_monitors (channel_id, state_json) VALUES (?, ?)'
+		).run(channelId, this._enc(json));
 	}
 
 	loadChainMonitor(channelId: string): IChainMonitorState | null {
-		const row = this.db
-			.prepare('SELECT state_json FROM chain_monitors WHERE channel_id = ?')
-			.get(channelId) as { state_json: string } | undefined;
+		const row = this._stmt(
+			'SELECT state_json FROM chain_monitors WHERE channel_id = ?'
+		).get(channelId) as { state_json: string } | undefined;
 		if (!row) return null;
 		return deserializeChainMonitorState(this._dec(row.state_json));
 	}
@@ -1451,9 +1439,9 @@ export class SqliteStorage implements IStorageBackend {
 		channelId: string;
 		state: IChainMonitorState;
 	}> {
-		const rows = this.db
-			.prepare('SELECT channel_id, state_json FROM chain_monitors')
-			.all() as Array<{ channel_id: string; state_json: string }>;
+		const rows = this._stmt(
+			'SELECT channel_id, state_json FROM chain_monitors'
+		).all() as Array<{ channel_id: string; state_json: string }>;
 		const results: Array<{ channelId: string; state: IChainMonitorState }> = [];
 		for (const row of rows) {
 			try {
@@ -1483,11 +1471,9 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			return;
 		}
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO gossip_channels (scid_hex, channel_json) VALUES (?, ?)'
-			)
-			.run(scidHex, json);
+		this._stmt(
+			'INSERT OR REPLACE INTO gossip_channels (scid_hex, channel_json) VALUES (?, ?)'
+		).run(scidHex, json);
 	}
 
 	deleteGossipChannel(scidHex: string): void {
@@ -1499,16 +1485,14 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			return;
 		}
-		this.db
-			.prepare('DELETE FROM gossip_channels WHERE scid_hex = ?')
-			.run(scidHex);
+		this._stmt('DELETE FROM gossip_channels WHERE scid_hex = ?').run(scidHex);
 	}
 
 	loadAllGossipChannels(): IGraphChannel[] {
 		this.gossipBatch?.flush();
-		const rows = this.db
-			.prepare('SELECT channel_json FROM gossip_channels')
-			.all() as Array<{ channel_json: string }>;
+		const rows = this._stmt(
+			'SELECT channel_json FROM gossip_channels'
+		).all() as Array<{ channel_json: string }>;
 		const results: IGraphChannel[] = [];
 		for (const row of rows) {
 			try {
@@ -1526,11 +1510,9 @@ export class SqliteStorage implements IStorageBackend {
 		limit: number
 	): IGossipRowPage<IGraphChannel> {
 		this.gossipBatch?.flush();
-		const rows = this.db
-			.prepare(
-				'SELECT rowid, channel_json FROM gossip_channels WHERE rowid > ? ORDER BY rowid LIMIT ?'
-			)
-			.all(afterRowid, limit) as Array<{ rowid: number; channel_json: string }>;
+		const rows = this._stmt(
+			'SELECT rowid, channel_json FROM gossip_channels WHERE rowid > ? ORDER BY rowid LIMIT ?'
+		).all(afterRowid, limit) as Array<{ rowid: number; channel_json: string }>;
 		const results: IGraphChannel[] = [];
 		for (const row of rows) {
 			try {
@@ -1560,11 +1542,9 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			return;
 		}
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO gossip_nodes (node_id_hex, node_json) VALUES (?, ?)'
-			)
-			.run(nodeIdHex, json);
+		this._stmt(
+			'INSERT OR REPLACE INTO gossip_nodes (node_id_hex, node_json) VALUES (?, ?)'
+		).run(nodeIdHex, json);
 	}
 
 	deleteGossipNode(nodeIdHex: string): void {
@@ -1576,16 +1556,14 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			return;
 		}
-		this.db
-			.prepare('DELETE FROM gossip_nodes WHERE node_id_hex = ?')
-			.run(nodeIdHex);
+		this._stmt('DELETE FROM gossip_nodes WHERE node_id_hex = ?').run(nodeIdHex);
 	}
 
 	loadAllGossipNodes(): IGraphNode[] {
 		this.gossipBatch?.flush();
-		const rows = this.db
-			.prepare('SELECT node_json FROM gossip_nodes')
-			.all() as Array<{ node_json: string }>;
+		const rows = this._stmt(
+			'SELECT node_json FROM gossip_nodes'
+		).all() as Array<{ node_json: string }>;
 		const results: IGraphNode[] = [];
 		for (const row of rows) {
 			try {
@@ -1603,11 +1581,9 @@ export class SqliteStorage implements IStorageBackend {
 		limit: number
 	): IGossipRowPage<IGraphNode> {
 		this.gossipBatch?.flush();
-		const rows = this.db
-			.prepare(
-				'SELECT rowid, node_json FROM gossip_nodes WHERE rowid > ? ORDER BY rowid LIMIT ?'
-			)
-			.all(afterRowid, limit) as Array<{ rowid: number; node_json: string }>;
+		const rows = this._stmt(
+			'SELECT rowid, node_json FROM gossip_nodes WHERE rowid > ? ORDER BY rowid LIMIT ?'
+		).all(afterRowid, limit) as Array<{ rowid: number; node_json: string }>;
 		const results: IGraphNode[] = [];
 		for (const row of rows) {
 			try {
@@ -1628,17 +1604,15 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Payment Secrets ───
 
 	savePaymentSecret(paymentHashHex: string, secret: Buffer): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO payment_secrets (payment_hash_hex, secret) VALUES (?, ?)'
-			)
-			.run(paymentHashHex, this._enc(secret.toString('hex')));
+		this._stmt(
+			'INSERT OR REPLACE INTO payment_secrets (payment_hash_hex, secret) VALUES (?, ?)'
+		).run(paymentHashHex, this._enc(secret.toString('hex')));
 	}
 
 	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT payment_hash_hex, secret FROM payment_secrets')
-			.all() as Array<{ payment_hash_hex: string; secret: string }>;
+		const rows = this._stmt(
+			'SELECT payment_hash_hex, secret FROM payment_secrets'
+		).all() as Array<{ payment_hash_hex: string; secret: string }>;
 		const results: Array<{ paymentHashHex: string; secret: Buffer }> = [];
 		for (const row of rows) {
 			try {
@@ -1658,9 +1632,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deletePaymentSecret(paymentHashHex: string): void {
-		this.db
-			.prepare('DELETE FROM payment_secrets WHERE payment_hash_hex = ?')
-			.run(paymentHashHex);
+		this._stmt('DELETE FROM payment_secrets WHERE payment_hash_hex = ?').run(
+			paymentHashHex
+		);
 	}
 
 	// ─── BOLT 12 Invoice Path IDs ───
@@ -1670,17 +1644,15 @@ export class SqliteStorage implements IStorageBackend {
 	// fail-closed receive check keeps working across restarts.
 
 	saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO invoice_path_ids (payment_hash_hex, path_id) VALUES (?, ?)'
-			)
-			.run(paymentHashHex, this._enc(pathId.toString('hex')));
+		this._stmt(
+			'INSERT OR REPLACE INTO invoice_path_ids (payment_hash_hex, path_id) VALUES (?, ?)'
+		).run(paymentHashHex, this._enc(pathId.toString('hex')));
 	}
 
 	loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT payment_hash_hex, path_id FROM invoice_path_ids')
-			.all() as Array<{ payment_hash_hex: string; path_id: string }>;
+		const rows = this._stmt(
+			'SELECT payment_hash_hex, path_id FROM invoice_path_ids'
+		).all() as Array<{ payment_hash_hex: string; path_id: string }>;
 		const results: Array<{ paymentHashHex: string; pathId: Buffer }> = [];
 		for (const row of rows) {
 			try {
@@ -1700,68 +1672,33 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteInvoicePathId(paymentHashHex: string): void {
-		this.db
-			.prepare('DELETE FROM invoice_path_ids WHERE payment_hash_hex = ?')
-			.run(paymentHashHex);
+		this._stmt('DELETE FROM invoice_path_ids WHERE payment_hash_hex = ?').run(
+			paymentHashHex
+		);
 	}
 
 	// ─── Invoices ───
 
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void {
-		const json = JSON.stringify({
-			paymentHash: invoice.paymentHash,
-			bolt11: invoice.bolt11,
-			amountMsat:
-				invoice.amountMsat !== undefined
-					? invoice.amountMsat.toString()
-					: undefined,
-			description: invoice.description,
-			expiry: invoice.expiry,
-			createdAt: invoice.createdAt,
-			hold: invoice.hold,
-			bolt12: invoice.bolt12,
-			cancelledAt: invoice.cancelledAt,
-			jitFee: invoice.jitFee,
-			minFinalCltvExpiry: invoice.minFinalCltvExpiry
-		});
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO invoices (payment_hash_hex, invoice_json) VALUES (?, ?)'
-			)
-			.run(paymentHashHex, this._enc(json));
+		const json = JSON.stringify(serializeInvoiceInfo(invoice));
+		this._stmt(
+			'INSERT OR REPLACE INTO invoices (payment_hash_hex, invoice_json) VALUES (?, ?)'
+		).run(paymentHashHex, this._enc(json));
 	}
 
 	loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> {
-		const rows = this.db
-			.prepare('SELECT payment_hash_hex, invoice_json FROM invoices')
-			.all() as Array<{ payment_hash_hex: string; invoice_json: string }>;
+		const rows = this._stmt(
+			'SELECT payment_hash_hex, invoice_json FROM invoices'
+		).all() as Array<{ payment_hash_hex: string; invoice_json: string }>;
 		const results: Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> =
 			[];
 		for (const row of rows) {
 			try {
-				const parsed = JSON.parse(this._dec(row.invoice_json));
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					invoice: {
-						paymentHash: parsed.paymentHash,
-						bolt11: parsed.bolt11,
-						amountMsat:
-							parsed.amountMsat !== undefined
-								? BigInt(parsed.amountMsat)
-								: undefined,
-						description: parsed.description,
-						expiry: parsed.expiry,
-						createdAt: parsed.createdAt,
-						hold: parsed.hold,
-						bolt12: parsed.bolt12,
-						cancelledAt: parsed.cancelledAt,
-						// A row written before #595 has none; the allowance is then
-						// absent and the final hop enforces BOLT 4 unchanged.
-						jitFee: parsed.jitFee,
-						// A row written before #770 has none: the final hop then
-						// enforces the node default, which is what it advertised.
-						minFinalCltvExpiry: parsed.minFinalCltvExpiry
-					}
+					invoice: deserializeInvoiceInfo(
+						JSON.parse(this._dec(row.invoice_json))
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -1772,25 +1709,23 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteInvoice(paymentHashHex: string): void {
-		this.db
-			.prepare('DELETE FROM invoices WHERE payment_hash_hex = ?')
-			.run(paymentHashHex);
+		this._stmt('DELETE FROM invoices WHERE payment_hash_hex = ?').run(
+			paymentHashHex
+		);
 	}
 
 	// ─── Mission Control ───
 
 	saveMissionControl(json: string): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO mission_control (id, data_json) VALUES (1, ?)'
-			)
-			.run(json);
+		this._stmt(
+			'INSERT OR REPLACE INTO mission_control (id, data_json) VALUES (1, ?)'
+		).run(json);
 	}
 
 	loadMissionControl(): string | null {
-		const row = this.db
-			.prepare('SELECT data_json FROM mission_control WHERE id = 1')
-			.get() as { data_json: string } | undefined;
+		const row = this._stmt(
+			'SELECT data_json FROM mission_control WHERE id = 1'
+		).get() as { data_json: string } | undefined;
 		return row ? row.data_json : null;
 	}
 
@@ -1802,17 +1737,15 @@ export class SqliteStorage implements IStorageBackend {
 		port: number,
 		transport?: IPeerTransportOptions
 	): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO peer_addresses (pubkey, host, port, last_connected, transport_json) VALUES (?, ?, ?, ?, ?)'
-			)
-			.run(
-				pubkey,
-				host,
-				port,
-				Date.now(),
-				transport ? JSON.stringify(transport) : null
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO peer_addresses (pubkey, host, port, last_connected, transport_json) VALUES (?, ?, ?, ?, ?)'
+		).run(
+			pubkey,
+			host,
+			port,
+			Date.now(),
+			transport ? JSON.stringify(transport) : null
+		);
 	}
 
 	loadAllPeerAddresses(): Array<{
@@ -1821,9 +1754,9 @@ export class SqliteStorage implements IStorageBackend {
 		port: number;
 		transport?: IPeerTransportOptions;
 	}> {
-		const rows = this.db
-			.prepare('SELECT pubkey, host, port, transport_json FROM peer_addresses')
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT pubkey, host, port, transport_json FROM peer_addresses'
+		).all() as Array<{
 			pubkey: string;
 			host: string;
 			port: number;
@@ -1852,7 +1785,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deletePeerAddress(pubkey: string): void {
-		this.db.prepare('DELETE FROM peer_addresses WHERE pubkey = ?').run(pubkey);
+		this._stmt('DELETE FROM peer_addresses WHERE pubkey = ?').run(pubkey);
 	}
 
 	// ─── Announced Peer Addresses ───
@@ -1862,11 +1795,9 @@ export class SqliteStorage implements IStorageBackend {
 		timestamp: number,
 		addresses: Array<{ host: string; port: number }>
 	): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO announced_peer_addresses (pubkey, announcement_timestamp, addresses_json) VALUES (?, ?, ?)'
-			)
-			.run(pubkey, timestamp, JSON.stringify(addresses));
+		this._stmt(
+			'INSERT OR REPLACE INTO announced_peer_addresses (pubkey, announcement_timestamp, addresses_json) VALUES (?, ?, ?)'
+		).run(pubkey, timestamp, JSON.stringify(addresses));
 	}
 
 	loadAllAnnouncedPeerAddresses(): Array<{
@@ -1874,11 +1805,9 @@ export class SqliteStorage implements IStorageBackend {
 		timestamp: number;
 		addresses: Array<{ host: string; port: number }>;
 	}> {
-		const rows = this.db
-			.prepare(
-				'SELECT pubkey, announcement_timestamp, addresses_json FROM announced_peer_addresses'
-			)
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT pubkey, announcement_timestamp, addresses_json FROM announced_peer_addresses'
+		).all() as Array<{
 			pubkey: string;
 			announcement_timestamp: number;
 			addresses_json: string;
@@ -1896,14 +1825,12 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Channel Key Indices ───
 
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO channel_key_indices (channel_id, channel_index) VALUES (?, ?)'
-			)
-			.run(
-				channelId,
-				this.encryptionKey ? this._enc(String(channelIndex)) : channelIndex
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO channel_key_indices (channel_id, channel_index) VALUES (?, ?)'
+		).run(
+			channelId,
+			this.encryptionKey ? this._enc(String(channelIndex)) : channelIndex
+		);
 	}
 
 	/** Decode a channel_index cell: plaintext INTEGER or encrypted TEXT. */
@@ -1922,11 +1849,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadChannelKeyIndex(channelId: string): number | null {
-		const row = this.db
-			.prepare(
-				'SELECT channel_index FROM channel_key_indices WHERE channel_id = ?'
-			)
-			.get(channelId) as { channel_index: number | string } | undefined;
+		const row = this._stmt(
+			'SELECT channel_index FROM channel_key_indices WHERE channel_id = ?'
+		).get(channelId) as { channel_index: number | string } | undefined;
 		return row ? this._decodeChannelIndex(row.channel_index) : null;
 	}
 
@@ -1934,9 +1859,9 @@ export class SqliteStorage implements IStorageBackend {
 		channelId: string;
 		channelIndex: number;
 	}> {
-		const rows = this.db
-			.prepare('SELECT channel_id, channel_index FROM channel_key_indices')
-			.all() as Array<{ channel_id: string; channel_index: number | string }>;
+		const rows = this._stmt(
+			'SELECT channel_id, channel_index FROM channel_key_indices'
+		).all() as Array<{ channel_id: string; channel_index: number | string }>;
 		return rows.map((row) => ({
 			channelId: row.channel_id,
 			channelIndex: this._decodeChannelIndex(row.channel_index)
@@ -1946,9 +1871,9 @@ export class SqliteStorage implements IStorageBackend {
 	loadNextChannelIndex(): number {
 		// Encrypted cells are TEXT, so SQL MAX() would compare ciphertext;
 		// decode in JS instead (one small row per channel)
-		const rows = this.db
-			.prepare('SELECT channel_index FROM channel_key_indices')
-			.all() as Array<{ channel_index: number | string }>;
+		const rows = this._stmt(
+			'SELECT channel_index FROM channel_key_indices'
+		).all() as Array<{ channel_index: number | string }>;
 		let maxIdx: number | null = null;
 		for (const row of rows) {
 			const idx = this._decodeChannelIndex(row.channel_index);
@@ -1960,30 +1885,28 @@ export class SqliteStorage implements IStorageBackend {
 	hasChannelKeyIndices(): boolean {
 		// Existence only: no cell is decoded, so an encrypted row counts the
 		// same as a plain one and a row at index 0 is told apart from none.
-		const row = this.db
-			.prepare('SELECT 1 AS present FROM channel_key_indices LIMIT 1')
-			.get() as { present: number } | undefined;
+		const row = this._stmt(
+			'SELECT 1 AS present FROM channel_key_indices LIMIT 1'
+		).get() as { present: number } | undefined;
 		return row !== undefined;
 	}
 
 	// ─── HTLC Shared Secrets ───
 
 	saveHtlcSharedSecret(key: string, secret: Buffer): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO htlc_shared_secrets (key, secret) VALUES (?, ?)'
-			)
-			.run(key, this._enc(secret.toString('hex')));
+		this._stmt(
+			'INSERT OR REPLACE INTO htlc_shared_secrets (key, secret) VALUES (?, ?)'
+		).run(key, this._enc(secret.toString('hex')));
 	}
 
 	deleteHtlcSharedSecret(key: string): void {
-		this.db.prepare('DELETE FROM htlc_shared_secrets WHERE key = ?').run(key);
+		this._stmt('DELETE FROM htlc_shared_secrets WHERE key = ?').run(key);
 	}
 
 	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT key, secret FROM htlc_shared_secrets')
-			.all() as Array<{ key: string; secret: string }>;
+		const rows = this._stmt(
+			'SELECT key, secret FROM htlc_shared_secrets'
+		).all() as Array<{ key: string; secret: string }>;
 		const results: Array<{ key: string; secret: Buffer }> = [];
 		for (const row of rows) {
 			try {
@@ -2011,11 +1934,9 @@ export class SqliteStorage implements IStorageBackend {
 		data: string;
 	}): void {
 		this.db.transaction(() => {
-			this.db
-				.prepare(
-					'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
-				)
-				.run(entry.category, entry.action, entry.timestamp, entry.data);
+			this._stmt(
+				'INSERT INTO action_log (category, action, timestamp, data) VALUES (?, ?, ?, ?)'
+			).run(entry.category, entry.action, entry.timestamp, entry.data);
 			// Cap at 10k rows, pruning oldest first
 			this._pruneOldestRows('action_log', 10_000);
 		})();
@@ -2031,15 +1952,13 @@ export class SqliteStorage implements IStorageBackend {
 		table: 'action_log' | 'forwarding_events',
 		cap: number
 	): void {
-		const { n } = this.db
-			.prepare(`SELECT COUNT(*) AS n FROM ${table}`)
-			.get() as { n: number };
+		const { n } = this._stmt(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+			n: number;
+		};
 		if (n <= cap) return;
-		this.db
-			.prepare(
-				`DELETE FROM ${table} WHERE id <= (SELECT id FROM ${table} ORDER BY id LIMIT 1 OFFSET ?)`
-			)
-			.run(n - cap - 1);
+		this._stmt(
+			`DELETE FROM ${table} WHERE id <= (SELECT id FROM ${table} ORDER BY id LIMIT 1 OFFSET ?)`
+		).run(n - cap - 1);
 	}
 
 	loadActionLog(options?: {
@@ -2322,21 +2241,24 @@ export class SqliteStorage implements IStorageBackend {
 				})();
 			}
 		}
+		// 18->19 saves channels through _stmt; dropping what the migrations
+		// cached leaves only statements prepared against the final schema.
+		this.statements.clear();
 	}
 
 	// ─── Metadata ───
 	// Values are encrypted at rest when a key is set (see ENCRYPTED_COLUMNS).
 
 	saveMetadata(key: string, value: string): void {
-		this.db
-			.prepare('INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)')
-			.run(key, this._enc(value));
+		this._stmt(
+			'INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)'
+		).run(key, this._enc(value));
 	}
 
 	loadMetadata(key: string): string | null {
-		const row = this.db
-			.prepare('SELECT value FROM metadata WHERE key = ?')
-			.get(key) as { value: string } | undefined;
+		const row = this._stmt('SELECT value FROM metadata WHERE key = ?').get(
+			key
+		) as { value: string } | undefined;
 		return row ? this._dec(row.value) : null;
 	}
 
@@ -2348,16 +2270,14 @@ export class SqliteStorage implements IStorageBackend {
 		const end =
 			prefix.slice(0, -1) +
 			String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
-		const rows = this.db
-			.prepare(
-				'SELECT key, value FROM metadata WHERE key >= ? AND key < ? ORDER BY key'
-			)
-			.all(prefix, end) as Array<{ key: string; value: string }>;
+		const rows = this._stmt(
+			'SELECT key, value FROM metadata WHERE key >= ? AND key < ? ORDER BY key'
+		).all(prefix, end) as Array<{ key: string; value: string }>;
 		return rows.map((row) => ({ key: row.key, value: this._dec(row.value) }));
 	}
 
 	deleteMetadata(key: string): void {
-		this.db.prepare('DELETE FROM metadata WHERE key = ?').run(key);
+		this._stmt('DELETE FROM metadata WHERE key = ?').run(key);
 	}
 
 	// ─── On-chain Wallet Data ───
@@ -2365,15 +2285,15 @@ export class SqliteStorage implements IStorageBackend {
 	// JSON strings, encrypted at rest when a key is set (see ENCRYPTED_COLUMNS).
 
 	saveWalletData(key: string, value: string): void {
-		this.db
-			.prepare('INSERT OR REPLACE INTO wallet_data (key, value) VALUES (?, ?)')
-			.run(key, this._enc(value));
+		this._stmt(
+			'INSERT OR REPLACE INTO wallet_data (key, value) VALUES (?, ?)'
+		).run(key, this._enc(value));
 	}
 
 	loadWalletData(key: string): string | null {
-		const row = this.db
-			.prepare('SELECT value FROM wallet_data WHERE key = ?')
-			.get(key) as { value: string } | undefined;
+		const row = this._stmt('SELECT value FROM wallet_data WHERE key = ?').get(
+			key
+		) as { value: string } | undefined;
 		return row ? this._dec(row.value) : null;
 	}
 
@@ -2381,20 +2301,18 @@ export class SqliteStorage implements IStorageBackend {
 	// Stored plaintext: the policy is public data (broadcast in channel_update).
 
 	saveChannelPolicy(channelId: string, policy: IPersistedChannelPolicy): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO channel_policies (channel_id, policy_json) VALUES (?, ?)'
-			)
-			.run(channelId, JSON.stringify(policy));
+		this._stmt(
+			'INSERT OR REPLACE INTO channel_policies (channel_id, policy_json) VALUES (?, ?)'
+		).run(channelId, JSON.stringify(policy));
 	}
 
 	loadAllChannelPolicies(): Array<{
 		channelId: string;
 		policy: IPersistedChannelPolicy;
 	}> {
-		const rows = this.db
-			.prepare('SELECT channel_id, policy_json FROM channel_policies')
-			.all() as Array<{ channel_id: string; policy_json: string }>;
+		const rows = this._stmt(
+			'SELECT channel_id, policy_json FROM channel_policies'
+		).all() as Array<{ channel_id: string; policy_json: string }>;
 		const results: Array<{
 			channelId: string;
 			policy: IPersistedChannelPolicy;
@@ -2413,9 +2331,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteChannelPolicy(channelId: string): void {
-		this.db
-			.prepare('DELETE FROM channel_policies WHERE channel_id = ?')
-			.run(channelId);
+		this._stmt('DELETE FROM channel_policies WHERE channel_id = ?').run(
+			channelId
+		);
 	}
 
 	// ─── Peer Storage Blobs (BOLT 1 option_provide_storage) ───
@@ -2427,21 +2345,17 @@ export class SqliteStorage implements IStorageBackend {
 		blob: Buffer,
 		receivedAt: number
 	): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO peer_storage_blobs (peer_pubkey, blob, received_at) VALUES (?, ?, ?)'
-			)
-			.run(peerPubkey, this._enc(blob.toString('base64')), receivedAt);
+		this._stmt(
+			'INSERT OR REPLACE INTO peer_storage_blobs (peer_pubkey, blob, received_at) VALUES (?, ?, ?)'
+		).run(peerPubkey, this._enc(blob.toString('base64')), receivedAt);
 	}
 
 	loadPeerStorageBlob(
 		peerPubkey: string
 	): { blob: Buffer; receivedAt: number } | null {
-		const row = this.db
-			.prepare(
-				'SELECT blob, received_at FROM peer_storage_blobs WHERE peer_pubkey = ?'
-			)
-			.get(peerPubkey) as { blob: string; received_at: number } | undefined;
+		const row = this._stmt(
+			'SELECT blob, received_at FROM peer_storage_blobs WHERE peer_pubkey = ?'
+		).get(peerPubkey) as { blob: string; received_at: number } | undefined;
 		if (!row) return null;
 		return {
 			blob: Buffer.from(this._dec(row.blob), 'base64'),
@@ -2450,9 +2364,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deletePeerStorageBlob(peerPubkey: string): void {
-		this.db
-			.prepare('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?')
-			.run(peerPubkey);
+		this._stmt('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?').run(
+			peerPubkey
+		);
 	}
 
 	// ─── BOLT 12 Offers ───
@@ -2468,22 +2382,20 @@ export class SqliteStorage implements IStorageBackend {
 		// an identical offer hits the same primary key. INSERT OR REPLACE reset
 		// created_at and could null out a stored path_id, silently downgrading
 		// the offer's blinded-path authentication; the upsert preserves both.
-		this.db
-			.prepare(
-				`INSERT INTO offers (offer_id, encoded, path_id, created_at, async_hold)
+		this._stmt(
+			`INSERT INTO offers (offer_id, encoded, path_id, created_at, async_hold)
 				 VALUES (?, ?, ?, ?, ?)
 				 ON CONFLICT(offer_id) DO UPDATE SET
 					encoded = excluded.encoded,
 					path_id = COALESCE(excluded.path_id, offers.path_id),
 					async_hold = excluded.async_hold`
-			)
-			.run(
-				offerIdHex,
-				this._enc(encoded),
-				pathId ? this._enc(pathId.toString('hex')) : null,
-				createdAt,
-				asyncHold ? 1 : 0
-			);
+		).run(
+			offerIdHex,
+			this._enc(encoded),
+			pathId ? this._enc(pathId.toString('hex')) : null,
+			createdAt,
+			asyncHold ? 1 : 0
+		);
 	}
 
 	loadAllOffers(): Array<{
@@ -2493,11 +2405,9 @@ export class SqliteStorage implements IStorageBackend {
 		createdAt: number;
 		asyncHold: boolean;
 	}> {
-		const rows = this.db
-			.prepare(
-				'SELECT offer_id, encoded, path_id, created_at, async_hold FROM offers'
-			)
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT offer_id, encoded, path_id, created_at, async_hold FROM offers'
+		).all() as Array<{
 			offer_id: string;
 			encoded: string;
 			path_id: string | null;
@@ -2534,7 +2444,7 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteOffer(offerIdHex: string): void {
-		this.db.prepare('DELETE FROM offers WHERE offer_id = ?').run(offerIdHex);
+		this._stmt('DELETE FROM offers WHERE offer_id = ?').run(offerIdHex);
 	}
 
 	// ─── Recovery Outbox (docs/RECOVERY-PROTOCOL.md 5.2) ───
@@ -2543,33 +2453,29 @@ export class SqliteStorage implements IStorageBackend {
 	// commits. wire_message is encrypted at rest (see ENCRYPTED_COLUMNS).
 
 	saveOutboxMessage(message: IRecoveryOutboxMessage): number {
-		const result = this.db
-			.prepare(
-				`INSERT INTO recovery_outbox
+		const result = this._stmt(
+			`INSERT INTO recovery_outbox
 					(peer_pubkey, channel_id, message_type, wire_message, disposition,
 					 frame_sequence, created_at)
 				 VALUES (?, ?, ?, ?, ?, NULL, ?)`
-			)
-			.run(
-				message.peerId,
-				message.channelId ?? null,
-				message.messageType,
-				this._enc(message.wireMessage.toString('hex')),
-				message.disposition,
-				Date.now()
-			);
+		).run(
+			message.peerId,
+			message.channelId ?? null,
+			message.messageType,
+			this._enc(message.wireMessage.toString('hex')),
+			message.disposition,
+			Date.now()
+		);
 		return Number(result.lastInsertRowid);
 	}
 
 	loadOutboxMessages(channelId?: string): IRecoveryOutboxStoredMessage[] {
 		const rows = (
 			channelId
-				? this.db
-						.prepare(
-							'SELECT * FROM recovery_outbox WHERE channel_id = ? ORDER BY id ASC'
-						)
-						.all(channelId)
-				: this.db.prepare('SELECT * FROM recovery_outbox ORDER BY id ASC').all()
+				? this._stmt(
+						'SELECT * FROM recovery_outbox WHERE channel_id = ? ORDER BY id ASC'
+				  ).all(channelId)
+				: this._stmt('SELECT * FROM recovery_outbox ORDER BY id ASC').all()
 		) as Array<{
 			id: number;
 			peer_pubkey: string;
@@ -2615,9 +2521,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	countOutboxMessages(channelId: string): number {
-		const row = this.db
-			.prepare('SELECT COUNT(*) as n FROM recovery_outbox WHERE channel_id = ?')
-			.get(channelId) as { n: number };
+		const row = this._stmt(
+			'SELECT COUNT(*) as n FROM recovery_outbox WHERE channel_id = ?'
+		).get(channelId) as { n: number };
 		return row.n;
 	}
 
@@ -2625,9 +2531,10 @@ export class SqliteStorage implements IStorageBackend {
 		id: number,
 		disposition: RecoveryOutboxDisposition
 	): void {
-		this.db
-			.prepare('UPDATE recovery_outbox SET disposition = ? WHERE id = ?')
-			.run(disposition, id);
+		this._stmt('UPDATE recovery_outbox SET disposition = ? WHERE id = ?').run(
+			disposition,
+			id
+		);
 	}
 
 	deleteOutboxMessages(channelId: string, messageTypes?: number[]): void {
@@ -2641,21 +2548,19 @@ export class SqliteStorage implements IStorageBackend {
 				.run(channelId, ...messageTypes);
 			return;
 		}
-		this.db
-			.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
-			.run(channelId);
+		this._stmt('DELETE FROM recovery_outbox WHERE channel_id = ?').run(
+			channelId
+		);
 	}
 
 	pruneOutboxMessages(channelId: string, keepNewest: number): void {
-		this.db
-			.prepare(
-				`DELETE FROM recovery_outbox
+		this._stmt(
+			`DELETE FROM recovery_outbox
 				 WHERE channel_id = ? AND id NOT IN (
 					 SELECT id FROM recovery_outbox
 					 WHERE channel_id = ? ORDER BY id DESC LIMIT ?
 				 )`
-			)
-			.run(channelId, channelId, keepNewest);
+		).run(channelId, channelId, keepNewest);
 	}
 
 	// ─── Recovery Journal (docs/RECOVERY-PROTOCOL.md 5.3) ───
@@ -2664,54 +2569,48 @@ export class SqliteStorage implements IStorageBackend {
 	// storage-key layer applies here (see the interface comment).
 
 	saveRecoveryFrame(frame: IStoredRecoveryFrame): void {
-		this.db
-			.prepare(
-				`INSERT INTO recovery_frames
+		this._stmt(
+			`INSERT INTO recovery_frames
 					(sequence, writer_epoch, frame_hash, previous_hash, ciphertext,
 					 created_at)
 				 VALUES (?, ?, ?, ?, ?, ?)`
-			)
-			.run(
-				frame.sequence,
-				frame.writerEpoch,
-				frame.frameHash,
-				frame.previousFrameHash,
-				frame.ciphertext,
-				frame.createdAt
-			);
+		).run(
+			frame.sequence,
+			frame.writerEpoch,
+			frame.frameHash,
+			frame.previousFrameHash,
+			frame.ciphertext,
+			frame.createdAt
+		);
 	}
 
 	loadRecoveryFrames(afterSequence?: number): IStoredRecoveryFrame[] {
 		const rows = (
 			afterSequence != null
-				? this.db
-						.prepare(
-							'SELECT * FROM recovery_frames WHERE sequence > ? ORDER BY sequence ASC'
-						)
-						.all(afterSequence)
-				: this.db
-						.prepare('SELECT * FROM recovery_frames ORDER BY sequence ASC')
-						.all()
+				? this._stmt(
+						'SELECT * FROM recovery_frames WHERE sequence > ? ORDER BY sequence ASC'
+				  ).all(afterSequence)
+				: this._stmt(
+						'SELECT * FROM recovery_frames ORDER BY sequence ASC'
+				  ).all()
 		) as IRecoveryFrameRow[];
 		return rows.map(decodeRecoveryFrameRow);
 	}
 
 	loadRecoveryFrame(sequence: number): IStoredRecoveryFrame | null {
-		const row = this.db
-			.prepare('SELECT * FROM recovery_frames WHERE sequence = ?')
-			.get(sequence) as IRecoveryFrameRow | undefined;
+		const row = this._stmt(
+			'SELECT * FROM recovery_frames WHERE sequence = ?'
+		).get(sequence) as IRecoveryFrameRow | undefined;
 		return row ? decodeRecoveryFrameRow(row) : null;
 	}
 
 	loadRecoveryFrameHeader(sequence: number): IStoredRecoveryFrameHeader | null {
 		// created_at is stored after the ciphertext, so selecting it would
 		// still walk the blob's overflow pages.
-		const row = this.db
-			.prepare(
-				`SELECT sequence, writer_epoch, frame_hash, previous_hash
+		const row = this._stmt(
+			`SELECT sequence, writer_epoch, frame_hash, previous_hash
 				 FROM recovery_frames WHERE sequence = ?`
-			)
-			.get(sequence) as IRecoveryFrameRow | undefined;
+		).get(sequence) as IRecoveryFrameRow | undefined;
 		return row ? decodeRecoveryFrameHeader(row) : null;
 	}
 
@@ -2727,26 +2626,22 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteRecoveryFramesBelow(sequence: number): void {
-		this.db
-			.prepare('DELETE FROM recovery_frames WHERE sequence < ?')
-			.run(sequence);
+		this._stmt('DELETE FROM recovery_frames WHERE sequence < ?').run(sequence);
 	}
 
 	// value is encrypted at rest (see ENCRYPTED_COLUMNS): from Phase 5 the
 	// writer lease keeps its signing secret here.
 	getRecoveryMeta(key: string): string | null {
-		const row = this.db
-			.prepare('SELECT value FROM recovery_meta WHERE key = ?')
-			.get(key) as { value: string } | undefined;
+		const row = this._stmt('SELECT value FROM recovery_meta WHERE key = ?').get(
+			key
+		) as { value: string } | undefined;
 		return row ? this._dec(row.value) : null;
 	}
 
 	setRecoveryMeta(key: string, value: string): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
-			)
-			.run(key, this._enc(value));
+		this._stmt(
+			'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
+		).run(key, this._enc(value));
 	}
 
 	recoveryFrameStats(): {
@@ -2754,11 +2649,9 @@ export class SqliteStorage implements IStorageBackend {
 		minSequence: number;
 		maxSequence: number;
 	} | null {
-		const row = this.db
-			.prepare(
-				'SELECT COUNT(*) AS count, MIN(sequence) AS min, MAX(sequence) AS max FROM recovery_frames'
-			)
-			.get() as { count: number; min: number | null; max: number | null };
+		const row = this._stmt(
+			'SELECT COUNT(*) AS count, MIN(sequence) AS min, MAX(sequence) AS max FROM recovery_frames'
+		).get() as { count: number; min: number | null; max: number | null };
 		if (!row.count) return null;
 		return {
 			count: row.count,
@@ -2769,47 +2662,45 @@ export class SqliteStorage implements IStorageBackend {
 
 	listRecoveryMetaKeys(): string[] {
 		return (
-			this.db.prepare('SELECT key FROM recovery_meta').all() as Array<{
+			this._stmt('SELECT key FROM recovery_meta').all() as Array<{
 				key: string;
 			}>
 		).map((row) => row.key);
 	}
 
 	deleteRecoveryMeta(key: string): void {
-		this.db.prepare('DELETE FROM recovery_meta WHERE key = ?').run(key);
+		this._stmt('DELETE FROM recovery_meta WHERE key = ?').run(key);
 	}
 
 	// ─── Watchtower (LND altruist client) ───
 	// session_key + encrypted_blob are encrypted at rest (see ENCRYPTED_COLUMNS).
 
 	saveWatchtowerSession(session: IWatchtowerSession, sessionKey: Buffer): void {
-		this.db
-			.prepare(
-				`INSERT OR REPLACE INTO watchtower_sessions
+		this._stmt(
+			`INSERT OR REPLACE INTO watchtower_sessions
 					(session_id, tower_uri, tower_pubkey, session_key, blob_type,
 					 max_updates, sweep_fee_rate, seq_num, last_applied, created_at,
 					 dials_with_session_key)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-			)
-			.run(
-				session.sessionId,
-				session.towerUri,
-				session.towerPubkey,
-				this._enc(sessionKey.toString('base64')),
-				session.blobType,
-				session.maxUpdates,
-				session.sweepFeeRate,
-				session.seqNum,
-				session.lastApplied,
-				session.createdAt,
-				session.dialsWithSessionKey ? 1 : 0
-			);
+		).run(
+			session.sessionId,
+			session.towerUri,
+			session.towerPubkey,
+			this._enc(sessionKey.toString('base64')),
+			session.blobType,
+			session.maxUpdates,
+			session.sweepFeeRate,
+			session.seqNum,
+			session.lastApplied,
+			session.createdAt,
+			session.dialsWithSessionKey ? 1 : 0
+		);
 	}
 
 	loadWatchtowerSessions(): Array<IWatchtowerSession & { sessionKey: Buffer }> {
-		const rows = this.db
-			.prepare('SELECT * FROM watchtower_sessions')
-			.all() as Array<Record<string, unknown>>;
+		const rows = this._stmt('SELECT * FROM watchtower_sessions').all() as Array<
+			Record<string, unknown>
+		>;
 		return rows.map((r) => ({
 			sessionId: r.session_id as string,
 			towerUri: r.tower_uri as string,
@@ -2830,51 +2721,45 @@ export class SqliteStorage implements IStorageBackend {
 		seqNum: number,
 		lastApplied: number
 	): void {
-		this.db
-			.prepare(
-				'UPDATE watchtower_sessions SET seq_num = ?, last_applied = ? WHERE session_id = ?'
-			)
-			.run(seqNum, lastApplied, sessionId);
+		this._stmt(
+			'UPDATE watchtower_sessions SET seq_num = ?, last_applied = ? WHERE session_id = ?'
+		).run(seqNum, lastApplied, sessionId);
 	}
 
 	deleteWatchtowerTower(towerUri: string): void {
 		this.db.transaction(() => {
-			this.db
-				.prepare('DELETE FROM watchtower_sessions WHERE tower_uri = ?')
-				.run(towerUri);
-			this.db
-				.prepare('DELETE FROM watchtower_updates WHERE tower_uri = ?')
-				.run(towerUri);
+			this._stmt('DELETE FROM watchtower_sessions WHERE tower_uri = ?').run(
+				towerUri
+			);
+			this._stmt('DELETE FROM watchtower_updates WHERE tower_uri = ?').run(
+				towerUri
+			);
 		})();
 	}
 
 	addWatchtowerUpdate(update: IWatchtowerUpdate): number {
-		const info = this.db
-			.prepare(
-				`INSERT INTO watchtower_updates
+		const info = this._stmt(
+			`INSERT INTO watchtower_updates
 					(tower_uri, channel_id, hint, encrypted_blob, seq_num, acked,
 					 created_at, blob_type)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-			)
-			.run(
-				update.towerUri,
-				update.channelId,
-				update.hint,
-				this._enc(update.encryptedBlob),
-				update.seqNum,
-				update.acked ? 1 : 0,
-				update.createdAt,
-				update.blobType
-			);
+		).run(
+			update.towerUri,
+			update.channelId,
+			update.hint,
+			this._enc(update.encryptedBlob),
+			update.seqNum,
+			update.acked ? 1 : 0,
+			update.createdAt,
+			update.blobType
+		);
 		return Number(info.lastInsertRowid);
 	}
 
 	loadPendingWatchtowerUpdates(): Array<IWatchtowerUpdate & { id: number }> {
-		const rows = this.db
-			.prepare(
-				'SELECT * FROM watchtower_updates WHERE acked = 0 ORDER BY id ASC'
-			)
-			.all() as Array<Record<string, unknown>>;
+		const rows = this._stmt(
+			'SELECT * FROM watchtower_updates WHERE acked = 0 ORDER BY id ASC'
+		).all() as Array<Record<string, unknown>>;
 		return rows.map((r) => ({
 			id: r.id as number,
 			towerUri: r.tower_uri as string,
@@ -2889,11 +2774,9 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	markWatchtowerUpdateAcked(id: number, seqNum: number): void {
-		this.db
-			.prepare(
-				'UPDATE watchtower_updates SET acked = 1, seq_num = ? WHERE id = ?'
-			)
-			.run(seqNum, id);
+		this._stmt(
+			'UPDATE watchtower_updates SET acked = 1, seq_num = ? WHERE id = ?'
+		).run(seqNum, id);
 	}
 
 	// ─── Forwarding Events (settled-forward ledger) ───
@@ -2902,23 +2785,21 @@ export class SqliteStorage implements IStorageBackend {
 
 	saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void {
 		this.db.transaction(() => {
-			this.db
-				.prepare(
-					`INSERT INTO forwarding_events
+			this._stmt(
+				`INSERT INTO forwarding_events
 						(settled_at, in_channel_id, out_channel_id, in_scid, out_scid,
 						 amount_in_msat, amount_out_msat, fee_msat)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-				)
-				.run(
-					event.settledAt,
-					event.inChannelId,
-					event.outChannelId,
-					event.inScid ?? null,
-					event.outScid ?? null,
-					event.amountInMsat.toString(),
-					event.amountOutMsat.toString(),
-					event.feeMsat.toString()
-				);
+			).run(
+				event.settledAt,
+				event.inChannelId,
+				event.outChannelId,
+				event.inScid ?? null,
+				event.outScid ?? null,
+				event.amountInMsat.toString(),
+				event.amountOutMsat.toString(),
+				event.feeMsat.toString()
+			);
 			// Cap the ledger (default 100k rows), pruning oldest first
 			this._pruneOldestRows('forwarding_events', this.forwardingEventsMaxRows);
 		})();
@@ -3016,25 +2897,23 @@ export class SqliteStorage implements IStorageBackend {
 		secretHash?: string,
 		createdAt?: number
 	): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO webhooks (id, url, events, secret_hash, created_at) VALUES (?, ?, ?, ?, ?)'
-			)
-			.run(
-				id,
-				url,
-				JSON.stringify(events),
-				secretHash ?? null,
-				createdAt ?? Date.now()
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO webhooks (id, url, events, secret_hash, created_at) VALUES (?, ?, ?, ?, ?)'
+		).run(
+			id,
+			url,
+			JSON.stringify(events),
+			secretHash ?? null,
+			createdAt ?? Date.now()
+		);
 	}
 
 	deleteWebhook(id: string): void {
-		this.db.prepare('DELETE FROM webhooks WHERE id = ?').run(id);
+		this._stmt('DELETE FROM webhooks WHERE id = ?').run(id);
 	}
 
 	deleteAllWebhooks(): void {
-		this.db.prepare('DELETE FROM webhooks').run();
+		this._stmt('DELETE FROM webhooks').run();
 	}
 
 	loadAllWebhooks(): Array<{
@@ -3044,9 +2923,9 @@ export class SqliteStorage implements IStorageBackend {
 		secretHash?: string;
 		createdAt: number;
 	}> {
-		const rows = this.db
-			.prepare('SELECT id, url, events, secret_hash, created_at FROM webhooks')
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT id, url, events, secret_hash, created_at FROM webhooks'
+		).all() as Array<{
 			id: string;
 			url: string;
 			events: string;
@@ -3089,20 +2968,18 @@ export class SqliteStorage implements IStorageBackend {
 		metadata?: string;
 		createdAt: number;
 	}): void {
-		this.db
-			.prepare(
-				'INSERT OR REPLACE INTO payment_queue (id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-			)
-			.run(
-				entry.id,
-				entry.bolt11,
-				entry.priority,
-				entry.status,
-				entry.amountSats ?? null,
-				entry.maxFeeSats ?? null,
-				entry.metadata ?? null,
-				entry.createdAt
-			);
+		this._stmt(
+			'INSERT OR REPLACE INTO payment_queue (id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		).run(
+			entry.id,
+			entry.bolt11,
+			entry.priority,
+			entry.status,
+			entry.amountSats ?? null,
+			entry.maxFeeSats ?? null,
+			entry.metadata ?? null,
+			entry.createdAt
+		);
 	}
 
 	updateQueueEntryStatus(
@@ -3111,15 +2988,13 @@ export class SqliteStorage implements IStorageBackend {
 		error?: string,
 		completedAt?: number
 	): void {
-		this.db
-			.prepare(
-				'UPDATE payment_queue SET status = ?, error = ?, completed_at = ? WHERE id = ?'
-			)
-			.run(status, error ?? null, completedAt ?? null, id);
+		this._stmt(
+			'UPDATE payment_queue SET status = ?, error = ?, completed_at = ? WHERE id = ?'
+		).run(status, error ?? null, completedAt ?? null, id);
 	}
 
 	deleteQueueEntry(id: string): void {
-		this.db.prepare('DELETE FROM payment_queue WHERE id = ?').run(id);
+		this._stmt('DELETE FROM payment_queue WHERE id = ?').run(id);
 	}
 
 	loadAllQueueEntries(): Array<{
@@ -3134,11 +3009,9 @@ export class SqliteStorage implements IStorageBackend {
 		createdAt: number;
 		completedAt?: number;
 	}> {
-		const rows = this.db
-			.prepare(
-				'SELECT id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at FROM payment_queue ORDER BY priority ASC, created_at ASC'
-			)
-			.all() as Array<{
+		const rows = this._stmt(
+			'SELECT id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at FROM payment_queue ORDER BY priority ASC, created_at ASC'
+		).all() as Array<{
 			id: string;
 			bolt11: string;
 			priority: number;

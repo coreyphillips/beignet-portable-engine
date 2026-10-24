@@ -1,11 +1,8 @@
 import { Block } from 'bitcoinjs-lib';
 import * as electrum from 'rn-electrum-client/helpers';
 
-import {
+import type {
 	EAddressType,
-	EAvailableNetworks,
-	EElectrumNetworks,
-	EScanningStrategy,
 	IAddress,
 	IAddresses,
 	IElectrumGetAddressBalanceRes,
@@ -38,6 +35,10 @@ import {
 	TUnspentAddressScriptHashResponse,
 	Tls
 } from '../types';
+import { EElectrumNetworks, EScanningStrategy } from '../types';
+import type { Network } from '../network';
+import { toElectrumNetwork } from '../network';
+import type { Result } from '../utils';
 import {
 	btcPerKbToSatPerVbyte,
 	err,
@@ -47,14 +48,13 @@ import {
 	filterAddressesObjForSingleIndex,
 	filterAddressesObjForStartingIndex,
 	getAddressFromScriptPubKey,
-	getElectrumNetwork,
 	getScriptHash,
 	ok,
-	Result,
 	sleep,
 	splitAddresses
 } from '../utils';
-import { Wallet } from '../wallet';
+import type { Wallet } from '../wallet';
+import { liveWalletData } from '../wallet/live-data';
 import {
 	defaultElectrumPeers,
 	ELECTRUM_SERVER_COOLDOWN_MS,
@@ -64,6 +64,9 @@ import {
 
 /** Answer of every subscribe refused because the instance has disconnected. */
 const DISCONNECTED_ERROR = 'Electrum instance is disconnected.';
+
+/** Answer of every call that needs a server, for a wallet created offline. */
+const OFFLINE_ERROR = 'The wallet was created with remainOffline.';
 
 /**
  * The constructor and connectToElectrum both accept one server or a list of
@@ -612,7 +615,7 @@ export class Electrum {
 	private _answeredAt = 0;
 
 	public servers?: TServer | TServer[];
-	public network: EAvailableNetworks;
+	public network: Network;
 	public electrumNetwork: EElectrumNetworks;
 	public connectedToElectrum: boolean;
 	public onReceive?: (data: unknown) => void;
@@ -631,7 +634,7 @@ export class Electrum {
 		pollConnection = true
 	}: {
 		wallet: Wallet;
-		network: EAvailableNetworks;
+		network: Network;
 		net: Net;
 		tls: Tls;
 		servers?: TServer | TServer[];
@@ -645,7 +648,7 @@ export class Electrum {
 		this.sendMessage = wallet.sendMessage;
 		this.servers = servers ?? [];
 		this.network = network;
-		this.electrumNetwork = getElectrumNetwork(this.network);
+		this.electrumNetwork = toElectrumNetwork(this.network);
 		this.connectedToElectrum = false;
 		this.onReceive = onReceive;
 		this.net = net;
@@ -653,6 +656,10 @@ export class Electrum {
 		this.batchLimit = batchLimit;
 		this.batchDelay = batchDelay;
 		this.connectionPollingInterval = null;
+		// Starts out as disconnect() leaves an instance, so every request that
+		// checks the flag refuses. Left to rn-electrum-client, a request with
+		// no client dials a random peer, or uses a sibling wallet's client.
+		if (wallet.remainOffline) this._disconnected = true;
 		if (pollConnection) this.startConnectionPolling();
 	}
 
@@ -686,10 +693,11 @@ export class Electrum {
 	 * real connect, so the others simply join its result.
 	 */
 	async connectToElectrum(args: {
-		network?: EAvailableNetworks;
+		network?: Network;
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
+		if (this._wallet.remainOffline) return err(OFFLINE_ERROR);
 		// An explicit connect revives an instance that had disconnected; a
 		// disconnect landing mid-connect keeps the flag set, so the attempt it
 		// interrupted still declines to re-register the instance.
@@ -706,7 +714,7 @@ export class Electrum {
 		servers,
 		disableRegtestCheck = false // Used to ignore regtest check for certain tests.
 	}: {
-		network?: EAvailableNetworks;
+		network?: Network;
 		servers?: TServer | TServer[];
 		disableRegtestCheck?: boolean;
 	}): Promise<Result<TConnectToElectrumRes>> {
@@ -716,7 +724,7 @@ export class Electrum {
 		const customPeers = givenPeers.length
 			? givenPeers
 			: toServerList(this.servers);
-		const electrumNetwork = getElectrumNetwork(network);
+		const electrumNetwork = toElectrumNetwork(network);
 		if (
 			!disableRegtestCheck &&
 			electrumNetwork === 'bitcoinRegtest' &&
@@ -1298,6 +1306,15 @@ export class Electrum {
 	async getAddressScriptHashBalances(
 		scriptHashes: string[]
 	): Promise<IGetAddressScriptHashBalances> {
+		if (this._wallet.remainOffline) {
+			return {
+				error: true,
+				data: OFFLINE_ERROR,
+				id: 0,
+				method: 'getAddressScriptHashBalances',
+				network: this.electrumNetwork
+			};
+		}
 		return await electrum.getAddressScriptHashBalances({
 			scriptHashes,
 			network: this.electrumNetwork
@@ -1411,7 +1428,8 @@ export class Electrum {
 	 * @param {boolean} [scanAllAddresses]
 	 * @param {Map<string, TTxResult[]>} [answered] The history already
 	 * answered for each script hash. A script hash found here is not asked
-	 * again, and every one the server answers is added to it.
+	 * again, and every one the server answers is added to it. One the server
+	 * failed is left out, which is how the gap scan tells it from unused.
 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
 	 */
 	async getAddressHistory({
@@ -1430,7 +1448,7 @@ export class Electrum {
 					network: this.network,
 					servers: this.servers
 				});
-			const currentWallet = this._wallet.data;
+			const currentWallet = liveWalletData(this._wallet);
 			const currentAddresses: TAddressTypeContent<IAddresses> =
 				currentWallet.addresses;
 			const currentChangeAddresses: TAddressTypeContent<IAddresses> =
@@ -1453,6 +1471,10 @@ export class Electrum {
 				addToScan(scriptHashes);
 			} else {
 				addToScan(currentWallet.utxos);
+				// The set leaves immature coinbase outputs out, and a restart finds
+				// them again only through their stored record, so their history is
+				// read wherever the gap window has moved.
+				addToScan(this._wallet.listImmatureUtxos());
 				const addressTypeKeys = this._wallet.addressTypesToMonitor;
 				addressTypeKeys.forEach((addressType) => {
 					const addresses = currentAddresses[addressType];
@@ -1566,7 +1588,7 @@ export class Electrum {
 			network: this.network,
 			address
 		});
-		if (!scriptHash) {
+		if (!scriptHash || this._wallet.remainOffline) {
 			return history;
 		}
 		const response = await electrum.getAddressScriptHashesHistory({
@@ -1655,7 +1677,7 @@ export class Electrum {
 			const existingUtxos: { [key: string]: IUtxo } = {};
 
 			// Make sure we're re-check existing utxos that may exist outside the gap limit and putting them in the necessary format.
-			this._wallet.data.utxos.map((utxo) => {
+			liveWalletData(this._wallet).utxos.map((utxo) => {
 				existingUtxos[utxo.scriptHash] = utxo;
 			});
 
@@ -1694,7 +1716,7 @@ export class Electrum {
 		addressTypesToCheck?: EAddressType[];
 		additionalAddresses?: string[];
 	}): IAddresses {
-		const currentWallet = this._wallet.data;
+		const currentWallet = liveWalletData(this._wallet);
 
 		let addresses = {} as IAddresses;
 		let changeAddresses = {} as IAddresses;
@@ -1929,7 +1951,7 @@ export class Electrum {
 	/**
 	 * Returns the block hex of the provided block height.
 	 * @param {number} [height]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {Promise<Result<string>>}
 	 */
 	public async getBlockHex({
@@ -1952,7 +1974,7 @@ export class Electrum {
 	 * Returns the block hash given a block hex.
 	 * Leaving blockHex empty will return the last known block hash from storage.
 	 * @param {string} [blockHex]
-	 * @param {TAvailableNetworks} [selectedNetwork]
+	 * @param {Network} [selectedNetwork]
 	 * @returns {string}
 	 */
 	public getBlockHashFromHex({ blockHex }: { blockHex?: string }): string {
@@ -1972,7 +1994,7 @@ export class Electrum {
 	 * @returns {IHeader}
 	 */
 	public getBlockHeader(): IHeader {
-		return this.wallet.data.header;
+		return liveWalletData(this.wallet).header;
 	}
 
 	/**
@@ -2033,7 +2055,7 @@ export class Electrum {
 			if (response && !response.error) {
 				return ok(response);
 			} else {
-				if (response?.error?.message) return err(response.error.message);
+				if (response?.error?.message) return err(response.error);
 				return err(response ?? 'Unable to get transactions from inputs.');
 			}
 		} catch (e) {
@@ -2058,6 +2080,7 @@ export class Electrum {
 		block_height: number;
 		pos: number;
 	}> {
+		if (this._wallet.remainOffline) throw new Error(OFFLINE_ERROR);
 		return await electrum.getTransactionMerkle({
 			tx_hash,
 			height,
@@ -2186,7 +2209,7 @@ export class Electrum {
 		this._tipUnverified = false;
 		if (!reorgDetected) return ok('Header stored.');
 		const reconciled = await this._wallet.checkUnconfirmedTransactions(true);
-		if (reconciled.isErr()) return err(reconciled.error.message);
+		if (reconciled.isErr()) return err(reconciled.error);
 		this._reorgOwed = false;
 		return ok('Header stored and reconciled.');
 	}
@@ -2261,7 +2284,13 @@ export class Electrum {
 		// not be refreshed or called back into. Checked after applyHeader, so a
 		// reconciliation this instance owes is still recorded in _reorgOwed.
 		if (this._disconnected) return;
-		if (this._fullRefreshOwed || this._wallet.refreshFailed) {
+		// A coinbase coming of age changes no script's status, so no
+		// notification would bring it into the set.
+		if (
+			this._fullRefreshOwed ||
+			this._wallet.refreshFailed ||
+			this._wallet.coinbaseMatured
+		) {
 			this._fullRefreshOwed = false;
 			await this._wallet.refreshWallet();
 		} else {
@@ -2654,7 +2683,7 @@ export class Electrum {
 		// a stopped wallet back on that path.
 		if (this._disconnected) return err(DISCONNECTED_ERROR);
 		const allUtxos: IUtxo[] = [];
-		const currentWallet = this._wallet.data;
+		const currentWallet = liveWalletData(this._wallet);
 		const addressTypeKeys = this._wallet.addressTypesToMonitor;
 		// Gather the receive and change gap windows for each address type if no
 		// scripthashes were provided. These are the windows a refresh scans, so a
@@ -2693,13 +2722,16 @@ export class Electrum {
 					);
 				}
 			}
-			// Keep an eye on existing UTXO's regardless of the gap limit.
+			// Keep an eye on existing UTXO's regardless of the gap limit, and on
+			// the immature coinbase outputs the set leaves out.
 			const inRange = new Set(scriptHashes);
-			currentWallet.utxos.forEach((utxo) => {
-				if (!inRange.has(utxo.scriptHash)) {
-					allUtxos.push(utxo);
+			[...currentWallet.utxos, ...this._wallet.listImmatureUtxos()].forEach(
+				(utxo) => {
+					if (!inRange.has(utxo.scriptHash)) {
+						allUtxos.push(utxo);
+					}
 				}
-			});
+			);
 		}
 
 		// Subscribe to all provided script hashes. Callbacks are registered
@@ -2803,6 +2835,7 @@ export class Electrum {
 		rawTx: string;
 		subscribeToOutputAddress?: boolean;
 	}): Promise<Result<string>> {
+		if (this._wallet.remainOffline) return err(OFFLINE_ERROR);
 		/**
 		 * Subscribe to the output address and refresh the wallet when the Electrum server detects it.
 		 * This prevents updating the wallet prior to the Electrum server detecting the new tx in the mempool.
@@ -3014,6 +3047,9 @@ export class Electrum {
 			}
 		}
 		this.withdrawFromRouters();
+		// An offline instance never started a client, so the one its network
+		// has belongs to a sibling wallet.
+		if (this._wallet.remainOffline) return;
 		// Named, because the client resolves a missing network from
 		// clients.network, which is whatever network connected LAST by any
 		// instance in this process: a bare stop() tears down a sibling's socket
@@ -3064,7 +3100,7 @@ export class Electrum {
 	}
 
 	public startConnectionPolling(): void {
-		if (this.connectionPollingInterval) return;
+		if (this.connectionPollingInterval || this._wallet.remainOffline) return;
 		this.connectionPollingInterval = setInterval((): void => {
 			void this.checkConnection();
 		}, POLLING_INTERVAL);

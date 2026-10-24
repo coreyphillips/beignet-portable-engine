@@ -43,10 +43,11 @@
  * `GuardianHttpTransport` function shape.
  */
 
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { timingSafeEqual } from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { ecc } from '../../utils/ecc';
 import { Peer } from '../transport/peer';
-import { IDuplexTransport } from '../transport/duplex-transport';
+import type { IDuplexTransport } from '../transport/duplex-transport';
 import {
 	BEIGNET_CUSTOM_MAX_PAYLOAD,
 	BEIGNET_CUSTOM_MESSAGE_TYPE,
@@ -54,20 +55,23 @@ import {
 	decodeCustomMessage,
 	encodeCustomMessage
 } from '../message/custom';
-import {
+import type {
 	GuardianHttpTransport,
+	IBolt8GuardianTarget
+} from './guardian-client';
+import {
 	GuardianTransportError,
-	IBolt8GuardianTarget,
 	parseBolt8GuardianUrl
 } from './guardian-client';
 import { GUARDIAN_HTTP_BASE_PATH, encodeInfoResponse } from './guardian-proto';
+import type { GuardianVerbName } from './guardian-http';
 import {
 	GUARDIAN_ENVELOPE_ALLOWANCE_BYTES,
-	GuardianVerbName,
 	dispatchGuardianVerb,
 	isGuardianVerbName
 } from './guardian-http';
-import { IGuardianInfoResponse, ReferenceGuardian } from './guardian';
+import type { IGuardianInfoResponse } from './guardian';
+import { ReferenceGuardian } from './guardian';
 
 // ─────────────── verbs ───────────────
 

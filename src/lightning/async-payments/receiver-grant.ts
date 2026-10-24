@@ -79,7 +79,7 @@
  * followed by the request nonce and a UTF-8 reason).
  */
 
-import crypto from 'crypto';
+import { taggedHash } from '../crypto/hash';
 import { sign, verify } from '../crypto/ecdh';
 
 export const RECEIVER_GRANT_VERSION = 1;
@@ -170,17 +170,6 @@ export type IUnsignedReceiverGrant = Omit<IReceiverGrant, 'signature'>;
 export type IRegistrationReply =
 	| { granted: true; grant: IReceiverGrant }
 	| { granted: false; nonce: Buffer; reason: string };
-
-/** BIP340-style tagged hash. */
-function taggedHash(tag: string, data: Buffer): Buffer {
-	const tagHash = crypto.createHash('sha256').update(tag).digest();
-	return crypto
-		.createHash('sha256')
-		.update(tagHash)
-		.update(tagHash)
-		.update(data)
-		.digest();
-}
 
 function expectLen(buf: Buffer, len: number, what: string): void {
 	if (buf.length !== len) throw new Error(`${what} must be ${len} bytes`);

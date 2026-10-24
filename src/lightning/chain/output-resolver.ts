@@ -7,13 +7,9 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
-import {
-	CommitmentType,
-	OutputType,
-	ITrackedOutput,
-	OutputStatus
-} from './types';
+import { sha256 } from '../crypto/provider';
+import type { ITrackedOutput } from './types';
+import { CommitmentType, OutputType, OutputStatus } from './types';
 import {
 	buildToLocalSweepTx,
 	buildToLocalDelayedWitness,
@@ -76,13 +72,13 @@ import {
 	perCommitmentPointFromSecret
 } from '../keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
-import { IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
 import { leaseCsvBlocks } from '../channel/liquidity-ads';
+import type { IHtlcEntry } from '../channel/types';
 import {
 	ChannelRole,
 	HtlcDirection,
 	HtlcState,
-	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel
 } from '../channel/types';
@@ -158,11 +154,9 @@ export function extractCommitmentNumber(
 	const obscured = (upper24 << 24n) | lower24;
 
 	// Compute the mask to un-obscure
-	const hash = crypto
-		.createHash('sha256')
-		.update(openPaymentBasepoint)
-		.update(acceptPaymentBasepoint)
-		.digest();
+	const hash = sha256(
+		Buffer.concat([openPaymentBasepoint, acceptPaymentBasepoint])
+	);
 
 	let mask = 0n;
 	for (let i = 26; i < 32; i++) {

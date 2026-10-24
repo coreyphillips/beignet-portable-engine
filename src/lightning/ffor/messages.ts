@@ -17,14 +17,29 @@
  * `[2: type] || body` exactly as sent.
  */
 
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import { sign, verify } from '../crypto/ecdh';
+import type { ITlvRecord } from '../message/tlv';
 import {
 	decodeTlvStream,
 	encodeTlvStream,
-	findTlvRecord,
-	ITlvRecord
+	findTlvRecord
 } from '../message/tlv';
+import type {
+	FforAbortReason,
+	IFforAbortMessage,
+	IFforAcceptMessage,
+	IFforActivateAckMessage,
+	IFforActivateMessage,
+	IFforCloseAckMessage,
+	IFforCloseMessage,
+	IFforErrorMessage,
+	IFforInitMessage,
+	IFforInvoicesMessage,
+	IFforReestablishTlv,
+	IFforSyncMessage,
+	IFforSyncReplyMessage
+} from './types';
 import {
 	FF_ABORT_TYPE,
 	FF_ACCEPT_TYPE,
@@ -39,20 +54,7 @@ import {
 	FF_REESTABLISH_TLV_TYPE,
 	FF_SYNC_TYPE,
 	FF_SYNC_REPLY_TYPE,
-	FforAbortReason,
-	FforState,
-	IFforAbortMessage,
-	IFforAcceptMessage,
-	IFforActivateAckMessage,
-	IFforActivateMessage,
-	IFforCloseAckMessage,
-	IFforCloseMessage,
-	IFforErrorMessage,
-	IFforInitMessage,
-	IFforInvoicesMessage,
-	IFforReestablishTlv,
-	IFforSyncMessage,
-	IFforSyncReplyMessage
+	FforState
 } from './types';
 
 const HEADER_LEN = 64;
@@ -192,12 +194,7 @@ export class Reader {
 
 /** SHA256("ffor/msg" || type || body_excluding_the_signature). */
 export function fforMessageDigest(type: number, unsignedBody: Buffer): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(MSG_TAG)
-		.update(u16(type))
-		.update(unsignedBody)
-		.digest();
+	return sha256(Buffer.concat([MSG_TAG, u16(type), unsignedBody]));
 }
 
 /** Append the node-key signature to an unsigned body, giving the wire body. */
@@ -359,8 +356,8 @@ export function encodeFforInitUnsigned(
 }
 
 /**
- * TLV 17 `concurrent_version` of ff_init and ff_accept (CONCURRENT-RECEIVE.md
- * section 1.1): exactly two bytes, big-endian.
+ * TLV 17 `concurrent_version` of ff_init and ff_accept, exactly two bytes,
+ * big-endian (docs/specs/CONCURRENT-RECEIVE.md section 1.1).
  */
 function encodeConcurrentVersion(version: number): Buffer {
 	if (!Number.isInteger(version) || version < 0 || version > 0xffff) {
@@ -550,8 +547,8 @@ export function decodeFforAcceptMessage(body: Buffer): IFforAcceptMessage {
 
 /**
  * What a stored setup transcript says about the concurrent profile
- * (CONCURRENT-RECEIVE.md section 1.1): the concurrent_version ff_init
- * requested and the one ff_accept echoed, read from the wire bytes the
+ * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): the concurrent_version
+ * ff_init requested and the one ff_accept echoed, read from the wire bytes the
  * epoch record keeps (`[2: type] || body`). `acceptWire` is null before
  * ff_accept. Returns null when a stored message does not decode, so the
  * caller can tell "says baseline" from "cannot say".

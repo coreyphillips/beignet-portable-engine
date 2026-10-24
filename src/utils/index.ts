@@ -1,5 +1,7 @@
+export * from './common';
 export * from './wallet';
 export * from './wallet-storage-encryption';
+export * from './wallet-memory-storage';
 export * from './watch-only';
 export * from './multisig';
 export * from './boost';
@@ -10,4 +12,6 @@ export * from './fees';
 export * from './derivation-path';
 export * from './descriptors';
 export * from './transaction';
+export * from './errors';
 export * from './result';
+export * from './conversion';

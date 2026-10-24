@@ -37,7 +37,7 @@
  * atomic payment-set policy; a set of one is an independent part release.
  */
 
-import crypto from 'crypto';
+import { taggedHash } from '../crypto/hash';
 import { sign, verify } from '../crypto/ecdh';
 
 export const RELEASE_CAPABILITY_VERSION = 1;
@@ -60,17 +60,6 @@ export interface IReleaseCapability {
 	/** Sorted ascending; the complete set the capability releases. */
 	holdIds: Buffer[];
 	signature: Buffer;
-}
-
-/** BIP340-style tagged hash. */
-function taggedHash(tag: string, data: Buffer): Buffer {
-	const tagHash = crypto.createHash('sha256').update(tag).digest();
-	return crypto
-		.createHash('sha256')
-		.update(tagHash)
-		.update(tagHash)
-		.update(data)
-		.digest();
 }
 
 /**

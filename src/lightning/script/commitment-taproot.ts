@@ -17,15 +17,13 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
-import crypto from 'crypto';
+import { taggedHash } from '../crypto/hash';
 
 bitcoin.initEccLib(ecc);
 
 const { opcodes, script } = bitcoin;
 
-function ripemd160(data: Buffer): Buffer {
-	return crypto.createHash('ripemd160').update(data).digest();
-}
+const { ripemd160 } = bitcoin.crypto;
 
 // Mirrors bitcoinjs-lib's (non-top-level-exported) Taptree type for p2tr.
 type Tapleaf = { output: Buffer; version?: number };
@@ -56,14 +54,6 @@ export function toXOnly(pubkey: Buffer): Buffer {
 		throw new Error(`Expected 33-byte compressed or 32-byte x-only key`);
 	}
 	return pubkey.subarray(1);
-}
-
-function taggedHash(tag: string, data: Buffer): Buffer {
-	const t = crypto.createHash('sha256').update(Buffer.from(tag)).digest();
-	return crypto
-		.createHash('sha256')
-		.update(Buffer.concat([t, t, data]))
-		.digest();
 }
 
 /**

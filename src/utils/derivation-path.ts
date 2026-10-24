@@ -1,14 +1,15 @@
-import {
-	EAddressType,
-	EAvailableNetworks,
+import type {
 	IKeyDerivationPath,
 	TKeyDerivationAccount,
 	TKeyDerivationChange,
 	TKeyDerivationCoinType,
 	TKeyDerivationPurpose
 } from '../types';
+import { EAddressType } from '../types';
+import { Network } from '../network';
 import { addressTypes } from '../shapes';
-import { err, ok, Result } from './result';
+import type { Result } from './result';
+import { err, ok } from './result';
 
 /**
  * Parses a key derivation path in string format Ex: "m/84'/0'/0'/0/0" and returns IKeyDerivationPath.
@@ -16,7 +17,7 @@ import { err, ok, Result } from './result';
  * @param {TKeyDerivationPurpose | string} [purpose]
  * @param {boolean} [changeAddress]
  * @param {string} [index]
- * @param {TAvailableNetworks} [network]
+ * @param {Network} [network]
  * @returns {Result<IKeyDerivationPath>}
  */
 export const getKeyDerivationPathObject = ({
@@ -30,7 +31,7 @@ export const getKeyDerivationPathObject = ({
 	purpose?: TKeyDerivationPurpose;
 	changeAddress?: boolean;
 	index?: string;
-	network: EAvailableNetworks;
+	network: Network;
 }): Result<IKeyDerivationPath> => {
 	try {
 		const parsedPath = path.replace(/'/g, '').split('/');
@@ -41,8 +42,7 @@ export const getKeyDerivationPathObject = ({
 
 		let coinType = parsedPath[2] as TKeyDerivationCoinType;
 		if (network) {
-			coinType =
-				network.toLocaleLowerCase() === EAvailableNetworks.bitcoin ? '0' : '1';
+			coinType = network.toLocaleLowerCase() === Network.bitcoin ? '0' : '1';
 		}
 
 		const account = parsedPath[3] as TKeyDerivationAccount;
@@ -97,7 +97,7 @@ export const getKeyDerivationPathString = ({
 	accountType?: string | number;
 	changeAddress?: boolean;
 	index?: string | number;
-	network: EAvailableNetworks;
+	network: Network;
 }): Result<string> => {
 	try {
 		if (!path) {
@@ -105,7 +105,7 @@ export const getKeyDerivationPathString = ({
 			const str = addressTypes[addressType].path;
 			const res = getKeyDerivationPathObject({ path: str, network });
 			if (res.isErr()) {
-				return err(res.error.message);
+				return err(res.error);
 			}
 			path = res.value;
 		}
@@ -114,8 +114,7 @@ export const getKeyDerivationPathString = ({
 			path.purpose = purpose;
 		}
 
-		path.coinType =
-			network.toLocaleLowerCase() === EAvailableNetworks.bitcoin ? '0' : '1';
+		path.coinType = network.toLocaleLowerCase() === Network.bitcoin ? '0' : '1';
 
 		if (accountType !== undefined) {
 			path.account =

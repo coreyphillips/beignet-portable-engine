@@ -1,13 +1,15 @@
 /**
  * BeignetNode: Simplified wrapper class for AI-friendly Bitcoin + Lightning.
  *
- * Wires together Wallet, LightningNode, SqliteStorage, WalletFundingProvider,
- * and ElectrumBackend behind a single class with plain JSON return types.
+ * Wires together Wallet, LightningNode, its storage (SqliteStorage unless one
+ * is injected), WalletFundingProvider and ElectrumBackend behind a single
+ * class with plain JSON return types.
  */
 
-import { IrohDaemonConfig, validateIrohConfig } from './iroh-config';
+import type { IrohDaemonConfig } from './iroh-config';
+import { validateIrohConfig } from './iroh-config';
+import type { ElectrumTlsConfig } from './electrum-tls-config';
 import {
-	ElectrumTlsConfig,
 	checkElectrumTls,
 	claimElectrumTls,
 	electrumTlsModule,
@@ -17,11 +19,10 @@ import {
 import type { IrohEndpointFactory } from '../lightning/transport/iroh';
 import { createNodeIrohEndpoint } from '../lightning/transport/iroh-node';
 import { OfflineReceive } from './offline-receive';
-import { FforReceiveService, FforReceiveFunding } from './ffor-receive';
+import type { FforReceiveFunding } from './ffor-receive';
+import { FforReceiveService } from './ffor-receive';
 import * as path from 'path';
-import * as fs from 'fs';
-import * as net from 'net';
-import { promises as dnsPromises } from 'dns';
+import { nodeFs, nodeNet } from '../utils/node-builtins';
 import {
 	acquireInstanceLock,
 	releaseInstanceLock,
@@ -29,27 +30,32 @@ import {
 } from './instance-lock';
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
+import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
+import { liveWalletData } from '../wallet/live-data';
 import { getDefaultSendTransaction } from '../shapes/wallet';
-import { EAddressType, ISendTransaction } from '../types/wallet';
-import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
-import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
+import type { EAddressType, ISendTransaction } from '../types/wallet';
+import type { ILogger, TLogLevel } from '../logger';
+import { LOG_LEVEL_PRIORITY } from '../logger';
+import { generateMnemonic } from '../utils/helpers';
+import { Network, toBitcoinJsNetwork } from '../network';
 import { btcToSats } from '../utils/conversion';
 import { BoostError } from '../utils/boost';
-import {
-	EAvailableNetworks,
-	EBoostType,
-	EPaymentType,
+import type {
+	ChannelIdHex,
+	PaymentHashHex,
+	TxidHex
+} from '../utils/identifiers';
+import { txidToDisplayHex } from '../utils/identifiers';
+import type {
 	IFormattedTransaction,
 	IOnchainFees,
 	TMessageDataMap
 } from '../types/wallet';
+import { EBoostType, EPaymentType } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
-import {
-	OnchainSweeps,
-	OnchainSweepInfo,
-	OnchainSweepRequest
-} from './onchain-sweep';
+import type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
+import { OnchainSweeps } from './onchain-sweep';
 import { ensurePrivateDir, writeFileAtomic } from './fs-utils';
 import { holdDbRestoredChannels } from './restore';
 import { deriveBackupMacKey, writeBackupMac } from './backup-mac';
@@ -59,47 +65,51 @@ import { LightningNode } from '../lightning/node/lightning-node';
 import { CommitmentType, OutputType } from '../lightning/chain/types';
 import { DF_DEFAULT_UNPAIRED_SPLICE_DEPTH } from '../lightning/direct-funding/receiver/types';
 import { SPLICE_LOCK_DEPTH_ACCEPT_MAX as DF_UNPAIRED_SPLICE_DEPTH_MAX } from '../lightning/message/splice';
+import type { IFforEpochRecord } from '../lightning/ffor/types';
 import {
 	FforAbortReason,
 	FforSlotState,
 	FforState,
-	isFforConcurrentVersion,
-	IFforEpochRecord
+	isFforConcurrentVersion
 } from '../lightning/ffor/types';
 import {
 	bitmapGet,
 	decodeFforSyncReplyMessage
 } from '../lightning/ffor/messages';
-import { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
-import { IOffer } from '../lightning/offer/types';
+import type { IFforIssuerStatusResp } from '../lightning/ffor/issuer-messages';
+import type { IOffer } from '../lightning/offer/types';
 import {
 	estimateSpliceTxWeight,
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
+import type { IL402Credential, IL402RequestInit } from '../lightning/l402';
 import {
 	isPrivateNetworkUrl,
 	l402Fetch,
-	IL402Credential,
-	IL402RequestInit,
 	MemoryL402CredentialStore,
 	readCappedBody
 } from '../lightning/l402';
-import { ILightningError, IPaymentInfo } from '../lightning/node/types';
-import { IInvoiceInfo } from '../lightning/storage/types';
-import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
+import type { ILightningError, IPaymentInfo } from '../lightning/node/types';
+import type { IInvoiceInfo } from '../lightning/storage/types';
+import type { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { normalizeHexPubkey } from '../lightning/validation';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
-import {
+import type {
 	IStoredPaymentRef,
 	SqliteStorage
 } from '../lightning/storage/sqlite-storage';
-import { deriveStorageKey } from '../lightning/storage/encryption';
+import type {
+	IStorageBackend,
+	IWalletDataStorage
+} from '../lightning/storage/types';
 import {
-	encodeScb,
-	decodeScb,
-	IStaticChannelBackup
-} from '../lightning/backup/scb';
+	hasStorageCapability,
+	STORAGE_CORE_MEMBERS
+} from '../lightning/storage/capabilities';
+import { deriveStorageKey } from '../lightning/storage/encryption';
+import type { IStaticChannelBackup } from '../lightning/backup/scb';
+import { encodeScb, decodeScb } from '../lightning/backup/scb';
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
@@ -107,31 +117,42 @@ import {
 	RapidGossipCancelledError
 } from '../lightning/gossip/rapid-sync';
 import { parseAnnouncedAddress } from '../lightning/gossip/messages';
-import {
+import type {
 	INodeAddress,
 	IGraphChannel,
 	IChannelUpdateMessage,
-	IRoute,
+	IRoute
+} from '../lightning/gossip/types';
+import {
 	CHANNEL_FLAG_DISABLED,
 	encodeShortChannelId,
 	decodeShortChannelId
 } from '../lightning/gossip/types';
 import { ElectrumBackend } from '../lightning/chain/electrum-backend';
 import {
-	Network,
+	Network as LnNetwork,
 	DEFAULT_MIN_FINAL_CLTV_EXPIRY
 } from '../lightning/invoice/types';
 import {
 	LnCoinType,
 	deriveLightningKeysFromSeed
 } from '../lightning/keys/wallet-keys';
-import {
+import type {
 	GuardianBootDecision,
 	GuardianState,
 	IGuardianConfigEntry,
 	IParsedGuardian,
 	IRestoreEvent,
 	IRestoreResult,
+	GuardianDescriptor,
+	GuardianTransportType,
+	IBolt8GuardianTransport,
+	IGuardianHostEvent,
+	IGuardianHostStatus,
+	IRotationEvent,
+	IGuardianReplicationEvent
+} from '../lightning/recovery';
+import {
 	RestoreRefusedError,
 	RestoreRotatedError,
 	buildGuardianRecovery,
@@ -140,15 +161,10 @@ import {
 	restoreBestRecoveryCapsule,
 	assertEmptyTarget,
 	CapsuleCandidateError,
-	GuardianDescriptor,
 	chainPromisedQuorum,
 	deriveRecoveryMasterKey,
 	PEER_STORAGE_SNAPSHOT_INTERVAL_BYTES,
-	GuardianTransportType,
 	GuardianClient,
-	IBolt8GuardianTransport,
-	IGuardianHostEvent,
-	IGuardianHostStatus,
 	bolt8GuardianTransport,
 	deriveGuardianRoot,
 	GuardianRotation,
@@ -164,64 +180,77 @@ import {
 	CRASH_V1_PROFILE,
 	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
-	IRotationEvent,
-	IGuardianReplicationEvent,
 	isOnionV3Hostname,
 	parseBolt8GuardianUrl
 } from '../lightning/recovery';
+import type { Socks5ProxyScope } from '../lightning/transport/peer-manager';
 import {
-	Socks5ProxyScope,
+	PeerError,
+	PeerErrorCode,
 	socks5SocketFactory
 } from '../lightning/transport/peer-manager';
+import {
+	JitReceiveError,
+	JitReceiveErrorCode
+} from '../lightning/liquidity/jit-receive';
 import { parsePeerUri } from '../lightning/transport/peer-uri';
 import { getPublicKey } from '../lightning/crypto/ecdh';
+import type {
+	IDfPaymentRecord,
+	IDfPrepareResult,
+	IDfSendResult
+} from '../lightning/direct-funding';
 import {
 	DF_HARD_MIN_OFFER_AMOUNT_SAT,
 	DF_POST_WITNESS_STATES,
 	DirectFundingError,
 	DirectFundingPaymentStore,
 	DirectFundingSender,
-	IDfPaymentRecord,
-	IDfPrepareResult,
-	IDfSendResult,
 	chainHashForNetwork
 } from '../lightning/direct-funding';
 import { directFundingWallet } from './direct-funding';
-import { AUTH_KEY_OVERRIDES_STORAGE_KEY } from './auth';
-import { WEBHOOK_SECRETS_STORAGE_KEY } from './webhooks';
 import {
+	AUTH_KEY_OVERRIDES_STORAGE_KEY,
+	WEBHOOK_SECRETS_STORAGE_KEY
+} from './daemon-state-keys';
+import type {
 	INodeConfig,
-	InvalidRequestError,
-	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode,
-	SpliceRefusalCode,
 	IHoldCancelledEvent,
 	IHoldInvoiceStateEvent,
 	IStructuredLog,
 	IGraphRestoreStats,
 	IRebalanceExecutionSummary,
-	IRebalanceResult,
+	IRebalanceResult
+} from '../lightning/node/types';
+import {
+	InvalidRequestError,
+	ChannelFundingUnavailableError,
+	ChannelFundingUnavailableCode,
+	SpliceRefusalCode,
 	PaymentDirection,
 	PaymentStatus,
 	PaymentWaitTimeoutError
 } from '../lightning/node/types';
 import { isAnchorChannel, ChannelState } from '../lightning/channel/types';
+import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import { isRecencyUnproven } from '../lightning/channel/channel-state';
 import type { Channel } from '../lightning/channel/channel';
 import { decode as decodeInvoice } from '../lightning/invoice/decode';
 import { decodeOffer } from '../lightning/offer/decode';
+import type { BeignetErrorCodeValue } from './errors';
 import {
 	BeignetError,
 	BeignetErrorCode,
 	describeFailureCode,
+	isBeignetErrorCode,
 	isRetryableError
 } from './errors';
-import {
+import type {
 	IPaymentQueueStorage,
-	InterruptedPaymentOutcome,
-	PaymentQueue
+	InterruptedPaymentOutcome
 } from './payment-queue';
-import {
+import { PaymentQueue } from './payment-queue';
+import type {
 	ListenerProblem,
 	NodeInfo,
 	PeerInfo,
@@ -264,6 +293,8 @@ import {
 	ReadinessCheck,
 	RetryPaymentOptions,
 	RetryPaymentResult,
+	IPayInvoiceOptions,
+	IOpenChannelOptions,
 	PaymentValidation,
 	PaymentValidationCheck,
 	PaymentValidationStatus,
@@ -299,6 +330,11 @@ export interface LogEntry {
 	timestamp: number;
 }
 
+/**
+ * Options for BeignetNode.create. The Factory table in src/cli/README.md is
+ * generated from this interface (`npm run docs:tables`), so the description
+ * of each option lives here.
+ */
 export interface BeignetNodeOptions
 	extends IrohDaemonConfig,
 		ElectrumTlsConfig {
@@ -307,11 +343,30 @@ export interface BeignetNodeOptions
 	irohFactory?: IrohEndpointFactory;
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
+	/** BIP39 mnemonic for the wallet and node keys. A new one is generated when omitted. */
 	mnemonic?: string;
 	/** Required by create(), which throws INVALID_PARAMS without it. */
 	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
+	/** Node alias advertised in node_announcement. */
 	alias?: string;
+	/**
+	 * Directory for the SQLite database and the instance lock, used as given.
+	 * Default: `~/.beignet/data/<tag>`, where the tag is the first 16 hex
+	 * characters of the mnemonic's SHA-256, so each seed gets its own
+	 * database. With `storage` there is no default, and without a dataDir
+	 * the node writes no files.
+	 */
 	dataDir?: string;
+	/**
+	 * Storage to run on instead of SQLite, such as a MemoryStorage or a
+	 * backend over a React Native database. It must implement the walletData
+	 * capability, where the node keeps its wallet state, spend ledger and
+	 * sweep journal. create() opens it and destroy() closes it. SQLite is
+	 * then never loaded, storageEncryption does not apply, the payment queue
+	 * is kept in memory, and backupPath, backup() and capsule restore, which
+	 * copy or install a SQLite file, are refused.
+	 */
+	storage?: IStorageBackend & IWalletDataStorage;
 	/**
 	 * Skip the single-instance lock on the data dir (default false). Leave this
 	 * off unless you have a specific reason — two instances sharing one data dir
@@ -319,8 +374,11 @@ export interface BeignetNodeOptions
 	 * risks database corruption.
 	 */
 	allowMultipleInstances?: boolean;
+	/** Electrum server host (default: the network's built-in server). */
 	electrumHost?: string;
+	/** Electrum server port (default: the built-in server's). */
 	electrumPort?: number;
+	/** Connect to Electrum over TLS (default: the built-in server's setting). The certificate is checked only with electrumTlsVerify. */
 	electrumTls?: boolean;
 	/**
 	 * Where the wallet sources on-chain fee estimates (default 'auto'):
@@ -335,6 +393,7 @@ export interface BeignetNodeOptions
 	 * kinds (issue #548, LFBW port #532 workstream 1F).
 	 */
 	addressType?: 'p2wpkh' | 'p2tr';
+	/** Accept inbound Lightning peers over TCP on this port. Off when unset. */
 	listenPort?: number;
 	/**
 	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
@@ -344,12 +403,14 @@ export interface BeignetNodeOptions
 	/** Inbound peer connections (default 125); once this many are up, only
 	 *  peers holding a channel with this node are admitted. */
 	maxInboundPeers?: number;
+	/** Open anchor channels (default true); false opens legacy static_remotekey channels. */
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
 	 */
 	largeChannels?: boolean;
+	/** Connect to DNS seed peers (BOLT 10) at startup (default false). */
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -367,15 +428,17 @@ export interface BeignetNodeOptions
 	forwardingEnabled?: boolean;
 	/**
 	 * Node-wide default routing fee policy advertised in channel_update, mapped
-	 * onto the library's forwardingFeeBaseMsat / forwardingFeePropMillionths /
-	 * forwardingCltvDelta (defaults 1000 / 1 / 40). BOLT 7 encodes them as
+	 * onto the library's forwarding.feeBaseMsat / forwarding.feePropMillionths /
+	 * forwarding.cltvDelta (defaults 1000 / 1 / 40). BOLT 7 encodes them as
 	 * u32 / u32 / u16; out-of-range values are refused in init because the wire
 	 * write would otherwise wrap or throw only after gossip is being built.
 	 * Per-channel overrides via updateChannelPolicy win over these defaults.
 	 * Issue #532 workstream 1B.
 	 */
 	routingFeeBaseMsat?: number;
+	/** Proportional routing fee in ppm (default 1); see routingFeeBaseMsat. */
 	routingFeePpm?: number;
+	/** CLTV delta this node requires on forwards (default 40); see routingFeeBaseMsat. */
 	routingCltvDelta?: number;
 	/**
 	 * Liquidity ads (bLIP-0051, option_will_fund) SELLER policy: answer a
@@ -397,13 +460,21 @@ export interface BeignetNodeOptions
 	 * what the LSP role fronts (issue #665); unset keeps the library defaults.
 	 */
 	jitReceive?: {
+		/** Run the LSP role. */
 		enabled?: boolean;
+		/** LSP role: flat part of the opening fee, in sats. */
 		flatFeeSat?: number;
+		/** LSP role: proportional part of the opening fee, in ppm of the held total. */
 		feePpm?: number;
+		/** Client role: the largest flat fee this node accepts from an LSP. */
 		maxFlatFeeSat?: number;
+		/** Client role: the largest proportional fee this node accepts from an LSP. */
 		maxFeePpm?: number;
+		/** LSP role: the most fronted for one client, open or splice (library default 1,000,000 sats). */
 		maxClientFundingSats?: number;
+		/** LSP role: opens plus splices in flight at once (library default 3). */
 		maxConcurrentFundings?: number;
+		/** LSP role: lifetime sats this node may front, counted across restarts. Unbounded when unset. */
 		maxTotalFundingSats?: number;
 	};
 	/**
@@ -411,15 +482,25 @@ export interface BeignetNodeOptions
 	 * numbers are whole sats/blocks; unset ones keep the library defaults.
 	 */
 	swaps?: {
+		/** Serve reverse swaps. */
 		enabled?: boolean;
+		/** Flat part of the swap fee, in sats (both directions). */
 		flatFeeSat?: number;
+		/** Proportional part of the swap fee, in ppm (both directions). */
 		feePpm?: number;
+		/** Smallest swap accepted, in sats. */
 		minSat?: number;
+		/** Largest swap accepted, in sats. */
 		maxSat?: number;
+		/** Principal at risk across every unresolved swap, in sats. */
 		maxExposureSat?: number;
+		/** Swaps whose principal may be at risk at once. */
 		maxConcurrent?: number;
+		/** Reverse swap: blocks from create to the contract's refund height. */
 		refundDeltaBlocks?: number;
+		/** Depth a funding output needs before the provider relies on it. */
 		fundingConfs?: number;
+		/** Depth a spend needs before the provider treats it as the outcome. */
 		resolutionConfs?: number;
 		/**
 		 * The submarine direction (issue #743): a peer locks coins in a
@@ -428,9 +509,13 @@ export interface BeignetNodeOptions
 		 * and caps above apply to both directions.
 		 */
 		submarine?: boolean;
+		/** Submarine: blocks between the last possible outgoing HTLC expiry and the refund height (library default 24). */
 		claimSafetyBlocks?: number;
+		/** Submarine: routing fee this node will spend, per million of the invoice (library default 5000). */
 		paymentMaxFeePpm?: number;
+		/** Submarine: blocks an unconfirmed claim waits before a rebuild at a higher fee (library default 2). */
 		claimBumpIntervalBlocks?: number;
+		/** Submarine: blocks from create to the contract's refund height (library default 288). */
 		submarineRefundDeltaBlocks?: number;
 	};
 	/**
@@ -488,11 +573,13 @@ export interface BeignetNodeOptions
 		code: string;
 		message: string;
 		timestamp: number;
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		/** The transaction a broadcast error is about, display order (issue #1062). */
-		txid?: string;
+		txid?: TxidHex;
 		/** The node still holds that transaction and rebroadcasts it every block. */
 		retained?: boolean;
+		/** Why the channel refused, when the refusing arm said so (a ChannelErrorCode). */
+		channelErrorCode?: ChannelErrorCode;
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
@@ -630,18 +717,42 @@ export interface BeignetNodeOptions
 	 * writer lease is quarantined (the guardian-only lane).
 	 */
 	guardianServe?: boolean;
-	/** FFOR settlement peer, witness and issuer roles (issue #729). */
+	/**
+	 * FFOR settlement peer role (issue #729): answer ff_init for receivers.
+	 * Off by default, since an epoch locks its whole budget of this node's
+	 * liquidity.
+	 */
 	fforSettle?: {
+		/** Answer ff_init; only an exact true turns it on. */
 		enabled: boolean;
+		/** Largest epoch budget accepted, in msat. */
 		maxBudgetMsat?: string | number;
+		/** Longest epoch accepted, in blocks. */
 		maxEpochBlocks?: number;
+		/** Smallest base fee accepted, in msat. */
 		feeBaseMsat?: number;
+		/** Smallest proportional fee accepted, in ppm. */
 		feePpm?: number;
 	};
+	/** Advertise FFOR concurrent receive, feature bits 562/563 (default true). */
 	fforConcurrent?: boolean;
+	/** Accept new concurrent-profile settlements when fforSettle is on (default true). */
 	fforSettleConcurrent?: boolean;
-	fforWitness?: { enabled: boolean; maxMailboxes?: number; maxBytes?: number };
+	/**
+	 * FFOR receipt witness role: store a receiver-encrypted record of every
+	 * delegated preimage this node relays before propagating the fulfil.
+	 */
+	fforWitness?: {
+		/** Run the witness role. */
+		enabled: boolean;
+		/** Mailboxes this node hosts at once. */
+		maxMailboxes?: number;
+		/** Bytes all mailboxes may occupy. */
+		maxBytes?: number;
+	};
+	/** FFOR issuer role: answer BOLT 12 invoice requests for offers a receiver delegated to this node. Needs fforWitness. */
 	fforIssuer?: boolean;
+	/** FFOR settlement peer: policy for funding new receive channels for receivers (BEIGNET_FFOR_RECEIVE_FUNDING). Off unless enabled. */
 	fforReceiveFunding?: FforReceiveFunding;
 	/** Bearer token every guardian session must present; absent runs open. */
 	guardianToken?: string;
@@ -674,9 +785,13 @@ export interface BeignetNodeOptions
 	 * dailySpendLimitSats hold it as they hold a manual one.
 	 */
 	autoRebalance?: {
+		/** Master switch; only an explicit true turns it on. */
 		enabled?: boolean;
+		/** Most routing fees spent on rebalances per UTC day, in sats (default 1000). */
 		budgetSatsPerDay?: number;
+		/** Local-balance percent below or above which a channel is imbalanced (default 20). */
 		minImbalancePct?: number;
+		/** Run interval in ms (default 3,600,000, one hour). */
 		intervalMs?: number;
 	};
 	/**
@@ -686,9 +801,13 @@ export interface BeignetNodeOptions
 	 * no forwards in the window, clamped to [floorPpm, ceilPpm].
 	 */
 	autoTuneFees?: {
+		/** Master switch; only an explicit true turns it on. */
 		enabled?: boolean;
+		/** Tune interval and forwarding observation window in ms (default six hours). */
 		intervalMs?: number;
+		/** Lowest ppm the tuner sets (default 1). */
 		floorPpm?: number;
+		/** Highest ppm the tuner sets (default 10,000). */
 		ceilPpm?: number;
 	};
 }
@@ -706,6 +825,38 @@ function defaultDataDir(): string {
 		'.beignet',
 		'data'
 	);
+}
+
+/**
+ * Required when a node first opens a SQLite database, so a node on injected
+ * storage loads neither it nor better-sqlite3.
+ */
+function sqliteStorageClass(): typeof SqliteStorage {
+	return (
+		require('../lightning/storage/sqlite-storage') as typeof import('../lightning/storage/sqlite-storage')
+	).SqliteStorage;
+}
+
+/** Why options.storage cannot carry a node, or null when it can. */
+function injectedStorageRefusal(storage: unknown): string | null {
+	if (typeof storage !== 'object' || storage === null) {
+		return 'storage must be a storage backend';
+	}
+	const methods = storage as Record<string, unknown>;
+	const missing = Object.keys(STORAGE_CORE_MEMBERS).filter(
+		(member) => typeof methods[member] !== 'function'
+	);
+	if (missing.length > 0) {
+		return `storage does not implement ${missing.join(', ')}`;
+	}
+	if (!hasStorageCapability(storage as IStorageBackend, 'walletData')) {
+		return (
+			'storage must implement the walletData capability (saveWalletData, ' +
+			'loadWalletData): the node keeps its wallet state, spend ledger and ' +
+			'sweep journal there'
+		);
+	}
+	return null;
 }
 
 export type RecoveryMode = 'off' | 'peer-storage' | 'async-remote' | 'quorum';
@@ -792,7 +943,10 @@ function sameGuardianIds(a: string[], b: string[]): boolean {
 	return sortedA.every((id, i) => id === sortedB[i]);
 }
 
-const RESTORE_ERROR_CODES: Record<RestoreRefusedError['reason'], string> = {
+const RESTORE_ERROR_CODES: Record<
+	RestoreRefusedError['reason'],
+	BeignetErrorCodeValue
+> = {
 	'no-quorum': 'RESTORE_NO_QUORUM',
 	'unknown-namespace': 'RESTORE_UNKNOWN_NAMESPACE',
 	conflict: 'RESTORE_CONFLICT',
@@ -883,7 +1037,9 @@ export function parseScid(scid: string): Buffer {
  * carries the same code, and over HTTP the same status, whichever method or
  * route it came in by.
  */
-export const ENGINE_PAYMENT_ERROR_CODES: Readonly<Record<string, string>> = {
+export const ENGINE_PAYMENT_ERROR_CODES: Readonly<
+	Record<string, BeignetErrorCodeValue>
+> = {
 	PAY_ALL_REVIEW_EXPIRED: 'PAY_ALL_REVIEW_EXPIRED',
 	PAY_ALL_REMAINDER: 'PAY_ALL_REMAINDER',
 	PAY_ALL_BUDGET_MISMATCH: 'PAY_ALL_BUDGET_MISMATCH',
@@ -1351,9 +1507,11 @@ const DEFAULT_ELECTRUM: Record<
  * the Electrum client's bare socket.connect cannot reach (no %zone id).
  */
 async function resolveHostToIPv4(host: string): Promise<string> {
-	if (net.isIP(host)) return host; // already an IP literal
 	try {
-		const { address } = await dnsPromises.lookup(host, { family: 4 });
+		if (nodeNet().isIP(host)) return host; // already an IP literal
+		// Required here: React Native has no dns, and dials the host as given.
+		const dns = require('dns') as typeof import('dns');
+		const { address } = await dns.promises.lookup(host, { family: 4 });
 		return address || host;
 	} catch {
 		return host;
@@ -1601,6 +1759,44 @@ function requireOpenAmounts(amountSats: unknown, pushSats?: unknown): void {
 }
 
 /**
+ * payInvoice's options from either call form. An options object followed by
+ * positional values is refused: one of the two would be dropped, and a dropped
+ * fee cap pays under the default one.
+ */
+function payInvoiceOptions(
+	first: IPayInvoiceOptions | number | undefined,
+	positional: Omit<IPayInvoiceOptions, 'timeoutMs'>
+): IPayInvoiceOptions {
+	if (first === null || typeof first !== 'object') {
+		return { timeoutMs: first ?? undefined, ...positional };
+	}
+	if (Object.values(positional).some((value) => value !== undefined)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'Pass payment options either as an object or positionally, not both'
+		);
+	}
+	return first;
+}
+
+/** openChannel's options from either call form, on payInvoiceOptions' terms. */
+function openChannelOptions(
+	first: IOpenChannelOptions | number | undefined,
+	positional: Omit<IOpenChannelOptions, 'pushSats'>
+): IOpenChannelOptions {
+	if (first === null || typeof first !== 'object') {
+		return { pushSats: first ?? undefined, ...positional };
+	}
+	if (Object.values(positional).some((value) => value !== undefined)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'Pass channel options either as an object or positionally, not both'
+		);
+	}
+	return first;
+}
+
+/**
  * A value the wire carries as a u32 (feerate_perkw, locktime). Buffer's
  * writeUInt32BE truncates 1.5 to 1 and throws on 2^32, and both happen after
  * the channel's state machine has moved, so the bound is enforced here.
@@ -1750,32 +1946,35 @@ export function holdInvoiceEvent(e: IHoldInvoiceStateEvent): HoldInvoiceEvent {
 }
 
 /**
- * The typed refusal a JIT receive request resolves to (issue #671). The
- * wallet side of the protocol throws plain Errors for the LSP's decline, a
- * quote above the configured ceiling, an ack with no intercept scid, the
- * ack window elapsing and a peer that is not connected; over the daemon a
- * plain Error is scrubbed to INTERNAL_ERROR, so the user saw "Internal
- * server error" on what is an ordinary policy refusal. Anything not
+ * The BeignetError code for each JitReceiveErrorCode the daemon answers with
+ * a reason. FEE_MODE_MISMATCH is left out: an LSP answering against its own
+ * protocol is a fault, and is scrubbed like one.
+ */
+const JIT_RECEIVE_ERROR_CODES: Partial<
+	Record<JitReceiveErrorCode, BeignetErrorCodeValue>
+> = {
+	[JitReceiveErrorCode.DECLINED]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.QUOTE_ABOVE_MAXIMUM]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.NO_INTERCEPT_SCID]: BeignetErrorCode.JIT_REFUSED,
+	[JitReceiveErrorCode.NEW_CHANNELS_REFUSED]:
+		BeignetErrorCode.NEW_CHANNELS_REFUSED,
+	[JitReceiveErrorCode.TIMEOUT]: BeignetErrorCode.JIT_TIMEOUT
+};
+
+/**
+ * The typed refusal a JIT receive request resolves to (issue #671). Over the
+ * daemon an untyped error is scrubbed to INTERNAL_ERROR, which is wrong for
+ * an ordinary policy refusal such as the LSP's decline. Anything not
  * recognised here stays untyped and is still scrubbed, as a fault should be.
  */
 export function jitInvoiceError(err: unknown): unknown {
 	if (err instanceof BeignetError) return err;
-	const message = err instanceof Error ? err.message : String(err);
-	if (
-		/^LSP declined the JIT receive intent|above the accepted maximum|without an intercept scid/.test(
-			message
-		)
-	) {
-		return new BeignetError(BeignetErrorCode.JIT_REFUSED, message);
+	if (err instanceof JitReceiveError) {
+		const code = JIT_RECEIVE_ERROR_CODES[err.code];
+		return code ? new BeignetError(code, err.message) : err;
 	}
-	if (/^JIT receive needs a new channel from the LSP/.test(message)) {
-		return new BeignetError(BeignetErrorCode.NEW_CHANNELS_REFUSED, message);
-	}
-	if (/timed out waiting for the LSP/.test(message)) {
-		return new BeignetError(BeignetErrorCode.JIT_TIMEOUT, message);
-	}
-	if (/^Not connected to peer/.test(message)) {
-		return new BeignetError(BeignetErrorCode.PEER_NOT_CONNECTED, message);
+	if (err instanceof PeerError && err.code === PeerErrorCode.NOT_CONNECTED) {
+		return new BeignetError(BeignetErrorCode.PEER_NOT_CONNECTED, err.message);
 	}
 	return err;
 }
@@ -1790,6 +1989,21 @@ function requireChannelIdHex(value: unknown, field = 'channelId'): Buffer {
 		throw new BeignetError(
 			BeignetErrorCode.INVALID_PARAMS,
 			`${field} must be a 64-character hex channel id`
+		);
+	}
+	return Buffer.from(value, 'hex');
+}
+
+/**
+ * A 32-byte payment hash as hex, checked for the reason requireChannelIdHex
+ * checks a channel id: unchecked, a malformed hash decodes to a short buffer
+ * that matches nothing, and a cancel or a metadata write answers success.
+ */
+function requirePaymentHashHex(value: unknown, field = 'paymentHash'): Buffer {
+	if (typeof value !== 'string' || !/^[0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a 64-character hex payment hash`
 		);
 	}
 	return Buffer.from(value, 'hex');
@@ -1850,9 +2064,11 @@ function canBecomeUsable(channel: Channel): boolean {
  * Private trigger for the pay-readiness wait: a channel closed, failed or
  * went away, so "no live channel left" may now hold (issue #967). A symbol,
  * so it is no public event, and shutdown's removeAllListeners() takes its
- * listeners with the rest.
+ * listeners with the rest. Being outside BeignetNodeEvents, it goes through
+ * EventEmitter's own methods.
  */
 const CHANNELS_CHANGED = Symbol('channels-changed');
+const untypedEmitter = EventEmitter.prototype;
 
 /**
  * The refusal an operator force close of a capsule-restored channel gets
@@ -1940,7 +2156,7 @@ function listenerLabel(kind: ListenerKind): string {
 		: 'WebSocket listener';
 }
 
-export class BeignetNode extends EventEmitter {
+export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
 	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
@@ -1965,43 +2181,20 @@ export class BeignetNode extends EventEmitter {
 			);
 		return this.fforReceiveService;
 	}
-	// ─── Typed event overloads ───
-	on<K extends keyof BeignetNodeEvents>(
-		event: K,
-		listener: BeignetNodeEvents[K]
-	): this;
-	on(event: string | symbol, listener: (...args: unknown[]) => void): this;
-	on(event: string | symbol, listener: (...args: unknown[]) => void): this {
-		return super.on(event, listener);
-	}
-
-	once<K extends keyof BeignetNodeEvents>(
-		event: K,
-		listener: BeignetNodeEvents[K]
-	): this;
-	once(event: string | symbol, listener: (...args: unknown[]) => void): this;
-	once(event: string | symbol, listener: (...args: unknown[]) => void): this {
-		return super.once(event, listener);
-	}
-
-	emit<K extends keyof BeignetNodeEvents>(
-		event: K,
-		...args: Parameters<BeignetNodeEvents[K]>
-	): boolean;
-	emit(event: string | symbol, ...args: unknown[]): boolean;
-	emit(event: string | symbol, ...args: unknown[]): boolean {
-		return super.emit(event, ...args);
-	}
-
 	private wallet!: Wallet;
 	private node!: LightningNode;
-	private storage!: SqliteStorage;
+	private storage!: IStorageBackend & IWalletDataStorage;
+	/**
+	 * Set when create() was given options.storage. Otherwise the storage is
+	 * the SqliteStorage this node opened in its dataDir.
+	 */
+	private storageInjected = false;
 	/**
 	 * The fenced view of the database the current node was built on (issue
 	 * #958). Kept so shutdown can fence it even when the node's own teardown
 	 * throws before its close.
 	 */
-	private _nodeStorageView?: SqliteStorage;
+	private _nodeStorageView?: IStorageBackend & IWalletDataStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
@@ -2012,7 +2205,7 @@ export class BeignetNode extends EventEmitter {
 	private _autoRebalanceTimer?: ReturnType<typeof setInterval>;
 	/**
 	 * Bound on the cooperative close's wallet-address lookup (issue #542
-	 * review): getNextAvailableAddress can enter an Electrum reconnect whose
+	 * review): fetchNextAvailableAddress can enter an Electrum reconnect whose
 	 * server_version handshake carries no timeout of its own (the same hazard
 	 * HEADER_SUBSCRIBE_GATE_MS bounds in electrum/index.ts), and an unbounded
 	 * wait here means the close never reaches the engine and the cached or
@@ -2120,7 +2313,8 @@ export class BeignetNode extends EventEmitter {
 	private _resuming = false;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
-	private dataDir: string;
+	/** Unset only for a node on injected storage that was given none. */
+	private dataDir: string | undefined;
 	/** Path to the single-instance lock file (null if locking was skipped). */
 	private _lockPath: string | null = null;
 	/** Bound process-exit handler that releases the lock; removed on destroy. */
@@ -2325,7 +2519,7 @@ export class BeignetNode extends EventEmitter {
 	private constructor(
 		mnemonic: string,
 		networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet',
-		dataDir: string
+		dataDir: string | undefined
 	) {
 		super();
 		this.mnemonic = mnemonic;
@@ -2370,6 +2564,28 @@ export class BeignetNode extends EventEmitter {
 				`unknown network '${opts.network}': expected 'mainnet', 'testnet', 'signet' or 'regtest'`
 			);
 		}
+		if (opts.storage !== undefined) {
+			const refusal = injectedStorageRefusal(opts.storage);
+			if (refusal !== null) throw new BeignetError('INVALID_PARAMS', refusal);
+			if (opts.backupPath !== undefined) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'backupPath copies the SQLite database, so it does not apply with storage'
+				);
+			}
+			if (opts.recoveryAutoApply === true) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'recoveryAutoApply installs a SQLite database, so it does not apply with storage'
+				);
+			}
+			if (opts.guardianServe && !opts.dataDir) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'guardianServe keeps the sets it serves under dataDir, so with storage it needs one'
+				);
+			}
+		}
 		const mnemonic = opts.mnemonic || generateMnemonic();
 		const networkName = opts.network;
 		// Before the lock and the database, so a node refused for another
@@ -2382,23 +2598,96 @@ export class BeignetNode extends EventEmitter {
 		// Namespace the default storage per-wallet so different mnemonics never
 		// share a database (which would load another seed's channels/identity).
 		// An explicit dataDir is respected as-is (one wallet per dataDir).
-		const dataDir = opts.dataDir || defaultDataDirForMnemonic(mnemonic);
+		const dataDir =
+			opts.dataDir ||
+			(opts.storage ? undefined : defaultDataDirForMnemonic(mnemonic));
 
 		// Owner-only data directory (issue #1004): the database's lookup
 		// columns are plaintext, and mkdir leaves an existing directory's bits
 		// alone, so one created by an older release under umask 022 is
 		// tightened here. A refused chmod is logged once the logger is wired.
-		const dirMode = ensurePrivateDir(dataDir);
+		const dirMode =
+			dataDir === undefined ? undefined : ensurePrivateDir(dataDir);
 
 		const instance = new BeignetNode(mnemonic, networkName, dataDir);
 		await instance.init(opts);
-		if (dirMode.error) {
+		if (dirMode?.error) {
 			instance.log('warn', 'Could not restrict data directory permissions', {
 				dataDir,
 				error: dirMode.error.message
 			});
 		}
 		return instance;
+	}
+
+	/**
+	 * Open the SQLite database in dataDir, finishing a staged capsule swap
+	 * first and holding the channels of a database restored from a backup.
+	 */
+	private openSqliteStorage(opts: BeignetNodeOptions): void {
+		const networkName = this.networkName;
+		const dbPath = path.join(this.requireDataDir(), `${networkName}.db`);
+
+		// Backward-compat notice: earlier versions stored every wallet in a single
+		// shared `<network>.db` under the default data dir. That meant any mnemonic
+		// loaded another seed's channels. Storage is now namespaced per-wallet, so
+		// pre-existing data at the legacy path is no longer auto-loaded — surface it
+		// rather than silently appearing to have lost the channels.
+		if (!opts.dataDir) {
+			const fs = nodeFs();
+			const legacyDir = defaultDataDir();
+			const legacyDb = path.join(legacyDir, `${networkName}.db`);
+			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
+				const legacyMsg =
+					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
+					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
+					`If it held this wallet's channels, re-run with dataDir set to "${legacyDir}" to use it.`;
+				this.log('warn', legacyMsg);
+				if (!this.logger) {
+					// Preserve the historical console notice when no logger is injected.
+					// eslint-disable-next-line no-console
+					console.warn(legacyMsg);
+				}
+			}
+		}
+
+		// Encryption at rest (default on): derive the storage key from the BIP39
+		// seed of the wallet mnemonic - the same seed material the Lightning and
+		// on-chain keys derive from - so DB files and backups are unreadable
+		// without the mnemonic. Pre-existing plaintext rows migrate on open().
+		let encryptionKey: Buffer | undefined;
+		if (opts.storageEncryption ?? true) {
+			encryptionKey = deriveStorageKey(this.walletSeed());
+		}
+
+		this._storageEncryptionKey = encryptionKey;
+		// A Tier 2 capsule restore that crashed mid-swap left its durable
+		// marker; finish the install before anything opens the database.
+		this.finishStagedCapsuleRestore(dbPath);
+		const Sqlite = sqliteStorageClass();
+		this.storage = new Sqlite(
+			dbPath,
+			(err) => {
+				this.log('warn', 'Skipped corrupted storage row during load', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			},
+			encryptionKey ? { encryptionKey } : undefined
+		);
+		this.storage.open();
+		this._bootOpts = opts;
+		// Before anything loads a channel: nothing may resume a `restore db`
+		// row unheld (issue #1363).
+		const dbRestore = holdDbRestoredChannels(dbPath, this.storage);
+		if (dbRestore) {
+			this.log(
+				'warn',
+				'Database was restored from a backup that cannot be proven ' +
+					'current, so its channels are held: no automatic force close and ' +
+					'no new HTLCs. Closing one from this node needs acceptStaleStateRisk',
+				{ ...dbRestore }
+			);
+		}
 	}
 
 	private async init(opts: BeignetNodeOptions): Promise<void> {
@@ -2554,7 +2843,7 @@ export class BeignetNode extends EventEmitter {
 		// duplicate connection → connect/disconnect storm) and one SQLite DB
 		// (corruption risk). Opt out with allowMultipleInstances if you really
 		// know the two instances won't collide.
-		if (!opts.allowMultipleInstances) {
+		if (!opts.allowMultipleInstances && this.dataDir !== undefined) {
 			const lockPath = path.join(this.dataDir, `${networkName}.lock`);
 			try {
 				// reclaimForeignHost: after a container recreate the recorded
@@ -2588,66 +2877,14 @@ export class BeignetNode extends EventEmitter {
 			process.once('exit', this._lockExitHandler);
 		}
 
-		// 3. Open SQLite storage
-		const dbPath = path.join(this.dataDir, `${networkName}.db`);
-
-		// Backward-compat notice: earlier versions stored every wallet in a single
-		// shared `<network>.db` under the default data dir. That meant any mnemonic
-		// loaded another seed's channels. Storage is now namespaced per-wallet, so
-		// pre-existing data at the legacy path is no longer auto-loaded — surface it
-		// rather than silently appearing to have lost the channels.
-		if (!opts.dataDir) {
-			const legacyDir = defaultDataDir();
-			const legacyDb = path.join(legacyDir, `${networkName}.db`);
-			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
-				const legacyMsg =
-					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
-					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
-					`If it held this wallet's channels, re-run with dataDir set to "${legacyDir}" to use it.`;
-				this.log('warn', legacyMsg);
-				if (!this.logger) {
-					// Preserve the historical console notice when no logger is injected.
-					// eslint-disable-next-line no-console
-					console.warn(legacyMsg);
-				}
-			}
-		}
-
-		// Encryption at rest (default on): derive the storage key from the BIP39
-		// seed of the wallet mnemonic - the same seed material the Lightning and
-		// on-chain keys derive from - so DB files and backups are unreadable
-		// without the mnemonic. Pre-existing plaintext rows migrate on open().
-		let encryptionKey: Buffer | undefined;
-		if (opts.storageEncryption ?? true) {
-			encryptionKey = deriveStorageKey(this.walletSeed());
-		}
-
-		this._storageEncryptionKey = encryptionKey;
-		// A Tier 2 capsule restore that crashed mid-swap left its durable
-		// marker; finish the install before anything opens the database.
-		this.finishStagedCapsuleRestore(dbPath);
-		this.storage = new SqliteStorage(
-			dbPath,
-			(err) => {
-				this.log('warn', 'Skipped corrupted storage row during load', {
-					error: err instanceof Error ? err.message : String(err)
-				});
-			},
-			encryptionKey ? { encryptionKey } : undefined
-		);
-		this.storage.open();
-		this._bootOpts = opts;
-		// Before anything loads a channel: nothing may resume a `restore db`
-		// row unheld (issue #1363).
-		const dbRestore = holdDbRestoredChannels(dbPath, this.storage);
-		if (dbRestore) {
-			this.log(
-				'warn',
-				'Database was restored from a backup that cannot be proven ' +
-					'current, so its channels are held: no automatic force close and ' +
-					'no new HTLCs. Closing one from this node needs acceptStaleStateRisk',
-				{ ...dbRestore }
-			);
+		// 3. Open storage: the caller's backend as given, else SQLite.
+		if (opts.storage) {
+			this.storageInjected = true;
+			this.storage = opts.storage;
+			this.storage.open();
+			this._bootOpts = opts;
+		} else {
+			this.openSqliteStorage(opts);
 		}
 
 		// Recovery Protocol boot decision (docs/RECOVERY-PROTOCOL.md section
@@ -2784,7 +3021,7 @@ export class BeignetNode extends EventEmitter {
 				? { feeEstimationSource: opts.feeEstimationSource }
 				: {}),
 			electrumOptions: {
-				net,
+				net: nodeNet(),
 				tls: walletTls,
 				servers: electrumServer
 			},
@@ -2981,50 +3218,54 @@ export class BeignetNode extends EventEmitter {
 				: undefined,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
-			forwardingEnabled: opts.forwardingEnabled ?? true,
 			// The routing* -> forwarding* rename seam: the CLI layer speaks the
 			// operator vocabulary (and the BEIGNET_FEE_* envs), the library
 			// speaks BOLT 7 forwarding terms. Undefined keeps the library
 			// defaults (1000 / 1 / 40).
-			forwardingFeeBaseMsat: opts.routingFeeBaseMsat,
-			forwardingFeePropMillionths: opts.routingFeePpm,
-			forwardingCltvDelta: opts.routingCltvDelta,
+			forwarding: {
+				enabled: opts.forwardingEnabled ?? true,
+				feeBaseMsat: opts.routingFeeBaseMsat,
+				feePropMillionths: opts.routingFeePpm,
+				cltvDelta: opts.routingCltvDelta
+			},
 			leaseRates: opts.leaseRates,
 			// FFOR roles (issue #729). Settlement is an explicit opt-in: a
 			// daemon that was not told to answers no ff_init, whatever the
 			// feature bit says. The witness and the issuer are services this
 			// node runs for others and are off unless switched on.
-			fforConcurrent: { enabled: opts.fforConcurrent !== false },
-			fforSettle: {
-				enabled: opts.fforSettle?.enabled === true,
-				allowConcurrent: opts.fforSettleConcurrent !== false,
-				...(opts.fforSettle?.maxBudgetMsat !== undefined
-					? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
+			ffor: {
+				concurrent: { enabled: opts.fforConcurrent !== false },
+				settle: {
+					enabled: opts.fforSettle?.enabled === true,
+					allowConcurrent: opts.fforSettleConcurrent !== false,
+					...(opts.fforSettle?.maxBudgetMsat !== undefined
+						? { maxBudgetMsat: BigInt(opts.fforSettle.maxBudgetMsat) }
+						: {}),
+					...(opts.fforSettle?.maxEpochBlocks !== undefined
+						? { maxEpochBlocks: opts.fforSettle.maxEpochBlocks }
+						: {}),
+					...(opts.fforSettle?.feeBaseMsat !== undefined
+						? { minFeeBaseMsat: opts.fforSettle.feeBaseMsat }
+						: {}),
+					...(opts.fforSettle?.feePpm !== undefined
+						? { minFeeProportionalMillionths: opts.fforSettle.feePpm }
+						: {})
+				},
+				...(opts.fforWitness?.enabled === true
+					? {
+							witness: {
+								enabled: true,
+								...(opts.fforWitness.maxMailboxes !== undefined
+									? { maxMailboxes: opts.fforWitness.maxMailboxes }
+									: {}),
+								...(opts.fforWitness.maxBytes !== undefined
+									? { maxBytes: opts.fforWitness.maxBytes }
+									: {})
+							}
+					  }
 					: {}),
-				...(opts.fforSettle?.maxEpochBlocks !== undefined
-					? { maxEpochBlocks: opts.fforSettle.maxEpochBlocks }
-					: {}),
-				...(opts.fforSettle?.feeBaseMsat !== undefined
-					? { minFeeBaseMsat: opts.fforSettle.feeBaseMsat }
-					: {}),
-				...(opts.fforSettle?.feePpm !== undefined
-					? { minFeeProportionalMillionths: opts.fforSettle.feePpm }
-					: {})
+				...(opts.fforIssuer === true ? { issuer: { enabled: true } } : {})
 			},
-			...(opts.fforWitness?.enabled === true
-				? {
-						fforWitness: {
-							enabled: true,
-							...(opts.fforWitness.maxMailboxes !== undefined
-								? { maxMailboxes: opts.fforWitness.maxMailboxes }
-								: {}),
-							...(opts.fforWitness.maxBytes !== undefined
-								? { maxBytes: opts.fforWitness.maxBytes }
-								: {})
-						}
-				  }
-				: {}),
-			...(opts.fforIssuer === true ? { fforIssuer: { enabled: true } } : {}),
 			// The LSP engine only exists when explicitly switched on; the client
 			// ceilings apply either way, because asking an LSP for a JIT receive
 			// is not the same role as being one.
@@ -3184,7 +3425,7 @@ export class BeignetNode extends EventEmitter {
 			...(opts.guardianServe
 				? {
 						guardianHost: {
-							path: path.join(this.dataDir, 'guardian'),
+							path: path.join(this.requireDataDir(), 'guardian'),
 							guardianSecret: deriveGuardianRoot(this.nodeSecret())
 								.guardianSecret,
 							token: opts.guardianToken,
@@ -3374,7 +3615,7 @@ export class BeignetNode extends EventEmitter {
 			'splice:complete',
 			'splice:aborted',
 			'splice:reverted'
-		]) {
+		] as const) {
 			this.node.on(event, (data: { channelId: Buffer }) =>
 				announceUsable(data.channelId)
 			);
@@ -3388,14 +3629,14 @@ export class BeignetNode extends EventEmitter {
 		// A channel that closed, failed or went away may have been the last
 		// live one; the pay-readiness wait then stops waiting.
 		const channelsChanged = (): void =>
-			deferEmit(() => this.emit(CHANNELS_CHANGED));
+			deferEmit(() => untypedEmitter.emit.call(this, CHANNELS_CHANGED));
 		for (const event of [
 			'channel:pending-close',
 			'channel:force-closing',
 			'channel:closed',
 			'channel:voided',
 			'channel:aborted'
-		]) {
+		] as const) {
 			this.node.on(event, channelsChanged);
 		}
 		this.node.getChannelManager().on('channel:errored', channelsChanged);
@@ -3448,7 +3689,7 @@ export class BeignetNode extends EventEmitter {
 				this.refreshStaticChannelBackup();
 				const channelId = data.channelId.toString('hex');
 				const fundingTxid = data.fundingTxid
-					? Buffer.from(data.fundingTxid).reverse().toString('hex')
+					? txidToDisplayHex(data.fundingTxid)
 					: undefined;
 				this.log('info', 'Splice complete', { channelId, fundingTxid });
 				this.emit('splice:complete', { channelId, fundingTxid });
@@ -3526,9 +3767,7 @@ export class BeignetNode extends EventEmitter {
 				// bitcoind) names a transaction in display order. Printed the
 				// other way round, an operator grepping the log for the id they
 				// see on screen found nothing (issue #681).
-				const fundingTxid = Buffer.from(data.fundingTxid)
-					.reverse()
-					.toString('hex');
+				const fundingTxid = txidToDisplayHex(data.fundingTxid);
 				this.log('info', 'Channel opening', { channelId, fundingTxid });
 				this.emit('channel:opening', { channelId, fundingTxid });
 			}
@@ -3854,7 +4093,7 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('recovery:durable', (through: bigint) => {
 			this.emit('recovery:durable', { through: through.toString() });
 		});
-		this.node.on('recovery:fenced', (superseding?: GuardianState) => {
+		this.node.on('recovery:fenced', (superseding) => {
 			this.log(
 				'error',
 				'Recovery fenced: a newer writer epoch owns this namespace; ' +
@@ -4458,7 +4697,9 @@ export class BeignetNode extends EventEmitter {
 	 * check), with one payload shape. The lease check has nothing left to
 	 * learn once the device is fenced, so it stops here too.
 	 */
-	private relayRecoveryFenced(supersededBy: GuardianState | undefined): void {
+	private relayRecoveryFenced(
+		supersededBy: GuardianState | null | undefined
+	): void {
 		this.stopRecoveryLeaseCheck();
 		// The fence closed every listener and a held one never binds: say so
 		// rather than report one bound or held forever.
@@ -4817,7 +5058,7 @@ export class BeignetNode extends EventEmitter {
 		 */
 		unfenced?: { guardians: IReportedGuardian[] };
 		recovering?: string[];
-		skipped?: Array<{ channelId: string; reason: string }>;
+		skipped?: Array<{ channelId: ChannelIdHex; reason: string }>;
 	}> {
 		if (this._restoreInFlight) {
 			throw new BeignetError(
@@ -4840,6 +5081,13 @@ export class BeignetNode extends EventEmitter {
 		// Rebuilding in-process needs the boot options; a caller that never
 		// booted through init holds for a restart like the manual route.
 		const resume = options.resume === true && this._bootOpts !== undefined;
+		if (this.storageInjected) {
+			throw new BeignetError(
+				'CAPSULE_RESTORE_UNSUPPORTED',
+				'Capsule restore installs a SQLite database; this node runs on ' +
+					'the storage passed to create()'
+			);
+		}
 		if (this.recoveryMode !== 'peer-storage' || this._restorePending) {
 			throw new BeignetError(
 				'CAPSULE_RESTORE_UNSUPPORTED',
@@ -4875,14 +5123,15 @@ export class BeignetNode extends EventEmitter {
 			this.log('info', `Capsule restore: ${type}`, { detail });
 			this.emit('recovery:restore-progress', { type, detail });
 		};
+		const Sqlite = sqliteStorageClass();
 		const stagedPath = path.join(
-			this.dataDir,
+			this.requireDataDir(),
 			`${this.networkName}.db.capsule-restore`
 		);
 		const dropStaged = (): void => {
 			for (const suffix of ['', '-wal', '-shm']) {
 				try {
-					fs.unlinkSync(`${stagedPath}${suffix}`);
+					nodeFs().unlinkSync(`${stagedPath}${suffix}`);
 				} catch {
 					// Not there.
 				}
@@ -4916,7 +5165,7 @@ export class BeignetNode extends EventEmitter {
 					  );
 			let staged: SqliteStorage;
 			try {
-				staged = new SqliteStorage(
+				staged = new Sqlite(
 					stagedPath,
 					() => {
 						/* a fresh file has no rows to skip */
@@ -4934,7 +5183,7 @@ export class BeignetNode extends EventEmitter {
 			try {
 				result = restoreBestRecoveryCapsule(blobs, staged, this.nodeSecret(), {
 					scratchStorage: (): SqliteStorage => {
-						const scratch = new SqliteStorage(':memory:');
+						const scratch = new Sqlite(':memory:');
 						scratch.open();
 						return scratch;
 					}
@@ -5084,7 +5333,7 @@ export class BeignetNode extends EventEmitter {
 			// webhooks and the peer addresses the operator just used) is
 			// carried across, or a restart would resurrect a revoked key.
 			try {
-				this.carryDaemonState(this.storage, staged);
+				this.carryDaemonState(this.sqlite()!, staged);
 			} catch (err) {
 				staged.close();
 				dropStaged();
@@ -5101,7 +5350,7 @@ export class BeignetNode extends EventEmitter {
 			// a crash left behind before the next boot opens a database, so
 			// no restart can land on an empty one. From the marker on, only a
 			// restart serves a node again, whatever happens below.
-			const dbPath = path.join(this.dataDir, `${this.networkName}.db`);
+			const dbPath = path.join(this.requireDataDir(), `${this.networkName}.db`);
 			const keptPath = `${dbPath}.pre-capsule-restore-${new Date()
 				.toISOString()
 				.replace(/[:.]/g, '-')}`;
@@ -5183,7 +5432,7 @@ export class BeignetNode extends EventEmitter {
 			const opts = this._bootOpts!;
 			let uncoveredEntries: IStaticChannelBackup['channels'] = [];
 			try {
-				this.storage = new SqliteStorage(
+				this.storage = new Sqlite(
 					dbPath,
 					(err) => {
 						this.log('warn', 'Skipped corrupted storage row during load', {
@@ -5326,7 +5575,7 @@ export class BeignetNode extends EventEmitter {
 		if (this._restoreInFlight || this._restartRequired || this._resuming) {
 			return;
 		}
-		if (fs.existsSync(this.capsuleRestoreMarkerPath())) return;
+		if (nodeFs().existsSync(this.capsuleRestoreMarkerPath())) return;
 		if (a.phase === 'idle') {
 			const now = Date.now();
 			this._autoApply = { phase: 'settling', firstArrivalAt: now };
@@ -5610,7 +5859,10 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	private capsuleRestoreMarkerPath(): string {
-		return path.join(this.dataDir, `${this.networkName}.capsule-restore.json`);
+		return path.join(
+			this.requireDataDir(),
+			`${this.networkName}.capsule-restore.json`
+		);
 	}
 
 	/**
@@ -5701,6 +5953,7 @@ export class BeignetNode extends EventEmitter {
 	 * after it is verified to hold no channel state.
 	 */
 	private finishStagedCapsuleRestore(dbPath: string): void {
+		const fs = nodeFs();
 		const markerPath = this.capsuleRestoreMarkerPath();
 		if (!fs.existsSync(markerPath)) return;
 		let marker: ICapsuleRestoreMarker;
@@ -5723,14 +5976,15 @@ export class BeignetNode extends EventEmitter {
 				}); inspect the data directory before starting`
 			);
 		}
-		const stagedPath = path.join(this.dataDir, marker.staged);
-		const keptPath = path.join(this.dataDir, marker.keep);
+		const stagedPath = path.join(this.requireDataDir(), marker.staged);
+		const keptPath = path.join(this.requireDataDir(), marker.keep);
 		const sidecars = ['-wal', '-shm'];
 		const moveAside = (): void => {
 			// The restore verified emptiness before writing the marker; verify
 			// again here so a database that somehow gained channel state in
 			// between is never moved out from under its channels.
-			const current = new SqliteStorage(
+			const Sqlite = sqliteStorageClass();
+			const current = new Sqlite(
 				dbPath,
 				() => {
 					/* residue check only */
@@ -5813,7 +6067,7 @@ export class BeignetNode extends EventEmitter {
 						}
 						return viaTor(host, port);
 					}
-					return net.connect(port, host);
+					return nodeNet().connect(port, host);
 				}
 			});
 		}
@@ -5975,7 +6229,10 @@ export class BeignetNode extends EventEmitter {
 	private rotationError(error: unknown): Error {
 		if (error instanceof BeignetError) return error;
 		if (error instanceof RotationRefusedError) {
-			const code: Record<RotationRefusedError['reason'], string> = {
+			const code: Record<
+				RotationRefusedError['reason'],
+				BeignetErrorCodeValue
+			> = {
 				'in-progress': 'ROTATION_IN_PROGRESS',
 				'no-quorum': 'ROTATION_NO_QUORUM',
 				'not-catching-up': 'ROTATION_NOT_CATCHING_UP',
@@ -6344,7 +6601,7 @@ export class BeignetNode extends EventEmitter {
 	 */
 	async recoverFallbackFunds(opts?: {
 		feeRatePerVbyte?: number;
-	}): Promise<{ txid: string; amountSat: number; inputCount: number } | null> {
+	}): Promise<{ txid: TxidHex; amountSat: number; inputCount: number } | null> {
 		const result = await this.node.recoverFallbackFunds(opts);
 		if (result) {
 			this.log('info', 'Recovered fallback funds to wallet', {
@@ -6696,7 +6953,7 @@ export class BeignetNode extends EventEmitter {
 	 * The next unused change address as an output script, or undefined when
 	 * the wallet cannot produce one (Electrum needed for the gap scan).
 	 * The change chain, never the receive chain: see resolveWalletSweepScript
-	 * (issue #1064). The lookup is the same getNextAvailableAddress call that
+	 * (issue #1064). The lookup is the same fetchNextAvailableAddress call that
 	 * gap-scans both chains, so the Electrum dependency and the timeouts the
 	 * callers wrap around it are unchanged; only the chain read out differs.
 	 */
@@ -6705,7 +6962,7 @@ export class BeignetNode extends EventEmitter {
 	> {
 		const bitcoin = require('bitcoinjs-lib');
 		try {
-			const res = await this.wallet.getNextAvailableAddress();
+			const res = await this.wallet.fetchNextAvailableAddress();
 			if (res.isOk()) {
 				return bitcoin.address.toOutputScript(
 					res.value.changeAddressIndex.address,
@@ -6777,7 +7034,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── On-chain ───────────────
 
 	async getNewAddress(): Promise<string> {
-		const result = await this.wallet.getNextAvailableAddress();
+		const result = await this.wallet.fetchNextAvailableAddress();
 		if (result.isErr()) {
 			throw new BeignetError('ADDRESS_FAILED', result.error.message);
 		}
@@ -7071,15 +7328,18 @@ export class BeignetNode extends EventEmitter {
 
 		const txn = this.wallet.transaction;
 		// The same UTXOs a send would gather: everything spendable, frozen ones out.
-		const inputs = txn.removeBlackListedUtxos(this.wallet.data.utxos);
+		const inputs = txn.removeBlackListedUtxos(
+			liveWalletData(this.wallet).utxos
+		);
 		if (!inputs.length) {
 			throw new BeignetError(
 				BeignetErrorCode.SEND_FAILED,
 				'No UTXOs available.'
 			);
 		}
-		const changeAddress =
-			this.wallet.data.changeAddressIndex[this.wallet.addressType]?.address;
+		const changeAddress = liveWalletData(this.wallet).changeAddressIndex[
+			this.wallet.addressType
+		]?.address;
 		if (!changeAddress) {
 			throw new BeignetError(
 				BeignetErrorCode.SEND_FAILED,
@@ -7155,7 +7415,8 @@ export class BeignetNode extends EventEmitter {
 		if (!channelFunding) {
 			// The wallet's own current receive address, of the type it actually uses.
 			// Reading it does not consume it.
-			return this.wallet.data.addressIndex[this.wallet.addressType].address;
+			return liveWalletData(this.wallet).addressIndex[this.wallet.addressType]
+				.address;
 		}
 		const bitcoin = require('bitcoinjs-lib');
 		// A witness-v0 32-byte program: the shape of a 2-of-2 funding output. The
@@ -7359,7 +7620,7 @@ export class BeignetNode extends EventEmitter {
 	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async bumpFeeOnchain(
-		txid: string,
+		txid: TxidHex,
 		satsPerVbyte: number
 	): Promise<BoostResult> {
 		this._validateTxid(txid);
@@ -7383,7 +7644,7 @@ export class BeignetNode extends EventEmitter {
 	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async boostOnchain(
-		txid: string,
+		txid: TxidHex,
 		satsPerVbyte?: number
 	): Promise<BoostResult> {
 		this._validateTxid(txid);
@@ -7468,7 +7729,9 @@ export class BeignetNode extends EventEmitter {
 		// spendable ones here.
 		const utxoCount = this.wallet
 			.listUtxos()
-			.filter((u) => !this.wallet.isUtxoFrozen(u.tx_hash, u.tx_pos)).length;
+			.filter(
+				(u) => !this.wallet.isUtxoFrozen({ txid: u.tx_hash, vout: u.tx_pos })
+			).length;
 		if (utxoCount < 2) {
 			throw new BeignetError(
 				BeignetErrorCode.NOTHING_TO_CONSOLIDATE,
@@ -7648,16 +7911,19 @@ export class BeignetNode extends EventEmitter {
 			address: utxo.address,
 			valueSats: utxo.value,
 			height: utxo.height,
-			frozen: this.wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)
+			frozen: this.wallet.isUtxoFrozen({
+				txid: utxo.tx_hash,
+				vout: utxo.tx_pos
+			})
 		}));
 	}
 
 	/** Freeze a UTXO: excluded from all coin selection until unfrozen. */
-	async freezeUtxo(txid: string, index: number): Promise<{ frozen: string }> {
+	async freezeUtxo(txid: TxidHex, index: number): Promise<{ frozen: string }> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
 			this.onchainSweeps().assertInputMutable(txid, index);
-			const res = await this.wallet.freezeUtxo({ txid, index });
+			const res = await this.wallet.freezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
 					BeignetErrorCode.INVALID_PARAMS,
@@ -7669,13 +7935,13 @@ export class BeignetNode extends EventEmitter {
 
 	/** Unfreeze a previously frozen UTXO. */
 	async unfreezeUtxo(
-		txid: string,
+		txid: TxidHex,
 		index: number
 	): Promise<{ unfrozen: string }> {
 		this._validateTxid(txid);
 		return this._runOnchainSend(async () => {
 			this.onchainSweeps().assertInputMutable(txid, index);
-			const res = await this.wallet.unfreezeUtxo({ txid, index });
+			const res = await this.wallet.unfreezeUtxo({ txid, vout: index });
 			if (res.isErr())
 				throw new BeignetError(
 					BeignetErrorCode.INVALID_PARAMS,
@@ -7716,7 +7982,7 @@ export class BeignetNode extends EventEmitter {
 
 	async getFeeEstimates(): Promise<IOnchainFees> {
 		try {
-			return await this.wallet.getFeeEstimates();
+			return await this.wallet.fetchFeeEstimates();
 		} catch (e) {
 			throw new BeignetError(
 				'FEE_ESTIMATE_FAILED',
@@ -7939,13 +8205,48 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Channels ───────────────
 
+	/**
+	 * Open a channel to a connected peer, funded from the on-chain wallet.
+	 * Returns once the open is under way, before the peer accepts it.
+	 */
+	openChannel(
+		pubkey: string,
+		amountSats: number,
+		opts?: IOpenChannelOptions
+	): ChannelInfo;
+	/**
+	 * @deprecated Pass an {@link IOpenChannelOptions} object after
+	 * amountSats. Removed in the next major release.
+	 */
 	openChannel(
 		pubkey: string,
 		amountSats: number,
 		pushSats?: number,
 		satsPerVbyte?: number,
-		max = false,
-		trusted = false
+		max?: boolean,
+		trusted?: boolean
+	): ChannelInfo;
+	openChannel(
+		pubkey: string,
+		amountSats: number,
+		opts?: IOpenChannelOptions | number,
+		satsPerVbyte?: number,
+		max?: boolean,
+		trusted?: boolean
+	): ChannelInfo {
+		const options = openChannelOptions(opts, { satsPerVbyte, max, trusted });
+		return this._openChannel(pubkey, amountSats, options);
+	}
+
+	private _openChannel(
+		pubkey: string,
+		amountSats: number,
+		{
+			pushSats,
+			satsPerVbyte,
+			max = false,
+			trusted = false
+		}: IOpenChannelOptions
 	): ChannelInfo {
 		requireOpenAmounts(amountSats, pushSats);
 		const fundingSatoshis = BigInt(amountSats);
@@ -7984,7 +8285,9 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		opts?: { pushSats?: number; timeoutMs?: number }
 	): Promise<ChannelInfo> {
-		const info = this.openChannel(pubkey, amountSats, opts?.pushSats);
+		const info = this.openChannel(pubkey, amountSats, {
+			pushSats: opts?.pushSats
+		});
 		await this.waitForChannelReady(info.channelId, opts?.timeoutMs ?? 120_000);
 		// Refresh channel info after it's ready
 		const updated = this.getChannel(info.channelId);
@@ -8009,14 +8312,12 @@ export class BeignetNode extends EventEmitter {
 		if (opts?.trusted) {
 			this.node.addTrustedPeer(pubkey);
 		}
-		return this.openChannel(
-			pubkey,
-			amountSats,
-			opts?.pushSats,
-			opts?.satsPerVbyte,
-			opts?.max,
-			opts?.trusted ?? false
-		);
+		return this.openChannel(pubkey, amountSats, {
+			pushSats: opts?.pushSats,
+			satsPerVbyte: opts?.satsPerVbyte,
+			max: opts?.max,
+			trusted: opts?.trusted
+		});
 	}
 
 	async ensureMinimumChannels(
@@ -8082,7 +8383,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async closeQuote(
-		channelId: string,
+		channelId: ChannelIdHex,
 		address?: string,
 		acceptStaleStateRisk = false
 	): Promise<ReturnType<LightningNode['closeQuote']>> {
@@ -8102,7 +8403,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async closeChannel(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// Required for a capsule-restored channel, whose balances nothing can
 		// prove current: a mutual close signs the allocation this row carries,
 		// and a stale one is peer-favourable by construction (issue #469).
@@ -8327,7 +8628,7 @@ export class BeignetNode extends EventEmitter {
 		return this.node.getChannelManager().peerNegotiatedFforConcurrent(peer);
 	}
 
-	fforSync(channelId: string): Record<string, unknown> {
+	fforSync(channelId: ChannelIdHex): Record<string, unknown> {
 		const id = this.fforChannelId(channelId).toString('hex');
 		const result = this.node.fforSync(id);
 		if (!result.ok)
@@ -8335,7 +8636,7 @@ export class BeignetNode extends EventEmitter {
 		return this.fforEpoch(id);
 	}
 
-	fforEpoch(channelId: string): Record<string, unknown> {
+	fforEpoch(channelId: ChannelIdHex): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
 		if (!f) {
@@ -8348,7 +8649,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforStartEpoch(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		voucherAmountsMsat?: Array<string | number>;
 		settlementDeadline?: number;
 		voucherExpiry?: number;
@@ -8434,7 +8735,7 @@ export class BeignetNode extends EventEmitter {
 
 	fforCreateInvoice(body: {
 		expirySecs?: number;
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		k?: number;
 		description?: string;
 	}): Record<string, unknown> {
@@ -8461,7 +8762,7 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
-	fforCloseEpoch(channelId: string): Record<string, unknown> {
+	fforCloseEpoch(channelId: ChannelIdHex): Record<string, unknown> {
 		const idBuf = this.fforChannelId(channelId);
 		const res = this.node.closeFforEpoch(idBuf.toString('hex'));
 		if (!res.ok)
@@ -8470,7 +8771,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforAbortEpoch(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		reason?: number;
 		text?: string;
 	}): Record<string, unknown> {
@@ -8488,7 +8789,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforAddPreimage(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		preimage?: string;
 	}): Record<string, unknown> {
 		const idBuf = this.fforChannelId(body.channelId);
@@ -8511,7 +8812,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async fforProvisionWitness(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		witnessNodeId?: string;
 		retentionUntil?: number;
 		minReceipts?: number;
@@ -8582,7 +8883,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async fforProvisionIssuer(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		issuerNodeId?: string;
 		offer?: string;
 		witnessHops?: Array<{
@@ -8652,7 +8953,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async fforRecover(body: {
-		channelId?: string;
+		channelId?: ChannelIdHex;
 		forceCloseIfUnreachable?: boolean;
 		acceptStaleStateRisk?: boolean;
 	}): Promise<Record<string, unknown>> {
@@ -8714,7 +9015,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async fforCloseWitnesses(
-		channelId: string
+		channelId: ChannelIdHex
 	): Promise<Record<string, unknown>[]> {
 		const idBuf = this.fforChannelId(channelId);
 		const f = this.node.getFforEpoch(idBuf.toString('hex'));
@@ -8747,7 +9048,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async fforIssuedSlots(
-		channelId: string | undefined,
+		channelId: ChannelIdHex | undefined,
 		issuerNodeId: string | undefined
 	): Promise<Record<string, unknown>> {
 		const idBuf = this.fforChannelId(channelId);
@@ -8784,7 +9085,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	fforEnforce(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// The RECOVERY-PROTOCOL 5.6 acknowledgement forceCloseChannel asks
 		// for on a capsule-restored channel (issue #469). This route publishes
 		// the same commitment, so it takes the same flag and refuses without
@@ -8851,7 +9152,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	forceCloseChannel(
-		channelId: string,
+		channelId: ChannelIdHex,
 		// The labelled risk acknowledgement RECOVERY-PROTOCOL 5.6 asks for
 		// (issues #469 and #907). Required for either recency hold, and on a
 		// fenced or quarantined device (issue #1013): this node refuses to
@@ -8863,7 +9164,7 @@ export class BeignetNode extends EventEmitter {
 	): {
 		ok: boolean;
 		error?: string;
-		commitmentTxid?: string;
+		commitmentTxid?: TxidHex;
 	} {
 		// Validate before deciding anything from it. Buffer.from(x, 'hex')
 		// truncates at the first non-hex pair and is case insensitive, so a
@@ -8990,10 +9291,10 @@ export class BeignetNode extends EventEmitter {
 	 * always rebuilds from the latest state, so no older commitment can be
 	 * selected.
 	 */
-	async rebroadcastClose(channelId: string): Promise<{
+	async rebroadcastClose(channelId: ChannelIdHex): Promise<{
 		ok: boolean;
 		error?: string;
-		txid?: string;
+		txid?: TxidHex;
 		broadcastOk?: boolean;
 	}> {
 		return this.node.rebroadcastClose(requireChannelIdHex(channelId));
@@ -9003,19 +9304,21 @@ export class BeignetNode extends EventEmitter {
 		return this.node.listChannels().map((ch) => this.toChannelInfo(ch));
 	}
 
-	getChannel(channelId: string): ChannelInfo | null {
+	getChannel(channelId: ChannelIdHex): ChannelInfo | null {
 		const ch = this.node.getChannel(requireChannelIdHex(channelId));
 		if (!ch) return null;
 		return this.toChannelInfo(ch);
 	}
 
 	getChannelHealth(
-		channelId: string
+		channelId: ChannelIdHex
 	): import('../lightning/node/types').IChannelHealth | null {
 		return this.node.getChannelHealth(requireChannelIdHex(channelId));
 	}
 
-	getChannelDiagnostics(channelId: string): Record<string, unknown> | null {
+	getChannelDiagnostics(
+		channelId: ChannelIdHex
+	): Record<string, unknown> | null {
 		const channelIdBuf = requireChannelIdHex(channelId);
 		const channel = this.node.getChannelManager().getChannel(channelIdBuf);
 		if (!channel) return null;
@@ -9142,6 +9445,7 @@ export class BeignetNode extends EventEmitter {
 				channelId?: string;
 				txid?: string;
 				retained?: boolean;
+				channelErrorCode?: ChannelErrorCode;
 			} = {
 				code: err.code,
 				message: err.message,
@@ -9150,6 +9454,9 @@ export class BeignetNode extends EventEmitter {
 			};
 			if (err.txid !== undefined) data.txid = err.txid;
 			if (err.retained !== undefined) data.retained = err.retained;
+			if (err.channelErrorCode !== undefined) {
+				data.channelErrorCode = err.channelErrorCode;
+			}
 			if (onError) onError(data);
 			this.emit('node:error', data);
 		});
@@ -9469,9 +9776,9 @@ export class BeignetNode extends EventEmitter {
 		const payments = new DirectFundingPaymentStore({
 			storage: {
 				saveWalletData: (key, value): void =>
-					this.getStorage().saveWalletData(key, value),
+					this.getStorageBackend().saveWalletData(key, value),
 				loadWalletData: (key): string | null =>
-					this.getStorage().loadWalletData(key)
+					this.getStorageBackend().loadWalletData(key)
 			}
 		});
 		payments.restore();
@@ -9799,7 +10106,7 @@ export class BeignetNode extends EventEmitter {
 		host?: string;
 		port?: number;
 		amountSats?: number;
-	}): { paymentHash: string; expiresAt: number; request: string } {
+	}): { paymentHash: PaymentHashHex; expiresAt: number; request: string } {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
 				throw new BeignetError(
@@ -10017,7 +10324,7 @@ export class BeignetNode extends EventEmitter {
 	 */
 	createHoldInvoice(opts: {
 		/** 32-byte payment hash, hex. sha256(preimage) held by the caller. */
-		paymentHash: string;
+		paymentHash: PaymentHashHex;
 		amountMsat?: bigint;
 		amountSats?: number;
 		description?: string;
@@ -10032,12 +10339,7 @@ export class BeignetNode extends EventEmitter {
 		 */
 		minFinalCltvExpiry?: number;
 	}): InvoiceInfo {
-		if (!/^[0-9a-fA-F]{64}$/.test(opts.paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be 32 bytes hex (64 hex chars)'
-			);
-		}
+		const paymentHash = requirePaymentHashHex(opts.paymentHash);
 		const amountMsat =
 			opts.amountMsat ??
 			(opts.amountSats !== undefined && opts.amountSats !== 0
@@ -10051,7 +10353,7 @@ export class BeignetNode extends EventEmitter {
 			description: opts.description || '',
 			expiry: opts.expiry,
 			hold: true,
-			paymentHash: Buffer.from(opts.paymentHash, 'hex'),
+			paymentHash,
 			...(opts.minFinalCltvExpiry !== undefined
 				? {
 						minFinalCltvExpiry: requireFinalCltvExpiry(opts.minFinalCltvExpiry)
@@ -10096,7 +10398,7 @@ export class BeignetNode extends EventEmitter {
 	 * MPP part). Throws NOT_FOUND when nothing is parked for the hash, and
 	 * HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
-	settleHoldInvoice(preimage: string): { paymentHash: string } {
+	settleHoldInvoice(preimage: string): { paymentHash: PaymentHashHex } {
 		if (!/^[0-9a-fA-F]{64}$/.test(preimage)) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -10125,17 +10427,11 @@ export class BeignetNode extends EventEmitter {
 	 * HTLCs. Throws NOT_FOUND when the hash is not a known open hold invoice,
 	 * and HOLD_RESOLUTION_PENDING when parts stay parked after the call.
 	 */
-	cancelHoldInvoice(paymentHash: string): {
-		paymentHash: string;
+	cancelHoldInvoice(paymentHash: PaymentHashHex): {
+		paymentHash: PaymentHashHex;
 		htlcsFailed: number;
 	} {
-		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be 32 bytes hex (64 hex chars)'
-			);
-		}
-		const hash = Buffer.from(paymentHash, 'hex');
+		const hash = requirePaymentHashHex(paymentHash);
 		const result = this.node.cancelHoldInvoice(hash);
 		if (!result) {
 			throw this.holdResolutionRefusal(
@@ -10645,7 +10941,9 @@ export class BeignetNode extends EventEmitter {
 	private _persistSpendState(strict = false): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		// A daemon that has not opened its database has nowhere to write.
-		const storage = this.storage as SqliteStorage | undefined;
+		const storage = this.storage as
+			| (IStorageBackend & IWalletDataStorage)
+			| undefined;
 		if (!storage) return;
 		const claims: PersistedDailySpendState['claims'] = {};
 		for (const [paymentHashHex, list] of this._asyncSpendClaims) {
@@ -11322,8 +11620,8 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * The BeignetError for a refusal the engine threw out of a send: its
-	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or, for an
-	 * untyped throw, the code its message implies. One mapping for every
+	 * LightningErrorCode through ENGINE_PAYMENT_ERROR_CODES, or PAYMENT_FAILED
+	 * for a throw with no code. The message is never read. One mapping for every
 	 * payment method (issue #991): sendPaymentAsync used to let the engine's
 	 * LightningPaymentError through untouched, and the daemon, seeing no
 	 * BeignetError, answered PAYMENT_FAILED with a 502 that told an agent to
@@ -11337,19 +11635,10 @@ export class BeignetNode extends EventEmitter {
 		if (err instanceof InvalidRequestError) {
 			return new BeignetError(BeignetErrorCode.INVALID_PARAMS, msg);
 		}
-		let code = 'PAYMENT_FAILED';
+		let code: BeignetErrorCodeValue = 'PAYMENT_FAILED';
 		if (err instanceof Error && 'code' in err) {
 			const lpErr = err as { code: string };
 			code = ENGINE_PAYMENT_ERROR_CODES[lpErr.code] || 'PAYMENT_FAILED';
-		} else if (msg.includes('No route found')) {
-			code = 'NO_ROUTE';
-		} else if (msg.includes('already in flight')) {
-			code = 'DUPLICATE_PAYMENT';
-		} else if (
-			msg.includes('No channel to first hop') ||
-			msg.includes('Peer not found')
-		) {
-			code = 'PEER_NOT_CONNECTED';
 		}
 		return new BeignetError(code, msg);
 	}
@@ -11426,14 +11715,53 @@ export class BeignetNode extends EventEmitter {
 		);
 	}
 
-	async payInvoice(
+	/**
+	 * Pay a BOLT 11 invoice and wait until it settles, fails or times out.
+	 * src/cli/README.md describes the timeout and fee-cap rules.
+	 */
+	payInvoice(bolt11: string, opts?: IPayInvoiceOptions): Promise<PaymentInfo>;
+	/**
+	 * @deprecated Pass an {@link IPayInvoiceOptions} object after the
+	 * invoice. Removed in the next major release.
+	 */
+	payInvoice(
 		bolt11: string,
-		timeoutMs = 60_000,
+		timeoutMs?: number,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
 		cltvLimit?: number,
-		maxFeeMsatCap?: number | string
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo>;
+	async payInvoice(
+		bolt11: string,
+		opts?: IPayInvoiceOptions | number,
+		maxFeeSats?: number,
+		amountSats?: number,
+		metadata?: Record<string, string>,
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo> {
+		const options = payInvoiceOptions(opts, {
+			maxFeeSats,
+			amountSats,
+			metadata,
+			cltvLimit,
+			maxFeeMsat
+		});
+		return this._payInvoice(bolt11, options);
+	}
+
+	private async _payInvoice(
+		bolt11: string,
+		{
+			timeoutMs = 60_000,
+			maxFeeSats,
+			amountSats,
+			metadata,
+			cltvLimit,
+			maxFeeMsat: maxFeeMsatCap
+		}: IPayInvoiceOptions
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
@@ -11585,9 +11913,26 @@ export class BeignetNode extends EventEmitter {
 	 * engine refused from, the durable row included (#975). Otherwise a
 	 * synthetic FAILED record whose failureDescription carries the code.
 	 */
+	payInvoiceSafe(
+		bolt11: string,
+		opts?: IPayInvoiceOptions
+	): Promise<PaymentInfo>;
+	/**
+	 * @deprecated Pass an {@link IPayInvoiceOptions} object after the
+	 * invoice. Removed in the next major release.
+	 */
+	payInvoiceSafe(
+		bolt11: string,
+		timeoutMs?: number,
+		maxFeeSats?: number,
+		amountSats?: number,
+		metadata?: Record<string, string>,
+		cltvLimit?: number,
+		maxFeeMsat?: number | string
+	): Promise<PaymentInfo>;
 	async payInvoiceSafe(
 		bolt11: string,
-		timeoutMs = 60_000,
+		opts?: IPayInvoiceOptions | number,
 		maxFeeSats?: number,
 		amountSats?: number,
 		metadata?: Record<string, string>,
@@ -11597,12 +11942,13 @@ export class BeignetNode extends EventEmitter {
 		try {
 			return await this.payInvoice(
 				bolt11,
-				timeoutMs,
-				maxFeeSats,
-				amountSats,
-				metadata,
-				cltvLimit,
-				maxFeeMsat
+				payInvoiceOptions(opts, {
+					maxFeeSats,
+					amountSats,
+					metadata,
+					cltvLimit,
+					maxFeeMsat
+				})
 			);
 		} catch (err: unknown) {
 			// Extract payment hash if possible (bolt11 itself may be invalid)
@@ -11652,14 +11998,12 @@ export class BeignetNode extends EventEmitter {
 
 		for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
 			try {
-				const result = await this.payInvoice(
-					bolt11,
-					60_000,
-					opts.maxFeeSats,
-					opts.amountSats,
-					opts.metadata,
-					opts.cltvLimit
-				);
+				const result = await this.payInvoice(bolt11, {
+					maxFeeSats: opts.maxFeeSats,
+					amountSats: opts.amountSats,
+					metadata: opts.metadata,
+					cltvLimit: opts.cltvLimit
+				});
 				return { ...result, attempts: attempt };
 			} catch (err: unknown) {
 				if (!(err instanceof BeignetError)) throw err;
@@ -11768,7 +12112,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		metadata?: Record<string, string>,
 		cltvLimit?: number
-	): { paymentHash: string; status: 'PENDING' | 'FAILED' } {
+	): { paymentHash: PaymentHashHex; status: 'PENDING' | 'FAILED' } {
 		// Returning before the payment settles is the point of this method, not
 		// a licence to skip admission: drain mode, the per-payment limit and the
 		// daily limit all apply, and the claim they raise is charged by the
@@ -11855,7 +12199,7 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		metadata?: Record<string, string>,
-		onPaymentHash?: (paymentHash: string) => void
+		onPaymentHash?: (paymentHash: PaymentHashHex) => void
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
@@ -12053,11 +12397,21 @@ export class BeignetNode extends EventEmitter {
 				load: () => p
 			}))
 			.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0));
-		const rows = this.storage.paymentsNewestFirst(since, {
-			status,
-			direction,
-			metadata
-		});
+		// Another backend has no lookup columns, so its rows are all read
+		// and tested by the same rules as the live records.
+		const sqlite = this.sqlite();
+		const rows: Iterator<IStoredPaymentRef> = sqlite
+			? sqlite.paymentsNewestFirst(since, { status, direction, metadata })
+			: this.storage
+					.loadAllPayments()
+					.filter(({ payment }) => matches(payment))
+					.map(({ paymentHash, payment }) => ({
+						paymentHash,
+						createdAt: payment.createdAt,
+						load: () => payment
+					}))
+					.sort((a, b) => (newer(a, b) ? -1 : newer(b, a) ? 1 : 0))
+					[Symbol.iterator]();
 		const nextRow = (): IStoredPaymentRef | undefined => {
 			for (let r = rows.next(); !r.done; r = rows.next()) {
 				if (!live.has(r.value.paymentHash)) return r.value;
@@ -12104,10 +12458,11 @@ export class BeignetNode extends EventEmitter {
 	 * a NOT_FOUND for a payment the caller already knew is the answer this
 	 * exists to prevent.
 	 */
-	getPayment(paymentHash: string): PaymentInfo | null {
-		const live = this.livePayment(paymentHash);
+	getPayment(paymentHash: PaymentHashHex): PaymentInfo | null {
+		const hashHex = requirePaymentHashHex(paymentHash).toString('hex');
+		const live = this.livePayment(hashHex);
 		if (live) return live;
-		const durable = this.storage.loadPayment(paymentHash);
+		const durable = this.storage.loadPayment(hashHex);
 		return durable ? this.toPaymentInfo(durable) : null;
 	}
 
@@ -12117,11 +12472,9 @@ export class BeignetNode extends EventEmitter {
 	 * PENDING or an HTLC is still out for it, 'gone' when nothing sent for it
 	 * can settle any more. A durable row that cannot be read reads as live.
 	 */
-	paymentOutcome(paymentHash: string): 'settled' | 'live' | 'gone' {
-		return this._spendClaimOutcomeAtBoot(
-			Buffer.from(paymentHash, 'hex'),
-			paymentHash
-		);
+	paymentOutcome(paymentHash: PaymentHashHex): 'settled' | 'live' | 'gone' {
+		const hash = requirePaymentHashHex(paymentHash);
+		return this._spendClaimOutcomeAtBoot(hash, hash.toString('hex'));
 	}
 
 	/**
@@ -12240,7 +12593,7 @@ export class BeignetNode extends EventEmitter {
 		truncated: boolean;
 		paid: boolean;
 		amountPaidSats: number;
-		paymentHash?: string;
+		paymentHash?: PaymentHashHex;
 	}> {
 		this._checkDraining();
 		// This method is reachable over the daemon API, which makes it a
@@ -12262,11 +12615,10 @@ export class BeignetNode extends EventEmitter {
 					bolt11: string,
 					payOptions
 				): Promise<{ preimage: Buffer }> => {
-					const info = await this.payInvoice(
-						bolt11,
-						payOptions.timeoutMs ?? 60_000,
-						payOptions.maxFeeSats
-					);
+					const info = await this.payInvoice(bolt11, {
+						timeoutMs: payOptions.timeoutMs,
+						maxFeeSats: payOptions.maxFeeSats
+					});
 					if (!info.preimage) {
 						throw new BeignetError(
 							'PAYMENT_FAILED',
@@ -12349,8 +12701,8 @@ export class BeignetNode extends EventEmitter {
 		this._l402Credentials.delete(scope);
 	}
 
-	getPaymentProof(paymentHash: string): PaymentProof | null {
-		const hash = Buffer.from(paymentHash, 'hex');
+	getPaymentProof(paymentHash: PaymentHashHex): PaymentProof | null {
+		const hash = requirePaymentHashHex(paymentHash);
 		const proof = this.node.getPaymentProof(hash);
 		// The proof is built from this record, so both exist or neither does.
 		// The sats come from the record, as getPayment's do: the proof carries
@@ -12371,7 +12723,7 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
-	verifyPaymentProof(paymentHash: string): PaymentProofVerification {
+	verifyPaymentProof(paymentHash: PaymentHashHex): PaymentProofVerification {
 		const proof = this.getPaymentProof(paymentHash);
 		if (!proof) return { valid: false, error: 'No proof found' };
 		const computed = crypto
@@ -12394,7 +12746,7 @@ export class BeignetNode extends EventEmitter {
 	 * proportional millionths); see updateChannelPolicy for that.
 	 */
 	updateChannelFee(
-		channelId: string,
+		channelId: ChannelIdHex,
 		feeratePerKw: number
 	): { ok: boolean; error?: string } {
 		return this.node.updateChannelFee(
@@ -12410,7 +12762,7 @@ export class BeignetNode extends EventEmitter {
 	 * channelId.
 	 */
 	updateChannelPolicy(
-		channelId: string,
+		channelId: ChannelIdHex,
 		policy: ChannelPolicyUpdateParams
 	): { updated: number; policies: ChannelPolicyInfo[] } {
 		return this.applyChannelPolicy(
@@ -12472,7 +12824,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/** Effective routing policy for a channel, or null if unknown. */
-	getChannelPolicy(channelId: string): ChannelPolicyInfo | null {
+	getChannelPolicy(channelId: ChannelIdHex): ChannelPolicyInfo | null {
 		const policy = this.node.getChannelPolicy(requireChannelIdHex(channelId));
 		if (!policy) return null;
 		return {
@@ -12493,8 +12845,8 @@ export class BeignetNode extends EventEmitter {
 	 * refusal here has to be a thrown BeignetError, so the daemon answers with
 	 * the failure envelope and a status to match.
 	 */
-	cancelPayment(paymentHash: string): { ok: true } {
-		this.node.failPayment(Buffer.from(paymentHash, 'hex'));
+	cancelPayment(paymentHash: PaymentHashHex): { ok: true } {
+		this.node.failPayment(requirePaymentHashHex(paymentHash));
 		return { ok: true };
 	}
 
@@ -12594,7 +12946,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Wait APIs ───────────────
 
 	async waitForChannelReady(
-		channelId: string,
+		channelId: ChannelIdHex,
 		timeoutMs = 60_000
 	): Promise<void> {
 		return this.node.waitForChannelReady(
@@ -12612,11 +12964,11 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	async waitForPayment(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
 		const info = await this.node.waitForPayment(
-			Buffer.from(paymentHash, 'hex'),
+			requirePaymentHashHex(paymentHash),
 			timeoutMs
 		);
 		return this.toPaymentInfo(info);
@@ -12785,7 +13137,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Splicing ───────────────
 
 	spliceQuote(
-		channelId: string,
+		channelId: ChannelIdHex,
 		direction: 'in' | 'out',
 		feeratePerkw: number,
 		destinationAddress?: string
@@ -12803,11 +13155,11 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	spliceIn(
-		channelId: string,
+		channelId: ChannelIdHex,
 		amountSats: number,
 		feeratePerkw: number,
 		fundingUtxos?: {
-			utxos: Array<{ txid: string; vout: number }>;
+			utxos: Array<{ txid: TxidHex; vout: number }>;
 			allowTopUp?: boolean;
 		}
 	): SpliceResult {
@@ -12864,7 +13216,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	spliceOut(
-		channelId: string,
+		channelId: ChannelIdHex,
 		amountSats: number,
 		feeratePerkw: number,
 		destinationAddress?: string
@@ -13009,7 +13361,7 @@ export class BeignetNode extends EventEmitter {
 		timeoutMs = 60_000,
 		maxFeeSats?: number,
 		maxFeeMsatCap?: number | string,
-		onPaymentHash?: (paymentHash: string) => void
+		onPaymentHash?: (paymentHash: PaymentHashHex) => void
 	): Promise<PaymentInfo> {
 		if (this.isGraphRestoring()) await this.whenGraphRestored();
 		// Paying an offer spends outbound liquidity exactly as payInvoice does,
@@ -13167,8 +13519,10 @@ export class BeignetNode extends EventEmitter {
 	 * from the in-memory record or, once that is pruned, the durable row
 	 * (issue #1063); EXPIRED past its expiry otherwise; PENDING until then.
 	 */
-	getInvoice(paymentHash: string): InvoiceInfo | null {
-		const inv = this.node.getInvoice(paymentHash);
+	getInvoice(paymentHash: PaymentHashHex): InvoiceInfo | null {
+		const inv = this.node.getInvoice(
+			requirePaymentHashHex(paymentHash).toString('hex')
+		);
 		if (!inv) return null;
 		const live = this.node.getPayment(Buffer.from(inv.paymentHash, 'hex'));
 		const paid = live
@@ -13194,10 +13548,19 @@ export class BeignetNode extends EventEmitter {
 			} else {
 				// The two fields settlesInvoice reads, so the answer is the same.
 				if (!durablePaid) {
-					durablePaid = this.storage.paymentHashesWith({
-						status: 'COMPLETED',
-						direction: 'INCOMING'
-					});
+					const match = { status: 'COMPLETED', direction: 'INCOMING' };
+					durablePaid =
+						this.sqlite()?.paymentHashesWith(match) ??
+						new Set(
+							this.storage
+								.loadAllPayments()
+								.filter(
+									({ payment }) =>
+										payment.status === match.status &&
+										payment.direction === match.direction
+								)
+								.map(({ paymentHash }) => paymentHash)
+						);
 				}
 				paid = durablePaid.has(inv.paymentHash);
 			}
@@ -13607,8 +13970,8 @@ export class BeignetNode extends EventEmitter {
 	 * maxFeeSats.
 	 */
 	async rebalanceChannel(
-		fromChannelId: string,
-		toChannelId: string,
+		fromChannelId: ChannelIdHex,
+		toChannelId: ChannelIdHex,
 		amountSats: number,
 		maxFeeSats: number
 	): Promise<RebalanceResult> {
@@ -14032,16 +14395,11 @@ export class BeignetNode extends EventEmitter {
 	 * claim, was never charged.
 	 */
 	sendToRoute(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		route: { hops: RouteHop[] },
 		paymentSecret?: string
 	): PaymentInfo {
-		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'paymentHash must be a 32-byte hex string'
-			);
-		}
+		const paymentHashBuf = requirePaymentHashHex(paymentHash);
 		if (!route || !Array.isArray(route.hops) || route.hops.length === 0) {
 			throw new BeignetError(
 				BeignetErrorCode.INVALID_PARAMS,
@@ -14061,9 +14419,9 @@ export class BeignetNode extends EventEmitter {
 		const hops = jsonToRouteHops(route.hops);
 		const finalHop = hops[hops.length - 1];
 		// The claim is keyed the way the settlement will look it up: the
-		// engine reports the hash as lowercase hex, and the regex above admits
+		// engine reports the hash as lowercase hex, and the caller may send
 		// uppercase.
-		const paymentHashHex = paymentHash.toLowerCase();
+		const paymentHashHex = paymentHashBuf.toString('hex');
 		// The wire amount is what the first hop is asked to carry.
 		const sentMsat = hops[0].amountToForwardMsat;
 		if (sentMsat < finalHop.amountToForwardMsat) {
@@ -14085,7 +14443,7 @@ export class BeignetNode extends EventEmitter {
 		try {
 			payment = this.node.sendPaymentToRoute(
 				wireRoute,
-				Buffer.from(paymentHashHex, 'hex'),
+				paymentHashBuf,
 				finalHop.outgoingCltvValue,
 				paymentSecret ? Buffer.from(paymentSecret, 'hex') : undefined,
 				finalHop.amountToForwardMsat
@@ -14097,10 +14455,10 @@ export class BeignetNode extends EventEmitter {
 			// Surface library payment errors (NO_CHANNEL_TO_HOP, ...) by code
 			const code =
 				err !== null && typeof err === 'object' && 'code' in err
-					? String((err as { code: unknown }).code)
-					: 'PAYMENT_FAILED';
+					? (err as { code: unknown }).code
+					: undefined;
 			throw new BeignetError(
-				code,
+				isBeignetErrorCode(code) ? code : 'PAYMENT_FAILED',
 				err instanceof Error ? err.message : String(err)
 			);
 		}
@@ -14196,11 +14554,12 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── Payment Metadata ───────────────
 
 	setPaymentMetadata(
-		paymentHash: string,
+		paymentHash: PaymentHashHex,
 		metadata: Record<string, string>
 	): void {
+		const hash = requirePaymentHashHex(paymentHash);
 		try {
-			this.node.setPaymentMetadata(Buffer.from(paymentHash, 'hex'), metadata);
+			this.node.setPaymentMetadata(hash, metadata);
 		} catch (err: unknown) {
 			if (err instanceof InvalidRequestError) {
 				throw new BeignetError(BeignetErrorCode.INVALID_PARAMS, err.message);
@@ -14346,11 +14705,11 @@ export class BeignetNode extends EventEmitter {
 					const recheck = (): void => {
 						if (live() && !this.canCarryHtlc()) return;
 						this.removeListener('channel:usable', recheck);
-						this.removeListener(CHANNELS_CHANGED, recheck);
+						untypedEmitter.removeListener.call(this, CHANNELS_CHANGED, recheck);
 						if (live()) run();
 					};
 					this.on('channel:usable', recheck);
-					this.on(CHANNELS_CHANGED, recheck);
+					untypedEmitter.on.call(this, CHANNELS_CHANGED, recheck);
 				},
 				() => {
 					// Destroyed (a shutdown, or a capsule restore rebuilding the
@@ -14381,7 +14740,12 @@ export class BeignetNode extends EventEmitter {
 		if (!this.paymentQueue) {
 			this.paymentQueue = new PaymentQueue(
 				(bolt11, timeout, maxFee, amount, meta) =>
-					this.payInvoiceSafe(bolt11, timeout, maxFee, amount, meta),
+					this.payInvoiceSafe(bolt11, {
+						timeoutMs: timeout,
+						maxFeeSats: maxFee,
+						amountSats: amount,
+						metadata: meta
+					}),
 				// No node yet (a guardian restore pending): no capacity, for
 				// now, rather than a throw (issue #967).
 				(amount) =>
@@ -14400,7 +14764,9 @@ export class BeignetNode extends EventEmitter {
 					invoiceAmountSats: (b) =>
 						paymentSpendSats(decodeInvoiceInput(b).amountMsat)
 				},
-				this.liveQueueStorage()
+				// The queue's rows are SQLite tables, so a node on injected
+				// storage keeps its queue in memory.
+				this.storageInjected ? undefined : this.liveQueueStorage()
 			);
 			// First built after shutdown began, while the database stays open
 			// for the wallet: the rows it restored must not dispatch against
@@ -14425,12 +14791,13 @@ export class BeignetNode extends EventEmitter {
 	 * (issue #978).
 	 */
 	private liveQueueStorage(): IPaymentQueueStorage {
+		const sqlite = (): SqliteStorage => this.sqlite()!;
 		return {
-			saveQueueEntry: (entry) => this.storage.saveQueueEntry(entry),
+			saveQueueEntry: (entry) => sqlite().saveQueueEntry(entry),
 			updateQueueEntryStatus: (id, status, error, completedAt) =>
-				this.storage.updateQueueEntryStatus(id, status, error, completedAt),
-			deleteQueueEntry: (id) => this.storage.deleteQueueEntry(id),
-			loadAllQueueEntries: () => this.storage.loadAllQueueEntries()
+				sqlite().updateQueueEntryStatus(id, status, error, completedAt),
+			deleteQueueEntry: (id) => sqlite().deleteQueueEntry(id),
+			loadAllQueueEntries: () => sqlite().loadAllQueueEntries()
 		};
 	}
 
@@ -14644,21 +15011,33 @@ export class BeignetNode extends EventEmitter {
 
 	/** Back up the database to `destPath`, with its MAC in backupMacPath(destPath). */
 	async backup(destPath: string): Promise<void> {
-		await this.storage.backup(destPath);
+		const sqlite = this.sqlite();
+		if (!sqlite) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'backup() copies the SQLite database; this node runs on the storage passed to create()'
+			);
+		}
+		await sqlite.backup(destPath);
 		await writeBackupMac(deriveBackupMacKey(this.walletSeed()), destPath);
 	}
 
-	/** The live database, its sidecars and the instance lock. */
+	/**
+	 * The live database, its sidecars and the instance lock. A node on
+	 * injected storage has no database file, so only its lock, if it holds one.
+	 */
 	storageFiles(): string[] {
-		const dbPath = fs.realpathSync.native(
-			path.join(this.dataDir, `${this.networkName}.db`)
+		if (this.storageInjected) return this._lockPath ? [this._lockPath] : [];
+		const dataDir = this.requireDataDir();
+		const dbPath = nodeFs().realpathSync.native(
+			path.join(dataDir, `${this.networkName}.db`)
 		);
 		return [
 			dbPath,
 			`${dbPath}-wal`,
 			`${dbPath}-shm`,
 			`${dbPath}-journal`,
-			path.join(this.dataDir, `${this.networkName}.lock`)
+			path.join(dataDir, `${this.networkName}.lock`)
 		];
 	}
 
@@ -14701,7 +15080,8 @@ export class BeignetNode extends EventEmitter {
 	 * Build, encrypt, and persist the static channel backup. The blob is
 	 * encrypted under the BIP39 seed of the wallet mnemonic (same seed material
 	 * as storage encryption), written atomically to <dataDir>/channels.scb, and
-	 * also returned for out-of-band storage.
+	 * also returned for out-of-band storage. A node without a dataDir writes
+	 * no file, and returns an empty path.
 	 */
 	exportStaticChannelBackup(): {
 		encoded: string;
@@ -14717,6 +15097,9 @@ export class BeignetNode extends EventEmitter {
 		};
 		const seed = this.walletSeed();
 		const encoded = encodeScb(backup, seed);
+		if (this.dataDir === undefined) {
+			return { encoded, channelCount: data.channels.length, path: '' };
+		}
 		const scbPath = path.join(this.dataDir, 'channels.scb');
 		// Atomic write: a crash mid-write must never leave a truncated backup.
 		// Owner-only: the blob is seed-encrypted, but it still names every
@@ -14736,7 +15119,7 @@ export class BeignetNode extends EventEmitter {
 	 */
 	async restoreFromScb(encoded: string): Promise<{
 		recovering: string[];
-		skipped: Array<{ channelId: string; reason: string }>;
+		skipped: Array<{ channelId: ChannelIdHex; reason: string }>;
 		channelCount: number;
 	}> {
 		const seed = this.walletSeed();
@@ -15277,10 +15660,44 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * The node's current SqliteStorage. An in-process capsule resume closes
 	 * it and installs a new one, so anything that persists through it reads
-	 * this on every call instead of keeping the handle (issue #978).
+	 * this on every call instead of keeping the handle (issue #978). Throws
+	 * for a node created with options.storage; getStorageBackend() returns
+	 * either.
 	 */
 	getStorage(): SqliteStorage {
+		const sqlite = this.sqlite();
+		if (!sqlite) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'This node runs on the storage passed to create(), not SQLite; use getStorageBackend()'
+			);
+		}
+		return sqlite;
+	}
+
+	/**
+	 * The storage the node runs on: the backend passed as options.storage,
+	 * or its SqliteStorage. Read it on every call, as getStorage() says.
+	 */
+	getStorageBackend(): IStorageBackend & IWalletDataStorage {
 		return this.storage;
+	}
+
+	/** The storage as the SqliteStorage it is unless create() was given one. */
+	private sqlite(): SqliteStorage | undefined {
+		return this.storageInjected ? undefined : (this.storage as SqliteStorage);
+	}
+
+	/**
+	 * The data directory, on paths only a node with one reaches: every
+	 * SQLite node has one, and create() refuses the options that need one
+	 * on injected storage without it.
+	 */
+	private requireDataDir(): string {
+		if (this.dataDir === undefined) {
+			throw new BeignetError('INVALID_PARAMS', 'This node has no dataDir');
+		}
+		return this.dataDir;
 	}
 
 	// ─────────────── Lifecycle ───────────────
@@ -15427,31 +15844,31 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Internal Helpers ───────────────
 
-	private toBeignetNetwork(network: NetworkName): EAvailableNetworks {
+	private toBeignetNetwork(network: NetworkName): Network {
 		switch (network) {
 			case 'mainnet':
-				return EAvailableNetworks.bitcoin;
+				return Network.bitcoin;
 			case 'testnet':
-				return EAvailableNetworks.testnet;
+				return Network.testnet;
 			case 'regtest':
-				return EAvailableNetworks.regtest;
+				return Network.regtest;
 			case 'signet':
-				return EAvailableNetworks.signet;
+				return Network.signet;
 			default:
 				return unknownNetwork(network);
 		}
 	}
 
-	private toLnNetwork(network: NetworkName): Network {
+	private toLnNetwork(network: NetworkName): LnNetwork {
 		switch (network) {
 			case 'mainnet':
-				return Network.MAINNET;
+				return LnNetwork.MAINNET;
 			case 'testnet':
-				return Network.TESTNET;
+				return LnNetwork.TESTNET;
 			case 'regtest':
-				return Network.REGTEST;
+				return LnNetwork.REGTEST;
 			case 'signet':
-				return Network.SIGNET;
+				return LnNetwork.SIGNET;
 			default:
 				return unknownNetwork(network);
 		}
@@ -15473,8 +15890,8 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	private getBitcoinNetwork(): unknown {
-		// getBitcoinJsNetwork covers signet, which bitcoinjs-lib's networks
+		// toBitcoinJsNetwork covers signet, which bitcoinjs-lib's networks
 		// object lacks.
-		return getBitcoinJsNetwork(this.toBeignetNetwork(this.networkName));
+		return toBitcoinJsNetwork(this.toBeignetNetwork(this.networkName));
 	}
 }

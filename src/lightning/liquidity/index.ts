@@ -1,5 +1,7 @@
 export {
 	JIT_INTERCEPT_SCID_BLOCK,
+	JitReceiveError,
+	JitReceiveErrorCode,
 	JitReceiveManager,
 	decodeJitAck,
 	decodeJitAuthorization,
@@ -21,5 +23,6 @@ export type {
 	IJitReceiveConfig,
 	IJitReceiveQuote,
 	IJitReceiveQuoteRequest,
-	IPersistedHeldPart
+	IPersistedHeldPart,
+	JitReceiveEvents
 } from './jit-receive';

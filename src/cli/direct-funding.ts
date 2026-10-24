@@ -17,7 +17,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../utils/ecc';
-import { ECPairInterface } from 'ecpair';
+import type { ECPairInterface } from 'ecpair';
 import { getECPair } from '../utils/ecc-apis';
 import type { Wallet } from '../wallet';
 import type { IUtxo } from '../types';
@@ -28,7 +28,7 @@ import {
 import { computeScriptHash } from '../lightning/chain/chain-watcher';
 import { schnorrSign } from '../lightning/offer/schnorr';
 import { getPublicKey } from '../lightning/crypto/ecdh';
-import {
+import type {
 	IDfCoinSigner,
 	IDfSenderCoin,
 	IDfSenderWallet
@@ -44,6 +44,7 @@ bitcoin.initEccLib(ecc);
 export type IDfWallet = Pick<
 	Wallet,
 	| 'listUtxos'
+	| 'listImmatureUtxos'
 	| 'isUtxoFrozen'
 	| 'listFrozenUtxos'
 	| 'freezeUtxoIfUnfrozen'
@@ -104,7 +105,8 @@ export function directFundingWallet(
 			for (const utxo of wallet.listUtxos() ?? []) {
 				// A frozen coin is one another funding already committed, or one the
 				// operator withheld. Either way it is not ours to offer.
-				if (wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)) continue;
+				if (wallet.isUtxoFrozen({ txid: utxo.tx_hash, vout: utxo.tx_pos }))
+					continue;
 				const script = scriptFor(utxo.address);
 				// Only the two kinds whose witness a receiver can verify and whose
 				// ownership proof the protocol defines.
@@ -188,9 +190,11 @@ export function directFundingWallet(
 		ownsOutpoint(txidHex: string, vout: number): boolean {
 			// Frozen coins included on purpose: the question is whether spending
 			// this outpoint moves OUR money, and a freeze does not change that.
-			return (wallet.listUtxos() ?? []).some(
-				(u) => u.tx_hash === txidHex && u.tx_pos === vout
-			);
+			// Neither does a coinbase output that has not matured yet.
+			return [
+				...(wallet.listUtxos() ?? []),
+				...(wallet.listImmatureUtxos() ?? [])
+			].some((u) => u.tx_hash === txidHex && u.tx_pos === vout);
 		},
 
 		async getTransaction(txidHex: string): Promise<Buffer> {
@@ -307,7 +311,7 @@ export function directFundingWallet(
 			// queued ahead of this call creates it first, and it is not ours.
 			const result = await wallet.freezeUtxoIfUnfrozen({
 				txid: txidHex,
-				index: vout,
+				vout,
 				tag: DF_FREEZE_TAG
 			});
 			return result.isOk() && result.value.created;
@@ -322,7 +326,7 @@ export function directFundingWallet(
 			// release, and false would keep the payer holding a spendable coin.
 			const result = await wallet.unfreezeUtxoIfTagged({
 				txid: txidHex,
-				index: vout,
+				vout,
 				tag: DF_FREEZE_TAG
 			});
 			return result.isOk() && result.value.unfrozen;

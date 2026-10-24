@@ -31,14 +31,16 @@
  * tests prove.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
-import { hkdfKey } from '../storage/encryption';
 import {
-	CorruptRecoveryRowError,
-	IStorageBackend,
-	IStoredRecoveryFrame
-} from '../storage/types';
-import { IStaticChannelBackup, decodeScb } from '../backup/scb';
+	aes256GcmDecrypt,
+	aes256GcmEncrypt,
+	randomBytes
+} from '../crypto/provider';
+import { hkdfKey } from '../storage/encryption';
+import type { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import { CorruptRecoveryRowError } from '../storage/types';
+import type { IStaticChannelBackup } from '../backup/scb';
+import { decodeScb } from '../backup/scb';
 import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
@@ -54,20 +56,21 @@ import {
 	verifyFrameChain
 } from './journal';
 import { withStorageTransaction } from '../storage/transaction';
-import {
+import type {
 	RecoveryFrame,
 	RecoveryMutation,
 	RecoverySnapshot,
 	VerifiedRecoveryChain
 } from './types';
-import { createOpenerState, IChannelState } from '../channel/channel-state';
+import type { IChannelState } from '../channel/channel-state';
+import { createOpenerState } from '../channel/channel-state';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
 	HtlcDirection
 } from '../channel/types';
 import { MonitorState } from '../chain/types';
-import { PaymentDirection, PaymentStatus } from '../node/types';
+import { PaymentDirection, PaymentStatus } from '../node/payment-types';
 
 /**
  * A capsule whose CONTENT could not replay (the chain verified, but a
@@ -110,8 +113,9 @@ export interface ICapsuleRestoreOptions {
 	 * Factory for a FRESH, empty storage backend used to dry-run the
 	 * candidate's reconstruction before the real target is written (see
 	 * CapsuleReplayError). Supply an in-memory backend (e.g.
-	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
-	 * the recovery core stays free of a concrete backend dependency.
+	 * `() => new MemoryStorage()`, or `new SqliteStorage(':memory:')`,
+	 * opened). Kept injectable so the recovery core stays free of a
+	 * concrete backend dependency.
 	 * OPTIONAL for the single-capsule restore (a throw is a throw there);
 	 * REQUIRED by restoreBestRecoveryCapsule whenever the target supports
 	 * Tier 2, because its candidate/Tier-1 fallback contract depends on
@@ -854,17 +858,17 @@ export function encryptRecoveryCapsule(
 ): Buffer {
 	const key = deriveCapsuleKey(nodeSecret);
 	const iv = randomBytes(IV_LENGTH);
-	const cipher = createCipheriv('aes-256-gcm', key, iv);
-	cipher.setAAD(Buffer.from(CAPSULE_HKDF_INFO, 'ascii'));
-	const ciphertext = Buffer.concat([
-		cipher.update(encodeCapsule(capsule)),
-		cipher.final()
-	]);
+	const sealed = aes256GcmEncrypt(
+		key,
+		iv,
+		encodeCapsule(capsule),
+		Buffer.from(CAPSULE_HKDF_INFO, 'ascii')
+	);
 	return Buffer.concat([
 		Buffer.from(CAPSULE_MAGIC, 'ascii'),
 		iv,
-		cipher.getAuthTag(),
-		ciphertext
+		sealed.subarray(sealed.length - TAG_LENGTH),
+		sealed.subarray(0, sealed.length - TAG_LENGTH)
 	]);
 }
 
@@ -896,17 +900,12 @@ export function decodeRecoveryCapsuleBlob(
 		CAPSULE_MAGIC.length + IV_LENGTH + TAG_LENGTH
 	);
 	try {
-		const decipher = createDecipheriv(
-			'aes-256-gcm',
+		const plaintext = aes256GcmDecrypt(
 			deriveCapsuleKey(nodeSecret),
-			iv
+			iv,
+			Buffer.concat([ciphertext, tag]),
+			Buffer.from(CAPSULE_HKDF_INFO, 'ascii')
 		);
-		decipher.setAAD(Buffer.from(CAPSULE_HKDF_INFO, 'ascii'));
-		decipher.setAuthTag(tag);
-		const plaintext = Buffer.concat([
-			decipher.update(ciphertext),
-			decipher.final()
-		]);
 		return decodeCapsule(plaintext);
 	} catch {
 		return null;

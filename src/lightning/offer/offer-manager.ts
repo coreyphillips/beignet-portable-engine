@@ -12,8 +12,8 @@
  */
 
 import { EventEmitter } from 'events';
-import crypto from 'crypto';
-import {
+import { randomBytes, sha256 } from '../crypto/provider';
+import type {
 	IBlindedPayInfo,
 	IOffer,
 	IInvoiceRequest,
@@ -40,14 +40,11 @@ import {
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
 import { decodeNoChecksum } from './bech32-nochecksum';
-import { ITlvRecord } from '../message/tlv';
+import type { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
-import {
-	IBlindedPath,
-	IBlindedPaymentPath,
-	constructBlindedPath
-} from '../onion/blinded-path';
-import { OnionMessageManager } from '../onion-message/manager';
+import type { IBlindedPath, IBlindedPaymentPath } from '../onion/blinded-path';
+import { constructBlindedPath } from '../onion/blinded-path';
+import type { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 import { BITCOIN_CHAIN_HASH } from '../channel/types';
 
@@ -641,7 +638,7 @@ export class OfferManager extends EventEmitter {
 		}
 
 		// Generate ephemeral payer key
-		const payerPrivkey = crypto.randomBytes(32);
+		const payerPrivkey = randomBytes(32);
 		const payerPubkey = getPublicKey(payerPrivkey);
 
 		// Build invoice request. invreq_metadata (type 0) is a payer-generated
@@ -663,7 +660,7 @@ export class OfferManager extends EventEmitter {
 			payerKey: payerPubkey,
 			offerId: offer.offerId,
 			amount: amountMsat,
-			metadata: crypto.randomBytes(32)
+			metadata: randomBytes(32)
 		};
 
 		// BOLT 12: an offer with offer_quantity_max requires invreq_quantity,
@@ -713,9 +710,9 @@ export class OfferManager extends EventEmitter {
 			// (the introduction node IS the recipient) and only WE ever decrypt
 			// the hop blob, so it also carries a path_id we verify on the reply
 			// (stored on the pending request below).
-			replyPathId = crypto.randomBytes(32);
+			replyPathId = randomBytes(32);
 			const replyPath = constructBlindedPath(
-				crypto.randomBytes(32),
+				randomBytes(32),
 				[this.nodeId],
 				[{ pathId: replyPathId }]
 			);
@@ -732,7 +729,7 @@ export class OfferManager extends EventEmitter {
 			const sendPath =
 				offerPath ??
 				(offer.issuerId
-					? constructBlindedPath(crypto.randomBytes(32), [offer.issuerId], [{}])
+					? constructBlindedPath(randomBytes(32), [offer.issuerId], [{}])
 					: null);
 			if (sendPath) {
 				// The request is handed straight to the introduction node.
@@ -754,9 +751,7 @@ export class OfferManager extends EventEmitter {
 		// (see pendingInvoiceRequests), so concurrent requests for the same
 		// offer coexist and this timer deletes exactly its own entry.
 		return new Promise<IBolt12Invoice>((resolve, reject) => {
-			const requestIdHex = (replyPathId ?? crypto.randomBytes(32)).toString(
-				'hex'
-			);
+			const requestIdHex = (replyPathId ?? randomBytes(32)).toString('hex');
 			const timer = setTimeout(
 				() => {
 					this.pendingInvoiceRequests.delete(requestIdHex);
@@ -906,8 +901,8 @@ export class OfferManager extends EventEmitter {
 		const amount = terms.amount;
 
 		// Create invoice
-		const preimage = crypto.randomBytes(32);
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		const preimage = randomBytes(32);
+		const paymentHash = sha256(preimage);
 		const paymentHashHex = paymentHash.toString('hex');
 
 		// Retain the preimage so the node can fulfill the incoming HTLC for this
@@ -937,7 +932,7 @@ export class OfferManager extends EventEmitter {
 		// with their true aggregate payinfo; anything else gets a real
 		// single-hop path terminating at us — the same shape CLN issues for a
 		// node without announced channels.
-		const invoicePathId = crypto.randomBytes(32);
+		const invoicePathId = randomBytes(32);
 		const isAsyncHold = this.offers.get(matchedOfferIdHex!)?.asyncHold === true;
 		let holdPaths: IBlindedPaymentPath[] = [];
 		if (isAsyncHold) {
@@ -969,7 +964,7 @@ export class OfferManager extends EventEmitter {
 		} else {
 			invoicePaths = [
 				constructBlindedPath(
-					crypto.randomBytes(32),
+					randomBytes(32),
 					[this.nodeId],
 					[{ pathId: invoicePathId }]
 				)

@@ -8,8 +8,8 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import { ecc } from '../../utils/ecc';
 import { getECPair } from '../../utils/ecc-apis';
-import { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
-import { ISpliceWalletInput } from '../channel/channel';
+import type { IFundingProvider, IUtxoSelectionOpts } from '../node/types';
+import type { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
@@ -128,7 +128,7 @@ export interface IWalletLike {
 	getPrivateKey?(path: string): string;
 	/** Returns Result<{ address: string }>. */
 	getChangeAddress?(): Promise<IResult>;
-	/** 'bitcoin' | 'testnet' | 'regtest' (beignet EAvailableNetworks). */
+	/** A beignet `Network` value: 'bitcoin' | 'testnet' | 'regtest' | 'signet'. */
 	network?: string;
 	/** UTXO freeze API, used to pledge inputs to in-flight fundings so two
 	 *  concurrent fundings can never select (and double-spend) the same coin. */
@@ -1115,6 +1115,9 @@ export class WalletFundingProvider implements IFundingProvider {
 			case 'bitcoin':
 				return bitcoin.networks.bitcoin;
 			case 'testnet':
+				return bitcoin.networks.testnet;
+			// Signet shares testnet's address prefixes and WIF version.
+			case 'signet':
 				return bitcoin.networks.testnet;
 			case 'regtest':
 				return bitcoin.networks.regtest;

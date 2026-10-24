@@ -5,14 +5,13 @@
  * to/from JSON-safe representations for SQLite storage.
  */
 
-import {
+import type {
 	IChannelState,
 	ISpliceInFlight,
 	IV2InFlight,
 	ChannelCloseReason
 } from '../channel/channel-state';
-import {
-	isFforConcurrentVersion,
+import type {
 	FforConcurrentVersion,
 	FforAbortReason,
 	FforRole,
@@ -20,25 +19,32 @@ import {
 	FforState,
 	IFforEpochRecord
 } from '../ffor/types';
+import { isFforConcurrentVersion } from '../ffor/types';
 import { fforTranscriptConcurrentVersion } from '../ffor/messages';
 import { validateFforSyncState } from '../ffor/sync-state';
-import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
-import { IChannelBasepoints } from '../keys/derivation';
-import {
+import type { IShaChainEntry } from '../keys/shachain';
+import { ShaChainStore } from '../keys/shachain';
+import type { IChannelBasepoints } from '../keys/derivation';
+import type {
 	ChannelState,
 	ChannelRole,
 	IChannelConfig,
 	IHtlcEntry,
 	IHtlcSnapshotEntry,
 	HtlcDirection,
-	HtlcState,
-	DEFAULT_CHANNEL_CONFIG
+	HtlcState
 } from '../channel/types';
-import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
-import { IChainMonitorState } from '../chain/chain-monitor';
-import { IGraphChannel, IGraphNode } from '../gossip/types';
+import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import type {
+	IPaymentInfo,
+	PaymentStatus,
+	PaymentDirection
+} from '../node/payment-types';
+import type { IChainMonitorState } from '../chain/chain-monitor';
+import type { IGraphChannel, IGraphNode } from '../gossip/types';
+import type { IInvoiceInfo } from './types';
+import type { ICompactHtlcHistory } from './htlc-history';
 import {
-	ICompactHtlcHistory,
 	encodeHtlcHistory,
 	decodeHtlcHistory,
 	usesCompactHtlcHistory
@@ -1153,7 +1159,7 @@ export function serializeChannelState(
 	};
 }
 
-// ─── FFOR Variant D epoch record (specs/ffor-offline-receive.md 7.5.5) ───
+// ─── FFOR Variant D epoch record (docs/specs/ffor-offline-receive.md 7.5.5) ───
 
 export interface ISerializedFforEpoch {
 	role: string;
@@ -1344,9 +1350,9 @@ export function serializeFforEpoch(f: IFforEpochRecord): ISerializedFforEpoch {
 
 /**
  * The selected profile of a stored epoch, checked against the transcript
- * it was persisted with (CONCURRENT-RECEIVE.md section 1.1: the version is
- * never inferred from features, connection status or preferences, and
- * section 8: it is compared with the persisted setup bytes).
+ * it was persisted with (docs/specs/CONCURRENT-RECEIVE.md section 1.1: the
+ * version is never inferred from features, connection status or preferences,
+ * and section 8: it is compared with the persisted setup bytes).
  *
  * The stored field and the stored ff_init and ff_accept must tell one
  * story: a request and its exact echo beside a selected version, or no
@@ -2035,4 +2041,62 @@ export function deserializeGraphNode(json: string): IGraphNode {
 		...parsed,
 		channels: new Set(parsed.channels as string[])
 	} as IGraphNode;
+}
+
+/** The JSON-safe form of an IInvoiceInfo: amountMsat as a decimal string. */
+export interface ISerializedInvoiceInfo {
+	paymentHash: string;
+	bolt11: string;
+	amountMsat?: string;
+	description?: string;
+	expiry: number;
+	createdAt: number;
+	hold?: boolean;
+	bolt12?: boolean;
+	cancelledAt?: number;
+	jitFee?: { flatFeeSat: number; feePpm: number };
+	minFinalCltvExpiry?: number;
+}
+
+export function serializeInvoiceInfo(
+	invoice: IInvoiceInfo
+): ISerializedInvoiceInfo {
+	return {
+		paymentHash: invoice.paymentHash,
+		bolt11: invoice.bolt11,
+		amountMsat:
+			invoice.amountMsat !== undefined
+				? invoice.amountMsat.toString()
+				: undefined,
+		description: invoice.description,
+		expiry: invoice.expiry,
+		createdAt: invoice.createdAt,
+		hold: invoice.hold,
+		bolt12: invoice.bolt12,
+		cancelledAt: invoice.cancelledAt,
+		jitFee: invoice.jitFee,
+		minFinalCltvExpiry: invoice.minFinalCltvExpiry
+	};
+}
+
+export function deserializeInvoiceInfo(
+	s: ISerializedInvoiceInfo
+): IInvoiceInfo {
+	return {
+		paymentHash: s.paymentHash,
+		bolt11: s.bolt11,
+		amountMsat: s.amountMsat !== undefined ? BigInt(s.amountMsat) : undefined,
+		description: s.description,
+		expiry: s.expiry,
+		createdAt: s.createdAt,
+		hold: s.hold,
+		bolt12: s.bolt12,
+		cancelledAt: s.cancelledAt,
+		// A row written before #595 has none; the allowance is then absent
+		// and the final hop enforces BOLT 4 unchanged.
+		jitFee: s.jitFee,
+		// A row written before #770 has none: the final hop then enforces
+		// the node default, which is what it advertised.
+		minFinalCltvExpiry: s.minFinalCltvExpiry
+	};
 }

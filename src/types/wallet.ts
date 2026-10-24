@@ -1,5 +1,6 @@
-import { Result } from '../utils';
-import {
+import type { Result } from '../utils/result';
+import type { Sats } from '../utils/conversion';
+import type {
 	EElectrumNetworks,
 	IHeader,
 	INewBlock,
@@ -8,12 +9,20 @@ import {
 	TTxResult,
 	Tls
 } from './electrum';
-import { ECoinSelectPreference, EFeeId, TGapLimitOptions } from './transaction';
-import { ECPairInterface } from 'ecpair';
-import { BIP32Interface } from 'bip32';
-import { ILogger } from '../logger';
+import type {
+	ECoinSelectPreference,
+	EFeeId,
+	TGapLimitOptions
+} from './transaction';
+import type { ECPairInterface } from 'ecpair';
+import type { BIP32Interface } from 'bip32';
+import type { ILogger } from '../logger';
+import { Network } from '../network';
 
-export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest' | 'signet';
+/**
+ * @deprecated Use {@link Network}. Removed in the next major release.
+ */
+export type TAvailableNetworks = `${Network}`;
 export type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh';
 export type TAddressLabel = 'bech32' | 'segwit' | 'legacy';
 export type TKeyDerivationPurpose = '84' | '49' | '44' | string; //"p2wpkh" | "p2sh" | "p2pkh";
@@ -24,17 +33,38 @@ export type TKeyDerivationIndex = string;
 export type TAddressTypes = {
 	[key in EAddressType]: Readonly<IAddressTypeData>;
 };
-export enum EAvailableNetworks {
-	bitcoin = 'bitcoin',
-	mainnet = 'bitcoin',
-	bitcoinMainnet = 'bitcoin',
-	testnet = 'testnet',
-	bitcoinTestnet = 'testnet',
-	regtest = 'regtest',
-	bitcoinRegtest = 'regtest',
-	signet = 'signet',
-	bitcoinSignet = 'signet'
+// A namespace rather than an object so the alias still behaves like the enum
+// it replaced: its const members widen to Network where an enum member would,
+// and its type members keep `EAvailableNetworks.mainnet` usable as a type.
+/**
+ * @deprecated Use {@link Network}. The extra member names are spellings of
+ * its four values. Removed in the next major release.
+ */
+// eslint-disable-next-line @typescript-eslint/no-namespace
+export namespace EAvailableNetworks {
+	export const bitcoin = Network.bitcoin;
+	export const mainnet = Network.bitcoin;
+	export const bitcoinMainnet = Network.bitcoin;
+	export const testnet = Network.testnet;
+	export const bitcoinTestnet = Network.testnet;
+	export const regtest = Network.regtest;
+	export const bitcoinRegtest = Network.regtest;
+	export const signet = Network.signet;
+	export const bitcoinSignet = Network.signet;
+	export type bitcoin = Network.bitcoin;
+	export type mainnet = Network.bitcoin;
+	export type bitcoinMainnet = Network.bitcoin;
+	export type testnet = Network.testnet;
+	export type bitcoinTestnet = Network.testnet;
+	export type regtest = Network.regtest;
+	export type bitcoinRegtest = Network.regtest;
+	export type signet = Network.signet;
+	export type bitcoinSignet = Network.signet;
 }
+/**
+ * @deprecated Use {@link Network}. Removed in the next major release.
+ */
+export type EAvailableNetworks = Network;
 
 /**
  * Where getFeeEstimates sources its data:
@@ -131,18 +161,40 @@ export interface IFormattedTransaction {
 	blockhash?: string;
 	height?: number;
 	scriptHash: string;
-	// The value fields below are denominated in BTC, not sats, because they are
-	// taken from the decoded raw transaction. Convert with btcToSats before
-	// comparing them against anything in sats. ISendTransaction.fee and
-	// IRbfData.fee are sats.
-	totalInputValue: number; // BTC
-	matchedInputValue: number; // BTC
-	totalOutputValue: number; // BTC
-	matchedOutputValue: number; // BTC
-	fee: number; // BTC
+	// Each amount is held in sats (the *Sats fields) and in BTC, as decoded
+	// from the raw transaction. The BTC fields are deprecated and go in the
+	// next major release. Until then the sats fields are optional, so code
+	// that builds or stores records without them still compiles. The wallet
+	// sets them on every record it formats or loads.
+	/** @deprecated BTC: use totalInputSats. */
+	totalInputValue: number;
+	/** The sum of the outputs the inputs spend. */
+	totalInputSats?: Sats;
+	/** @deprecated BTC: use matchedInputSats. */
+	matchedInputValue: number;
+	/** The part of totalInputSats this wallet's addresses held. */
+	matchedInputSats?: Sats;
+	/** @deprecated BTC: use totalOutputSats. */
+	totalOutputValue: number;
+	totalOutputSats?: Sats;
+	/** @deprecated BTC: use matchedOutputSats. */
+	matchedOutputValue: number;
+	/** The part of totalOutputSats paid to this wallet's addresses. */
+	matchedOutputSats?: Sats;
+	/** @deprecated BTC: use feeSats. */
+	fee: number;
+	/** 0 for a coinbase, which pays no fee. */
+	feeSats?: Sats;
+	/** The fee rate in sat/vB, rounded to a whole number. */
 	satsPerByte: number;
 	type: EPaymentType;
-	value: number; // BTC
+	/** @deprecated BTC: use valueSats. */
+	value: number;
+	/**
+	 * matchedOutputSats minus matchedInputSats: negative for a send, and then
+	 * it includes the fee.
+	 */
+	valueSats?: Sats;
 	txid: string;
 	messages: string[];
 	vin: TFormattedVin[];
@@ -172,9 +224,10 @@ export interface ISendTransaction {
 	outputs: IOutput[];
 	inputs: IUtxo[];
 	changeAddress: string;
+	/** @deprecated Never read. Removed in the next major release. */
 	fiatAmount: number;
 	fee: number; //Total fee in sats
-	satsPerByte: number;
+	satsPerByte: number; // sat/vB
 	selectedFeeId: EFeeId;
 	message: string; // OP_RETURN data for a given transaction.
 	label: string; // User set label for a given transaction.
@@ -183,8 +236,13 @@ export interface ISendTransaction {
 	minFee: number; // (sats/vbyte) Lowest fee rate to offer for an RBF/CPFP boost. A rate like satsPerByte, not a total like fee.
 	max: boolean; // If the user intends to send the max amount.
 	tags: string[];
-	slashTagsUrl?: string; // TODO: Remove after migration.
-	lightningInvoice?: string; // TODO: Remove after migration.
+	/** @deprecated Never read. Removed in the next major release. */
+	slashTagsUrl?: string;
+	/**
+	 * @deprecated Left over from Bitkit, which staged Lightning payments
+	 * here. Removed in the next major release.
+	 */
+	lightningInvoice?: string;
 }
 
 export interface IAddresses {
@@ -230,16 +288,58 @@ export type TAddressLabels = { [address: string]: string };
 
 export type TWalletDataKeys = keyof IWalletData;
 
-// Must return ok(undefined) for a key the storage does not hold, and err only
-// when the read itself fails. Wallet.create refuses to start on an err (see
-// IWallet.resetOnReadFailure), since a wallet loaded from defaults would save
-// them over the data it could not read.
-export type TGetData = <K extends keyof IWalletData>(
-	key: string
-) => Promise<Result<IWalletData[K]>>;
-export type TSetData = <K extends keyof IWalletData>(
-	key: string,
+// Mapped rather than a bare `${string}-${K}`: TypeScript reads K back out of
+// a bare template as `${K}`, so an adapter declared with its own <K> would
+// not be assignable to TGetData.
+/**
+ * The key a wallet stores one IWalletData field under:
+ * `${name}-${network}-${field}`, with `-acct${account}` before the field for
+ * a non-zero account (see getWalletDataStorageKey). The field is always the
+ * last segment, so the key alone says which IWalletData value it holds.
+ */
+export type TWalletStorageKey<K extends TWalletDataKeys = TWalletDataKeys> = {
+	[P in K]: `${string}-${P}`;
+}[K];
+
+/**
+ * Reads the value stored under `key`. Must return ok(undefined) for a key
+ * the storage does not hold, and err only when the read itself fails.
+ * Wallet.create refuses to start on an err (see IWallet.resetOnReadFailure),
+ * since a wallet loaded from defaults would save them over the data it could
+ * not read.
+ */
+export type TGetData = <K extends TWalletDataKeys>(
+	key: TWalletStorageKey<K>
+) => Promise<Result<IWalletData[K] | undefined>>;
+/**
+ * Stores `value` under `key`, replacing what was there. Resolve err, or
+ * reject, when the write did not happen: the wallet reports it to onMessage
+ * as storageWriteFailed.
+ */
+export type TSetData = <K extends TWalletDataKeys>(
+	key: TWalletStorageKey<K>,
 	value: IWalletData[K]
+) => Promise<Result<boolean>>;
+
+/**
+ * The records of the transaction map that changed since the write before
+ * this one. Each record in `set` is added or replaces the stored record with
+ * its txid, and each txid in `deleted` is removed. A txid is in at most one
+ * of the two.
+ */
+export type TTransactionChanges = {
+	set: IFormattedTransactions;
+	deleted: string[];
+};
+
+/**
+ * Applies changes to the transaction map stored under `key`. getData for that
+ * key must then return the map with every change applied, and a setData for
+ * it replaces the whole map, earlier changes included.
+ */
+export type TSetTransactionChanges = (
+	key: TWalletStorageKey<'transactions'>,
+	changes: TTransactionChanges
 ) => Promise<Result<boolean>>;
 
 export interface IWallet {
@@ -247,6 +347,10 @@ export interface IWallet {
 	// Account-level extended public key (xpub/ypub/zpub/tpub/upub/vpub) for
 	// watch-only wallets. Used only when no mnemonic is provided.
 	xpub?: string;
+	/**
+	 * @deprecated Never read: a wallet's id is derived from its keys. Removed
+	 * in the next major release.
+	 */
 	id?: string;
 	name?: string;
 	passphrase?: string;
@@ -255,7 +359,7 @@ export interface IWallet {
 	// its PBKDF2 pass. It is not checked against the mnemonic, so it must be
 	// that mnemonic's seed. Ignored without a mnemonic.
 	seed?: Buffer;
-	network?: EAvailableNetworks;
+	network?: Network;
 	addressType?: EAddressType;
 	// BIP32 account index (m/purpose'/coin'/ACCOUNT'/change/index). Defaults
 	// to 0. Non-zero accounts use distinct storage keys so instances over the
@@ -268,8 +372,14 @@ export interface IWallet {
 	// protocol cannot, see Wallet.birthdayHeight docs.
 	birthdayHeight?: number;
 	coinSelectPreference?: ECoinSelectPreference;
+	/**
+	 * @deprecated Never read: the wallet loads its data from `storage`. Use
+	 * Wallet.updateData after creating it. Removed in the next major release.
+	 */
 	data?: IWalletData;
-	storage?: TStorage;
+	// Without it the wallet keeps its data in memory only, and every save is
+	// a no-op. See IWalletStorage for the contract and createMemoryStorage.
+	storage?: IWalletStorage;
 	// Treat a storage read that fails as a missing key and start from the
 	// default for it. Off by default: the wallet's next save then overwrites
 	// whatever the storage could not read, frozen coins and labels included.
@@ -281,6 +391,12 @@ export interface IWallet {
 		batchLimit?: number; // Maximum number of requests to be sent in a single batch
 		batchDelay?: number; // Delay (in milliseconds) between each batch of requests
 	};
+	/**
+	 * Never open a connection: no Electrum server, no fee lookup over HTTP.
+	 * Every call that needs a server fails instead, and a refresh stops after
+	 * deriving the wallet's first addresses. electrumOptions is still
+	 * required, and is not used.
+	 */
 	remainOffline?: boolean;
 	onMessage?: TOnMessage;
 	// Answers every single-key address in place of the wallet's own
@@ -309,7 +425,15 @@ export interface IWallet {
 	logger?: ILogger;
 	addressTypesToMonitor?: EAddressType[];
 	gapLimitOptions?: TGapLimitOptions;
+	/**
+	 * @deprecated Never read. Use `gapLimitOptions.lookBehind`. Removed in the
+	 * next major release.
+	 */
 	addressLookBehind?: number;
+	/**
+	 * @deprecated Never read. Use `gapLimitOptions.lookAhead`. Removed in the
+	 * next major release.
+	 */
 	addressLookAhead?: number;
 	// Sorted-multisig configuration. Prefer Wallet.createMultisig over
 	// passing this directly.
@@ -503,6 +627,7 @@ export type TProcessUnconfirmedTransactions = {
 	ghostTxs: string[]; // Transactions that have been removed from the mempool.
 };
 
+/** @deprecated Never read. Removed in the next major release. */
 export enum EUnit {
 	satoshi = 'satoshi',
 	BTC = 'BTC',
@@ -613,7 +738,7 @@ export interface ISendTx {
 
 export interface ISend {
 	txs: ISendTx | ISendTx[];
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 }
 
 // Watch-only wallets are constructed from an account-level xpub; mnemonic,
@@ -662,7 +787,7 @@ export interface IBuildPsbtArgs {
 	address?: string;
 	amount?: number; // sats
 	message?: string;
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 	rbf?: boolean;
 	shuffleOutputs?: boolean;
 }
@@ -685,12 +810,42 @@ export interface IBuildPsbtResponse {
 	psbtBase64: string;
 	fee: number; // sats
 	vsizeEstimate: number; // vbytes
-	satsPerByte: number;
+	satsPerByte: number; // sat/vB
 	inputs: IBuildPsbtInputSummary[];
 	outputs: IBuildPsbtOutputSummary[];
 }
 
 export interface IImportSignedPsbtResponse {
+	txHex: string;
+	txid: string;
+}
+
+/**
+ * A transaction output: the txid of the transaction that created it, in
+ * display order, and the output's position in that transaction.
+ */
+export interface IOutpoint {
+	txid: string;
+	vout: number;
+}
+
+/** The outpoint shape the freeze methods took before {@link IOutpoint}. */
+export interface IIndexedOutpoint {
+	txid: string;
+	/** @deprecated Use `vout`. Removed in the next major release. */
+	index: number;
+}
+
+export interface ICreateSignedTransactionArgs extends IBuildPsbtArgs {
+	/**
+	 * Spend every unfrozen coin to `address`, less the fee, as sendMax does.
+	 * Refused alongside `amount` or `txs`.
+	 */
+	max?: boolean;
+}
+
+/** A signed transaction that has not been broadcast. */
+export interface ISignedTransaction {
 	txHex: string;
 	txid: string;
 }
@@ -702,10 +857,36 @@ export type TAddressIndexInfo = {
 	lastUsedChangeAddressIndex: IAddress;
 };
 
-export type TStorage = {
+/**
+ * Where a wallet keeps its data: a key-value store holding one value per
+ * IWalletData field, under the keys TWalletStorageKey describes. Values are
+ * plain JSON data. A read must return a copy of what the last write of the
+ * key stored: the wallet goes on changing the object it handed over, and a
+ * store that keeps that object would serve changes that were never saved.
+ *
+ * The wallet reads every field when it is created and when it switches
+ * networks, and writes a field each time it changes. Writes to one key reach
+ * the store one at a time, in the order the wallet made them. Nothing is
+ * deleted: a wallet that clears a field writes its empty value.
+ *
+ * createMemoryStorage is a complete implementation to start from.
+ */
+export interface IWalletStorage {
+	/** Without it every read is a missing key, so the wallet starts empty. */
 	getData?: TGetData;
+	/** Without it the wallet writes nothing, and saves succeed. */
 	setData?: TSetData;
-};
+	/**
+	 * Optional, and used only alongside setData. With it, a change to some
+	 * transaction records writes only those records, where setData would be
+	 * handed the whole history. Replacing or clearing the history, and
+	 * upgrading records on load, still go through setData.
+	 */
+	setTransactionChanges?: TSetTransactionChanges;
+}
+
+/** @deprecated Use {@link IWalletStorage}. Removed in the next major release. */
+export type TStorage = IWalletStorage;
 
 export interface IRbfData {
 	outputs: IOutput[];
@@ -731,7 +912,7 @@ export interface IBoostedTransactions {
 export interface IBoost {
 	txid: string;
 	type: EBoostType;
-	/** Defaults to the rate setupRbf or setupCpfp picks. */
+	/** In sat/vB. Defaults to the rate setupRbf or setupCpfp picks. */
 	satsPerByte?: number;
 }
 
@@ -753,7 +934,7 @@ export interface IPrivateKeyInfo {
 export interface ISweepPrivateKey {
 	privateKey: string;
 	toAddress: string;
-	satsPerByte?: number;
+	satsPerByte?: number; // sat/vB
 	broadcast?: boolean;
 	combineWithWalletUtxos?: boolean;
 }
@@ -825,7 +1006,7 @@ export interface IBtInfo {
 		ln2: string;
 	};
 	onchain: {
-		network: EAvailableNetworks;
+		network: Network;
 		feeRates: {
 			/**
 			 * Fast fee in sat/vbyte.
@@ -872,7 +1053,7 @@ export interface IExportedDescriptor {
 
 export interface IExportDescriptorsResponse {
 	fingerprint: string; // Master fingerprint hex (see getMasterFingerprint)
-	network: EAvailableNetworks;
+	network: Network;
 	account: number;
 	// Present when a birthday was recorded; helps a restore bound its scan.
 	birthdayHeight?: number;

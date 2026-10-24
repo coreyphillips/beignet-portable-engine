@@ -6,31 +6,44 @@
  * channel/node info queries.
  */
 
-import { IRoutingHintHop, Network } from '../invoice/types';
-import { IBolt12Invoice } from '../offer/types';
-import { IChannelConfig, ChannelState } from '../channel/types';
-import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute, INodeAddress, IChannelUpdateMessage } from '../gossip/types';
-import { FeatureFlags } from '../features/flags';
-import { IStorageBackend, IInvoiceInfo } from '../storage/types';
-import { IChainBackend } from '../chain/chain-watcher';
-import { ILogger } from '../../logger';
-import { IPerChannelKeys } from '../channel/channel-manager';
-import { SignerFactory } from '../keys/signer';
-import { WebSocketConstructor } from '../transport/websocket';
-import { Socks5ProxyScope } from '../transport/peer-manager';
-import { GuardianStartupGate } from '../recovery/startup-gate';
-import { DurabilityBarrier } from '../recovery/durability-barrier';
-import { IGuardianHostConfig } from '../recovery/guardian-host';
-import { RecoveryDurability } from '../recovery/types';
+import type { IRoutingHintHop, Network } from '../invoice/types';
+import type { IBolt12Invoice } from '../offer/types';
+import type { IChannelConfig, ChannelState } from '../channel/types';
+import type { ChannelErrorCode } from '../channel/channel-actions';
+import { CodedError } from '../../utils/errors';
+import type { IChannelBasepoints } from '../keys/derivation';
+import type {
+	IRoute,
+	INodeAddress,
+	IChannelUpdateMessage
+} from '../gossip/types';
+import type { FeatureFlags } from '../features/flags';
+import type { IStorageBackend, IInvoiceInfo } from '../storage/types';
+import type { IChainBackend } from '../chain/chain-watcher';
+import type { ILogger } from '../../logger';
+import type { IPerChannelKeys } from '../channel/channel-manager';
+import type { SignerFactory } from '../keys/signer';
+import type { WebSocketConstructor } from '../transport/websocket';
+import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type { GuardianStartupGate } from '../recovery/startup-gate';
+import type { DurabilityBarrier } from '../recovery/durability-barrier';
+import type { IGuardianHostConfig } from '../recovery/guardian-host';
+import type { RecoveryDurability } from '../recovery/types';
 import type { GuardianDescriptor } from '../recovery/capsule';
 import type {
 	ISwapChainSource,
 	ISwapConfirmationPolicy,
 	ISwapExposurePolicy
 } from '../swaps';
+import type { IFforSettlePolicy } from '../ffor/types';
+import type { IFforWitnessConfig } from '../ffor/witness-service';
+import type { IFforIssuerConfig } from '../ffor/issuer-service';
+import type { IIrohConfig } from '../transport/iroh';
+import type { IPayAllBudget, PaymentStatus } from './payment-types';
 
 export type { IInvoiceInfo };
+
+export * from './payment-types';
 
 export interface IResourceConfig {
 	/** Maximum completed/failed payments to retain (default 10_000) */
@@ -262,14 +275,29 @@ export interface IFundingProvider {
 	}>;
 }
 
+/**
+ * LightningNode construction options. The INodeConfig table in
+ * src/lightning/README.md is generated from this interface (`npm run
+ * docs:tables`), so the description of each field lives here. The defaults
+ * live in `resolveNodeConfig`.
+ */
 export interface INodeConfig {
 	/** One-way reserve waivers for new private home channels. */
 	zeroReserve?: import('../channel/zero-reserve').IZeroReserveConfig;
+	/** The node identity key (32 bytes); its public key is the node id. */
 	nodePrivateKey: Buffer;
+	/** The network for invoices and chain hashes (default REGTEST). */
 	network?: Network;
+	/**
+	 * Parameters for new channels. Not a partial: supply every field or omit
+	 * it to take the defaults.
+	 */
 	channelConfig?: IChannelConfig;
+	/** This node's channel basepoints, the public keys channel keys derive from. */
 	channelBasepoints: IChannelBasepoints;
+	/** 32-byte seed for the per-commitment secrets (shachain). */
 	perCommitmentSeed: Buffer;
+	/** 32-byte private key for the 2-of-2 funding output. */
 	fundingPrivkey: Buffer;
 	/**
 	 * Custom channel signer factory (ISigner) so channel signing keys can
@@ -315,35 +343,54 @@ export interface INodeConfig {
 	 * under an active registration are admitted, within the limits.
 	 */
 	asyncReceiveService?: import('../async-payments/types').IAsyncReceiveServiceConfig;
-	/**
-	 * FFOR D-R receipt witness (spec section 9.6): store a receiver-encrypted
-	 * record of every delegated preimage this node relays, before propagating
-	 * the fulfil, and serve it to the receiver on return. Disabled by default.
-	 */
-	fforWitness?: import('../ffor/witness-service').IFforWitnessConfig;
-	/**
-	 * FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for
-	 * offers a receiver delegated to this node, one fixed-amount slot per
-	 * invoice. Needs `fforWitness` (the issuer is co-hosted with the first
-	 * witness, whose mailbox holds the book). Disabled by default.
-	 */
-	fforIssuer?: import('../ffor/issuer-service').IFforIssuerConfig;
-	/**
-	 * Whether this node answers ff_init as a settlement peer, and on what
-	 * terms (issue #729). Absent answers on any terms (the library default);
-	 * a daemon passes `enabled: false` unless its operator opted in.
-	 */
-	fforSettle?: import('../ffor/types').IFforSettlePolicy;
-	/**
-	 * FFOR concurrent receive (specs/CONCURRENT-RECEIVE.md). Enabled by
-	 * default when option_ff_receive and option_quiesce are present.
-	 * Explicit true requires both dependencies. Explicit false clears bits
-	 * 562/563 and refuses peers requiring the feature. Epochs still select
-	 * their profile explicitly. To refuse only new concurrent books, set
-	 * `fforSettle.allowConcurrent: false` and retain this advertisement for
-	 * existing books. The feature assignment remains experimental.
-	 */
-	fforConcurrent?: { enabled: boolean };
+	/** The FFOR roles this node plays for its peers. */
+	ffor?: {
+		/**
+		 * Whether this node answers ff_init as a settlement peer, and on what
+		 * terms (issue #729). Absent answers on any terms (the library
+		 * default); a daemon passes `enabled: false` unless its operator
+		 * opted in.
+		 */
+		settle?: IFforSettlePolicy;
+		/**
+		 * FFOR concurrent receive (docs/specs/CONCURRENT-RECEIVE.md). Enabled
+		 * by default when option_ff_receive and option_quiesce are present.
+		 * Explicit true requires both dependencies. Explicit false clears bits
+		 * 562/563 and refuses peers requiring the feature. Epochs still select
+		 * their profile explicitly. To refuse only new concurrent books, set
+		 * `ffor.settle.allowConcurrent: false` and retain this advertisement
+		 * for existing books. The feature assignment remains experimental.
+		 */
+		concurrent?: {
+			/** Advertise concurrent receive, feature bits 562/563. */
+			enabled: boolean;
+		};
+		/**
+		 * FFOR D-R receipt witness (spec section 9.6): store a
+		 * receiver-encrypted record of every delegated preimage this node
+		 * relays, before propagating the fulfil, and serve it to the receiver
+		 * on return. Disabled by default.
+		 */
+		witness?: IFforWitnessConfig;
+		/**
+		 * FFOR BOLT 12 issuer (spec section 9.7): answer invoice_requests for
+		 * offers a receiver delegated to this node, one fixed-amount slot per
+		 * invoice. Needs `ffor.witness` (the issuer is co-hosted with the
+		 * first witness, whose mailbox holds the book). Disabled by default.
+		 */
+		issuer?: IFforIssuerConfig;
+	};
+	/** @deprecated Use `ffor.witness`. */
+	fforWitness?: IFforWitnessConfig;
+	/** @deprecated Use `ffor.issuer`. */
+	fforIssuer?: IFforIssuerConfig;
+	/** @deprecated Use `ffor.settle`. */
+	fforSettle?: IFforSettlePolicy;
+	/** @deprecated Use `ffor.concurrent`. */
+	fforConcurrent?: {
+		/** Advertise concurrent receive, feature bits 562/563. */
+		enabled: boolean;
+	};
 	/** Max reconnect delay in ms */
 	maxReconnectDelay?: number;
 	/** Inbound peer connections (default 125). Once this many are up, only
@@ -373,7 +420,13 @@ export interface INodeConfig {
 	 * what lets nodes that guard each other restart together.
 	 */
 	guardianHost?: IGuardianHostConfig;
+	/**
+	 * The Recovery Protocol journal and its guardian replication
+	 * (docs/RECOVERY-PROTOCOL.md). Off unless `enabled` is true and the
+	 * storage backend supports the journal.
+	 */
 	recovery?: {
+		/** Keep the hash-chained recovery journal. */
 		enabled?: boolean;
 		/**
 		 * How durable a safety transition must be before the wire messages it
@@ -479,14 +532,35 @@ export interface INodeConfig {
 	chainBackend?: IChainBackend;
 	/** HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) */
 	htlcSafetyMargin?: number;
-	/**
-	 * Whether to relay third-party HTLCs (be a routing hop). Default true, which
-	 * preserves the historical behaviour: any node with an announced channel
-	 * forwards. Set false to decline all forwards (a wallet that does not want to
-	 * route); declined forwards fail back promptly with temporary_node_failure,
-	 * and our channel_updates advertise the BOLT 7 disable bit so route finders
-	 * stop selecting us. Does not affect our own sends or receives.
-	 */
+	/** Whether and on what terms this node relays third-party HTLCs. */
+	forwarding?: {
+		/**
+		 * Whether to relay third-party HTLCs (be a routing hop). Default true,
+		 * which preserves the historical behaviour: any node with an announced
+		 * channel forwards. Set false to decline all forwards (a wallet that
+		 * does not want to route); declined forwards fail back promptly with
+		 * temporary_node_failure, and our channel_updates advertise the BOLT 7
+		 * disable bit so route finders stop selecting us. Does not affect our
+		 * own sends or receives.
+		 */
+		enabled?: boolean;
+		/** CLTV delta for forwarding (default 40). */
+		cltvDelta?: number;
+		/** Base fee in msat for forwarding (default 1000). */
+		feeBaseMsat?: number;
+		/** Proportional fee in millionths for forwarding (default 1). */
+		feePropMillionths?: number;
+		/**
+		 * How long a forward may still satisfy the PREVIOUS policy after a fee
+		 * or CLTV increase on a channel (default 600000, ten minutes; 0
+		 * disables). A receiver authors the relay terms of a blinded path from
+		 * the policy it read at build time and a blinded payer cannot retry
+		 * with new terms, so the window lets outstanding invoices survive a
+		 * bump, the way a channel_update's grace does for cleartext forwards.
+		 */
+		policyGraceMs?: number;
+	};
+	/** @deprecated Use `forwarding.enabled`. */
 	forwardingEnabled?: boolean;
 	/**
 	 * Whether to signature-verify foreign broadcast gossip at intake. Default
@@ -545,20 +619,13 @@ export interface INodeConfig {
 	 * construction so no engine ever serves from an empty view.
 	 */
 	swaps?: ISwapNodeConfig;
-	/** CLTV delta for forwarding (default 40) */
+	/** @deprecated Use `forwarding.cltvDelta`. */
 	forwardingCltvDelta?: number;
-	/** Base fee in msat for forwarding (default 1000) */
+	/** @deprecated Use `forwarding.feeBaseMsat`. */
 	forwardingFeeBaseMsat?: number;
-	/** Proportional fee in millionths for forwarding (default 1) */
+	/** @deprecated Use `forwarding.feePropMillionths`. */
 	forwardingFeePropMillionths?: number;
-	/**
-	 * How long a forward may still satisfy the PREVIOUS policy after a fee or
-	 * CLTV increase on a channel (default 600000, ten minutes; 0 disables). A
-	 * receiver authors the relay terms of a blinded path from the policy it
-	 * read at build time and a blinded payer cannot retry with new terms, so
-	 * the window lets outstanding invoices survive a bump, the way a
-	 * channel_update's grace does for cleartext forwards.
-	 */
+	/** @deprecated Use `forwarding.policyGraceMs`. */
 	forwardingPolicyGraceMs?: number;
 	/** MPP partial payment timeout in ms (default 60000) */
 	mppTimeoutMs?: number;
@@ -569,7 +636,12 @@ export interface INodeConfig {
 	 *  least one announced (public) channel. */
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
-	socks5Proxy?: { host: string; port: number };
+	socks5Proxy?: {
+		/** Proxy host. */
+		host: string;
+		/** Proxy port. */
+		port: number;
+	};
 	/**
 	 * Which destinations ride socks5Proxy (default 'all'). 'all' sends every
 	 * public host through it; 'onion' sends only .onion hosts through it and
@@ -670,7 +742,9 @@ export interface INodeConfig {
 	newChannelsRefused?: () => string | null;
 	/** Per-peer rate limit config */
 	rateLimitConfig?: {
+		/** HTLCs per second per peer (default 30). */
 		maxHtlcsPerSecond?: number;
+		/** Bucket capacity as a multiple of maxHtlcsPerSecond (default 2). */
 		burstMultiplier?: number;
 	};
 	/** Number of blocks a channel can remain in AWAITING_REESTABLISH before force-closing (default 2016 ≈ 2 weeks) */
@@ -704,6 +778,39 @@ export interface INodeConfig {
 	 */
 	autoTuneFees?: IAutoTuneFeesConfig;
 }
+
+/** The INodeConfig fields `LightningNode.fromMnemonic` derives from the seed. */
+type SeedDerivedNodeConfigKey =
+	| 'nodePrivateKey'
+	| 'channelBasepoints'
+	| 'perCommitmentSeed'
+	| 'fundingPrivkey'
+	| 'htlcBasepointSecret'
+	| 'revocationBasepointSecret'
+	| 'paymentBasepointSecret'
+	| 'delayedPaymentBasepointSecret';
+
+/**
+ * Options for `LightningNode.fromMnemonic`: every INodeConfig option except
+ * the key material, which is derived from the seed.
+ */
+export type LightningNodeSeedOptions = Omit<
+	INodeConfig,
+	SeedDerivedNodeConfigKey | 'iroh'
+> & {
+	/** BIP39 passphrase. */
+	passphrase?: string;
+	/**
+	 * The BIP39 seed of `mnemonic` and `passphrase`, for a caller that
+	 * already holds it: skips the PBKDF2 pass. It is not checked against
+	 * the mnemonic, so it must be that mnemonic's seed.
+	 */
+	seed?: Buffer;
+	/** BIP32 coin type of the Lightning key paths (default LnCoinType.REGTEST). */
+	coinType?: number;
+	/** Opt-in Iroh endpoint. Its secret key is derived from the seed. */
+	iroh?: Omit<IIrohConfig, 'secretKey'>;
+};
 
 // ─── Direct funding ───
 
@@ -826,83 +933,6 @@ export interface IRebalanceExecutionSummary {
 	feeSpentMsat: bigint;
 	/** Remaining fee budget for the current UTC day in msat. */
 	budgetRemainingMsat: bigint;
-}
-
-export enum PaymentStatus {
-	PENDING = 'PENDING',
-	COMPLETED = 'COMPLETED',
-	FAILED = 'FAILED'
-}
-
-export enum PaymentDirection {
-	OUTGOING = 'OUTGOING',
-	INCOMING = 'INCOMING'
-}
-
-export interface IPayAllBudget {
-	debitMsat: bigint;
-	maxFeeMsat: bigint;
-}
-
-export interface IPayAllQuote extends IPayAllBudget {
-	minRecipientMsat: bigint;
-	routeFound: boolean;
-	remainderMsat: bigint;
-	searchExhausted: boolean;
-}
-
-/** Planned figures while pending; exact settled figures when completed. */
-export interface IPayAllPayment extends IPayAllBudget {
-	deliveredMsat: bigint;
-	feeMsat: bigint;
-	/** Unspent part of the approved debit, excluding reserves and later receipts. */
-	remainderMsat: bigint;
-}
-
-export interface IPaymentInfo {
-	payAll?: IPayAllPayment;
-	paymentHash: Buffer;
-	preimage?: Buffer;
-	amountMsat: bigint;
-	/**
-	 * The msat that left this node, fees included, when amountMsat is not
-	 * that figure. A single-path send records its first-hop amount in
-	 * amountMsat, so it needs nothing here; an MPP send records the invoice
-	 * amount there and the sum of its parts' first-hop amounts here, written
-	 * with the record's first persist. A part refused at dispatch is not
-	 * subtracted, so this can overstate by that part.
-	 */
-	sentMsat?: bigint;
-	status: PaymentStatus;
-	direction: PaymentDirection;
-	route?: IRoute;
-	sharedSecrets?: Buffer[];
-	failureCode?: number;
-	failureSourceIndex?: number;
-	/**
-	 * Why a payment failed when no onion failure code is available: it failed
-	 * LOCALLY, before the HTLC ever reached the network, or a peer's failure came
-	 * back undecryptable. Without this a local failure is indistinguishable from a
-	 * remote one, since both surface only as an absent failureCode.
-	 */
-	failureReason?: string;
-	retryCount?: number;
-	/**
-	 * Block height this attempt converted its relative route CLTV deltas against.
-	 * A payee reporting a height at or below this cannot be telling us anything
-	 * new, so it is what a height-skew failure must be judged against, not our
-	 * live height.
-	 */
-	cltvBaseHeight?: number;
-	createdAt: number;
-	completedAt?: number;
-	/**
-	 * The received HTLCs (`channelIdHex:htlcId`) that completed an incoming
-	 * payment. A restart redispatch fulfills only these for a completed hash;
-	 * any other HTLC for it is a replay.
-	 */
-	settledHtlcs?: string[];
-	metadata?: Record<string, string>;
 }
 
 /** A keysend has no invoice to re-pay, so a retry replays these instead. */
@@ -1068,7 +1098,7 @@ export interface ICreateInvoiceOptions {
 	 */
 	asyncHold?: boolean;
 	/**
-	 * FFOR Variant D voucher invoice (specs/ffor-offline-receive.md sections
+	 * FFOR Variant D voucher invoice (docs/specs/ffor-offline-receive.md sections
 	 * 7.3, 7.6): `paymentHash` is the voucher's H_k whose preimage the
 	 * settlement peer holds, the invoice is not a hold invoice, and only the
 	 * caller's `extraRoutingHints` are emitted (the hint carrying S's fee
@@ -1309,8 +1339,14 @@ export interface INodeInfo {
 	asyncReceiveService: import('../async-payments/types').IAsyncReceiveServiceMetrics;
 }
 
-export interface ILightningError {
-	code: string;
+/**
+ * A `node:error` payload. Listeners receive `ILightningError<NodeErrorCode>`,
+ * so a switch over `code` can be exhaustive. The parameter defaults to string
+ * for one minor release, so code that builds an ILightningError of its own
+ * keeps compiling; the default becomes NodeErrorCode after that.
+ */
+export interface ILightningError<C extends string = string> {
+	code: C;
 	channelId?: Buffer;
 	message: string;
 	timestamp: number;
@@ -1328,6 +1364,12 @@ export interface ILightningError {
 	 * close, a sweep) or the transaction is not one this node tracks.
 	 */
 	retained?: boolean;
+	/**
+	 * Why the channel refused, on CHANNEL_ERROR, CLOSE_CHANNEL_FAILED and
+	 * UPDATE_FEE_FAILED when the refusing arm said so. Absent on refusals not
+	 * yet classified.
+	 */
+	channelErrorCode?: ChannelErrorCode;
 }
 
 export interface IPaymentPart {
@@ -1678,13 +1720,10 @@ export interface IKeysendOptions {
  * Typed error for Lightning payment failures.
  * Extends Error for backward compatibility with existing catch blocks.
  */
-export class LightningPaymentError extends Error {
-	code: LightningErrorCode;
-
+export class LightningPaymentError extends CodedError<LightningErrorCode> {
 	constructor(code: LightningErrorCode, message: string) {
-		super(message);
+		super(code, message);
 		this.name = 'LightningPaymentError';
-		this.code = code;
 	}
 }
 
@@ -1755,13 +1794,10 @@ export enum ChannelFundingUnavailableCode {
  * untyped throw to a generic 500. The sibling for argument refusals is
  * InvalidChannelOpenError; node faults stay untyped and keep scrubbing.
  */
-export class ChannelFundingUnavailableError extends Error {
-	code: ChannelFundingUnavailableCode;
-
+export class ChannelFundingUnavailableError extends CodedError<ChannelFundingUnavailableCode> {
 	constructor(code: ChannelFundingUnavailableCode, message: string) {
-		super(message);
+		super(code, message);
 		this.name = 'ChannelFundingUnavailableError';
-		this.code = code;
 	}
 }
 

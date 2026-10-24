@@ -1,49 +1,8 @@
-export {
-	BeignetNode,
-	BeignetNodeOptions,
-	LogLevel,
-	LogEntry
-} from './beignet-node';
-export {
-	BeignetError,
-	BeignetErrorCode,
-	describeFailureCode,
-	isRetryableError,
-	isPermanentFailure
-} from './errors';
-export { startDaemon, DaemonOptions, IStartedDaemon } from './daemon';
-export {
-	ApiKeyAuthenticator,
-	ApiKeyDefinition,
-	ApiScope,
-	AuthResult,
-	AuthSuccess,
-	ROUTE_SCOPES,
-	getRouteScopes,
-	scopesAllowRoute
-} from './auth';
-export { getOpenApiSpec } from './openapi';
-export { WebhookManager, IWebhookStorage } from './webhooks';
-export {
-	PaymentQueue,
-	IPaymentQueueStorage,
-	PaymentQueueOptions,
-	InterruptedPaymentOutcome,
-	INTERRUPTED_PAYMENT_ERROR
-} from './payment-queue';
-export { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
-export {
-	LightningErrorCode,
-	LightningPaymentError,
-	InvalidChannelOpenError,
-	InvalidSpliceError,
-	ChannelFundingUnavailableError,
-	ChannelFundingUnavailableCode,
-	IChannelHealth,
-	IStructuredLog,
-	IGraphRestoreStats,
-	IPaymentProof,
-	IKeysendOptions
-} from '../lightning/node/types';
-export * from './types';
-export type { OnchainSweepInfo, OnchainSweepRequest } from './onchain-sweep';
+/**
+ * `beignet/node` and `beignet/daemon` together, as this entry exported them
+ * before they were split, kept for existing imports. Loading it loads the
+ * daemon; import `beignet/node` for the node alone.
+ * @module beignet/cli
+ */
+export * from '../node';
+export * from '../daemon';

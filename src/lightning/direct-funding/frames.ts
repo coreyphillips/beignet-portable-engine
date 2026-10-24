@@ -27,15 +27,12 @@
  *    funding attestation; the per-request key does all sealing.
  */
 
-import crypto from 'crypto';
+import { randomBytes } from '../crypto/provider';
 import { decrypt, encrypt } from '../crypto/chacha20poly1305';
 import { ecdh, getPublicKey, isValidPrivateKey } from '../crypto/ecdh';
 import { hkdf } from '../crypto/hkdf';
-import {
-	DF_NODE_ID_BYTES,
-	DF_REQUEST_ID_BYTES,
-	IDfRequestEnvelope
-} from './types';
+import type { IDfRequestEnvelope } from './types';
+import { DF_NODE_ID_BYTES, DF_REQUEST_ID_BYTES } from './types';
 
 /** Byte-exact HKDF info strings; both sides derive from the same pair. */
 export const DF_INFO_SENDER_TO_RECEIVER = 'beignet-df:v3:sender-to-receiver';
@@ -87,7 +84,7 @@ export interface IDfRequestEncryptionKeys {
 function randomPrivateKey(): Buffer {
 	let key: Buffer;
 	do {
-		key = crypto.randomBytes(32);
+		key = randomBytes(32);
 	} while (!isValidPrivateKey(key));
 	return key;
 }
@@ -185,7 +182,7 @@ export function sealFrame(
 	plaintext: Buffer
 ): IDfSealedFrame {
 	const aad = frameAad(requestId, subtype);
-	const nonce = crypto.randomBytes(DF_FRAME_NONCE_BYTES);
+	const nonce = randomBytes(DF_FRAME_NONCE_BYTES);
 	return { nonce, ciphertext: encrypt(key, nonce, plaintext, aad) };
 }
 

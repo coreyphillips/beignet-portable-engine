@@ -1,16 +1,21 @@
-/** Node-only Iroh backend. Import this entry explicitly, never in portable code. */
+/**
+ * Node-only Iroh backend. Import this entry explicitly, never in portable code.
+ * @module beignet/lightning/iroh-node
+ */
 import type * as Binding from '@number0/iroh';
-import {
-	IROH_ALPN,
+import type {
 	IIrohAddress,
 	IIrohDiagnostics,
 	IIrohEndpoint,
-	IIrohEndpointOptions,
+	IIrohEndpointOptions
+} from './iroh';
+import {
+	IROH_ALPN,
 	IrohTransport,
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from './iroh';
-import { IDuplexTransport } from './duplex-transport';
+import type { IDuplexTransport } from './duplex-transport';
 
 /** Lazily load the optional native addon only after an explicit opt-in. */
 export async function createNodeIrohEndpoint(
@@ -21,6 +26,8 @@ export async function createNodeIrohEndpoint(
 	let binding: typeof Binding;
 	try {
 		binding = require('@number0/iroh/index.js') as typeof Binding;
+		// React Native bundles resolve it to an empty module (package.json).
+		if (!binding.Endpoint) throw new Error('empty module');
 	} catch {
 		throw new Error(
 			'Iroh requires the optional @number0/iroh binding and Node >= 20.3'

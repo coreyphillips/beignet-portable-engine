@@ -1,15 +1,15 @@
-import crypto from 'crypto';
+import { sha256 } from '../crypto/provider';
 import {
 	decodeFforHeader,
 	decodeFforSyncMessage,
 	decodeFforSyncReplyMessage,
 	verifyFforMessage
 } from './messages';
+import type { IFforEpochRecord } from './types';
 import {
 	FF_SYNC_TYPE,
 	FF_SYNC_REPLY_TYPE,
 	FforSlotState,
-	IFforEpochRecord,
 	isFforConcurrentVersion
 } from './types';
 
@@ -71,13 +71,7 @@ export function validateFforSyncState(record: IFforEpochRecord): void {
 		if (i === 2 && record.role !== 'R')
 			throw new Error('Invalid receipt conflict role');
 		for (const proof of snapshot.preimages) {
-			if (
-				!crypto
-					.createHash('sha256')
-					.update(proof.preimage)
-					.digest()
-					.equals(record.paymentHashes[proof.k - 1])
-			)
+			if (!sha256(proof.preimage).equals(record.paymentHashes[proof.k - 1]))
 				throw new Error('Persisted receipt proof mismatch');
 			if (
 				record.role === 'R' &&

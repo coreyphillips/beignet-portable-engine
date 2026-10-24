@@ -1,4 +1,4 @@
-import {
+import type {
 	EAddressType,
 	IOutput,
 	ISendTransaction,
@@ -6,10 +6,10 @@ import {
 	IVin,
 	IVout
 } from './wallet';
-import { BIP32Interface } from 'bip32';
-import { Psbt } from 'bitcoinjs-lib';
-import { Result } from '../utils';
-import { ECPairInterface } from 'ecpair';
+import type { BIP32Interface } from 'bip32';
+import type { Psbt } from 'bitcoinjs-lib';
+import type { Result } from '../utils/result';
+import type { ECPairInterface } from 'ecpair';
 
 export interface ICreateTransaction {
 	transactionData?: ISendTransaction;
@@ -71,8 +71,8 @@ export type TDecodeRawTx = {
 export type TGetTotalFeeObj = {
 	totalFee: number;
 	transactionByteCount: number;
-	satsPerByte: number;
-	maxSatPerByte: number; // Max sats per byte that can be used for a given transaction without exceeding 50% of the balance.
+	satsPerByte: number; // sat/vB
+	maxSatPerByte: number; // Max sat/vB that can be used for a given transaction without exceeding 50% of the balance.
 };
 
 export type TGapLimitOptions = {

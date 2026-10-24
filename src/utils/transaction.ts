@@ -1,9 +1,9 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { Psbt } from 'bitcoinjs-lib';
-import { err, ok, Result } from './result';
-import {
+import type { Psbt } from 'bitcoinjs-lib';
+import type { Result } from './result';
+import { err, ok } from './result';
+import type {
 	EAddressType,
-	EAvailableNetworks,
 	IOutput,
 	ISendTransaction,
 	TDecodeRawTx,
@@ -12,11 +12,13 @@ import {
 	TGetByteCountOutput,
 	TGetByteCountOutputs
 } from '../types';
-import { availableNetworks, reduceValue } from './wallet';
+import { availableNetworks, reduceValue } from './common';
 import validate, { getAddressInfo } from 'bitcoin-address-validation';
 import * as bip21 from 'bip21';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
-import { getBitcoinJsNetwork, validateAddress } from './helpers';
+import { validateAddress } from './helpers';
+import type { Network } from '../network';
+import { toBitcoinJsNetwork } from '../network';
 import { btcToSats } from './conversion';
 
 /**
@@ -103,15 +105,15 @@ export const encodeBip21 = ({
  * Attempts to parse any given string as an on-chain payment request.
  * Returns an error if invalid.
  * @param {string} data
- * @param {EAvailableNetworks} [network]
- * @returns {Result<{address: string; network: EAvailableNetworks; sats: number; message: string;}>}
+ * @param {Network} [network]
+ * @returns {Result<{address: string; network: Network; sats: number; message: string;}>}
  */
 export const parseOnChainPaymentRequest = (
 	data: string,
-	network?: EAvailableNetworks
+	network?: Network
 ): Result<{
 	address: string;
-	network: EAvailableNetworks;
+	network: Network;
 	sats: number;
 	message: string;
 }> => {
@@ -426,7 +428,7 @@ export const getByteCount = (
 // Bitcoin Core prices dust at three sats per vbyte (the default dust relay
 // fee) over the serialized output plus the cost of spending it: 67 vbytes for
 // a witness program, 148 for anything else. See GetDustThreshold in
-// src/policy/policy.cpp.
+// https://github.com/bitcoin/bitcoin/blob/master/src/policy/policy.cpp.
 const DUST_RELAY_SATS_PER_VBYTE = 3;
 const WITNESS_SPEND_VBYTES = 67;
 const LEGACY_SPEND_VBYTES = 148;
@@ -454,7 +456,7 @@ export const getDustThreshold = (address: string): number => {
 	try {
 		const { version } = bitcoin.address.fromBase58Check(address);
 		const isP2sh = availableNetworks().some(
-			(network) => getBitcoinJsNetwork(network).scriptHash === version
+			(network) => toBitcoinJsNetwork(network).scriptHash === version
 		);
 		// P2SH is OP_HASH160 <20 bytes> OP_EQUAL. P2PKH wraps the same hash in
 		// OP_DUP, OP_HASH160, OP_EQUALVERIFY and OP_CHECKSIG.
@@ -526,7 +528,7 @@ export const validateTransaction = (
 			value: 'value'
 		});
 		if (inputsReduce.isErr()) {
-			return err(inputsReduce.error.message);
+			return err(inputsReduce.error);
 		}
 		//Remove the change address from the outputs array, if any.
 		let filteredOutputs = outputs;
@@ -540,7 +542,7 @@ export const validateTransaction = (
 			value: 'value'
 		});
 		if (outputsReduce.isErr()) {
-			return err(outputsReduce.error.message);
+			return err(outputsReduce.error);
 		}
 
 		return ok('Transaction is valid.');
@@ -553,15 +555,15 @@ export const validateTransaction = (
  * Attempts to decode a raw tx hex.
  * Source: https://github.com/bitcoinjs/bitcoinjs-lib/issues/1606#issuecomment-664740672
  * @param {string} hex
- * @param {EAvailableNetworks} [_network]
+ * @param {Network} [_network]
  * @returns {Result<TDecodeRawTx>}
  */
 export const decodeRawTransaction = (
 	hex: string,
-	_network: EAvailableNetworks
+	_network: Network
 ): Result<TDecodeRawTx> => {
 	try {
-		const network = getBitcoinJsNetwork(_network);
+		const network = toBitcoinJsNetwork(_network);
 		const tx = bitcoin.Transaction.fromHex(hex);
 		return ok({
 			txid: tx.getId(),

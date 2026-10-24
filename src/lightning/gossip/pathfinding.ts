@@ -5,19 +5,21 @@
  * since fees accumulate at each hop. Minimizes total cost to the sender.
  */
 
-import {
+import type {
 	IGraphChannel,
 	IGraphEdge,
 	IChannelUpdateMessage,
 	IRoute,
-	IRouteHop,
+	IRouteHop
+} from './types';
+import {
 	CHANNEL_FLAG_DISABLED,
 	MESSAGE_FLAG_HTLC_MAX,
 	DEFAULT_PRUNE_MAX_AGE
 } from './types';
-import { NetworkGraph } from './network-graph';
-import { MissionControl } from './mission-control';
-import { IRoutingHintHop } from '../invoice/types';
+import type { NetworkGraph } from './network-graph';
+import type { MissionControl } from './mission-control';
+import type { IRoutingHintHop } from '../invoice/types';
 
 /** Default max hops per BOLT 4. */
 const DEFAULT_MAX_HOPS = 20;
@@ -563,6 +565,24 @@ function searchRoute(
 	amountMsat: bigint,
 	usedCapacity?: Map<string, bigint>
 ): IRoute | null {
+	const route = searchCheapestRoute(search, amountMsat, usedCapacity);
+	if (route || !search.missionControl) return route;
+	// Each node keeps only its cheapest path. A penalty can make that a path
+	// needing more than an upstream channel carries, and drop the penalized
+	// one that fits. Penalties only rank routes, so they must not leave a
+	// payment with none.
+	return searchCheapestRoute(
+		{ ...search, missionControl: undefined },
+		amountMsat,
+		usedCapacity
+	);
+}
+
+function searchCheapestRoute(
+	search: IRouteSearch,
+	amountMsat: bigint,
+	usedCapacity?: Map<string, bigint>
+): IRoute | null {
 	const {
 		graph,
 		sourceHex,
@@ -726,9 +746,10 @@ function searchRoute(
 			if (newCltv > maxCltvExpiry) continue;
 
 			const penalty = missionControl ? missionControl.getPenalty(scidHex) : 0n;
-			// Accumulate a per-hop penalty so shorter, more reliable routes win.
-			const newCost =
-				newAmount + penalty + BigInt(current.hops + 1) * HOP_PENALTY_MSAT;
+			// Cost accumulates along the path, so a penalty weighs on every
+			// route through its edge. Each edge also strictly raises the cost,
+			// which keeps the predecessor map free of cycles.
+			const newCost = current.cost + fee + penalty + HOP_PENALTY_MSAT;
 
 			const existingBest = bestCost.get(upstreamNodeHex);
 			if (existingBest !== undefined && newCost >= existingBest) {
@@ -763,12 +784,17 @@ function searchRoute(
 
 	const hops: IRouteHop[] = [];
 	let currentNode = sourceHex;
+	// A chain that revisits a node would loop here forever, adding hops
+	// until memory runs out.
+	const visited = new Set<string>([sourceHex]);
 
 	while (currentNode !== destHex) {
 		const pred = predecessors.get(currentNode);
 		if (!pred) break;
 
 		const hopNodeHex = pred.nextNodeId;
+		if (visited.has(hopNodeHex)) return null;
+		visited.add(hopNodeHex);
 		// Look ahead: the hop's own forwarding fee comes from its own predecessor entry
 		const hopPred = predecessors.get(hopNodeHex);
 
@@ -917,7 +943,7 @@ export function findMultiPathRoute(
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
 
-import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
+import type { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
 
 /**
  * Find a route from `source` through a blinded path to the recipient.
