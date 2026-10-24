@@ -4,7 +4,7 @@ The fork tracks Beignet **0.32.1** at `daed636187e42bfbd156e5f5b74fda9c7a6379cd`
 
 All on Node 24.22.1:
 - `npm test`: 225 of 225 pass. That is the 224 before plus one new test: the engine's crypto provider running over `portable/crypto.ts`.
-  - Without the ChaCha20 `final()` fix, that test and the ChaCha20 stream test fail: `The platform's chacha20 failed its self-test`.
+  - Without the ChaCha20 `final()` fix, that test fails with `The platform's chacha20 failed its self-test`, and the ChaCha20 stream test with `Cipher already finalized`.
   - Without `portable/better-sqlite3.ts`, all eight `sqlite-surface` tests fail.
   - Without the test persistence, all twelve `private-home-channel` tests fail.
 - `npm run check:types` passes.
