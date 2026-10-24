@@ -14,7 +14,7 @@ const aliases = {
 	http: 'unsupported',
 	os: 'unsupported',
 	zlib: 'zlib',
-	'better-sqlite3': 'sqlite'
+	'better-sqlite3': 'better-sqlite3'
 };
 for (const k in aliases)
 	aliases[k] = path.resolve('portable', aliases[k] + '.ts');

@@ -87,7 +87,8 @@ export function pbkdf2Sync(
 function cipher(name: string, key: any, iv: any, decrypt: boolean) {
 	let aad = Buffer.alloc(0),
 		tag: Buffer | undefined,
-		used = false;
+		used = false,
+		streamed = false;
 	const chunks: Buffer[] = [];
 	const result = {
 		setAAD(value: any) {
@@ -105,6 +106,7 @@ function cipher(name: string, key: any, iv: any, decrypt: boolean) {
 				if (decrypt) throw new Error('Use ChaCha20 stream encryption');
 				if (iv.length !== 16) throw new Error('Invalid chacha20 IV');
 				used = true;
+				streamed = true;
 				return Buffer.from(
 					chacha20(
 						key,
@@ -119,6 +121,12 @@ function cipher(name: string, key: any, iv: any, decrypt: boolean) {
 			return Buffer.alloc(0);
 		},
 		final() {
+			// A stream cipher has nothing left to emit. The engine's crypto
+			// provider (0.32.0) calls final() after update(), as Node allows.
+			if (streamed) {
+				streamed = false;
+				return Buffer.alloc(0);
+			}
 			if (used) throw new Error('Cipher already finalized');
 			used = true;
 			const impl =

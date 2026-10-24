@@ -59,7 +59,10 @@ function config(id, role, advertise) {
 		},
 		localFeatures,
 		preferAnchors: true,
-		zeroReserve: { role, advertise, waiveClientReserve: role === 'primary' }
+		zeroReserve: { role, advertise, waiveClientReserve: role === 'primary' },
+		// Beignet 0.32.0 (#1831) builds no ChannelManager without persistence.
+		// These opens are not about durability, so every write commits.
+		persistence: { persist: () => ({ committed: true, outboxIds: [] }) }
 	};
 }
 
