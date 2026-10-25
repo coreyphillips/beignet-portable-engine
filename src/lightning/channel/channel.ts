@@ -314,7 +314,6 @@ import {
 	spliceFeeSats,
 	dualFundingContributionWeight,
 	SPLICE_TX_BASE_WEIGHT,
-	SHARED_FUNDING_INPUT_WEIGHT,
 	outputWeight
 } from './splice-weight';
 import type { ISpliceTxInput, ISpliceTxOutput } from './splice-tx';
@@ -596,6 +595,18 @@ function auditMinInputWeightWu(input: IInteractiveTxInput): number {
 	// P2WPKH: count(1) + low-R DER sig(1+71) + pubkey(1+33)
 	return base + 107;
 }
+
+/**
+ * Shared 2-of-2 splice input minimum for the tx_complete audit. Both signatures
+ * may use low-R DER encoding (71 bytes including SIGHASH_ALL): base 164 plus
+ * count 1, dummy 1, two length 1 + signature 71 pairs, script length 1 and script 71.
+ * The funding-side estimate remains 386 WU, so our own contributions keep their
+ * cushion. Using that estimate as this minimum rejects valid peer splices (#359).
+ * BOLT 2 tx_signatures makes the sender responsible for its actual witness fee;
+ * this pre-signature minimum does not replace cryptographic witness validation.
+ * https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-tx_signatures-message
+ */
+const AUDIT_MIN_SHARED_INPUT_WEIGHT = 164 + 1 + 1 + 2 * (1 + 71) + 1 + 71;
 
 /** A force close this channel cannot perform, and why. */
 export interface IForceClosePlanRefused {
@@ -18050,7 +18061,7 @@ export class Channel {
 				if (unsupported) return unsupported;
 			}
 			weight += isShared
-				? SHARED_FUNDING_INPUT_WEIGHT
+				? AUDIT_MIN_SHARED_INPUT_WEIGHT
 				: auditMinInputWeightWu(input);
 			if (isShared) {
 				// Pre-splice capacity rolls over; it is nobody's new contribution.
