@@ -1601,6 +1601,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	private _pendingReconnects = 0;
 	private liquidityAdvisor = new LiquidityAdvisor();
 	private feeAdvisor = new FeeAdvisor();
+	private initialCommitmentFeeRefreshAtMs = 0;
 	private channelSuggestions = new ChannelSuggestions();
 	// Advisor execution (both OFF by default; see INodeConfig)
 	private autoRebalanceConfig: ResolvedNodeConfig['autoRebalance'];
@@ -2072,8 +2073,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// request_funds and fund the contribution via the fundingProvider.
 			leaseRates: config.leaseRates,
 			// Cooperative closes are priced from the LIVE feerate, not the
-			// commitment feerate (pinned to the 253 sat/kw floor on anchors,
-			// where fees ride on CPFP — a closing tx has no anchor to bump).
+			// initial commitment feerate. A cooperative closing transaction
+			// has no anchor output available for a later CPFP fee bump.
 			getClosingFeeratePerKw: (): number | undefined => {
 				const satPerVbyte = this.feeAdvisor.getCurrentRate();
 				return satPerVbyte > 0
@@ -12098,7 +12099,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					this.fundingMaxRequests.add(tempId);
 				}
 			},
-			{ trusted }
+			{ trusted, commitmentFeeratePerkw: this.initialCommitmentFeeratePerkw() }
 		);
 	}
 
@@ -12128,6 +12129,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		params: {
 			fundingSatoshis: bigint;
 			fundingFeeratePerkw?: number;
+			/** Explicit initial commitment policy; otherwise use the fresh local estimate. */
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
 			/**
@@ -12280,7 +12282,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			fundingFeeratePerkw:
 				params.fundingFeeratePerkw ?? localConfig.feeratePerKw,
 			commitmentFeeratePerkw:
-				params.commitmentFeeratePerkw ?? localConfig.feeratePerKw,
+				params.commitmentFeeratePerkw ?? this.initialCommitmentFeeratePerkw(),
 			dustLimitSatoshis: localConfig.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: localConfig.maxHtlcValueInFlightMsat,
 			htlcMinimumMsat: localConfig.htlcMinimumMsat,
@@ -29766,6 +29768,44 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (!this.feeEstimator) return null;
 		const raw = await this.feeEstimator.estimateFee(targetBlocks);
 		return raw > 0 ? this.clampEstimatedFeeRate(raw) : null;
+	}
+
+	/**
+	 * Pin a new channel's commitment fee independently of its funding fee.
+	 * Anchors support later CPFP but do not make a below-mempool commitment
+	 * acceptable to every peer. Existing channels and splices keep their
+	 * negotiated rate. A configured estimator must have a recent sample before
+	 * any opening state or external funding contribution is created.
+	 */
+	private initialCommitmentFeeratePerkw(): number {
+		const config = this.channelManager['config'] as {
+			localConfig?: import('../channel/types').IChannelConfig;
+		};
+		const configured = (config.localConfig ?? DEFAULT_CHANNEL_CONFIG)
+			.feeratePerKw;
+		if (!this.feeEstimator) return configured;
+		const now = Date.now();
+		const rate = this.feeAdvisor.getFreshRate(30 * 60 * 1000, now);
+		if (!(rate > 0)) {
+			// Bound retries of the existing asynchronous refresh path. A stale
+			// cached sample never authorizes a new open while this is in flight.
+			if (
+				now - this.initialCommitmentFeeRefreshAtMs >= 5000 ||
+				now < this.initialCommitmentFeeRefreshAtMs
+			) {
+				this.initialCommitmentFeeRefreshAtMs = now;
+				this.warmFeeAdvisor();
+			}
+			throw new ChannelFundingUnavailableError(
+				ChannelFundingUnavailableCode.FEE_ESTIMATE_NOT_READY,
+				'fee estimate not ready or stale for the initial commitment; retry after the estimator refreshes'
+			);
+		}
+		return Math.max(
+			configured,
+			253,
+			Math.ceil(this.clampEstimatedFeeRate(rate) * 250)
+		);
 	}
 
 	/**

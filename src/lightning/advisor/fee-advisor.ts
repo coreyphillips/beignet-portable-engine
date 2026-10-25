@@ -26,12 +26,14 @@ export class FeeAdvisor {
 	private samples: number[] = [];
 	private pointer = 0;
 	private filled = false;
+	private latestSampleAtMs = 0;
 
 	/**
 	 * Record a new fee rate sample (sat/vByte).
 	 */
 	recordSample(satPerVbyte: number): void {
-		if (satPerVbyte <= 0) return;
+		if (!Number.isFinite(satPerVbyte) || satPerVbyte <= 0) return;
+		this.latestSampleAtMs = Date.now();
 		if (this.samples.length < MAX_SAMPLES) {
 			this.samples.push(satPerVbyte);
 		} else {
@@ -87,6 +89,14 @@ export class FeeAdvisor {
 					: this.samples.length - 1
 				: this.pointer - 1;
 		return this.samples[idx];
+	}
+
+	/** Return zero if the latest sample is missing, stale, or predates a clock rollback. */
+	getFreshRate(maxAgeMs: number, nowMs = Date.now()): number {
+		const age = nowMs - this.latestSampleAtMs;
+		return this.samples.length > 0 && age >= 0 && age <= maxAgeMs
+			? this.getCurrentRate()
+			: 0;
 	}
 
 	/**

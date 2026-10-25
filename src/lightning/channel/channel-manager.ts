@@ -1444,7 +1444,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
-		opts?: { trusted?: boolean }
+		opts?: { trusted?: boolean; commitmentFeeratePerkw?: number }
 	): Channel {
 		peerPubkey = normalizeHexPubkey(peerPubkey);
 		// Verify peer is connected before creating channel state
@@ -1461,12 +1461,28 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			);
 		}
 
+		const commitmentRate = opts?.commitmentFeeratePerkw;
+		if (
+			commitmentRate !== undefined &&
+			(!Number.isInteger(commitmentRate) ||
+				commitmentRate < 253 ||
+				commitmentRate > 0xffffffff)
+		) {
+			throw new Error(
+				'Initial commitment fee must be an integer from 253 to 4294967295 sat/kw'
+			);
+		}
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
 			temporaryChannelId: randomBytes(32),
 			fundingSatoshis,
 			pushMsat: pushMsat || 0n,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			localConfig: {
+				...(this.config.localConfig || DEFAULT_CHANNEL_CONFIG),
+				...(commitmentRate !== undefined
+					? { feeratePerKw: commitmentRate }
+					: {})
+			},
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
