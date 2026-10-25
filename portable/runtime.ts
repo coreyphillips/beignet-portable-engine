@@ -21,6 +21,7 @@ import { drainFence } from './drain-fence.cjs';
 import { closeNotStarted } from './drain-close-state.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { engineDiagnostics } from './engine-diagnostics.cjs';
+import { watchReestablishment } from './reestablish-watchdog.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
@@ -633,56 +634,20 @@ export async function createPortableRuntime(options: any) {
 					activity,
 					save: () => save('/wallet/activity.json', activity)
 				});
-				// A first connection after a cold start has been seen to come up
-				// dead: the handshake completes, the primary never answers
-				// channel_reestablish, and nothing notices until the first ping
-				// fails thirty seconds later. Reestablishment gets
-				// REESTABLISH_WATCHDOG_MS after a connect; a home channel still not
-				// usable by then, with the peer still listed as connected, is
-				// dialled again rather than waited on. Bounded per start so a
-				// primary that genuinely cannot reestablish is not hammered.
-				const REESTABLISH_WATCHDOG_MS = 8000;
-				const REESTABLISH_REDIALS_MAX = 3;
-				let reestablishRedials = 0;
-				const homeChannelUsable = (): boolean => {
-					const primaryPubkey = record?.lfbw?.primaryPubkey;
-					const mine = node!
-						.listChannels()
-						.filter(
-							(c: any) =>
-								c.peerPubkey === primaryPubkey &&
-								c.state !== 'CLOSED' &&
-								c.state !== 'FORCE_CLOSED'
-						);
-					return (
-						mine.length === 0 ||
-						mine.some((c: any) => c.htlcUsable ?? c.state === 'NORMAL')
-					);
-				};
-				node.on('peer:connect', (first: any) => {
-					if (peerKey(first) !== record?.lfbw?.primaryPubkey) return;
-					probeOfflineReceive();
-					const pending = setTimeout(() => {
-						pendingTimers.delete(pending);
-						if (closed || !node) return;
-						if (recoveryHold()) return;
-						if (homeChannelUsable()) {
-							reestablishRedials = 0;
-							return;
-						}
-						if (
-							!primaryConnected() ||
-							reestablishRedials >= REESTABLISH_REDIALS_MAX
-						)
-							return;
-						reestablishRedials += 1;
-						options.onDiagnostic?.({
-							phase: 'primary-redial',
-							message: `channel not usable ${REESTABLISH_WATCHDOG_MS / 1000}s after connecting, dialling again (${reestablishRedials}/${REESTABLISH_REDIALS_MAX})`
-						});
-						void redialPrimary({ force: true });
-					}, REESTABLISH_WATCHDOG_MS);
-					pendingTimers.add(pending);
+				// Only an incomplete channel_reestablish exchange needs this bounded
+				// redial. Quiescence, splicing and custody holds can legitimately
+				// refuse HTLCs on a live, fully reestablished connection.
+				watchReestablishment({
+					node,
+					primaryPubkey: () => record?.lfbw?.primaryPubkey,
+					peerKey,
+					primaryConnected,
+					recoveryHold,
+					isClosed: () => closed || !node,
+					onConnect: probeOfflineReceive,
+					redial: () => redialPrimary({ force: true }),
+					onDiagnostic: options.onDiagnostic,
+					pendingTimers
 				});
 				// A transport error on the primary's connection is followed by a
 				// redial after a short pause, rather than waiting for the poll.
