@@ -244,6 +244,24 @@ test('an observed close and submitted frozen sweep release the hold before confi
 	assert.equal(h.calls.filter((call) => call === 'close').length, 1);
 });
 
+test('a signed close is listed with the drain before its payout is observed', async () => {
+	const h = harness(),
+		drain = h.create();
+	await drain.quote(request);
+	const started = await drain.send(request.requestId);
+	assert.equal(started.phase, 'closing');
+	assert.deepEqual(started.txids, ['close-tx', 'sweep-tx']);
+	assert.deepEqual(h.create().get(request.requestId).txids, [
+		'close-tx',
+		'sweep-tx'
+	]);
+	assert.equal(h.journal().records[0].close.txid, undefined);
+	h.state.closeSeen = true;
+	const pending = await h.create().sync();
+	assert.equal(pending.phase, 'pending');
+	assert.deepEqual(pending.txids, ['close-tx', 'sweep-tx']);
+});
+
 test('a lost close response retains the hold and restart never repeats the close', async () => {
 	const h = harness();
 	await h.create().quote(request);

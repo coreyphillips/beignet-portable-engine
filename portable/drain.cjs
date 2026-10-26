@@ -51,6 +51,18 @@ const isHistoricalClose = (channel) => {
 	);
 };
 
+// The cooperative close the engine signed for a drain's channel, paying the
+// drain's destination.
+const payoutFor = (engine, row) =>
+	engine
+		.listOnchainTransactions()
+		.find(
+			(entry) =>
+				entry.source === 'cooperative-close' &&
+				entry.channelId === row.channelId &&
+				entry.address === row.address
+		);
+
 /**
  * Durable orchestration only. Signing, input ownership and broadcast retries
  * belong to the engine. The private journal never enters activity or API output.
@@ -196,6 +208,19 @@ function drainCoordinator({
 			].every((name) => typeof engine[name] === 'function')
 		);
 	};
+	// The engine lists a close once both sides sign it, before its payout is
+	// observed at the destination. Showing its txid from then on keeps the
+	// close from reading as a second send while the drain waits; only an
+	// observed payout is saved as close.txid.
+	const signedClose = (row) => {
+		if (!row.channelId || row.close?.txid || !ACTIVE.has(row.phase))
+			return undefined;
+		try {
+			return payoutFor(node(), row)?.txid;
+		} catch {
+			return undefined;
+		}
+	};
 	const publicInfo = (row) => ({
 		requestId: row.requestId,
 		revision: row.revision ?? 0,
@@ -210,7 +235,9 @@ function drainCoordinator({
 		closeFeeSats: row.close?.feeSats ?? 0,
 		sweepAmountSats: row.sweep?.amountSats ?? 0,
 		sweepFeeSats: row.sweep?.feeSats ?? 0,
-		txids: [row.close?.txid, row.sweep?.txid].filter(Boolean),
+		txids: [row.close?.txid ?? signedClose(row), row.sweep?.txid].filter(
+			Boolean
+		),
 		createdAt: row.createdAt,
 		expiresAt: row.expiresAt,
 		...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
@@ -422,14 +449,7 @@ function drainCoordinator({
 		const engine = node();
 		let sweepSubmitted = !row.coins.length;
 		if (row.channelId) {
-			const payout = engine
-				.listOnchainTransactions()
-				.find(
-					(entry) =>
-						entry.source === 'cooperative-close' &&
-						entry.channelId === row.channelId &&
-						entry.address === row.address
-				);
+			const payout = payoutFor(engine, row);
 			let seen;
 			try {
 				seen = payout ? await observe(payout, row) : null;
