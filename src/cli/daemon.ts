@@ -45,6 +45,7 @@ import type { IWebhookStorage } from './webhooks';
 import {
 	WEBHOOK_SECRETS_STORAGE_KEY,
 	WebhookManager,
+	webhookMetrics,
 	webhookTargetRefusal
 } from './webhooks';
 import type { RateLimitOptions } from './http-rate-limiter';
@@ -3506,6 +3507,18 @@ async function bootDaemon(
 			);
 		},
 		'GET /queue': () => success(paymentQueue.list()),
+		'GET /queue/history': (_body, query) => {
+			const limit = parseIntParam(query, 'limit', { min: 1 });
+			const before = query.get('before') || undefined;
+			return success(paymentQueue.history({ limit, before }));
+		},
+		'GET /queue/entry': (_body, query) => {
+			const id = query.get('id');
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			const entry = paymentQueue.get(id);
+			if (!entry) return failure('NOT_FOUND', 'Queued payment not found');
+			return success(entry);
+		},
 		'POST /queue/cancel': (body) => {
 			const { id } = body as { id: string };
 			if (!id) return failure('INVALID_PARAMS', 'id required');
@@ -3883,7 +3896,9 @@ async function bootDaemon(
 		// back into the old unauthenticated behavior).
 		if (routeKey === 'GET /metrics') {
 			res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-			res.end(node.getMetrics());
+			res.end(
+				node.getMetrics() + webhookMetrics(webhookManager.deliveryStats())
+			);
 			return;
 		}
 
@@ -4159,8 +4174,8 @@ async function bootDaemon(
 	// The in-flight promise is memoized so a second caller (a signal during
 	// /stop) waits for the SAME teardown instead of resolving early and
 	// letting the process exit before it finishes. Webhook registrations are
-	// deliberately left alone: they persist across restarts by contract, and
-	// dispatch stops with the node's listeners.
+	// deliberately left alone: they persist across restarts by contract.
+	// Deliveries still queued or in flight once the node is down are dropped.
 	let stopping: Promise<void> | null = null;
 	const stop = (timeoutMs = 30_000): Promise<void> => {
 		stopping ??= (async (): Promise<void> => {
@@ -4170,6 +4185,7 @@ async function bootDaemon(
 			paymentQueue.stop();
 			paymentQueue.removeAllListeners();
 			await node.gracefulShutdown(timeoutMs).catch(() => node.destroy());
+			await webhookManager.stop();
 			if (rateLimiter) rateLimiter.destroy();
 			clearInterval(idempotencyCleanupTimer);
 			// SSE responses hold their sockets open indefinitely; destroy them

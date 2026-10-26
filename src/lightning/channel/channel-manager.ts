@@ -729,7 +729,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private ownChannelIndex: {
 		revision: number;
 		byScid: Map<string, Channel[]>;
-		peers: Set<string>;
+		peers: Map<string, number>;
 	} | null = null;
 	/** Synchronous funding promotions reserved across reentrant observers. */
 	private channelIdReservations: Map<string, Channel> = new Map();
@@ -1759,7 +1759,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		paymentHash: Buffer,
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
-		blindingPoint?: Buffer
+		blindingPoint?: Buffer,
+		skimmedFeeMsat?: bigint
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -1780,7 +1781,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			paymentHash,
 			cltvExpiry,
 			onionRoutingPacket,
-			blindingPoint
+			blindingPoint,
+			skimmedFeeMsat
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -2949,9 +2951,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return this.getOwnChannelIndex().peers.has(pubkey);
 	}
 
+	/** How many of `pubkey`'s channels hasChannelWithPeer counts. */
+	countChannelsWithPeer(pubkey: string): number {
+		return this.getOwnChannelIndex().peers.get(pubkey) ?? 0;
+	}
+
 	private getOwnChannelIndex(): {
 		byScid: Map<string, Channel[]>;
-		peers: Set<string>;
+		peers: Map<string, number>;
 	} {
 		// Every counter only grows, so the sum changes whenever any of them does.
 		const revision =
@@ -2962,7 +2969,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		if (this.ownChannelIndex?.revision === revision)
 			return this.ownChannelIndex;
 		const byScid = new Map<string, Channel[]>();
-		const peers = new Set<string>();
+		const peers = new Map<string, number>();
 		for (const map of [this.channels, this.tempChannels]) {
 			for (const channel of map.values()) {
 				const state = channel.getFullState();
@@ -2979,7 +2986,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 				}
 				const channelId = channel.getChannelId();
 				const peer = channelId && this.getPeerForChannel(channelId);
-				if (peer) peers.add(peer);
+				if (peer) peers.set(peer, (peers.get(peer) ?? 0) + 1);
 			}
 		}
 		this.ownChannelIndex = { revision, byScid, peers };
@@ -6418,7 +6425,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Whether the peer's init features negotiated FFOR: option_ff_receive
-	 * (560/561) and option_quiesce (activation runs under quiescence). True
+	 * (440/441) and option_quiesce (activation runs under quiescence). True
 	 * when the peer's init is unknown, as for splicing.
 	 */
 	private peerSupportsFfor(peerPubkey: string): boolean {
@@ -6450,8 +6457,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	/**
 	 * Whether the current init exchange negotiated concurrent receive
 	 * (docs/specs/CONCURRENT-RECEIVE.md section 1.1): each side advertised either
-	 * bit of option_ff_receive (560/561) and either bit of option_ff_concurrent
-	 * (562/563). Unlike peerSupportsFfor this is FALSE when the peer's init
+	 * bit of option_ff_receive (440/441) and either bit of option_ff_concurrent
+	 * (442/443). Unlike peerSupportsFfor this is FALSE when the peer's init
 	 * is unknown: an advertisement that was not seen selects nothing, and
 	 * the reconnect check of section 8 must not pass on a guess.
 	 */

@@ -158,7 +158,7 @@ await node.destroy();
 | `fforSettle.maxEpochBlocks?` | `number` | Longest epoch accepted, in blocks. |
 | `fforSettle.feeBaseMsat?` | `number` | Smallest base fee accepted, in msat. |
 | `fforSettle.feePpm?` | `number` | Smallest proportional fee accepted, in ppm. |
-| `fforConcurrent?` | `boolean` | Advertise FFOR concurrent receive, feature bits 562/563 (default true). |
+| `fforConcurrent?` | `boolean` | Advertise FFOR concurrent receive, feature bits 442/443 (default true). |
 | `fforSettleConcurrent?` | `boolean` | Accept new concurrent-profile settlements when fforSettle is on (default true). |
 | `fforWitness?` | `object` | FFOR receipt witness role: store a receiver-encrypted record of every delegated preimage this node relays before propagating the fulfil. |
 | `fforWitness.enabled` | `boolean` | Run the witness role. |
@@ -373,12 +373,14 @@ verify the Lightning leg outlives its on-chain refund before funding.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `enqueuePayment(bolt11, priority?, opts?)` | `QueuedPayment` | Add payment to priority queue (1-10, lower = higher priority). `opts: { amountSats?, maxFeeSats?, metadata? }` |
-| `listQueue()` | `QueuedPayment[]` | List all queue entries |
+| `listQueue()` | `QueuedPayment[]` | The queued and dispatching entries, with the 1000 most recently finished |
+| `getQueuedPayment(id)` | `QueuedPayment \| undefined` | One queue entry by id, whatever its status, from memory or the database |
+| `listQueueHistory(opts?)` | `QueuedPayment[]` | Finished entries, the most recently finished first. `opts: { limit?, before? }`: up to `limit` (default 100, at most 1000), after the entry with id `before` |
 | `cancelQueuedPayment(id)` | `boolean` | Cancel a queued payment by ID |
 | `resolveInterruptedPayment(bolt11)` | `Promise<InterruptedPaymentOutcome>` | How a payment the queue was dispatching ended (one a restart interrupted, or one still out at the queue's payment timeout), from the node's record (in memory, then on disk): `{ status: 'completed', paymentHash }` or `{ status: 'unpaid' }`, once every HTLC offered for it is resolved. The queue's resolver for such an entry |
 | `whenReadyToPay(run)` | `void` | Calls `run` once the node can pay: after a pending guardian restore, once the node is ready, and once some channel can carry an HTLC (or there is no channel); never after shutdown |
 
-Entries survive a restart. The queue dispatches the restored ones once some channel can carry an HTLC after the start (or no channel is left that could), and looks again on every `channel:usable`, without waiting for another enqueue. A payment enqueued before that dispatches on its own; the restored ones wait. An entry left `dispatching` by a restart is checked against the node's record for its invoice before anything sends it again: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead, and one you build yourself dispatches restored entries only once you call `start()`. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching`, its concurrency slot is released, and it is recorded from the node's outcome through the same check, `completed` when the payment settles and `failed` ("Payment was left pending by the dispatch and then failed without paying") once every HTLC resolved with nothing paid; it is not queued again in this process; a restart settles it like any interrupted entry, and one that paid nothing is then queued again. An entry the resolver could not answer (no node to ask yet) is asked about again on `start()` and on `resettle()`, which the daemon calls once a capsule resume has rebuilt the node; a `PaymentQueue` you build yourself calls `resettle()` itself. A `PaymentQueue` without a resolver records such a dispatch `failed` with its outcome unknown, for you to look up before paying that invoice again (issue #976). `amountSats` and `maxFeeSats` must be whole numbers of satoshis, zero or greater; `enqueuePayment` (and `POST /queue/add`) refuses anything else with `INVALID_PARAMS`. An entry whose amount is in its invoice rather than in `amountSats` waits for capacity for that amount just as one with `amountSats` does, instead of being dispatched unchecked into "no route" (issue #981); a `PaymentQueue` you build yourself gets this by passing `invoiceAmountSats`, a callback that returns the invoice's amount in whole satoshis, since the queue never decodes an invoice itself. The daemon and `BeignetNode` share one queue per process: the routes under `/queue` and `enqueuePayment`/`listQueue`/`cancelQueuedPayment` serve the same `PaymentQueue`, which persists through the node's current storage, so it keeps working after an in-process capsule restore replaces the database (issue #978).
+Entries survive a restart. The queue dispatches the restored ones once some channel can carry an HTLC after the start (or no channel is left that could), and looks again on every `channel:usable`, without waiting for another enqueue. A payment enqueued before that dispatches on its own; the restored ones wait. An entry left `dispatching` by a restart is checked against the node's record for its invoice before anything sends it again: a payment that was made is recorded `completed`, one whose HTLCs are still out stays `dispatching` until they resolve, and only one that paid nothing is queued again (issue #967). A `PaymentQueue` built without a `resolveInterrupted` option records such an entry `failed` instead, and one you build yourself dispatches restored entries only once you call `start()`. A dispatch whose HTLC is still out when the queue's own payment timeout fires (60 s by default) is not recorded `failed` either: it stays `dispatching`, its concurrency slot is released, and it is recorded from the node's outcome through the same check, `completed` when the payment settles and `failed` ("Payment was left pending by the dispatch and then failed without paying") once every HTLC resolved with nothing paid; it is not queued again in this process; a restart settles it like any interrupted entry, and one that paid nothing is then queued again. An entry the resolver could not answer (no node to ask yet) is asked about again on `start()` and on `resettle()`, which the daemon calls once a capsule resume has rebuilt the node; a `PaymentQueue` you build yourself calls `resettle()` itself. A `PaymentQueue` without a resolver records such a dispatch `failed` with its outcome unknown, for you to look up before paying that invoice again (issue #976). `amountSats` and `maxFeeSats` must be whole numbers of satoshis, zero or greater; `enqueuePayment` (and `POST /queue/add`) refuses anything else with `INVALID_PARAMS`. An entry whose amount is in its invoice rather than in `amountSats` waits for capacity for that amount just as one with `amountSats` does, instead of being dispatched unchecked into "no route" (issue #981); a `PaymentQueue` you build yourself gets this by passing `invoiceAmountSats`, a callback that returns the invoice's amount in whole satoshis, since the queue never decodes an invoice itself. The daemon and `BeignetNode` share one queue per process: the routes under `/queue` and `enqueuePayment`/`listQueue`/`cancelQueuedPayment` serve the same `PaymentQueue`, which persists through the node's current storage, so it keeps working after an in-process capsule restore replaces the database (issue #978). Memory holds every queued and dispatching entry but only the 1000 most recently finished ones, so a long-running queue neither grows nor slows with its history; a `PaymentQueue` you build yourself sets this with `maxRetainedHistory` (`Infinity` keeps them all). The older ones stay in the database: `getQueuedPayment(id)` (`GET /queue/entry`) finds any entry, and `listQueueHistory` (`GET /queue/history`) pages through every finished one. Only `PaymentQueue.prune()` deletes queue history, and it never touches a queued or dispatching entry (issue #1866).
 
 #### Liquidity & Channel Intelligence
 
@@ -1158,7 +1160,9 @@ interface PaymentInfo {
   paymentHash: string;      // hex
   preimage?: string;        // hex, present when settled
   amountSats: number;       // OUTGOING: what left the node, fees included, rounded up
-  feeSats?: number;         // routing fee paid, rounded up
+                            // INCOMING: what the node was credited, rounded down
+  feeSats?: number;         // OUTGOING: routing fee paid; INCOMING: a JIT LSP's skim
+                            // (invoice amount less amountSats); rounded up
   status: 'PENDING' | 'COMPLETED' | 'FAILED';
   direction: 'OUTGOING' | 'INCOMING';
   failureCode?: number;     // BOLT 4 failure code
@@ -2035,6 +2039,8 @@ beignet payment metadata <paymentHash> '{"orderId":"1234"}'
 beignet queue add <bolt11> [--priority 5] [--amount 1000] [--max-fee 100]
 beignet queue list
 beignet queue cancel <id>
+beignet queue get <id>
+beignet queue history [--limit 100] [--before <id>]
 ```
 
 ### Messages & Gossip
@@ -2393,9 +2399,11 @@ CLI flags > environment variables > config file > defaults.
 
 | Network | Host | Port | TLS |
 |---------|------|------|-----|
-| mainnet | `fulcrum.bitkit.blocktank.to` | 8900 | yes |
+| mainnet | `bitkit.to` | 9999 | yes |
 | testnet | `electrum.blockstream.info` | 60002 | yes |
-| regtest | `34.65.252.32` | 18483 | no |
+| regtest | `electrs.bitkit.stag0.blocktank.to` | 9999 | yes |
+
+The mainnet and regtest defaults are the servers the Bitkit app uses.
 
 > The regtest default is a hosted Synonym regtest Electrum server. For local
 > development against your own regtest node, override it with
@@ -2421,11 +2429,13 @@ connection per network, so they must use the same `electrumTlsVerify` and
 `electrumTlsFingerprints`. A node whose settings differ from those of a node
 already running on the same network is refused with `INVALID_PARAMS`.
 
-Turn it on together with your own server. As of October 2026 none of the
-built-in mainnet servers passes: `fulcrum.bitkit.blocktank.to` serves an
-expired certificate, and the fallback peers serve self-signed ones. With
-verification on and no pin, the daemon refuses all of them and stays without
-Electrum until a server it can verify answers.
+The mainnet and regtest defaults pass with no pin: each serves a certificate a
+public authority signed for its name. Of the mainnet fallback peers, as of
+October 2026 only `bitkit.to` passes; `bitcoin.lu.ke` and `kirsche.emzy.de`
+serve self-signed certificates and `electrum.aantonop.com` does not answer. So
+with verification on, an outage of `bitkit.to` leaves the daemon without
+Electrum until a server it can verify answers. Run your own server as well if
+that matters.
 
 ---
 
@@ -2615,7 +2625,9 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
 | POST | `/queue/add` | `{ bolt11, priority?, amountSats?, maxFeeSats?, metadata? }` | Enqueue payment. Dispatched through `/invoice/pay-safe`, with the same default fee cap and limits |
-| GET | `/queue` | -- | List payment queue |
+| GET | `/queue` | -- | List the queued and dispatching payments, with the 1000 most recently finished |
+| GET | `/queue/history` | `?limit=&before=` | Finished queue entries, the most recently finished first: up to `limit` (default 100, at most 1000), after the entry with id `before` |
+| GET | `/queue/entry` | `?id=` | One queue entry by id, whatever its status, from memory or the database |
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. Without `maxFeeSats` the fee is capped at 1% of the amount, never below 50 sats; the spending limits count the amount plus the cap. A 504 `PAYMENT_TIMEOUT` carries the `paymentHash` to query with `GET /payment`; a keyed retry of it does not send again while that payment can still settle (issue #1133). |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
@@ -2697,6 +2709,19 @@ best effort: a request can be received more than once, and an event is dropped
 after both attempts fail. Handle duplicates without repeating funding and treat
 `SETTLED` and `CANCELLED` as terminal. After a disconnect or missed delivery,
 reconcile with `GET /invoices/held` before acting on an old acceptance event.
+
+Deliveries wait for a worker: at most 4 per registration and 32 in all are in
+flight or waiting to retry, and registrations take turns, so a slow recipient
+does not hold up the others. An attempt that takes longer than 5 seconds,
+response included, fails. Queued and active deliveries may hold at most 1 MiB
+of payload per registration and 8 MiB in all. An event that would pass either
+ceiling is not delivered to that registration. Unregistering drops the
+registration's queued deliveries and its pending retries. Stopping the daemon
+drops all of them and aborts the requests in flight. `GET /metrics` reports
+`beignet_webhook_deliveries_active`, `beignet_webhook_deliveries_queued`,
+`beignet_webhook_queued_bytes`, and `beignet_webhook_deliveries_total` by
+`outcome` (`delivered`, `failed`, `overflow`, `discarded`). A library host sets
+the ceilings with the second `WebhookManager` constructor argument.
 
 ### API Versioning
 

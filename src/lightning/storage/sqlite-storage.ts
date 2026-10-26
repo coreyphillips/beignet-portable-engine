@@ -82,11 +82,35 @@ const OWNER_ONLY_FILE_MODE = 0o600;
 /** Payment keys read per query by paymentsNewestFirst. */
 const PAYMENT_KEY_BATCH = 500;
 
+/** Rows read per query by _rowsInBatches. */
+const HISTORY_ROW_BATCH = 500;
+
 /** Derives the key payments.metadata_tags are computed under. */
 const METADATA_TAG_INFO = 'beignet-payment-metadata-tag-v1';
 
 /** Hex characters kept of each metadata tag's HMAC. */
 const METADATA_TAG_HEX = 32;
+
+const QUEUE_COLUMNS =
+	'id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at';
+/** A payment_queue row the queue no longer dispatches. */
+const QUEUE_FINISHED = "status NOT IN ('queued', 'dispatching')";
+/** When a row finished; idx_payment_queue_finished indexes this expression. */
+const QUEUE_FINISHED_AT = 'COALESCE(completed_at, created_at)';
+
+/** A payment_queue row, as the CLI payment queue stores it. */
+export interface IQueueEntryRow {
+	id: string;
+	bolt11: string;
+	priority: number;
+	status: string;
+	amountSats?: number;
+	maxFeeSats?: number;
+	metadata?: string;
+	error?: string;
+	createdAt: number;
+	completedAt?: number;
+}
 
 /** A payment row's key from paymentsNewestFirst; load() decodes the row. */
 export interface IStoredPaymentRef {
@@ -351,6 +375,30 @@ export class SqliteStorage implements IStorageBackend {
 			this.statements.set(sql, statement);
 		}
 		return statement;
+	}
+
+	/**
+	 * Every row of a table that only grows with history, in rowid order (the
+	 * order a plain scan returns), read a batch at a time. A loader that
+	 * decodes as it goes then never holds every raw row beside its decoded
+	 * copy (issue #1861). Each batch is a whole all(), so no statement is
+	 * left busy while the caller decodes or reports a corrupt row.
+	 */
+	private *_rowsInBatches<T>(table: string, columns: string): Generator<T> {
+		const first = this._stmt(
+			`SELECT rowid, ${columns} FROM ${table} ORDER BY rowid LIMIT ?`
+		);
+		const next = this._stmt(
+			`SELECT rowid, ${columns} FROM ${table} WHERE rowid > ? ` +
+				'ORDER BY rowid LIMIT ?'
+		);
+		let rows = first.all(HISTORY_ROW_BATCH) as Array<T & { rowid: number }>;
+		for (;;) {
+			for (const row of rows) yield row;
+			if (rows.length < HISTORY_ROW_BATCH) return;
+			const after = rows[rows.length - 1].rowid;
+			rows = next.all(after, HISTORY_ROW_BATCH) as Array<T & { rowid: number }>;
+		}
 	}
 
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
@@ -865,6 +913,11 @@ export class SqliteStorage implements IStorageBackend {
 				created_at INTEGER NOT NULL,
 				completed_at INTEGER
 			);
+			-- A start reads the active rows and the newest finished ones,
+			-- however long the history (issue #1866).
+			CREATE INDEX IF NOT EXISTS idx_payment_queue_status ON payment_queue(status);
+			CREATE INDEX IF NOT EXISTS idx_payment_queue_finished
+				ON payment_queue(COALESCE(completed_at, created_at), id);
 
 			CREATE TABLE IF NOT EXISTS channel_policies (
 				channel_id TEXT PRIMARY KEY,
@@ -1142,11 +1195,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo }> {
-		const rows = this._stmt(
-			'SELECT payment_hash, payment_json FROM payments'
-		).all() as Array<{ payment_hash: string; payment_json: string }>;
 		const results: Array<{ paymentHash: string; payment: IPaymentInfo }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash: string;
+			payment_json: string;
+		}>('payments', 'payment_hash, payment_json')) {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
@@ -1277,11 +1330,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }> {
-		const rows = this._stmt(
-			'SELECT payment_hash, preimage FROM preimages'
-		).all() as Array<{ payment_hash: string; preimage: string }>;
 		const results: Array<{ paymentHash: string; preimage: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash: string;
+			preimage: string;
+		}>('preimages', 'payment_hash, preimage')) {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
@@ -1341,11 +1394,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string }> {
-		const rows = this._stmt(
-			'SELECT htlc_key, payment_hash_hex FROM htlc_payment_map'
-		).all() as Array<{ htlc_key: string; payment_hash_hex: string }>;
 		const results: Array<{ key: string; paymentHashHex: string }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			htlc_key: string;
+			payment_hash_hex: string;
+		}>('htlc_payment_map', 'htlc_key, payment_hash_hex')) {
 			try {
 				results.push({
 					key: row.htlc_key,
@@ -1610,11 +1663,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
-		const rows = this._stmt(
-			'SELECT payment_hash_hex, secret FROM payment_secrets'
-		).all() as Array<{ payment_hash_hex: string; secret: string }>;
 		const results: Array<{ paymentHashHex: string; secret: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash_hex: string;
+			secret: string;
+		}>('payment_secrets', 'payment_hash_hex, secret')) {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
@@ -1687,12 +1740,12 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> {
-		const rows = this._stmt(
-			'SELECT payment_hash_hex, invoice_json FROM invoices'
-		).all() as Array<{ payment_hash_hex: string; invoice_json: string }>;
 		const results: Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> =
 			[];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			payment_hash_hex: string;
+			invoice_json: string;
+		}>('invoices', 'payment_hash_hex, invoice_json')) {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
@@ -1904,11 +1957,11 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	loadAllHtlcSharedSecrets(): Array<{ key: string; secret: Buffer }> {
-		const rows = this._stmt(
-			'SELECT key, secret FROM htlc_shared_secrets'
-		).all() as Array<{ key: string; secret: string }>;
 		const results: Array<{ key: string; secret: Buffer }> = [];
-		for (const row of rows) {
+		for (const row of this._rowsInBatches<{
+			key: string;
+			secret: string;
+		}>('htlc_shared_secrets', 'key, secret')) {
 			try {
 				results.push({
 					key: row.key,
@@ -2997,21 +3050,50 @@ export class SqliteStorage implements IStorageBackend {
 		this._stmt('DELETE FROM payment_queue WHERE id = ?').run(id);
 	}
 
-	loadAllQueueEntries(): Array<{
-		id: string;
-		bolt11: string;
-		priority: number;
-		status: string;
-		amountSats?: number;
-		maxFeeSats?: number;
-		metadata?: string;
-		error?: string;
-		createdAt: number;
-		completedAt?: number;
-	}> {
-		const rows = this._stmt(
-			'SELECT id, bolt11, priority, status, amount_sats, max_fee_sats, metadata, error, created_at, completed_at FROM payment_queue ORDER BY priority ASC, created_at ASC'
-		).all() as Array<{
+	loadAllQueueEntries(): IQueueEntryRow[] {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue ORDER BY priority ASC, created_at ASC`
+		);
+	}
+
+	/** The rows still 'queued' or 'dispatching', in loadAllQueueEntries order. */
+	loadActiveQueueEntries(): IQueueEntryRow[] {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE status IN ('queued', 'dispatching') ORDER BY priority ASC, created_at ASC`
+		);
+	}
+
+	/**
+	 * Up to limit finished rows (any status but 'queued' and 'dispatching'),
+	 * the most recently finished first: by completed_at, or created_at for a
+	 * row without one, then by id. With before, the rows after that finished
+	 * row in this order, and none when no finished row has that id.
+	 */
+	loadQueueHistory(limit: number, before?: string): IQueueEntryRow[] {
+		if (before === undefined) {
+			return this._queueRows(
+				`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE ${QUEUE_FINISHED} ORDER BY ${QUEUE_FINISHED_AT} DESC, id DESC LIMIT ?`,
+				limit
+			);
+		}
+		// The <= term alone is what lets SQLite seek the index to the
+		// cursor; the OR that settles a tie on the time does not.
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue, (SELECT ${QUEUE_FINISHED_AT} AS cursor_at, id AS cursor_id FROM payment_queue WHERE id = ? AND ${QUEUE_FINISHED}) WHERE ${QUEUE_FINISHED} AND ${QUEUE_FINISHED_AT} <= cursor_at AND (${QUEUE_FINISHED_AT} < cursor_at OR id < cursor_id) ORDER BY ${QUEUE_FINISHED_AT} DESC, id DESC LIMIT ?`,
+			before,
+			limit
+		);
+	}
+
+	loadQueueEntry(id: string): IQueueEntryRow | undefined {
+		return this._queueRows(
+			`SELECT ${QUEUE_COLUMNS} FROM payment_queue WHERE id = ?`,
+			id
+		)[0];
+	}
+
+	private _queueRows(sql: string, ...params: unknown[]): IQueueEntryRow[] {
+		const rows = this._stmt(sql).all(...params) as Array<{
 			id: string;
 			bolt11: string;
 			priority: number;

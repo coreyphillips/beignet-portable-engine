@@ -32,7 +32,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { TypedEmitter } from '../utils/typed-emitter';
 import { Wallet } from '../wallet';
-import { liveWalletData } from '../wallet/live-data';
+import { liveWalletData, refreshLiveWallet } from '../wallet/live-data';
 import { getDefaultSendTransaction } from '../shapes/wallet';
 import type { EAddressType, ISendTransaction } from '../types/wallet';
 import type { ILogger, TLogLevel } from '../logger';
@@ -734,7 +734,7 @@ export interface BeignetNodeOptions
 		/** Smallest proportional fee accepted, in ppm. */
 		feePpm?: number;
 	};
-	/** Advertise FFOR concurrent receive, feature bits 562/563 (default true). */
+	/** Advertise FFOR concurrent receive, feature bits 442/443 (default true). */
 	fforConcurrent?: boolean;
 	/** Accept new concurrent-profile settlements when fforSettle is on (default true). */
 	fforSettleConcurrent?: boolean;
@@ -1171,27 +1171,32 @@ function sentSats(info: IPaymentInfo): number | undefined {
 /**
  * A payment's amount as every public surface reports it (history, proof,
  * stats): an outgoing amount is what left the node, fees included, rounded
- * UP; an incoming amount rounds down, as the balance does (issue #1185).
- * Truncating the outgoing figure let a send paying 20,001.5 sats from a
- * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
- * up makes one send agree with the balance when the balance held whole sats
- * before it; sub-sat remainders across several sends can still differ from
- * the balance by a sat, which only msat figures reconcile exactly.
+ * UP; an incoming amount is what the node was credited, rounded down, as the
+ * balance does (issue #1185). Truncating the outgoing figure let a send
+ * paying 20,001.5 sats from a 50,000 sat balance read 20,001 while the
+ * balance fell to 29,998. Rounding up makes one send agree with the balance
+ * when the balance held whole sats before it; sub-sat remainders across
+ * several sends can still differ from the balance by a sat, which only msat
+ * figures reconcile exactly.
  */
 function paymentAmountSats(info: IPaymentInfo): number {
 	return info.direction === PaymentDirection.OUTGOING
 		? sentSats(info) ?? spendLimitSats(info.amountMsat)
-		: Number(info.amountMsat / 1000n);
+		: Number((info.receivedMsat ?? info.amountMsat) / 1000n);
 }
 
 /**
- * The routing fee a payment paid, in msat, or undefined when the record does
- * not say. An MPP record's route is its first part only, so its fee is what
- * left the node over what the invoice asked (#1008).
+ * The fee a payment paid, in msat, or undefined when the record does not
+ * say. An MPP record's route is its first part only, so its fee is what left
+ * the node over what the invoice asked (#1008). An incoming payment's fee is
+ * a JIT LSP's skim: what the invoice asked over what the node was credited.
  */
 function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
 	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
 		return info.sentMsat - info.amountMsat;
+	}
+	if (info.receivedMsat !== undefined && info.receivedMsat < info.amountMsat) {
+		return info.amountMsat - info.receivedMsat;
 	}
 	return info.route?.totalFeeMsat;
 }
@@ -1490,14 +1495,26 @@ function unknownNetwork(network: never): never {
 	);
 }
 
+/**
+ * Mainnet and regtest are the servers the Bitkit app uses (bitkit-android,
+ * `Env.kt`), each with a certificate a public authority signed for its name,
+ * so `electrumTlsVerify` passes on them with no pin. They replace
+ * `fulcrum.bitkit.blocktank.to:8900`, whose certificate expired on May 10,
+ * 2026, and the plaintext `34.65.252.32:18483`, which serves the same regtest
+ * chain.
+ */
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
 > = {
-	mainnet: { host: 'fulcrum.bitkit.blocktank.to', port: 8900, useTls: true },
+	mainnet: { host: 'bitkit.to', port: 9999, useTls: true },
 	testnet: { host: 'electrum.blockstream.info', port: 60002, useTls: true },
 	signet: { host: 'mempool.space', port: 60602, useTls: true },
-	regtest: { host: '34.65.252.32', port: 18483, useTls: false }
+	regtest: {
+		host: 'electrs.bitkit.stag0.blocktank.to',
+		port: 9999,
+		useTls: true
+	}
 };
 
 /**
@@ -4286,8 +4303,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 				timer.unref?.();
 			});
-			const attempt = this.wallet
-				.refreshWallet({})
+			const attempt = refreshLiveWallet(this.wallet)
 				.then((res) => {
 					if (res.isErr()) {
 						this.log('warn', 'Initial wallet refresh failed', {
@@ -7762,7 +7778,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	async refreshWallet(): Promise<void> {
-		const result = await this.wallet.refreshWallet({});
+		const result = await refreshLiveWallet(this.wallet);
 		if (result.isErr()) {
 			throw new BeignetError('REFRESH_FAILED', result.error.message);
 		}
@@ -14797,7 +14813,11 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			updateQueueEntryStatus: (id, status, error, completedAt) =>
 				sqlite().updateQueueEntryStatus(id, status, error, completedAt),
 			deleteQueueEntry: (id) => sqlite().deleteQueueEntry(id),
-			loadAllQueueEntries: () => sqlite().loadAllQueueEntries()
+			loadAllQueueEntries: () => sqlite().loadAllQueueEntries(),
+			loadActiveQueueEntries: () => sqlite().loadActiveQueueEntries(),
+			loadQueueHistory: (limit, before) =>
+				sqlite().loadQueueHistory(limit, before),
+			loadQueueEntry: (id) => sqlite().loadQueueEntry(id)
 		};
 	}
 
@@ -14815,6 +14835,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 
 	listQueue(): QueuedPayment[] {
 		return this.getPaymentQueue().list();
+	}
+
+	getQueuedPayment(id: string): QueuedPayment | undefined {
+		return this.getPaymentQueue().get(id);
+	}
+
+	listQueueHistory(opts?: {
+		limit?: number;
+		before?: string;
+	}): QueuedPayment[] {
+		return this.getPaymentQueue().history(opts);
 	}
 
 	cancelQueuedPayment(id: string): boolean {
@@ -14860,7 +14891,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			} else if (p.direction === 'INCOMING' && p.status === 'COMPLETED') {
 				received++;
-				satsReceived += Number(p.amountMsat / 1000n);
+				satsReceived += paymentAmountSats(p);
 			} else if (p.status === 'FAILED') {
 				failed++;
 			}
