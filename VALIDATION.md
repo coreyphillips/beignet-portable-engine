@@ -1,3 +1,29 @@
+# Portable engine validation, 2026-10-26 addendum for 0.33.0
+
+The fork tracks Beignet **0.33.0** at `b0b65167f94c652727b8a0b4b68541840ab7ae02`, npm's `gitHead` for the release. Its `src/` is the same as `c0a79ca3` (#1888): the version bump changes only `package.json` and `package-lock.json`. This addendum supersedes the baseline statement of the 0.32.1 addendum below. The patch reapplies with every hunk in place, no hand merge and no portable change (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 226 of 226 pass, the same tests as the 0.32.1 tree.
+- `npm run check:types` passes.
+- A full `tsc --noEmit -p .` reports 21 errors, up from the 0.32.1 tree's 19. The two new ones are `Buffer<ArrayBufferLike>` argument type errors (TS2345) in `src/lightning/message/channel-update.ts`, a kind the baseline already had, in a file the fork does not patch. The other 19 are the same by file and message.
+- The built bundle reports `0.33.0-portable` and is 7,327,543 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.33.0` tarball matches npm's integrity hash, and its `dist/` is byte-identical to a local `tsc` build of `b0b65167`.
+- Upstream's offline suites, run in an upstream `b0b65167` tree with this fork's `src/` in place of its own:
+  - The seven test files 0.33.0 adds (`tests/cli/old-address-notification-requests`, `payment-queue-history`, `refresh-data-copies`, `tests/lightning/feature-bit-collisions`, `jit-skim-receive-amount`, `recovery-guardian-frame-reads`, `startup-history-batches`) pass, 62 tests.
+  - `test:lightning`: 9994 passing and 21 failing. `test:cli`: 2427 passing and none failing (the `daemon-http-limits` connection cap now passes under the parallel run, #1888).
+  - The 21 break down as follows:
+    - Four in `agent-review.test.ts` expect a channel the node opens to be public: the three the 0.32.1 fork failed, plus `isPrivate=false for announced channels`, the same expectation. The fork keeps a wallet's new channels private.
+    - Two are `doc-tables.test.ts` README checks, which the fork's added options make stale.
+    - One is `comment-paths.test.ts`, which runs `git ls-files` and so fails in any tree that is not a git checkout.
+    - Thirteen are in `channel-policy`, `forwarding-history`, `forward-fail-deferral`, `forward-fail-replay` and `forward-fulfill-replay`. Pristine 0.33.0 passes all 64 tests of those five files in the same tree, as did the 0.32.1 fork. Their fixtures write SCID aliases into channel state after the channel is ready; the fork's private channels send their policy at ready (#1880), which caches the channel-by-SCID index before that write (see `PATCHES.md`). Reverting either of the fork's two private-channel hunks makes them pass; the engine's own alias assignment bumps the index, so the phone does not meet this.
+    - The one "Uncaught error outside test suite" is mocha's parallel worker failing to serialize a BigInt inside one of those thirteen failure reports (`workerpool` IPC), not a test.
+- `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - It ran against the local Bitcoin and Electrum containers, with the primary the published `beignet@0.33.0` package through `BEIGNET_SOURCE_DIR`.
+  - The relay was a local stand-in for `beignet-relay`: a WebSocket byte relay with the same `beignet.v1` and `auth.<token>` handshake and fixed `/electrum` and `/peer` upstreams. The shared client was wallet-core `cc544e6`, the commit Chicory pins.
+- `scripts/regtest-send-max.cjs` passes all six cases asked of it against the same primary, with 69 PASS lines: jit, the three address types, unconfirmed address and phone.
+
+Not run: the `cln` send-max case, `smoke-regtest.cjs`, `test:regtest:channelize` and the FFOR regtests (this machine has no CLN on 19846), and a device start.
+
 # Portable engine validation, 2026-10-23 addendum for 0.32.1
 
 The fork tracks Beignet **0.32.1** at `daed636187e42bfbd156e5f5b74fda9c7a6379cd`, npm's `gitHead` for the release. Its `src/` is the same as `82c9170d` (#1848), the source of 0.32.0, whose published `gitHead` is `33f5e8eb`. 0.32.1 adds only #1851, which moves the `@noble/hashes` and `@noble/secp256k1` pins. This addendum supersedes the baseline statement of the 0.31.1 addendum below. The patch reapplies with 14 hunks merged by hand, one rework and three portable changes. The tree's change is upstream's own, line for line, apart from those (see `PATCHES.md`).

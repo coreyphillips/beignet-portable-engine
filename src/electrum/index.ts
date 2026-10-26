@@ -54,7 +54,7 @@ import {
 	splitAddresses
 } from '../utils';
 import type { Wallet } from '../wallet';
-import { liveWalletData } from '../wallet/live-data';
+import { liveWalletData, refreshLiveWallet } from '../wallet/live-data';
 import {
 	defaultElectrumPeers,
 	ELECTRUM_SERVER_COOLDOWN_MS,
@@ -107,9 +107,10 @@ const NO_TXINDEX_MISS = /^No such mempool transaction\. Use -txindex/;
 
 type TScriptHashSubscription = {
 	callbacks: Set<(data: TSubscribedReceive) => void>;
-	/** Address index of a UTXO tracked beyond the gap limit; that index is
-	 *  rescanned before the wallet refresh on notification. */
-	utxoIndex?: number;
+	/** Set when the hash holds a UTXO tracked beyond the gap limit, so the
+	 *  record outlives any callback detached from it. Its notification needs
+	 *  no scan of its own: the refresh lists every UTXO the wallet holds. */
+	tracksUtxo?: boolean;
 	/** Set when the hash is in the wallet's own gap windows. A block does not
 	 *  refresh for these (see _onNewBlock), so the record outlives any
 	 *  callback detached from it. */
@@ -121,7 +122,7 @@ type TScriptHashSubscription = {
 	/** Set while deliveries to this instance have not yet started its refresh:
 	 *  the status it heard before them, and how many are still on their way. A
 	 *  status only counts as heard once its refresh starts, so this is what
-	 *  disconnect() saves while a delivery is parked in a scan. */
+	 *  disconnect() saves while that refresh waits behind one in flight. */
 	pendingRefresh?: { heard: string | null; deliveries: number };
 	/** Callbacks no subscribe has succeeded with yet: how many attempts still
 	 *  wait on each, and whether the first of them created this record. A
@@ -404,19 +405,19 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 	if (!router) {
 		/** Hands one notification to one instance registered for its hash.
 		 *  `pending` is the record notePendingRefresh was called on for it. */
-		const deliver = async (
+		const deliver = (
 			instance: Electrum,
 			subs: Map<Electrum, TScriptHashSubscription>,
 			data: TSubscribedReceive,
 			pending: TScriptHashSubscription
-		): Promise<void> => {
+		): void => {
 			// Re-read rather than taken from a snapshot, as the header dispatch
-			// does: the entry ahead of this one parks for as long as a single
-			// index scan takes, and an instance that withdrew in the meantime
-			// (disconnect() deletes it from exactly this map) must not be called
-			// back or refreshed by a notification it is merely still queued for.
-			// An instance that withdrew and registered again holds a new record,
-			// which its reconnect compares and refreshes on its own.
+			// does: a callback of the entry ahead of this one can disconnect
+			// this instance (disconnect() deletes it from exactly this map), and
+			// an instance that withdrew must not be called back or refreshed by
+			// a notification it is merely still queued for. An instance that
+			// withdrew and registered again holds a new record, which its
+			// reconnect compares and refreshes on its own.
 			const sub = subs.get(instance);
 			if (sub !== pending) return;
 			// Snapshots: a callback may unregister itself or a sibling
@@ -428,17 +429,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// One subscriber must not starve the rest or the refresh.
 				}
 			}
-			if (sub.utxoIndex !== undefined) {
-				await instance.getUtxos({
-					scanningStrategy: EScanningStrategy.singleIndex,
-					addressIndex: sub.utxoIndex,
-					changeAddressIndex: sub.utxoIndex
-				});
-				// Checked again: the withdrawal can land while this instance's
-				// own scan is in flight, and the refresh below would restart a
-				// wallet that has shut down.
-				if (subs.get(instance) !== pending) return;
-			}
+			if (subs.get(instance) !== pending) return;
 			// Spent when the refresh body starts rather than here: a wallet
 			// already refreshing only queues this call, and the refresh in flight
 			// may have scanned before this status arrived.
@@ -452,7 +443,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					owed.heard = created.statuses.get(data[0]) ?? null;
 				}
 			};
-			void instance.wallet.refreshWallet({ onStart: started });
+			void refreshLiveWallet(instance.wallet, { onStart: started });
 		};
 		const created: TScriptHashRouter = {
 			instances: new Set(),
@@ -493,7 +484,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					delete sub.savedStatus;
 					if (saved !== current) {
 						notePendingRefresh(sub, saved);
-						void deliver(instance, subs, [scriptHash, current as string], sub);
+						deliver(instance, subs, [scriptHash, current as string], sub);
 					}
 				}
 				return unheard;
@@ -517,14 +508,15 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					// subscription that predates the registry): fall back to the
 					// pre-registry behaviour and refresh every subscribed wallet.
 					for (const instance of [...created.instances]) {
-						void instance.wallet.refreshWallet({});
+						void refreshLiveWallet(instance.wallet);
 					}
 					return;
 				}
 				// Every instance registered now is refreshed below, so none is
 				// still owed a comparison of what it heard before withdrawing.
-				// Marked up front, because an instance queued behind another's
-				// scan has not heard this status until its own refresh starts.
+				// Marked up front, because an instance has not heard this status
+				// until its own refresh starts: a callback ahead of its delivery
+				// can withdraw it, and a busy wallet queues the refresh.
 				const queued = [...subs];
 				for (const [, sub] of queued) {
 					const heard =
@@ -533,7 +525,7 @@ function getScriptHashRouter(network: EElectrumNetworks): TScriptHashRouter {
 					notePendingRefresh(sub, heard);
 				}
 				for (const [instance, sub] of queued) {
-					await deliver(instance, subs, data, sub);
+					deliver(instance, subs, data, sub);
 				}
 			}
 		};
@@ -1430,16 +1422,20 @@ export class Electrum {
 	 * answered for each script hash. A script hash found here is not asked
 	 * again, and every one the server answers is added to it. One the server
 	 * failed is left out, which is how the gap scan tells it from unused.
+	 * @param {IAddresses} [additionalScriptHashes] Read besides the addresses
+	 * picked above.
 	 * @returns {Promise<Result<IGetAddressHistoryResponse[]>>}
 	 */
 	async getAddressHistory({
 		scriptHashes = [],
 		scanAllAddresses = false,
-		answered
+		answered,
+		additionalScriptHashes = {}
 	}: {
 		scriptHashes?: IAddress[];
 		scanAllAddresses?: boolean;
 		answered?: Map<string, TTxResult[]>;
+		additionalScriptHashes?: IAddresses;
 	}): Promise<Result<IGetAddressHistoryResponse[]>> {
 		try {
 			if (this._disconnected) return err(DISCONNECTED_ERROR);
@@ -1508,6 +1504,7 @@ export class Electrum {
 					addToScan(changeAddressValues);
 				});
 			}
+			addToScan(Object.values(additionalScriptHashes));
 			scriptHashes = [...toScan.values()];
 			if (scriptHashes.length < 1) {
 				return err('No scriptHashes available to check.');
@@ -2292,7 +2289,7 @@ export class Electrum {
 			this._wallet.coinbaseMatured
 		) {
 			this._fullRefreshOwed = false;
-			await this._wallet.refreshWallet();
+			await refreshLiveWallet(this._wallet);
 		} else {
 			// Every script a refresh scans is subscribed, and a status change
 			// refreshes on its own, so a block that changed none of them only
@@ -2575,11 +2572,7 @@ export class Electrum {
 		}
 		const removed = sub.callbacks.delete(onReceive);
 		sub.unconfirmedCallbacks?.delete(onReceive);
-		if (
-			sub.callbacks.size === 0 &&
-			sub.utxoIndex === undefined &&
-			!sub.inWindow
-		) {
+		if (sub.callbacks.size === 0 && !sub.tracksUtxo && !sub.inWindow) {
 			subs.delete(this);
 			if (subs.size === 0) {
 				router.subscriptions.delete(scriptHash);
@@ -2645,7 +2638,7 @@ export class Electrum {
 			this._fullRefreshOwed = true;
 			return;
 		}
-		if (sub.callbacks.size > 0 || sub.utxoIndex !== undefined) return;
+		if (sub.callbacks.size > 0 || sub.tracksUtxo) return;
 		const heard = router.statuses.has(scriptHash)
 			? lastHeardStatus(router, scriptHash, sub)
 			: undefined;
@@ -2788,7 +2781,7 @@ export class Electrum {
 			const unconfirmed = onReceive
 				? this.addScriptHashCallback(sub, onReceive, created)
 				: undefined;
-			sub.utxoIndex = utxo.index;
+			sub.tracksUtxo = true;
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
 				network: this.electrumNetwork,
