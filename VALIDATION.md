@@ -5,7 +5,7 @@ The fork tracks Beignet **0.33.0** at `b0b65167f94c652727b8a0b4b68541840ab7ae02`
 All on Node 24.22.1:
 - `npm test`: 226 of 226 pass, the same tests as the 0.32.1 tree.
 - `npm run check:types` passes.
-- A full `tsc --noEmit -p .` reports 21 errors, up from the 0.32.1 tree's 19. The two new ones are `Buffer<ArrayBufferLike>` assignments in `src/lightning/message/channel-update.ts`, a kind the baseline already had, in a file the fork does not patch. The other 19 are the same by file and message.
+- A full `tsc --noEmit -p .` reports 21 errors, up from the 0.32.1 tree's 19. The two new ones are `Buffer<ArrayBufferLike>` argument type errors (TS2345) in `src/lightning/message/channel-update.ts`, a kind the baseline already had, in a file the fork does not patch. The other 19 are the same by file and message.
 - The built bundle reports `0.33.0-portable` and is 7,327,543 bytes. The build prints no esbuild warnings.
 - The published `beignet@0.33.0` tarball matches npm's integrity hash, and its `dist/` is byte-identical to a local `tsc` build of `b0b65167`.
 - Upstream's offline suites, run in an upstream `b0b65167` tree with this fork's `src/` in place of its own:
