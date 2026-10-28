@@ -21,6 +21,7 @@ import { drainFence } from './drain-fence.cjs';
 import { closeNotStarted } from './drain-close-state.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { engineDiagnostics } from './engine-diagnostics.cjs';
+import { peerDiagnostic } from './peer-diagnostics.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
@@ -589,8 +590,8 @@ export async function createPortableRuntime(options: any) {
 				// peer went away or a funding did not broadcast; the client's
 				// diagnostic hook gets them. Registered before the primary is
 				// dialled, so the first connection is reported like every later
-				// one. The peer events carry (pubkey, error) as two arguments;
-				// node:error carries one object.
+				// one. BeignetNode emits each as one object; a disconnect names
+				// who closed it and why (peer-diagnostics.cjs).
 				const peerKey = (first: any): string =>
 					typeof first === 'string' ? first : String(first?.pubkey ?? '');
 				for (const event of [
@@ -600,27 +601,7 @@ export async function createPortableRuntime(options: any) {
 					'peer:disconnect'
 				]) {
 					node.on(event, (first: any, second: any) => {
-						const detail =
-							second instanceof Error
-								? second.message
-								: typeof second?.message === 'string'
-									? second.message
-									: undefined;
-						const message =
-							detail !== undefined
-								? `${detail} (peer ${peerKey(first).slice(0, 16)})`
-								: String(
-										first?.message ??
-											first?.error ??
-											(typeof first === 'string' ? first : first?.pubkey) ??
-											event
-									);
-						const code = second?.code ?? first?.code;
-						options.onDiagnostic?.({
-							phase: event,
-							message,
-							code: typeof code === 'string' ? code : undefined
-						});
+						options.onDiagnostic?.(peerDiagnostic(event, first, second));
 					});
 				}
 				// A broadcast the network refused is the one outcome a splice-out
