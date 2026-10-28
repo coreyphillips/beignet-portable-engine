@@ -17350,6 +17350,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	// ─────────────── Invoice Management ───────────────
 
 	createInvoice(options: ICreateInvoiceOptions): ICreateInvoiceResult {
+		return this.createInvoiceWithPreimage(options);
+	}
+
+	/** Build an invoice, optionally using the preimage already authorized for JIT. */
+	private createInvoiceWithPreimage(
+		options: ICreateInvoiceOptions,
+		invoicePreimage?: Buffer
+	): ICreateInvoiceResult {
+		if (invoicePreimage !== undefined) {
+			if (!Buffer.isBuffer(invoicePreimage) || invoicePreimage.length !== 32) {
+				throw new Error('Invoice preimage must be 32 bytes');
+			}
+			if (options.hold || options.fforVoucher || options.paymentHash) {
+				throw new Error('Internal invoice preimage requires an ordinary invoice');
+			}
+		}
 		// Validate description / descriptionHash (BOLT 11: exactly one required)
 		if (
 			options.description !== undefined &&
@@ -17392,16 +17408,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (externalHash && externalHash.length !== 32) {
 			throw new Error('paymentHash must be 32 bytes');
 		}
-		// An external hash must be new to this node. Writing an invoice under
+		const preimage = externalHash
+			? undefined
+			: invoicePreimage !== undefined
+			? Buffer.from(invoicePreimage)
+			: randomBytes(32);
+		const paymentHash = externalHash ?? sha256(preimage!);
+		// An externally supplied or preselected hash must be new to this node.
+		// Check after the JIT authorization await too: another operation may
+		// have claimed the hash while the provider answered. Writing under
 		// a hash we already hold a record for would replace that record: a
 		// payment we are sending would read as an unpaid incoming one, its
 		// fulfilment would never complete it, and a later cancel of the new
 		// invoice would mark it failed and lift the duplicate-send guard.
-		if (externalHash && this.paymentHashInUse(externalHash)) {
+		if (
+			(externalHash || invoicePreimage !== undefined) &&
+			this.paymentHashInUse(paymentHash)
+		) {
 			throw new Error('paymentHash is already in use by this node');
 		}
-		const preimage = externalHash ? undefined : randomBytes(32);
-		const paymentHash = externalHash ?? sha256(preimage!);
 		const paymentSecret = randomBytes(32);
 
 		if (preimage) {
@@ -23920,7 +23945,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			opts.amountMsat !== undefined
 				? this.jitShareCrossingLspMsat(lspPubkeyHex, opts.amountMsat)
 				: undefined;
+		// Bind this authorization before issuing its invoice. An unused receive
+		// request may still have a live intent after another rail paid it; amount
+		// matching cannot distinguish equal requests or the first part of MPP.
+		// Keep the preimage local until the accepted quote can be persisted with
+		// the ordinary invoice and its fee allowance.
+		const invoicePreimage = randomBytes(32);
 		const grant = await this.requestJitReceive(lspPubkeyHex, {
+			paymentHash: sha256(invoicePreimage),
 			maxAmountMsat,
 			...(expectedTotalMsat !== undefined ? { expectedTotalMsat } : {}),
 			targetRemainingInboundSat: opts.targetRemainingInboundSat ?? 0n,
@@ -23944,7 +23976,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// receives under its pre-splice scid, and an intercept hint minted
 		// while it splices is the same second channel by another door.
 		const existing = this.liveChannelWith(lspPubkeyHex);
-		const result = this.createInvoice({
+		const result = this.createInvoiceWithPreimage({
 			amountMsat: opts.amountMsat,
 			description: opts.description ?? '',
 			expiry,
@@ -23970,7 +24002,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						}
 				  }
 				: {})
-		});
+		}, invoicePreimage);
 		return {
 			...result,
 			interceptScid: grant.interceptScid,
