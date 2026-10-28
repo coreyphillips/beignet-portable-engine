@@ -1,3 +1,29 @@
+# Portable engine validation, 2026-10-28 addendum for 0.35.1
+
+The fork tracks Beignet **0.35.1** at `b4117016482ccaeec014f055f544b2b8781fde12`, upstream's version bump #1906. Its `src/` is the same as `345f59e1` (#1904, the `v0.35.0` tag). This addendum supersedes the baseline statement of the 0.34.0 addendum below. The patch reapplies with every hunk in place and no hand merge. 0.35.0 is skipped, because its npm tarball carried unreleased modules (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 230 of 230 pass. That is the 0.34.0 tree's 226 plus the four of `portable-tests/peer-diagnostics.test.cjs` (#52).
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.34.0 tree.
+- The built bundle reports `0.35.1-portable` and is 7,353,290 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.35.1` tarball matches npm's integrity hash. Its `dist/` is byte-identical to a local `tsc` build of `345f59e1` (1,053 files), and its `package.json`, README, LICENSE and docs match `b4117016`. npm recorded no `gitHead`, because the package was published from a git worktree.
+- Upstream's offline suites, run in an upstream `b4117016` tree with this fork's `src/` in place of its own:
+  - The four test files 0.35.1's PRs change or add (`tests/lightning/errored-channel-backstops`, `disconnect-reason`, `tests/cli/channel-diagnostics-stale-wrap`, `beignet-node`) pass, 177 tests.
+  - `test:lightning`: 10,025 passing and 21 failing. The failures are the 0.33.0 record's 21: four `agent-review` tests that expect a public channel, two `doc-tables` README checks, `comment-paths` (this tree is not a git checkout), the thirteen forwarding and policy tests whose fixtures write SCID aliases behind the private-channel index, and mocha's BigInt serialization error reporting one of those.
+  - `test:cli`: 2,431 passing and none failing.
+  - `test:api` fails on `beignet-lightning.txt` only. The fork's own patch adds `IDfReceiverDeps.newFundingRefused` and makes `IDirectFundingPolicy.liquidityHost` and `liquidityPort` nullable.
+- The live scripts ran against the local Bitcoin and Electrum containers. The primary was the published `beignet@0.35.1` package, unpacked, with `npm install --omit=dev`, through `BEIGNET_SOURCE_DIR`. The shared client was wallet-core `f1cae26`, and the relay a stand-in byte relay with the same `createRelay` surface as `beignet-relay`. The scripts ran from a scratch copy of this tree with those two beside it.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS.
+  - `scripts/regtest-ffor.cjs` exits 0 with all 17 checks reporting PASS.
+  - `scripts/regtest-send-max.cjs` passes the six cases that need no Core Lightning (jit, the three address types, unconfirmed address and phone), with 69 PASS lines.
+
+Not run:
+- `regtest-send-max.cjs`'s `cln` case and `scripts/smoke-regtest.cjs`: no Core Lightning container was running on this machine.
+- `scripts/regtest-ffor-worker.cjs` and `scripts/regtest-ffor-native.cjs`: no `beignet-web` checkout or emulator was set up.
+- A start of the production app on a device.
+
 # Portable engine validation, 2026-10-27 addendum for 0.34.0
 
 The fork tracks Beignet **0.34.0** at `1e398e97ac121dd31d011bfd279509e8bef53472`, npm's `gitHead` for the release (the merge of #1900, after the version bump #1895). This addendum supersedes the baseline statement of the 0.33.0 addendum below. The patch reapplies with every hunk in place, no hand merge, and the runtime gains `GET /direct-funding/received` (see `PATCHES.md`).
