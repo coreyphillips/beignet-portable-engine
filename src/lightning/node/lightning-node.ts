@@ -7971,10 +7971,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Void a channel whose funding tx vanished before confirming and cannot
 	 * (or can no longer) be rebroadcast: drop it from the manager, retire its
 	 * watch, its persisted state and any retained funding tx, and tell the
-	 * embedder via channel:voided.
+	 * embedder via channel:voided. `txid` is in display byte order; the
+	 * retained funding tx is keyed by the internal order it reverses to.
 	 */
 	private voidMissingFundingChannel(channelId: Buffer, txid: string): boolean {
 		const idHex = channelId.toString('hex');
+		// The funding as the channel holds it (internal byte order), read
+		// before the channel is removed: the direct-funding receipts it paid
+		// are marked by it once the void is durable (issue #1909).
+		const voidedFunding =
+			this.getRawChannel(channelId)?.getFullState().fundingTxid;
 		// Durable FIRST: the live channel and its funding watch are only
 		// removed once the deletion, or at least the durable intent to
 		// delete, exists on disk. Removing them first and failing both
@@ -7991,6 +7997,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				txid
 			});
 			return false;
+		}
+		// The void is the durable decision that this funding is not on chain,
+		// so a direct-funding payment it carried never landed (issue #1909).
+		// A zero-conf open locks before its funding confirms, and its receipt
+		// keeps a lockedAt; REVERTED is the status that takes the payment back.
+		if (voidedFunding) {
+			this.getDirectFundingRequests()?.markReceivedReverted(
+				Buffer.from(voidedFunding).reverse().toString('hex')
+			);
 		}
 		if (!this.channelManager.voidChannel(channelId)) return true;
 		this.chainWatcher?.removeWatchedFunding(channelId);
@@ -28828,6 +28843,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		};
 		this.on('channel:ready', ({ channelId }) => markLocked(channelId));
 		this.on('splice:complete', ({ channelId }) => markLocked(channelId));
+		// Every other way a channel is voided (an open abandoned before it
+		// funded, a condemned row deleted at start) removes a channel that
+		// never funded, so a payment recorded against it never landed
+		// either (issue #1909). Matched by channel, since the row is gone.
+		this.on('channel:voided', ({ channelId }) => {
+			const idHex = channelId.toString('hex');
+			const fundings = new Set(
+				requests
+					.received()
+					.filter((r) => r.channelId === idHex && r.status === 'PAID')
+					.map((r) => r.fundingTxid)
+			);
+			for (const funding of fundings) requests.markReceivedReverted(funding);
+		});
 		this.directFunding = {
 			requests,
 			registry,
@@ -29719,9 +29748,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// keeps the pledges: a restart would restore the open and its
 			// inputs must still be reserved.
 			const pledges = channel.getReleasableV2PledgeOutpoints();
+			// Display byte order, as the funding-missing watch passes it:
+			// voidMissingFundingChannel reverses it into the internal-order
+			// key of the retained funding tx. Internal order here missed the
+			// key, so the void left this attempt's retained tx on disk.
 			const voided = this.voidMissingFundingChannel(
 				channelId,
-				state.fundingTxid.toString('hex')
+				Buffer.from(state.fundingTxid).reverse().toString('hex')
 			);
 			if (voided && pledges.length > 0) {
 				releaseInputPledgesBestEffort(this.fundingProvider, pledges);
