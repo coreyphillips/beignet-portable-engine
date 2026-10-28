@@ -434,6 +434,8 @@ export interface IChannelManagerConfig {
 	 * every open is allowed exactly as before.
 	 */
 	newChannelsRefused?: () => string | null;
+	/** Application approval in addition to the current explicit trusted-peer set. */
+	trustedPeerSplice?: (peerPubkey: string) => boolean;
 	/**
 	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
 	 * set, it replaces the internal ChannelSigner construction for every
@@ -2785,6 +2787,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			// Rebuild the in-memory splice session/driver for a persisted in-flight
 			// splice BEFORE markForReestablish, so the splice survives the
 			// reconnect handling (markForReestablish keeps it only when present).
+			this.configureTrustedPeerSplice(channel, peerPubkey);
 			channel.restoreSpliceInFlight();
 			// Same for a v2 open past its initial commitment_signed: rebuild the
 			// builder-less session from the durable record so the signature
@@ -6981,6 +6984,14 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		return init.features.hasFeature(Feature.SIMPLE_CLOSE);
 	}
 
+	private configureTrustedPeerSplice(channel: Channel, peerPubkey: string): void {
+		channel.setTrustedPeerSplicePolicy(() =>
+			this.getPeerForChannel(channel.getChannelId()!) === peerPubkey &&
+			this.zeroConfManager.isTrustedPeer(peerPubkey) &&
+			this.config.trustedPeerSplice?.(peerPubkey) === true
+		);
+	}
+
 	private handleSpliceMsg(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeSpliceMessage>;
 		try {
@@ -7012,6 +7023,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		// from the peer's live init features before validating.
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		this.configureZeroReserve(channel, peerPubkey);
+		this.configureTrustedPeerSplice(channel, peerPubkey);
 		const actions = channel.handleSplice(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}

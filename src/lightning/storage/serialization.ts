@@ -694,6 +694,7 @@ export interface ISerializedSpliceInFlight {
 	confirmedHeight?: number;
 	/** Issue #760: per-splice lock depth; absent on older rows. */
 	lockAtDepth?: number;
+	trustedPeerFunding?: boolean;
 	/** Issue #760: the confirmed competing spend of one of its inputs. */
 	conflict?: {
 		txid: string;
@@ -739,6 +740,7 @@ export function serializeSpliceInFlight(
 		confirmed: f.confirmed,
 		confirmedHeight: f.confirmedHeight,
 		lockAtDepth: f.lockAtDepth,
+		...(f.trustedPeerFunding === true ? { trustedPeerFunding: true } : {}),
 		conflict: f.conflict ? { ...f.conflict } : undefined
 	};
 }
@@ -781,6 +783,7 @@ export function deserializeSpliceInFlight(
 		confirmed: s.confirmed,
 		confirmedHeight: s.confirmedHeight,
 		lockAtDepth: s.lockAtDepth,
+		...(s.trustedPeerFunding === true ? { trustedPeerFunding: true } : {}),
 		conflict: s.conflict ? { ...s.conflict } : undefined
 	};
 }

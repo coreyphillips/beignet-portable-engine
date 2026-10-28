@@ -740,6 +740,8 @@ export interface INodeConfig {
 	 * opens at a nonzero height. Unset, opens are never fenced.
 	 */
 	newChannelsRefused?: () => string | null;
+	/** Explicit application trust for peer-only splice funding; absent denies fast lock. */
+	trustedPeerSplice?: (peerPubkey: string) => boolean;
 	/** Per-peer rate limit config */
 	rateLimitConfig?: {
 		/** HTLCs per second per peer (default 30). */

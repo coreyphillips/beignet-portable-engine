@@ -105,6 +105,8 @@ export interface ISpliceInFlight {
 	 * zero-conf channel); absent means the channel type decides, as before.
 	 */
 	lockAtDepth?: number;
+	/** Exact candidate accepted under explicit application trust; absent is false. */
+	trustedPeerFunding?: boolean;
 	/**
 	 * Issue #760: an input of this splice was spent by another transaction,
 	 * confirmed SPLICE_CONFLICT_DEPTH deep while the splice is not on chain,

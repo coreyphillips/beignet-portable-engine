@@ -341,6 +341,8 @@ export interface BeignetNodeOptions
 		ElectrumTlsConfig {
 	/** Host admission fence for new funding. Existing protocol work continues. */
 	newChannelsRefused?: () => string | null;
+	/** Current paired primary trust for peer-only splice funding. Default denied. */
+	trustedPeerSplice?: (peerPubkey: string) => boolean;
 	irohFactory?: IrohEndpointFactory;
 	/** Primary-only switch for new private client channels. Default false. */
 	waiveClientReserve?: boolean;
@@ -3210,6 +3212,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			seed: this.walletSeed(),
 			network: lnNetwork,
 			storage: this._nodeStorageView,
+			trustedPeerSplice: opts.trustedPeerSplice,
 			// Issue #906: fence fresh indices during active auto-apply or a
 			// rebuild, and while the node's block height is zero.
 			newChannelsRefused: (): string | null =>

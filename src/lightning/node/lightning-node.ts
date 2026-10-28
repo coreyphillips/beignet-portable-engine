@@ -2071,6 +2071,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			onChannelIndexAllocated: (channelIndex: number): void =>
 				this.recordChannelIndexAllocation(channelIndex),
 			newChannelsRefused: config.newChannelsRefused,
+			// A trusted candidate still needs a durable channel/outbox transaction.
+			trustedPeerSplice: (peer) =>
+				!!this.storage && config.trustedPeerSplice?.(peer) === true,
 			signerFactory: config.signerFactory,
 			// Recovery 5.8: in quorum mode this holds a batch's remaining
 			// actions until the frame behind them is replicated. In every

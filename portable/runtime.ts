@@ -550,6 +550,9 @@ export async function createPortableRuntime(options: any) {
 					recoveryAutoApply: recoveryImport.autoApply,
 					autoReconnect: true,
 					forwardingEnabled: false,
+					trustedPeerSplice: peer =>
+						!durabilityFailed && !recoveryHold() && !drain.blocksWallet() &&
+						record?.lfbw.trusted === true && primary().pubkey === peer,
 					newChannelsRefused: () => drain.blocksWallet()
 						? 'New funding is paused while this wallet is being emptied'
 						: options.nodeOptions?.newChannelsRefused?.() ?? null,

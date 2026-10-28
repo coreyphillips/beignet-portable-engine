@@ -936,6 +936,7 @@ export class Channel {
 	 */
 	private _fforPeerLacksClose = false;
 	private _spliceSession: SpliceSession | null = null;
+	private _trustedPeerSplicePolicy: (() => boolean) | undefined;
 	// A splice the caller requested while the channel was not yet quiescent.
 	// Fired automatically once we reach QUIESCENT (we drive quiescence ourselves
 	// so we become the quiescence initiator, as splice requires). A request the
@@ -10615,8 +10616,9 @@ export class Channel {
 						})
 					)
 				);
-			} else if (inflight?.confirmed && inflight.receivedTxSignatures) {
-				// The splice tx confirmed while we were disconnected: lock it now.
+			} else if (inflight?.receivedTxSignatures &&
+				(inflight.confirmed || this._canLockTrustedPeerSplice())) {
+				// Confirmation or current candidate trust now permits the lock.
 				actions.push(...this.sendSpliceLocked());
 			}
 		}
@@ -14504,10 +14506,103 @@ export class Channel {
 		];
 	}
 
+	/** Current explicit application trust, separate from channel type and open depth. */
+	setTrustedPeerSplicePolicy(policy: () => boolean): void {
+		this._trustedPeerSplicePolicy = policy;
+	}
+
+	private _trustedPeerSpliceAllowed(): boolean {
+		try {
+			return this._trustedPeerSplicePolicy?.() === true;
+		} catch {
+			return false;
+		}
+	}
+
 	/**
-	 * Clear the interactive-tx driving state for a splice.
+	 * Authorize only the finalized transcript of a positive peer-only splice.
+	 * Zero declared local contribution is insufficient: local inputs and outputs
+	 * could cancel each other. Every nonshared input and every output must belong
+	 * to the peer's initiator serial namespace. Existing signature and witness
+	 * checks remain authoritative before the candidate can lock.
 	 */
-	/** Issue #760: does the current splice wait for the chain before locking? */
+	private _authorizeTrustedPeerSplice(): boolean {
+		const session = this._spliceSession;
+		const st = this._spliceTx;
+		if (!this._trustedPeerSpliceAllowed() || !session || !st ||
+			session.isInitiator() || session.getLocalRelativeSatoshis() !== 0n ||
+			session.getRemoteRelativeSatoshis() <= 0n ||
+			this._spliceLockAtDepth !== null || session.getLockDepth() !== undefined ||
+			st.ourWalletInputIndices.length !== 0 || st.ourExternalInputIndices.length !== 0 ||
+			!this._state.fundingTxid) return false;
+		const builder = session.getTxBuilder();
+		if (!builder) return false;
+		const inputs = [...builder.getInputs()].sort((a, b) => a.serialId < b.serialId ? -1 : 1);
+		const outputs = [...builder.getOutputs()].sort((a, b) => a.serialId < b.serialId ? -1 : 1);
+		if (inputs.length < 2 || inputs.length !== st.tx.ins.length ||
+			outputs.length !== st.tx.outs.length) return false;
+		let shared = 0;
+		let inputValue = 0n;
+		for (let i = 0; i < inputs.length; i++) {
+			const input = inputs[i], wire = st.tx.ins[i];
+			if (input.serialId % 2n !== 0n || !wire.hash.equals(input.prevTxid) ||
+				wire.index !== input.prevOutputIndex || wire.sequence !== input.sequence) return false;
+			if (input.isShared || !input.prevTx?.length) {
+				if (i !== st.sharedInputIndex || !wire.hash.equals(this._state.fundingTxid) ||
+					wire.index !== this._state.fundingOutputIndex) return false;
+				shared++;
+				inputValue += this._state.fundingSatoshis;
+			} else {
+				const value = interactiveInputValueSats(input);
+				if (value === null || value <= 0n) return false;
+				inputValue += value;
+			}
+		}
+		if (shared !== 1) return false;
+		let outputValue = 0n;
+		for (let i = 0; i < outputs.length; i++) {
+			const output = outputs[i], wire = st.tx.outs[i];
+			if (output.serialId % 2n !== 0n || output.amountSats !== BigInt(wire.value) ||
+				!output.scriptPubkey.equals(wire.script)) return false;
+			outputValue += output.amountSats;
+		}
+		const funding = st.tx.outs[st.newFundingOutputIndex];
+		const remoteKey = session.getRemoteFundingPubkey();
+		return inputValue >= outputValue && !!funding && !!remoteKey &&
+			BigInt(funding.value) === this._state.fundingSatoshis + session.getRemoteRelativeSatoshis() &&
+			funding.script.equals(createFundingScript(
+				this._state.localBasepoints.fundingPubkey, remoteKey
+			).p2wshOutput);
+	}
+
+	/** The persisted permission names one exact, fully signed candidate only. */
+	private _canLockTrustedPeerSplice(): boolean {
+		const f = this._state.spliceInFlight;
+		if (!this._trustedPeerSpliceAllowed() || f?.trustedPeerFunding !== true ||
+			f.isInitiator || f.localRelativeSatoshis !== 0n || f.remoteRelativeSatoshis <= 0n ||
+			f.lockAtDepth !== undefined || this._spliceLockAtDepth !== null || f.conflict ||
+			!f.sentTxSignatures || !f.receivedTxSignatures || !f.fullySigned ||
+			f.ourWalletInputIndices.length !== 0 || (f.externalInputIndices?.length ?? 0) !== 0 ||
+			!this._state.fundingTxid) return false;
+		try {
+			const tx = bitcoin.Transaction.fromHex(f.spliceTxHex);
+			const funding = tx.outs[f.newFundingOutputIndex];
+			if (!tx.getHash().equals(f.spliceTxid) || tx.ins.length < 2 ||
+				f.inputPrevouts.length !== tx.ins.length ||
+				tx.ins.some(input => input.witness.length === 0) ||
+				!funding || BigInt(funding.value) !== f.newFundingSatoshis ||
+				f.newFundingSatoshis !== this._state.fundingSatoshis + f.remoteRelativeSatoshis) return false;
+			const shared = tx.ins.filter(input => input.hash.equals(this._state.fundingTxid!) &&
+				input.index === this._state.fundingOutputIndex);
+			return shared.length === 1 && funding.script.equals(createFundingScript(
+				this._state.localBasepoints.fundingPubkey, f.remoteFundingPubkey
+			).p2wshOutput);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Does the current splice explicitly wait for the chain before locking? */
 	private _spliceLocksAtDepth(): boolean {
 		return (
 			(this._spliceLockAtDepth ??
@@ -14597,7 +14692,8 @@ export class Channel {
 				localSpliceLocked: false,
 				remoteSpliceLocked: false,
 				confirmed: false,
-				lockAtDepth: this._spliceLockAtDepth ?? session.getLockDepth()
+				lockAtDepth: this._spliceLockAtDepth ?? session.getLockDepth(),
+				...(this._authorizeTrustedPeerSplice() ? { trustedPeerFunding: true } : {})
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
@@ -15786,9 +15882,9 @@ export class Channel {
 		// mirror ordering (ours first, peer's arrive later) locks in
 		// handleTxSignatures.
 		if (
-			this._isZeroConfChannelType() &&
-			!this._spliceLocksAtDepth() &&
-			this._state.spliceInFlight?.receivedTxSignatures
+			(this._isZeroConfChannelType() && !this._spliceLocksAtDepth() &&
+				this._state.spliceInFlight?.receivedTxSignatures) ||
+			this._canLockTrustedPeerSplice()
 		) {
 			actions.push(...this.sendSpliceLocked());
 		}
@@ -15836,17 +15932,13 @@ export class Channel {
 				minimumDepth: this._spliceWatchDepth()
 			}
 		];
-		// Zero-conf channels lock the splice immediately after tx_signatures
-		// (BOLT 2): confirmation gating would idle the channel in exactly the
-		// window zero-conf exists for. Ordinary channels lock at depth; the
-		// confirmed check covers a confirmation that arrived while we were
-		// missing the peer's signatures (e.g. it completed and broadcast
-		// during a disconnect).
-		// A splice with a lock depth waits for the chain whatever the channel
-		// type (issue #760); the funding watch reports it at depth and the
-		// node sends splice_locked then.
+		// Explicitly trusted peer-only candidates and zero-conf channels lock
+		// after tx_signatures. Candidate trust never changes the channel type
+		// or chain watch. An explicit lock depth still waits for the chain.
+		// Confirmation may also have arrived while peer signatures were missing.
 		if (
 			(this._isZeroConfChannelType() && !this._spliceLocksAtDepth()) ||
+			this._canLockTrustedPeerSplice() ||
 			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
@@ -16165,14 +16257,15 @@ export class Channel {
 		// tx_signatures, when the network may well have refused the splice (a
 		// splice-out of a funding that is itself not relayed yet, for one).
 		// The transaction is kept until the funding watch sees it confirmed;
-		// an ordinary channel locks at depth and owes nothing here.
+		// A trusted peer-only candidate has the same broadcast obligation,
+		// without becoming a zero-conf channel. Other candidates lock at depth.
 		const record = this._state.spliceInFlight;
 		if (
 			record?.fullySigned &&
 			record.spliceTxHex &&
 			!record.confirmed &&
 			!record.lockAtDepth &&
-			this._isZeroConfChannelType()
+			(this._isZeroConfChannelType() || record.trustedPeerFunding === true)
 		) {
 			const owed = this._state.unconfirmedSpliceTxs ?? [];
 			if (!owed.some((e) => e.txid.equals(record.spliceTxid))) {
