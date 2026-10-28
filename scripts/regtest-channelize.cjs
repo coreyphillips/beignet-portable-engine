@@ -227,6 +227,25 @@ function runPayerChild(env) {
 			'the funding spends the payer coin directly'
 		);
 		console.log('PASS one transaction, from the payer coin to the recipient channel');
+		// The recipient can tell its request was paid (beignet #1893): the
+		// engine keeps a record of the payment, and once the splice has locked
+		// the request reads as completed by direct funding.
+		const received = (await a.rpc('/direct-funding/received')).find(
+			(r) => r.fundingTxid === child.sent.txid
+		);
+		assert.ok(received, 'the recipient recorded the payment it received');
+		assert.equal(received.status, 'PAID');
+		assert.equal(Number(received.amountSat), 15000);
+		const paid = await a.client.getReceiveStatus(request);
+		assert.deepEqual(
+			[paid.phase, paid.method, paid.receivedSats],
+			['completed', 'direct-funding', 15000]
+		);
+		const paidRow = (await a.client.snapshot()).activity.find(
+			(row) => row.paymentHash === request.paymentHash
+		);
+		assert.deepEqual([paidRow.kind, paidRow.status], ['received', 'completed']);
+		console.log('PASS the recipient request reads completed by direct funding');
 		assert.ok(child.row && child.row.status === 'completed' && child.row.txid === child.sent.txid, 'payer row completed');
 		assert.equal((child.utxos || []).some((u) => u.valueSats === 20000), false, 'the payer coin is spent');
 		console.log('PASS the payer history settles to completed');

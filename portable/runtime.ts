@@ -1144,6 +1144,11 @@ export async function createPortableRuntime(options: any) {
 				return n.getFeeEstimates();
 			case 'GET /direct-funding/payments':
 				return n.listDirectFundingPayments();
+			// What this wallet received by direct funding: a payment funds the
+			// home channel, so it settles no invoice and pays no address, and this
+			// record is how the client tells which request it paid (issue #49).
+			case 'GET /direct-funding/received':
+				return n.listDirectFundingReceived();
 			case 'GET /direct-funding/config':
 				return n.getDirectFundingConfig();
 			case 'POST /wallet/refresh':
