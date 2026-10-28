@@ -32,7 +32,7 @@ function peerDiagnostic(event, first, second) {
 			detail !== undefined
 				? `${detail} (peer ${peerKey.slice(0, 16)})`
 				: event === 'peer:disconnect' && disconnectCause(first)
-					? `${peerKey} ${disconnectCause(first)}`
+					? [peerKey, disconnectCause(first)].filter(Boolean).join(' ')
 					: String(
 							first?.message ??
 								first?.error ??
@@ -52,7 +52,9 @@ function disconnectCause(data) {
 		data.direction === 'inbound' || data.direction === 'outbound'
 			? data.direction
 			: '',
-		Number.isFinite(data.uptimeMs) ? `up ${Math.round(data.uptimeMs)}ms` : ''
+		Number.isFinite(data.uptimeMs) && data.uptimeMs >= 0
+			? `up ${Math.round(data.uptimeMs)}ms`
+			: ''
 	].filter(Boolean);
 	return `closed by ${data.closedBy}${reason}${
 		context.length ? ` (${context.join(', ')})` : ''

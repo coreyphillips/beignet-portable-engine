@@ -34,6 +34,38 @@ test('a disconnect names who closed it, why, which side dialled and how long it 
 	);
 });
 
+test('a zero uptime is a figure; odd fields are left out and never throw', () => {
+	assert.equal(
+		peerDiagnostic('peer:disconnect', {
+			pubkey: PEER,
+			closedBy: 'peer',
+			reason: '',
+			direction: 'outbound',
+			uptimeMs: 0
+		}).message,
+		`${PEER} closed by peer (outbound, up 0ms)`
+	);
+	for (const odd of [
+		{ reason: 42, direction: 'sideways', uptimeMs: Number.NaN },
+		{ reason: null, uptimeMs: -4 },
+		{ uptimeMs: '1200' },
+		{ uptimeMs: 10n }
+	]) {
+		assert.equal(
+			peerDiagnostic('peer:disconnect', { pubkey: PEER, closedBy: 'us', ...odd })
+				.message,
+			`${PEER} closed by us`
+		);
+	}
+	// No pubkey: the cause alone, without a leading space.
+	assert.equal(
+		peerDiagnostic('peer:disconnect', { closedBy: 'peer' }).message,
+		'closed by peer'
+	);
+	assert.equal(peerDiagnostic('peer:disconnect', null).message, 'peer:disconnect');
+	assert.equal(peerDiagnostic('peer:disconnect', undefined).message, 'peer:disconnect');
+});
+
 test('a disconnect with no cause, as from an engine before 0.35.0, is the bare pubkey', () => {
 	assert.equal(
 		peerDiagnostic('peer:disconnect', { pubkey: PEER }).message,
