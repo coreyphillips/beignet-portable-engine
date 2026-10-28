@@ -1,3 +1,23 @@
+# Portable engine validation, 2026-10-28 addendum for 0.36.1
+
+The fork tracks Beignet **0.36.1** at `23a52a3e9525d7de993e143919930d60f5260dc4`, npm's `gitHead` for the release (the version bump #1912, whose `src/` is the same as #1911's merge `94f1a3f0`). This addendum supersedes the baseline statement of the 0.36.0 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 230 of 230 pass, the same tests as the 0.36.0 tree.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.36.0 tree.
+- The built bundle reports `0.36.1-portable` and is 7,361,130 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.36.1` tarball matches npm's integrity hash, and its `dist/` is identical to a clean build of `23a52a3e`.
+- Upstream's offline suites, run in an upstream `23a52a3e` tree with this fork's `src/` in place of its own: the two test files #1910 and #1911 change pass, 51 tests.
+- The live scripts ran against the local Bitcoin and Electrum containers. The primary was the published `beignet@0.36.1` package, unpacked, with `npm install --omit=dev`. The shared client was wallet-core `9151e30` (what Chicory 0.7.9 ships), and the relay the stand-in byte relay, both beside a scratch copy of this tree.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS.
+  - `scripts/regtest-ffor.cjs` exits 0 with all 17 checks reporting PASS.
+
+Not run:
+- `regtest-send-max.cjs` and `smoke-regtest.cjs`: 0.36.1 changes nothing on the send path, and no Core Lightning container was running.
+- `regtest-ffor-worker.cjs`, `regtest-ffor-native.cjs`, and a start of the production app on a device.
+
 # Portable engine validation, 2026-10-28 addendum for 0.36.0
 
 The fork tracks Beignet **0.36.0** at `14cdfbbdf4638277acfb1d37e7f41880caecd1b0`, npm's `gitHead` for the release (the version bump #1908, whose `src/` is the same as #1907's merge `56a38c82`). This addendum supersedes the baseline statement of the 0.35.1 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).
