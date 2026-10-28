@@ -1,3 +1,26 @@
+# Portable engine validation, 2026-10-28 addendum for 0.36.0
+
+The fork tracks Beignet **0.36.0** at `14cdfbbdf4638277acfb1d37e7f41880caecd1b0`, npm's `gitHead` for the release (the version bump #1908, whose `src/` is the same as #1907's merge `56a38c82`). This addendum supersedes the baseline statement of the 0.35.1 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 230 of 230 pass, the same tests as the 0.35.1 tree.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.35.1 tree.
+- The built bundle reports `0.36.0-portable` and is 7,360,379 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.36.0` tarball matches npm's integrity hash, and its `dist/` and `package.json` are byte-identical to a clean build of `14cdfbbd`.
+- Upstream's offline suites, run in an upstream `14cdfbbd` tree with this fork's `src/` in place of its own:
+  - The seven test files #1907 changes or adds pass, 455 tests.
+  - `test:lightning`: 10,056 passing and the same 21 failing as the 0.33.0 record.
+  - `test:cli`: 2,432 passing and none failing.
+- The live scripts ran against the local Bitcoin and Electrum containers. The primary was the published `beignet@0.36.0` package, unpacked, with `npm install --omit=dev`. The shared client was wallet-core `f1cae26`, and the relay the stand-in byte relay, both beside a scratch copy of this tree.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS.
+  - `scripts/regtest-ffor.cjs` exits 0 with all 17 checks reporting PASS.
+
+Not run:
+- `regtest-send-max.cjs` and `smoke-regtest.cjs`: 0.36.0 changes nothing on the send path, and no Core Lightning container was running.
+- `regtest-ffor-worker.cjs`, `regtest-ffor-native.cjs`, and a start of the production app on a device.
+
 # Portable engine validation, 2026-10-28 addendum for 0.35.1
 
 The fork tracks Beignet **0.35.1** at `b4117016482ccaeec014f055f544b2b8781fde12`, upstream's version bump #1906. Its `src/` is the same as `345f59e1` (#1904, the `v0.35.0` tag). This addendum supersedes the baseline statement of the 0.34.0 addendum below. The patch reapplies with every hunk in place and no hand merge. 0.35.0 is skipped, because its npm tarball carried unreleased modules (see `PATCHES.md`).
