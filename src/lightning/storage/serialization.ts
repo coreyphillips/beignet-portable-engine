@@ -404,6 +404,11 @@ export interface ISerializedChannelState {
 	 * order hex (issue #1060). Absent on rows written before the field.
 	 */
 	previousFundingTxids?: string[];
+	/**
+	 * Funding txids this channel has locked, oldest first, internal byte order
+	 * hex (issue #1899). Absent on rows written before the field.
+	 */
+	lockedFundingTxids?: string[];
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -961,6 +966,7 @@ export function serializeChannelState(
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
 		previousFundingTxids: s.previousFundingTxids?.map((t) => t.toString('hex')),
+		lockedFundingTxids: s.lockedFundingTxids?.map((t) => t.toString('hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -1595,6 +1601,7 @@ export function deserializeChannelState(
 		previousFundingTxids: s.previousFundingTxids?.map((t) =>
 			Buffer.from(t, 'hex')
 		),
+		lockedFundingTxids: s.lockedFundingTxids?.map((t) => Buffer.from(t, 'hex')),
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),
@@ -1824,6 +1831,8 @@ export interface ISerializedPaymentInfo {
 	amountMsat: string;
 	/** Msat that left the node, fees included, when amountMsat is not that (MPP). */
 	sentMsat?: string;
+	/** Msat an incoming payment's settled HTLCs paid, when amountMsat is not that. */
+	receivedMsat?: string;
 	status: string;
 	direction: string;
 	route?: string; // JSON string
@@ -1854,6 +1863,9 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		preimage: bufToHex(p.preimage) ?? undefined,
 		amountMsat: bigintToStr(p.amountMsat),
 		...(p.sentMsat !== undefined ? { sentMsat: bigintToStr(p.sentMsat) } : {}),
+		...(p.receivedMsat !== undefined
+			? { receivedMsat: bigintToStr(p.receivedMsat) }
+			: {}),
 		status: p.status,
 		direction: p.direction,
 		route: p.route
@@ -1909,6 +1921,9 @@ export function deserializePaymentInfo(
 		preimage: s.preimage ? Buffer.from(s.preimage, 'hex') : undefined,
 		amountMsat: strToBigint(s.amountMsat),
 		...(s.sentMsat !== undefined ? { sentMsat: strToBigint(s.sentMsat) } : {}),
+		...(s.receivedMsat !== undefined
+			? { receivedMsat: strToBigint(s.receivedMsat) }
+			: {}),
 		status: s.status as PaymentStatus,
 		direction: s.direction as PaymentDirection,
 		route: s.route ? JSON.parse(s.route, reviver) : undefined,

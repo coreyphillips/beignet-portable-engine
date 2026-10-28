@@ -826,6 +826,15 @@ function boundedFailureReason(reason: string): string {
 }
 
 /**
+ * Note what a settled receive's HTLCs paid when it is not the record's
+ * amount. The record keeps the amount it was validated against, which a
+ * JIT skim or an overpaying sender moves away from what the channel credits.
+ */
+function recordReceivedMsat(payment: IPaymentInfo, settledMsat: bigint): void {
+	if (settledMsat !== payment.amountMsat) payment.receivedMsat = settledMsat;
+}
+
+/**
  * How long `requestJitReceive` waits for the LSP's ack. Kept at 15 s because
  * the round trip sits inside the caller's own request budget: the daemon's
  * only consumer allows 20 s for the whole POST /jit/invoice call, so raising
@@ -1276,6 +1285,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		string,
 		{ announcement: Buffer; update: Buffer }
 	> = new Map();
+	/** Last timestamp signed into a direct channel_update, per channel. */
+	private directUpdateTimestamps = new Map<string, number>();
+	/**
+	 * Per channel peer, its newest private update for each SCID we have not
+	 * assigned yet, keyed by SCID hex. Without an alias, each side takes the
+	 * real SCID from its own chain view, so the peer's update can arrive first.
+	 */
+	private earlyPeerUpdates = new Map<string, Map<string, Buffer>>();
 	/** Periodic timer that refreshes + re-broadcasts our gossip so the node stays in the public graph. */
 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
@@ -4997,11 +5014,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on(
 			'channel:scid-assigned',
 			(channelId: Buffer, scid: Buffer) => {
+				this.adoptEarlyPeerUpdate(channelId, scid);
 				const channel = this.channelManager.getChannel(channelId);
 				if (!channel || !this.shouldAcceptRealScid(channel.getFullState())) {
 					return;
 				}
 				this.registerChannelScid(channelId, scid);
+				// A private peer may omit the channel_ready alias. Its first
+				// addressable policy update then has to wait for the real SCID.
+				this.sendPrivateChannelPolicy(channelId);
 			}
 		);
 		// A channel restored from persistence has finished reestablishing:
@@ -5040,6 +5061,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// facts only, which is what makes it safe on this every-reconnect
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
+			this.sendPrivateChannelPolicy(channelId);
 			this.settleForwardsOwedUpstream(channelId);
 			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
@@ -5061,6 +5083,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
+			this.sendPrivateChannelPolicy(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
 			this._stuckChannelTracker.delete(
 				`reestablish:${channelId.toString('hex')}`
@@ -5177,6 +5200,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
 			this._ownChannelGossip.delete(channelId.toString('hex'));
+			this.directUpdateTimestamps.delete(channelId.toString('hex'));
 			this.persistChannel(channelId);
 			// A cooperative close records its signed tx just before the manager
 			// emits broadcast:tx; register the txid so the watcher's
@@ -13167,6 +13191,28 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		return out;
 	}
 
+	private sendPrivateChannelPolicy(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (channel && !channel.getFullState().announceChannel) {
+			// Private peers cannot learn our fees from public gossip. Send the
+			// signed policy when the channel first becomes usable and after each
+			// reconnect so their invoice hints use the fees we actually enforce.
+			this.regenerateChannelUpdateForPolicy(channelId);
+		}
+	}
+
+	/** Take the peer's held private update once we assign the SCID it names. */
+	private adoptEarlyPeerUpdate(channelId: Buffer, scid: Buffer): void {
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		const held = peer ? this.earlyPeerUpdates.get(peer) : undefined;
+		const scidHex = scid.toString('hex');
+		const payload = held?.get(scidHex);
+		if (!peer || !held || !payload) return;
+		held.delete(scidHex);
+		if (held.size === 0) this.earlyPeerUpdates.delete(peer);
+		this.adoptPeerChannelPolicyNow(payload);
+	}
+
 	/**
 	 * Push the (new) effective policy out as a channel_update. Announced
 	 * channels: rewrite the cached update, re-add to our graph, and broadcast
@@ -13201,7 +13247,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			try {
 				this.peerManager.sendToPeer(peer, MessageType.CHANNEL_UPDATE, payload);
 			} catch {
-				// Peer not connected; it will learn the policy from route hints.
+				// Retry when the channel reestablishes with the peer.
 			}
 		} else {
 			this.emitOutbound(peer, MessageType.CHANNEL_UPDATE, payload);
@@ -13245,13 +13291,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				policy.htlcMaximumMsat > capacityMsat
 					? capacityMsat
 					: policy.htlcMaximumMsat;
+			// The peer keeps only a strictly newer update, and readiness plus a
+			// policy change made from its listener land in the same second.
+			const hex = channelId.toString('hex');
+			const timestamp = Math.max(
+				Math.floor(Date.now() / 1000),
+				(this.directUpdateTimestamps.get(hex) ?? 0) + 1
+			);
+			this.directUpdateTimestamps.set(hex, timestamp);
 			const payload = encodeChannelUpdateMessage({
 				signature: Buffer.alloc(64), // placeholder, signed below
 				// Match the chain scope the receiver enforces (acceptableChainHashes),
 				// defaulting to OUR network's hash — never mainnet (S-7.M1).
 				chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
 				shortChannelId: scid,
-				timestamp: Math.floor(Date.now() / 1000),
+				timestamp,
 				// bit 0: htlc_maximum_msat present; bit 1: dont_forward — this
 				// update is for an UNANNOUNCED channel, so a peer relaying it would
 				// leak private-channel existence and policy (BOLT 7).
@@ -15434,6 +15488,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			fundingSatoshis: state.fundingSatoshis,
 			channelType: state.channelType
 		};
+		// What a disconnect wrapped (issue #1899): a client otherwise reads an
+		// opening and an open channel alike while the peer is away.
+		if (
+			state.state === ChannelState.AWAITING_REESTABLISH &&
+			state.preReestablishState
+		) {
+			info.preReestablishState = state.preReestablishState;
+		}
 		if (state.fundingTxid) {
 			info.fundingTxid = Buffer.from(state.fundingTxid)
 				.reverse()
@@ -15461,6 +15523,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// channel has moved on. Display order like fundingTxid.
 		if (state.previousFundingTxids && state.previousFundingTxids.length > 0) {
 			info.previousFundingTxids = state.previousFundingTxids.map((t) =>
+				Buffer.from(t).reverse().toString('hex')
+			);
+		}
+		// The fundings this channel has locked (issue #1899), whatever state it
+		// is in now: a closed channel, or one whose peer is away, still says
+		// its funding locked. Display order like fundingTxid.
+		if (state.lockedFundingTxids && state.lockedFundingTxids.length > 0) {
+			info.lockedFundingTxids = state.lockedFundingTxids.map((t) =>
 				Buffer.from(t).reverse().toString('hex')
 			);
 		}
@@ -16474,15 +16544,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// right now, and its volume is bounded by our channel count,
 				// so it keeps the synchronous path. Decode here is cheap; the
 				// expensive signature check stays behind the graph's gates.
-				let ours = false;
+				let msg: IChannelUpdateMessage;
 				try {
-					ours = this.channelUpdateTargetsOurChannel(
-						decodeChannelUpdateMessage(payload)
-					);
+					msg = decodeChannelUpdateMessage(payload);
 				} catch {
 					return; // malformed gossip — same silent drop as the handler's
 				}
-				if (ours) {
+				if (this.channelUpdateTargetsOurChannel(msg)) {
 					// While the stored map is restored in slices, the peer's
 					// policy is taken at once, since a private channel's route
 					// hints and blinded paths read it from the channel state;
@@ -16495,6 +16563,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					}
 					this.handleChannelUpdate(payload);
 					break;
+				}
+				if (
+					(msg.messageFlags & 0x02) !== 0 &&
+					this.channelManager.hasChannelWithPeer(pubkey)
+				) {
+					const held = this.earlyPeerUpdates.get(pubkey) ?? new Map();
+					const scidHex = msg.shortChannelId.toString('hex');
+					held.delete(scidHex);
+					held.set(scidHex, payload);
+					// One slot per channel with the peer, oldest dropped first.
+					const slots = this.channelManager.countChannelsWithPeer(pubkey);
+					for (const key of held.keys()) {
+						if (held.size <= slots) break;
+						held.delete(key);
+					}
+					this.earlyPeerUpdates.set(pubkey, held);
 				}
 				this.enqueueBroadcastGossip(pubkey, type, payload);
 				break;
@@ -21584,6 +21668,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				htlcId,
 				paymentHash,
 				keysendPreimage,
+				amountMsat,
 				amountMsat
 			);
 			return;
@@ -21922,6 +22007,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				channelId,
 				htlcId,
 				partAmountMsat,
+				amountMsat,
 				paymentHash,
 				hopPayload!,
 				preimage!,
@@ -21940,7 +22026,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			htlcId,
 			paymentHash,
 			preimage!,
-			partAmountMsat
+			partAmountMsat,
+			amountMsat
 		);
 	}
 
@@ -22176,6 +22263,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 			// 0n is an any-amount invoice that had no payment until now.
 			if (payment.amountMsat === 0n) payment.amountMsat = settledMsat;
+			recordReceivedMsat(payment, settledMsat);
 			this.safeStorage(
 				() => this.persistPayment(paymentHash),
 				'persistPayment'
@@ -24081,14 +24169,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
 	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
 	 * amountMsat is the part's onion-declared amt_to_forward, NOT the
-	 * incoming HTLC value, which may exceed it; declaredTotalMsat is the
-	 * sender-declared total the parts accumulate toward: payment_data
-	 * total_msat or blinded-final total_amount_msat.
+	 * incoming HTLC value, which may exceed it or (a JIT skim) fall short of
+	 * it; htlcAmountMsat is that HTLC value, kept for what the settled set
+	 * credits. declaredTotalMsat is the sender-declared total the parts
+	 * accumulate toward: payment_data total_msat or blinded-final
+	 * total_amount_msat.
 	 */
 	private handleMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
+		htlcAmountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload: IHopPayload,
 		preimage: Buffer,
@@ -24183,6 +24274,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			channelId,
 			htlcId,
 			amountMsat,
+			htlcAmountMsat,
 			status: PaymentStatus.PENDING
 		};
 		pending.receivedParts.push(part);
@@ -24242,6 +24334,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				// An any-amount invoice's record holds 0n until paid, so the
 				// settled parts are the only source of what it received.
 				if (payment.amountMsat === 0n) payment.amountMsat = totalReceived;
+				recordReceivedMsat(
+					payment,
+					pending.receivedParts.reduce((sum, p) => sum + p.htlcAmountMsat, 0n)
+				);
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
 				this.emitInvoiceSettled(paymentHash, payment);
@@ -24371,16 +24467,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * receivedMsat is the settled HTLC's payment amount. It replaces the
-	 * record's amount only when that is 0n, which is an any-amount invoice
-	 * that has not been paid yet.
+	 * declaredMsat is the onion's amt_to_forward for the settled HTLC. It
+	 * replaces the record's amount only when that is 0n, which is an
+	 * any-amount invoice that has not been paid yet. htlcMsat is the HTLC's
+	 * own value, what the channel credits, recorded as receivedMsat when the
+	 * two differ.
 	 */
 	private fulfillPayment(
 		channelId: Buffer,
 		htlcId: bigint,
 		paymentHash: Buffer,
 		preimage: Buffer,
-		receivedMsat: bigint
+		declaredMsat: bigint,
+		htlcMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
@@ -24401,7 +24500,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			payment.status = PaymentStatus.COMPLETED;
 			payment.completedAt = Date.now();
 			payment.settledHtlcs = [`${channelId.toString('hex')}:${htlcId}`];
-			if (payment.amountMsat === 0n) payment.amountMsat = receivedMsat;
+			if (payment.amountMsat === 0n) payment.amountMsat = declaredMsat;
+			recordReceivedMsat(payment, htlcMsat);
 		}
 
 		// Persist BEFORE sending fulfill message: on crash, reestablish
@@ -25217,7 +25317,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					part.paymentHash,
 					part.forwardCltv,
 					nextOnionBuf,
-					part.nextBlindingPoint
+					part.nextBlindingPoint,
+					part.skimmedFeeMsat
 				);
 			}
 		);
@@ -27069,8 +27170,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					),
 					`${'0'.repeat(64)}:${U64_MAX}`
 				];
-				// An any-amount invoice records what its parts paid.
+				// An any-amount invoice records what its parts paid, and any
+				// invoice what they credited when that differs.
 				if (payment.amountMsat === 0n) settled.amountMsat = U64_MAX;
+				settled.receivedMsat = U64_MAX;
 			}
 		}
 		return { type: 'payment_state', paymentHash: hashHex, payment: settled };
@@ -28525,6 +28628,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						this.removeListener('splice:reverted', cb);
 					};
 				},
+				hasRevertedSplice: (channelIdHex, spliceTxid): boolean =>
+					this.channelManager
+						.getChannel(Buffer.from(channelIdHex, 'hex'))
+						?.hasRevertedSplice(spliceTxid) ?? false,
+				// getRawChannel also finds a v2 open not yet promoted out of the
+				// temporary map, which a zero-conf open can still be when it locks.
+				hasLockedFunding: (channelIdHex, fundingTxid): boolean =>
+					this.getRawChannel(
+						Buffer.from(channelIdHex, 'hex')
+					)?.hasLockedFunding(fundingTxid) ?? false,
 				log
 			},
 			{
@@ -28554,6 +28667,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		receiver.on('offer:completed', (e) =>
 			this.emit('direct-funding:offer:completed', e)
 		);
+		// A funding lock stamps lockedAt on the payments it carried (issue
+		// #1899). Both events fire after the node has persisted the lock, and
+		// every funding the channel has recorded as locked is marked, not only
+		// the one the event names: the mark is idempotent, and a lock missed
+		// earlier is picked up too. The record holds display byte order; the
+		// channel's list, like the splice event's txid, is internal order.
+		const markLocked = (channelId: Buffer): void => {
+			const locked =
+				this.getRawChannel(channelId)?.getFullState().lockedFundingTxids;
+			for (const txid of locked ?? []) {
+				requests.markReceivedLocked(
+					Buffer.from(txid).reverse().toString('hex')
+				);
+			}
+		};
+		this.on('channel:ready', ({ channelId }) => markLocked(channelId));
+		this.on('splice:complete', ({ channelId }) => markLocked(channelId));
 		this.directFunding = {
 			requests,
 			registry,
@@ -31567,7 +31697,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const channels = this.channelManager.listChannels();
 		for (const channel of channels) {
 			const state = channel.getFullState();
-			const effectiveState = state.preReestablishState ?? state.state;
+			// Nothing clears preReestablishState when a marked channel closes,
+			// so reading through it on any other state would find a closed
+			// channel's HTLCs still live: it would fail their payments before
+			// the chain decides and close the channel again every block.
+			const effectiveState =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
 			// ERRORED is admitted so the force-close backstop below still guards an
 			// offered HTLC on a failed channel: the value is OURS, and the
 			// downstream can claim it with the preimage whether or not the channel

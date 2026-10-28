@@ -65,15 +65,21 @@ import {
 	decodeDfWitness,
 	encodeDfOfferAck,
 	encodeDfReceipt,
-	encodeDfSignRequest
+	encodeDfSignRequest,
+	spliceAttestationMessage
 } from '../messages';
-import type { IDfAttemptFunding, IDfRequestRecord } from '../types';
+import type {
+	IDfAttemptFunding,
+	IDfReceivedRecord,
+	IDfRequestRecord
+} from '../types';
 import { DF_SIGNATURE_BYTES, DirectFundingError } from '../types';
 import type { DfTransportRegistry } from '../transport/registry';
 import type { IDfInboundFrame, IDfLaneSender } from '../transport/types';
 import type { IDfOfferSession } from './sessions';
 import { contentHashOf, DfOfferSessions, outpointKey } from './sessions';
 import {
+	attestedKeysProblem,
 	classifyOfferedCoin,
 	fundingTransactionProblem,
 	offerFieldProblem,
@@ -170,6 +176,8 @@ interface IDfFinalTx {
 	baseFundingValueSat?: bigint;
 	/** Splice only. */
 	sharedInputIndex?: number;
+	/** Splice only: the new output's pair, when the channel reports it. */
+	newFundingPubkeys?: { local: Buffer; remote: Buffer };
 }
 
 interface DfFinalTxWaiter {
@@ -358,6 +366,9 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				this.deps.onSpliceReverted((e) => this.failRevertedSpliceFunding(e))
 			);
 		}
+		// After the subscription, so no revert falls between the two.
+		this.markRevertedReceipts();
+		this.markLockedReceipts();
 		this.sweepTimer = setInterval(() => {
 			this.state.sweep(this.now());
 			this.retireLapsedFundings();
@@ -509,6 +520,65 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				error: reason
 			});
 			this.emit('offer:failed', { offerId: held.offerIdHex, reason });
+		}
+		// A funding whose receipt already went out is no longer held above, and
+		// its request still reads paid. Its received record is what says it was
+		// not (issue #1893).
+		this.deps.requests.markReceivedReverted(e.spliceTxid);
+	}
+
+	/**
+	 * Mark the received payments whose splice the channel remembers reverting
+	 * (issue #1893): the event that marks one fires once, and a mark that did
+	 * not reach storage, or a revert from before this receiver was listening,
+	 * would otherwise read as paid for good. A record with no channel, one
+	 * backfilled from a tombstone, cannot be checked.
+	 */
+	private markRevertedReceipts(): void {
+		if (!this.deps.hasRevertedSplice) return;
+		for (const entry of this.deps.requests.received()) {
+			if (entry.status !== 'PAID' || !entry.splice || !entry.channelId) {
+				continue;
+			}
+			if (this.deps.hasRevertedSplice(entry.channelId, entry.fundingTxid)) {
+				this.deps.requests.markReceivedReverted(entry.fundingTxid);
+			}
+		}
+	}
+
+	/**
+	 * Set lockedAt on the received payments whose funding the channel has
+	 * recorded as locked (issue #1899). The node marks records on its lock
+	 * events, which fire once: a mark that did not reach storage, or a lock
+	 * from before this receiver was listening, would otherwise never be made.
+	 */
+	private markLockedReceipts(): void {
+		for (const entry of this.deps.requests.received()) {
+			this.markIfLocked(entry);
+		}
+	}
+
+	/**
+	 * The same check for the record a revealed receipt just created (issue
+	 * #1899). A zero-conf open or splice can lock before the payer's witness
+	 * is in, so the lock event has already fired by the time the record
+	 * exists and will not fire again.
+	 */
+	private markLockedReceipt(receiptHashHex: string): void {
+		const entry = this.deps.requests.receivedFor(receiptHashHex);
+		if (entry) this.markIfLocked(entry);
+	}
+
+	/**
+	 * A record with no channel, one backfilled from a tombstone, cannot be
+	 * checked here; the node's lock event still marks it by funding.
+	 */
+	private markIfLocked(entry: IDfReceivedRecord): void {
+		if (!this.deps.hasLockedFunding) return;
+		if (entry.status !== 'PAID' || entry.lockedAt !== undefined) return;
+		if (!entry.channelId) return;
+		if (this.deps.hasLockedFunding(entry.channelId, entry.fundingTxid)) {
+			this.deps.requests.markReceivedLocked(entry.fundingTxid);
 		}
 	}
 
@@ -875,9 +945,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: held.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(held.receiptHash);
 		const complete = final.tx.ins.every((i) => i.witness.length > 0);
 		const receipt = encodeDfReceipt({
 			offerId,
@@ -1674,7 +1745,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				// record in the same batch that releases our tx_signatures, and a
 				// txid recorded afterwards would be lost by exactly the crash it
 				// exists for (issue #658).
-				fundingTxid: final.fundingTxidDisplay.toString('hex')
+				fundingTxid: final.fundingTxidDisplay.toString('hex'),
+				// What the received record of a funding finished on a recovery
+				// path reports, the offer being gone with this session (issue #1893).
+				amountSat: ctx.offer.amountSat.toString()
 			},
 			session.expiresAt
 		);
@@ -1904,9 +1978,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		} catch (err) {
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(record.receiptHash);
 		const receipt = encodeDfReceipt({
 			offerId,
 			preimage: Buffer.from(record.preimageHex, 'hex'),
@@ -2264,17 +2339,49 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			offer: ctx.offer
 		});
 		if (problem) throw new Error(`refusing to attest: ${problem}`);
-		const pubkeys = this.deps.fundingPubkeys(final.channelId);
-		if (!pubkeys) throw new Error('funding pubkeys are unavailable');
+		const committed = this.deps.fundingPubkeys(final.channelId);
+		if (!committed) throw new Error('funding pubkeys are unavailable');
+		// A splice's output pays the keys negotiated for it, which a peer may
+		// have rotated (issue #1871). The shared input still spends the committed
+		// pair, and the attestation then has to name both.
+		const pubkeys = final.newFundingPubkeys ?? committed;
+		const prior =
+			final.sharedInputIndex !== undefined &&
+			!(
+				pubkeys.local.equals(committed.local) &&
+				pubkeys.remote.equals(committed.remote)
+			)
+				? committed
+				: undefined;
+		const keysProblem = attestedKeysProblem({
+			tx: final.tx,
+			fundingOutputIndex: final.fundingOutputIndex,
+			fundingPubkeys: pubkeys,
+			prevoutScripts: final.prevouts.scripts,
+			...(final.sharedInputIndex !== undefined
+				? { sharedInputIndex: final.sharedInputIndex }
+				: {}),
+			...(prior ? { priorFundingPubkeys: prior } : {})
+		});
+		if (keysProblem) throw new Error(`refusing to attest: ${keysProblem}`);
 		const rawTx = final.tx.toBuffer();
 		const signature = zbase32Decode(
 			this.deps.signMessage(
-				attestationMessage(
-					ctx.offer.offerId,
-					rawTx,
-					final.fundingOutputIndex,
-					pubkeys.local
-				)
+				prior
+					? spliceAttestationMessage(
+							ctx.offer.offerId,
+							rawTx,
+							final.fundingOutputIndex,
+							pubkeys,
+							final.sharedInputIndex!,
+							prior
+					  )
+					: attestationMessage(
+							ctx.offer.offerId,
+							rawTx,
+							final.fundingOutputIndex,
+							pubkeys.local
+					  )
 			)
 		);
 		if (!signature || signature.length !== DF_SIGNATURE_BYTES) {
@@ -2296,6 +2403,7 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 					fundingOutputIndex: final.fundingOutputIndex,
 					localFundingPubkey: pubkeys.local,
 					remoteFundingPubkey: pubkeys.remote,
+					...(prior ? { priorFundingPubkeys: prior } : {}),
 					signature
 				},
 				...(final.sharedInputIndex !== undefined
@@ -2448,7 +2556,8 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 		try {
 			this.deps.requests.markReceiptRevealed(ctx.session.receiptHashHex, {
 				offerIdHex: ctx.session.offerIdHex,
-				fundingTxidHex: final.fundingTxidDisplay.toString('hex')
+				fundingTxidHex: final.fundingTxidDisplay.toString('hex'),
+				amountSat: ctx.offer.amountSat.toString()
 			});
 		} catch (err) {
 			// Only the write failed; the in-memory tombstone stands. Withholding
@@ -2457,9 +2566,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 			// the two failures by a distance.
 			this.log(DF_LOG_OFFER_FAILED, {
 				offerId: ctx.session.offerIdHex,
-				error: `receipt tombstone not persisted: ${errorText(err)}`
+				error: `receipt not persisted: ${errorText(err)}`
 			});
 		}
+		this.markLockedReceipt(ctx.session.receiptHashHex);
 		// The complete transaction, when every witness is in: no chain round
 		// trip, and a payer holding it can rebroadcast alone. Omitted while the
 		// channel counterparty's own tx_signatures are still outstanding.
@@ -2758,7 +2868,10 @@ export class DirectFundingReceiver extends TypedEmitter<DirectFundingReceiverEve
 				// The new funding output carries the pre-splice capacity as well,
 				// and the shared input's value IS that capacity.
 				baseFundingValueSat: prevouts.values[pending.sharedInputIndex],
-				sharedInputIndex: pending.sharedInputIndex
+				sharedInputIndex: pending.sharedInputIndex,
+				...(pending.newFundingPubkeys
+					? { newFundingPubkeys: pending.newFundingPubkeys }
+					: {})
 			};
 		}
 		return {

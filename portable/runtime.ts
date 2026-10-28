@@ -1109,6 +1109,8 @@ export async function createPortableRuntime(options: any) {
 				return n.getFeeEstimates();
 			case 'GET /direct-funding/payments':
 				return n.listDirectFundingPayments();
+			case 'GET /direct-funding/received':
+				return n.listDirectFundingReceived();
 			case 'GET /direct-funding/config':
 				return n.getDirectFundingConfig();
 			case 'POST /wallet/refresh':

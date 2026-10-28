@@ -198,6 +198,7 @@ import { getPublicKey } from '../lightning/crypto/ecdh';
 import type {
 	IDfPaymentRecord,
 	IDfPrepareResult,
+	IDfReceivedRecord,
 	IDfSendResult
 } from '../lightning/direct-funding';
 import {
@@ -1171,27 +1172,32 @@ function sentSats(info: IPaymentInfo): number | undefined {
 /**
  * A payment's amount as every public surface reports it (history, proof,
  * stats): an outgoing amount is what left the node, fees included, rounded
- * UP; an incoming amount rounds down, as the balance does (issue #1185).
- * Truncating the outgoing figure let a send paying 20,001.5 sats from a
- * 50,000 sat balance read 20,001 while the balance fell to 29,998. Rounding
- * up makes one send agree with the balance when the balance held whole sats
- * before it; sub-sat remainders across several sends can still differ from
- * the balance by a sat, which only msat figures reconcile exactly.
+ * UP; an incoming amount is what the node was credited, rounded down, as the
+ * balance does (issue #1185). Truncating the outgoing figure let a send
+ * paying 20,001.5 sats from a 50,000 sat balance read 20,001 while the
+ * balance fell to 29,998. Rounding up makes one send agree with the balance
+ * when the balance held whole sats before it; sub-sat remainders across
+ * several sends can still differ from the balance by a sat, which only msat
+ * figures reconcile exactly.
  */
 function paymentAmountSats(info: IPaymentInfo): number {
 	return info.direction === PaymentDirection.OUTGOING
 		? sentSats(info) ?? spendLimitSats(info.amountMsat)
-		: Number(info.amountMsat / 1000n);
+		: Number((info.receivedMsat ?? info.amountMsat) / 1000n);
 }
 
 /**
- * The routing fee a payment paid, in msat, or undefined when the record does
- * not say. An MPP record's route is its first part only, so its fee is what
- * left the node over what the invoice asked (#1008).
+ * The fee a payment paid, in msat, or undefined when the record does not
+ * say. An MPP record's route is its first part only, so its fee is what left
+ * the node over what the invoice asked (#1008). An incoming payment's fee is
+ * a JIT LSP's skim: what the invoice asked over what the node was credited.
  */
 function paymentFeeMsat(info: IPaymentInfo): bigint | undefined {
 	if (info.sentMsat !== undefined && info.sentMsat >= info.amountMsat) {
 		return info.sentMsat - info.amountMsat;
+	}
+	if (info.receivedMsat !== undefined && info.receivedMsat < info.amountMsat) {
+		return info.amountMsat - info.receivedMsat;
 	}
 	return info.route?.totalFeeMsat;
 }
@@ -9324,6 +9330,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!channel) return null;
 
 		const state = channel.getFullState();
+		// Nothing clears preReestablishState when a marked channel closes, so
+		// it names the earlier state only while the channel is still wrapped.
+		const wrappedState =
+			state.state === ChannelState.AWAITING_REESTABLISH
+				? state.preReestablishState
+				: null;
 		// Mid-negotiation v2 channels are keyed by temporary id in the peer map
 		// (see buildChannelInfo); fall back so diagnostics name the peer too.
 		const peerPubkey =
@@ -9376,12 +9388,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 		if (
 			state.state !== 'NORMAL' &&
-			state.preReestablishState !== 'NORMAL' &&
+			wrappedState !== 'NORMAL' &&
 			!acceptsNewThrough
 		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
-					state.preReestablishState || 'none'
+					wrappedState || 'none'
 				}). Routing hints require a usable channel.`
 			);
 		}
@@ -9406,7 +9418,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			channelId,
 			peerPubkey,
 			state: state.state,
-			preReestablishState: state.preReestablishState || null,
+			preReestablishState: wrappedState || null,
 			isPeerConnected,
 			announceChannel: state.announceChannel,
 			announcementSigsSent: state.announcementSigsSent || false,
@@ -9466,6 +9478,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		channelId: Buffer;
 		peerPubkey: string;
 		state: string;
+		preReestablishState?: string;
 		localBalanceMsat: bigint;
 		spendableOutboundMsat?: bigint;
 		remoteBalanceMsat: bigint;
@@ -9479,6 +9492,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		pendingSpliceLocalBalanceMsat?: bigint;
 		pendingSpliceTxid?: string;
 		previousFundingTxids?: string[];
+		lockedFundingTxids?: string[];
 		htlcUsable?: boolean;
 		restoreRecencyUnproven?: boolean;
 		reestablishRecencyUnproven?: boolean;
@@ -9525,6 +9539,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
 		};
+		if (ch.preReestablishState)
+			info.preReestablishState = ch.preReestablishState as CS;
 		// What the connected peer's init negotiated, read rather than guessed:
 		// a client deciding whether to offer splice controls has no other way
 		// to know, and reconstructing feature bits client-side is exactly the
@@ -9555,6 +9571,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			info.pendingSpliceTxid = ch.pendingSpliceTxid;
 		if (ch.previousFundingTxids && ch.previousFundingTxids.length > 0)
 			info.previousFundingTxids = [...ch.previousFundingTxids];
+		// What a wallet counts a funding as locked from once the channel has
+		// closed or its peer is away (issue #1899). Display order already.
+		if (ch.lockedFundingTxids && ch.lockedFundingTxids.length > 0)
+			info.lockedFundingTxids = [...ch.lockedFundingTxids];
 		// The dashboard's Send gating reads these off the wire; dropping them
 		// here re-parked every mid-splice channel in the UI while the daemon
 		// happily paid through the window.
@@ -10300,6 +10320,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	/** Every direct-funding payment this device has a record of. */
 	listDirectFundingPayments(): IDfPaymentRecord[] {
 		return this.directFundingSender?.payments() ?? [];
+	}
+
+	/**
+	 * Every payment received against a request this node minted, newest first
+	 * (issue #1893). `receiptHash` is the `paymentHash` the request was minted
+	 * with. Kept after the request itself expires, so a client can still tell
+	 * its request was paid: a direct-funding payment settles no invoice and pays
+	 * no address, and REVERTED means the splice it went into was undone.
+	 */
+	listDirectFundingReceived(): IDfReceivedRecord[] {
+		return this.node.getDirectFundingRequests()?.received() ?? [];
 	}
 
 	/**
@@ -14860,7 +14891,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				}
 			} else if (p.direction === 'INCOMING' && p.status === 'COMPLETED') {
 				received++;
-				satsReceived += Number(p.amountMsat / 1000n);
+				satsReceived += paymentAmountSats(p);
 			} else if (p.status === 'FAILED') {
 				failed++;
 			}

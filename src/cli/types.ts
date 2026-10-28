@@ -165,6 +165,13 @@ export interface ChannelInfo {
 	channelId: ChannelIdHex;
 	peerPubkey: string;
 	state: ChannelStateString;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. It tells a
+	 * channel still opening from one already open while the peer is away
+	 * (issue #1899).
+	 */
+	preReestablishState?: ChannelStateString;
 	localBalanceSats: number;
 	/** Balance-based debit ceiling for one new outbound HTLC, floored to
 	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
@@ -199,6 +206,18 @@ export interface ChannelInfo {
 	 * has never been spliced (issue #1060).
 	 */
 	previousFundingTxids?: TxidHex[];
+	/**
+	 * Funding txids this channel has locked, oldest first (display byte
+	 * order): the open's funding once both channel_ready messages crossed,
+	 * and each splice's funding once both splice_locked messages did (issue
+	 * #1899). Kept through close. Complete for the locks this version
+	 * recorded; a channel written by an earlier version is seeded on load
+	 * with what its stored state proves, so treat a txid that is not listed,
+	 * and an absent field, as "not known", not as "never locked". On a
+	 * zero-conf channel a lock comes before the funding confirms, so a listed
+	 * txid is not proof of confirmation.
+	 */
+	lockedFundingTxids?: TxidHex[];
 	/** Whether the channel will accept a NEW HTLC (0.6.0+). */
 	htlcUsable?: boolean;
 	ffor?: {

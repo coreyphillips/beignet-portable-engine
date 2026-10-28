@@ -1112,6 +1112,13 @@ export interface IChannelInfo {
 	channelId: Buffer;
 	peerPubkey: string;
 	state: ChannelState;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. A consumer
+	 * tells a channel still opening from one already open by it while the
+	 * peer is away, as the node's own balance does (issue #1899).
+	 */
+	preReestablishState?: ChannelState;
 	localBalanceMsat: bigint;
 	/** Balance-based debit ceiling for one new outbound HTLC, including
 	 * commitment costs and buffers. Zero while new HTLCs are unavailable.
@@ -1150,6 +1157,26 @@ export interface IChannelInfo {
 	 * that has never been spliced (issue #1060).
 	 */
 	previousFundingTxids?: string[];
+	/**
+	 * Funding txids this channel has locked, oldest first (display byte
+	 * order): the open's funding once both channel_ready messages crossed,
+	 * and each splice's funding once both splice_locked messages did (issue
+	 * #1899). Kept through close, so it still answers once the channel has
+	 * closed or while its peer is away. A force close that adopts a confirmed
+	 * splice locks nothing.
+	 *
+	 * Complete for the locks this version recorded. A channel written by an
+	 * earlier version is seeded on load with what its stored state proves
+	 * (the open's funding, and the current funding of a channel still open),
+	 * so an earlier splice lock, or the last funding of a channel closed
+	 * before the upgrade, can be missing. Treat a txid that is not listed,
+	 * and an absent field, as "not known", not as "never locked".
+	 *
+	 * A lock is the channel_ready or splice_locked exchange. On a zero-conf
+	 * channel that comes before the funding confirms, so a listed txid is not
+	 * proof of confirmation.
+	 */
+	lockedFundingTxids?: string[];
 	/**
 	 * Whether the channel will accept a NEW HTLC: it can carry traffic right
 	 * now (NORMAL, or ECDSA pending-lock mid-splice with pay-during-splice
@@ -1376,7 +1403,10 @@ export interface IPaymentPart {
 	partIndex: number;
 	channelId: Buffer;
 	htlcId: bigint;
+	/** The part's onion amt_to_forward, which the set accumulates toward its total. */
 	amountMsat: bigint;
+	/** The committed HTLC's value: what settling this part credits. */
+	htlcAmountMsat: bigint;
 	status: PaymentStatus;
 }
 
@@ -1429,6 +1459,8 @@ export interface IForwardablePart {
 	inHtlcId: bigint;
 	paymentHash: Buffer;
 	forwardAmountMsat: bigint;
+	/** Agreed JIT fee deducted from this part, announced to its recipient. */
+	skimmedFeeMsat?: bigint;
 	/**
 	 * The inbound HTLC's value (msat), i.e. `forwardAmountMsat` plus whatever
 	 * routing fee the sender paid this hop. Recorded by the forwarding path

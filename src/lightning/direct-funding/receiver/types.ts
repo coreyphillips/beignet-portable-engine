@@ -263,6 +263,13 @@ export interface IDfPendingSpliceTx {
 	spliceTxid: Buffer;
 	sharedInputIndex: number;
 	newFundingOutputIndex: number;
+	/**
+	 * The keys of the new funding output's 2-of-2, which a splice that rotated
+	 * a funding key makes different from `fundingPubkeys` (issue #1871).
+	 * Absent or null reads as unchanged keys, and the receiver refuses to attest
+	 * if the transaction says otherwise.
+	 */
+	newFundingPubkeys?: { local: Buffer; remote: Buffer } | null;
 	prevouts: { scripts: Buffer[]; values: bigint[] } | null;
 	owedExternalInputs: IDfExternalInput[];
 	filledExternalInputs: IDfExternalInput[];
@@ -343,7 +350,10 @@ export interface IDfReceiverDeps {
 	 * peer is started, splice or open.
 	 */
 	spliceInFlightWith(peerHex: string): boolean;
-	/** Funding pubkeys of a channel, for the attestation. */
+	/**
+	 * The committed funding pubkeys of a channel, for the attestation: the 2-of-2
+	 * a new channel's output pays, or the one a splice's shared input spends.
+	 */
 	fundingPubkeys(channelId: Buffer): { local: Buffer; remote: Buffer } | null;
 	/** Upstream's own zero-conf gate (zero-conf.ts canOpenZeroConfTo). */
 	canOpenZeroConfTo(peerHex: string): boolean;
@@ -422,6 +432,23 @@ export interface IDfReceiverDeps {
 			conflictTxid: string;
 		}) => void
 	): () => void;
+	/**
+	 * Whether the channel remembers reverting this splice (display txid). What
+	 * a starting receiver checks its received payments against (issue #1893):
+	 * the event above fires once, so a mark that did not reach storage, or a
+	 * revert that landed before the subscription, would otherwise read as paid
+	 * for good. Optional.
+	 */
+	hasRevertedSplice?(channelIdHex: string, spliceTxid: string): boolean;
+	/**
+	 * Whether the channel has recorded a lock of this funding (display txid)
+	 * in its lockedFundingTxids (issue #1899). What a receiver checks a
+	 * received payment against when the record is created and when it starts:
+	 * a zero-conf lock can land before the receipt is revealed and the record
+	 * exists, and a mark that did not reach storage would otherwise never be
+	 * made. Optional; without it only the node's lock events set lockedAt.
+	 */
+	hasLockedFunding?(channelIdHex: string, fundingTxid: string): boolean;
 	now?(): number;
 	/** Structured-log sink, the same one 4B's lanes take. */
 	log?: DfTransportLog;
