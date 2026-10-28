@@ -165,6 +165,13 @@ export interface ChannelInfo {
 	channelId: ChannelIdHex;
 	peerPubkey: string;
 	state: ChannelStateString;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. It tells a
+	 * channel still opening from one already open while the peer is away
+	 * (issue #1899).
+	 */
+	preReestablishState?: ChannelStateString;
 	localBalanceSats: number;
 	/** Balance-based debit ceiling for one new outbound HTLC, floored to
 	 * sats, before routing fees and route HTLC limits. Zero when unavailable.
@@ -891,6 +898,10 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */
 	logLevel?: TLogLevel;
+	/** Log every non-gossip wire message (type and length, no payloads) at
+	 *  info: true for every peer, or a list of peer pubkeys. Env
+	 *  BEIGNET_WIRE_TRACE: '1'/'true', or comma-separated pubkeys. */
+	wireTrace?: boolean | string[];
 	/** Recovery Protocol mode (docs/RECOVERY-PROTOCOL.md section 8):
 	 *  'off' | 'peer-storage' | 'async-remote' | 'quorum'. Exact values only;
 	 *  anything else is ignored and the default (off) rules. Env:

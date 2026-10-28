@@ -1,3 +1,26 @@
+# Portable engine validation, 2026-10-27 addendum for 0.34.0
+
+The fork tracks Beignet **0.34.0** at `1e398e97ac121dd31d011bfd279509e8bef53472`, npm's `gitHead` for the release (the merge of #1900, after the version bump #1895). This addendum supersedes the baseline statement of the 0.33.0 addendum below. The patch reapplies with every hunk in place, no hand merge, and the runtime gains `GET /direct-funding/received` (see `PATCHES.md`).
+
+- `npm test`: 226 of 226 pass on Node 24.22.1 and on 24.19.0, the same tests as the 0.33.0 tree.
+- `npm run check:types` passes.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.33.0 tree.
+- The built bundle reports `0.34.0-portable` and is 7,351,917 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.34.0` tarball matches npm's integrity hash, and its `dist/` is byte-identical to a local `tsc` build of `1e398e97` (1,053 files).
+- Upstream's offline suites, run on Node 24.19.0 in an upstream `1e398e97` tree with this fork's `src/` in place of its own:
+  - The nine test files outside the eclair interop tier that 0.34.0 changes or adds (`tests/cli/agent-phase4`, `balance-visibility`, `webhooks`, `tests/lightning/channel-list-pre-reestablish`, `direct-funding-receiver`, `direct-funding-requests`, `disconnect-reason`, `resolve-node-config`, `splice-input-conflict`) pass, 383 tests.
+  - `test:lightning`: 10,024 passing and 20 failing. The 20 are the 0.33.0 record's 21 without `comment-paths.test.ts`, which passes here because this tree is a git worktree: four `agent-review` tests that expect a public channel, two `doc-tables` README checks, the thirteen forwarding and policy tests whose fixtures write SCID aliases behind the private-channel index (see `PATCHES.md`), and mocha's BigInt serialization error reporting one of those.
+  - A first run of `test:lightning` also failed `own-channel-gossip-index.test.ts`'s "holds a channel peer's unknown private updates", counting 501 channel state reads where it expects 500. The test counts every `Channel.prototype.getFullState` call in its process, so a channel another file left behind in the same parallel worker adds to it. It passes alone five times out of five, after each of the five failing forwarding files in one process, and in the second full run.
+  - `test:cli`: 2,428 passing and none failing.
+- The live scripts ran on Node 24.19.0 against the local Bitcoin, Electrum and CLN containers. The primary was upstream `1e398e97`'s `dist/`, byte-identical to the published package's, through `BEIGNET_SOURCE_DIR`. The relay was the sibling `beignet-relay` checkout, and the shared client wallet-core `f1cae26`.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-send-max.cjs` passes all seven cases, with 73 PASS lines: jit, the three address types, unconfirmed address, phone and, for the first time, cln (its retained balance is explained as the 1,938-sat reserve).
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS. The new one: after a stranger's direct funding of a unified request locks, the recipient's `GET /direct-funding/received` lists it as `PAID` for 15,000 sats, and wallet-core reads the request as completed by direct funding, with a completed received row.
+  - `scripts/regtest-ffor.cjs` and `scripts/regtest-ffor-worker.cjs` (`beignet-web` `57449f6`) each exit 0 with all 17 checks reporting PASS.
+  - `scripts/smoke-regtest.cjs` exits 0, its onion-routed handshake, invoice and identity restored across a full engine restart. It had not run on this machine before.
+
+Not run: `scripts/regtest-ffor-native.cjs` (no emulator was started) and a start of the production app on a device.
+
 # Portable engine validation, 2026-10-26 addendum for 0.33.0
 
 The fork tracks Beignet **0.33.0** at `b0b65167f94c652727b8a0b4b68541840ab7ae02`, npm's `gitHead` for the release. Its `src/` is the same as `c0a79ca3` (#1888): the version bump changes only `package.json` and `package-lock.json`. This addendum supersedes the baseline statement of the 0.32.1 addendum below. The patch reapplies with every hunk in place, no hand merge and no portable change (see `PATCHES.md`).

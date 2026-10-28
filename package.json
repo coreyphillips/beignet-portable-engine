@@ -2,8 +2,8 @@
   "name": "@beignet/portable-engine",
   "version": "0.1.0",
   "description": "Portable Beignet Bitcoin and Lightning engine for browser workers and React Native",
-  "upstreamVersion": "0.33.0",
-  "upstreamCommit": "b0b65167f94c652727b8a0b4b68541840ab7ae02",
+  "upstreamVersion": "0.34.0",
+  "upstreamCommit": "1e398e97ac121dd31d011bfd279509e8bef53472",
   "main": "dist/portable.cjs",
   "scripts": {
     "build": "node scripts/build-portable.cjs",
