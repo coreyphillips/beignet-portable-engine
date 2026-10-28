@@ -711,6 +711,12 @@ export interface INodeConfig {
 	 * "category:action" alongside the persisted action log.
 	 */
 	logger?: ILogger;
+	/**
+	 * Log every non-gossip wire message (direction, type name, length; no
+	 * payloads) at logger.info: true for every peer, or a list of peer
+	 * pubkeys. Off by default. Ping and pong are never traced.
+	 */
+	wireTrace?: boolean | string[];
 	/** Maximum payment retries (default 3) */
 	maxPaymentRetries?: number;
 	/** Global HTLC limit across all channels (default 1000) */
@@ -1112,6 +1118,13 @@ export interface IChannelInfo {
 	channelId: Buffer;
 	peerPubkey: string;
 	state: ChannelState;
+	/**
+	 * The state the channel was in when a disconnect, or a restart, put it in
+	 * AWAITING_REESTABLISH; present exactly while it is there. A consumer
+	 * tells a channel still opening from one already open by it while the
+	 * peer is away, as the node's own balance does (issue #1899).
+	 */
+	preReestablishState?: ChannelState;
 	localBalanceMsat: bigint;
 	/** Balance-based debit ceiling for one new outbound HTLC, including
 	 * commitment costs and buffers. Zero while new HTLCs are unavailable.
