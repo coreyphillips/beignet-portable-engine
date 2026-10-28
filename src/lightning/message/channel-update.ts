@@ -118,7 +118,7 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
 
 	// Optional trailing blinding_point TLV (type 0, length 33). BOLT 1 allows
 	// trailing TLV extensions; legacy decoders ignore the extra bytes.
-	const parts = [buf];
+	const parts: Buffer[] = [buf];
 	if (msg.blindingPoint) {
 		if (msg.blindingPoint.length !== 33) {
 			throw new Error('blindingPoint must be 33 bytes');
