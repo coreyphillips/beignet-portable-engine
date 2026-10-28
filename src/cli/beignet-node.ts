@@ -3959,9 +3959,8 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this.node.on('peer:connect', (pubkey: string) => {
 			let direction: string | undefined;
 			try {
-				direction = this.node
-					.getPeerManager()
-					?.getConnectionInfo(pubkey)?.direction;
+				direction = this.node.getPeerManager()?.getConnectionInfo(pubkey)
+					?.direction;
 			} catch {
 				// The log line must not cost the gossip sync below.
 			}
@@ -4002,20 +4001,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this.node.on(
 			'peer:disconnect',
 			(pubkey: string, info?: IPeerDisconnectInfo) => {
-				this.log('info', 'Peer disconnected', {
-					pubkey,
-					...(info
-						? {
-								closedBy: info.initiator === 'remote' ? 'peer' : 'us',
-								...(info.reason ? { reason: info.reason } : {}),
-								direction: info.direction,
-								...(info.uptimeMs !== undefined
-									? { uptimeMs: info.uptimeMs }
-									: {})
-						  }
-						: {})
-				});
-				this.emit('peer:disconnect', { pubkey });
+				// Subscribers (SSE, webhooks, an embedding app's diagnostics)
+				// get the same cause the log line names.
+				const cause = info
+					? {
+							closedBy:
+								info.initiator === 'remote'
+									? ('peer' as const)
+									: ('us' as const),
+							...(info.reason ? { reason: info.reason } : {}),
+							direction: info.direction,
+							...(info.uptimeMs !== undefined
+								? { uptimeMs: info.uptimeMs }
+								: {})
+					  }
+					: {};
+				this.log('info', 'Peer disconnected', { pubkey, ...cause });
+				this.emit('peer:disconnect', { pubkey, ...cause });
 			}
 		);
 		// The transport error that caused a disconnect (pong timeout, decrypt
@@ -9377,6 +9379,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (!channel) return null;
 
 		const state = channel.getFullState();
+		// Nothing clears preReestablishState when a marked channel closes, so
+		// it names the earlier state only while the channel is still wrapped.
+		const wrappedState =
+			state.state === ChannelState.AWAITING_REESTABLISH
+				? state.preReestablishState
+				: null;
 		// Mid-negotiation v2 channels are keyed by temporary id in the peer map
 		// (see buildChannelInfo); fall back so diagnostics name the peer too.
 		const peerPubkey =
@@ -9429,12 +9437,12 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			);
 		if (
 			state.state !== 'NORMAL' &&
-			state.preReestablishState !== 'NORMAL' &&
+			wrappedState !== 'NORMAL' &&
 			!acceptsNewThrough
 		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
-					state.preReestablishState || 'none'
+					wrappedState || 'none'
 				}). Routing hints require a usable channel.`
 			);
 		}
@@ -9459,7 +9467,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			channelId,
 			peerPubkey,
 			state: state.state,
-			preReestablishState: state.preReestablishState || null,
+			preReestablishState: wrappedState || null,
 			isPeerConnected,
 			announceChannel: state.announceChannel,
 			announcementSigsSent: state.announcementSigsSent || false,
