@@ -1,3 +1,28 @@
+# Portable engine validation, 2026-11-04 addendum for 0.37.0
+
+The fork tracks Beignet **0.37.0** at `0512b5f6271fd1d56f821abdae14b6e23a4b5878`, npm's `gitHead` for the release. That is the version bump #1964, whose `src/` is the same as #1963's merge `f0c1f03b`. This addendum supersedes the baseline statement of the 0.36.1 addendum below. Two hunks were merged by hand, on context upstream rewrote, and the diagnostic hook gains `peer:warning` and `htlc:forward-refused` (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 232 of 232 pass. That is the 0.36.1 tree's 230 plus the two new `peer-diagnostics` tests.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, in the same files as the 0.36.1 tree.
+- The built bundle reports `0.37.0-portable` and is 7,518,356 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.37.0` tarball matches npm's integrity hash (`sha512-nenG94Go...08KOA==`), and its `dist/` and `package.json` are identical to a clean build of `0512b5f6`.
+- Upstream's offline suites ran in an upstream `0512b5f6` tree with this fork's `src/` in place of its own:
+  - `test:cli` passes, 2,551 tests.
+  - `test:lightning` runs 10,163 passing and 20 failing: the 19 known failures listed in `PATCHES.md`, and one timing test that passes alone.
+- The live scripts ran against the local Bitcoin and Electrum containers. The primary was the published `beignet@0.37.0` package, unpacked, with `npm install --omit=dev`. The shared client was wallet-core `fdbe9dc`, which Chicory 0.7.12 ships. The relay was a stand-in byte relay. Both sat beside a scratch copy of this tree.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS.
+  - `scripts/regtest-send-max.cjs` exits 0 with every case passing, 73 PASS lines. That includes the `cln` case, against the local Core Lightning v26.06.1 on port 19846.
+  - `scripts/regtest-ffor.cjs` exits 0 with all 17 checks reporting PASS, but in only 2 of 7 runs: one with wallet-core `fdbe9dc` (of 5) and one with `9151e30` (of 2).
+    - In the other five runs, the first concurrent epoch (`receive()` in offline mode) ended ABORTED with reason 6 (DISCONNECT) on both sides before it went ACTIVE. The client answered `RECEIVE_UNAVAILABLE`.
+    - The 0.36.1 fork, with a 0.36.1 primary, failed the same way in its one run on this machine. With all 17 passing for 0.36.1 on 2026-10-28, the race predates 0.37.0 and depends on the machine's timing.
+
+Not run:
+- `smoke-regtest.cjs`: it dials a fixed Core Lightning identity (`028c6651...`), and the local container is a different node (`0377f2c7...`).
+- `regtest-ffor-worker.cjs`, `regtest-ffor-native.cjs`, and a start of the production app on a device.
+
 # Portable engine validation, 2026-10-28 addendum for 0.36.1
 
 The fork tracks Beignet **0.36.1** at `23a52a3e9525d7de993e143919930d60f5260dc4`, npm's `gitHead` for the release (the version bump #1912, whose `src/` is the same as #1911's merge `94f1a3f0`). This addendum supersedes the baseline statement of the 0.36.0 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).

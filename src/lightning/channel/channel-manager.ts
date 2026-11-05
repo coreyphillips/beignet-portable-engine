@@ -1752,6 +1752,11 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 
 	/**
 	 * Add an HTLC to a channel.
+	 *
+	 * A refusal comes back in the result and is also emitted as `error`,
+	 * unless `options.emitRefusal` is false. The forwarding path passes false
+	 * and reports its refusal itself (`htlc:forward-refused`), because a
+	 * channel turning away someone else's payment is not a fault of this node.
 	 */
 	addHtlc(
 		channelId: Buffer,
@@ -1760,19 +1765,21 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		cltvExpiry: number,
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer,
-		skimmedFeeMsat?: bigint
+		skimmedFeeMsat?: bigint,
+		options?: { emitRefusal?: boolean }
 	): ChannelResult {
+		const emitRefusal = options?.emitRefusal !== false;
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
 			const error = `Channel not found: ${idHex}`;
-			this.emit('error', channelId, error);
+			if (emitRefusal) this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			const error = `Peer not found for channel: ${idHex}`;
-			this.emit('error', channelId, error);
+			if (emitRefusal) this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
 
@@ -1784,7 +1791,15 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			blindingPoint,
 			skimmedFeeMsat
 		);
-		this.processActions(peerPubkey, channel, actions);
+		// A refused add changed nothing in the channel and its ERROR carries no
+		// cleanup, so dropping it from the dispatch only drops the event.
+		this.processActions(
+			peerPubkey,
+			channel,
+			emitRefusal
+				? actions
+				: actions.filter((a) => a.type !== ChannelActionType.ERROR)
+		);
 
 		// BOLT 2: after sending update_add_htlc we must send commitment_signed so
 		// the peer commits the HTLC. This kicks off the commitment exchange.
@@ -2461,6 +2476,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		peerPubkey: string,
 		cause?: { initiator: 'local' | 'remote'; reason?: string }
 	): void {
+		// Before the channels forget their pre-commitment splices: a composite
+		// splice (issue #1922) ends with the connection and must hear it first.
+		this.emit('peer:disconnected', peerPubkey);
 		const openDiedOnDisconnect = (state: ChannelState): string => {
 			const base = `Peer disconnected during channel open (state: ${state})`;
 			if (!cause) return base;
@@ -4832,6 +4850,61 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		);
 	}
 
+	/**
+	 * An undecodable closing_complete or closing_sig for a channel that is
+	 * mid cooperative close. Unlike the other undecodable payloads this one
+	 * does not fail the channel: nothing about the balances is in dispute,
+	 * only the shape of the closing message, and the ERRORED path would
+	 * broadcast our commitment over a disagreement the next reconnect can
+	 * settle (channel_reestablish restarts the close from shutdown). The peer
+	 * gets a BOLT 1 warning scoped to the channel and is disconnected; the
+	 * channel keeps its closing state. The reason this exists is LND 0.21,
+	 * which answers a taproot shutdown with closing_complete carrying its
+	 * partial signatures in TLVs 5 to 7, including even type 6 (issue #1929).
+	 *
+	 * A channel in any other state, an unknown id and another peer's channel
+	 * all take the usual path, with its ownership check.
+	 */
+	private refuseUndecodableClosingMessage(
+		peerPubkey: string,
+		payload: Buffer,
+		name: string,
+		err: unknown
+	): void {
+		const channelId =
+			payload.length >= 32 ? Buffer.from(payload.subarray(0, 32)) : null;
+		const channel = channelId ? this.findChannelByChannelId(channelId) : null;
+		const state = channel?.getState();
+		const owner = channel ? this.findPeerForChannel(channel) : undefined;
+		if (
+			!channel ||
+			!channelId ||
+			(state !== ChannelState.SHUTTING_DOWN &&
+				state !== ChannelState.NEGOTIATING_CLOSING) ||
+			(owner !== undefined && owner !== peerPubkey)
+		) {
+			this.failChannelForUndecodablePayload(peerPubkey, payload, name, err);
+			return;
+		}
+		const detail = err instanceof Error ? err.message : String(err);
+		const reason = `Undecodable ${name}: ${detail}`;
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
+		if (canScopeWireError(channelId)) {
+			actions.unshift({
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.WARNING,
+				payload: encodeErrorMessage({
+					channelId,
+					data: clampWireErrorData(reason)
+				})
+			});
+		}
+		this.processActions(peerPubkey, channel, actions);
+		this.peerManager?.disconnectPeer(peerPubkey);
+	}
+
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
 		let msg: ReturnType<typeof decodeShutdownMessage>;
 		try {
@@ -5668,7 +5741,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		try {
 			msg = decodeClosingCompleteMessage(payload);
 		} catch (err) {
-			this.failChannelForUndecodablePayload(
+			this.refuseUndecodableClosingMessage(
 				peerPubkey,
 				payload,
 				'closing_complete',
@@ -5781,7 +5854,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		try {
 			msg = decodeClosingSigMessage(payload);
 		} catch (err) {
-			this.failChannelForUndecodablePayload(
+			this.refuseUndecodableClosingMessage(
 				peerPubkey,
 				payload,
 				'closing_sig',
@@ -7159,6 +7232,61 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			};
 		}
 		return { ok: true, actions };
+	}
+
+	/**
+	 * Release the splice commitment_signed a composite session held at
+	 * tx_complete (issue #1922), once the node has checked every session of
+	 * the composite negotiated the same transaction.
+	 */
+	releaseCompositeSpliceCommitment(channelId: Buffer): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.releaseCompositeSpliceCommitment();
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
+	}
+
+	/**
+	 * Forget a channel's in-flight splice whose tx_signatures never left this
+	 * side, owing the peer a tx_abort (issue #1922): the restore path of a
+	 * composite that ended before RELEASED. The channel refuses once its
+	 * signatures are out.
+	 */
+	forgetUnsentSplice(channelId: Buffer, reason: string): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.forgetUnsentSplice(reason);
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
 	}
 
 	/**
@@ -9209,14 +9337,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		this.emit('channel:errored', channelId, reason);
 	}
 
-	private handleWarningMsg(_peerPubkey: string, payload: Buffer): void {
+	private handleWarningMsg(peerPubkey: string, payload: Buffer): void {
 		// BOLT 1 warning shares the error wire format (channel_id ++ data). A
-		// warning is informational — the peer keeps the connection/channel alive —
-		// but the text is often the only clue to a protocol disagreement (CLN
-		// reports e.g. "Splice feerate_perkw is too low" this way), so surface it.
+		// warning is informational (the peer keeps the connection and channel
+		// alive), but the text is often the only clue to a protocol disagreement
+		// (CLN reports e.g. "Splice feerate_perkw is too low" this way), so
+		// surface it with its sender, and not as an error.
 		const msg = decodeErrorMessage(payload);
-		const warningText = getErrorText(msg);
-		this.emit('error', msg.channelId, `Remote warning: ${warningText}`);
+		const connectionWide = msg.channelId.every((b) => b === 0);
+		this.emit(
+			'peer:warning',
+			peerPubkey,
+			connectionWide ? null : msg.channelId,
+			getErrorText(msg)
+		);
 	}
 
 	private findTempChannel(channelId: Buffer): Channel | undefined {
@@ -10173,6 +10307,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.fundingOutputIndex,
 						action.inputIndices,
 						action.externalInputIndices
+					);
+					break;
+				case ChannelActionType.SPLICE_TX_NEGOTIATED:
+					// A composite session holds its commitment; the node decides
+					// (issue #1922). Nothing left the node, so no persist gate.
+					this.emit(
+						'splice:negotiated',
+						action.channelId,
+						action.compositeId,
+						action.spliceTxid,
+						action.newFundingOutputIndex
 					);
 					break;
 				case ChannelActionType.SPLICE_TX_SIGNATURES_NEEDED:

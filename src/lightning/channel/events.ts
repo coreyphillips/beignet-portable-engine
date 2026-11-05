@@ -36,6 +36,8 @@ export interface ChannelManagerEvents {
 	'channel:restore-ready': (channelId: Buffer) => void;
 	/** A channel completed reestablishment back to NORMAL. Fires on EVERY reconnect, so listeners must gate on durable facts. */
 	'channel:reestablished': (channelId: Buffer) => void;
+	/** The connection to a peer ended; its channels are being marked for reestablish. Emitted before any of them is. */
+	'peer:disconnected': (peerPubkey: string) => void;
 	/** The real short channel id was assigned once the funding reached announcement depth. */
 	'channel:scid-assigned': (channelId: Buffer, shortChannelId: Buffer) => void;
 	/** A caller-driven v2 open owes its tx_signatures. */
@@ -52,6 +54,12 @@ export interface ChannelManagerEvents {
 		spliceTxid: Buffer,
 		newFundingOutputIndex: number,
 		externalInputIndices: number[]
+	) => void;
+	'splice:negotiated': (
+		channelId: Buffer,
+		compositeId: Buffer,
+		spliceTxid: Buffer,
+		newFundingOutputIndex: number
 	) => void;
 	/** A restored v2 open was rolled back or refused. */
 	'channel:v2-open-disposed': (
@@ -280,6 +288,16 @@ export interface ChannelManagerEvents {
 		peerPubkey: string,
 		type: MessageType,
 		payload: Buffer
+	) => void;
+	/**
+	 * A peer sent a BOLT 1 warning. The connection and every channel stay as
+	 * they were. `channelId` is null when the warning is about the connection
+	 * (the all-zero id); `text` is the peer's text as printable ASCII.
+	 */
+	'peer:warning': (
+		peerPubkey: string,
+		channelId: Buffer | null,
+		text: string
 	) => void;
 	/**
 	 * A channel-level or protocol error. Node's EventEmitter throws on an

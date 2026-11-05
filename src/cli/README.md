@@ -170,7 +170,7 @@ await node.destroy();
 | `guardianToken?` | `string` | Bearer token every guardian session must present; absent runs open. |
 | `guardianMaxBytesPerSet?` | `number` | Disk one served set may occupy before writes are refused (256 MiB). |
 | `guardianMaxSets?` | `number` | Sets this node will register (default 16). |
-| `guardianMaxCiphertextBytes?` | `number` | Advertised per-record ciphertext limit (default 4 MiB). |
+| `guardianMaxCiphertextBytes?` | `number` | Advertised per-record ciphertext limit (default 4 MiB, which is also the least a node accepts from a guardian). |
 | `storageEncryption?` | `boolean` | Encrypt the SQLite database at rest with a key derived from the wallet seed (default true). An existing plaintext database is migrated in place on first open; restoring a backup requires the same mnemonic. Set false to keep storage in plaintext. |
 | `peerStorageEnabled?` | `boolean` | BOLT 1 peer storage (default true): push our seed-encrypted static channel backup to connected peers that advertise option_provide_storage, store one small blob per channel/trusted peer in return, and keep the newest valid SCB peers hand back on reconnect (see getPeerRetrievedBackup). Recovery stays explicit via restoreFromScb. |
 | `autoRebalance?` | `object` | Automatic circular rebalancing (default DISABLED). When enabled the node periodically executes the advisor's rebalance plan, spending at most budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true. Each run is an executeRebalances call, so drain mode and dailySpendLimitSats hold it as they hold a manual one. |
@@ -237,6 +237,7 @@ The signatures name three of those IDs: `ChannelIdHex` and `PaymentHashHex` (32 
 | `connectPeer(pubkey, host, port)` | `Promise<PeerInfo>` | Connect to Lightning peer. Times out after `connectTimeoutMs` (default 15s). |
 | `disconnectPeer(pubkey)` | `void` | Disconnect peer |
 | `listPeers()` | `PeerInfo[]` | List connected peers |
+| `getPeerAddress(pubkey)` | `Pick<PeerInfo, 'host' \| 'port' \| 'transport'> \| undefined` | The address this node last dialed the peer at, if it ever did, in this run or, from the persisted peer addresses, an earlier one. A peer that only ever connected inbound has none: `listPeers()` then shows its socket's ephemeral source port |
 
 #### DNS Bootstrap (BOLT 10)
 
@@ -265,6 +266,11 @@ The signatures name three of those IDs: `ChannelIdHex` and `PaymentHashHex` (32 
 | `forceCloseChannel(channelId, acceptStaleStateRisk?)` | `{ ok, error?, commitmentTxid? }` | Force close; the sweep pays the wallet's change chain, never a handed-out receive address. A capsule-restored channel needs `acceptStaleStateRisk: true` |
 | `spliceIn(channelId, amountSats, feerate)` | `SpliceResult` | Add funds to existing channel |
 | `spliceOut(channelId, amountSats, feerate, destinationAddress?)` | `SpliceResult` | Withdraw funds from channel, to the wallet or an external address. An address-targeted splice-out counts amount + fee against `maxPaymentSats` and `dailySpendLimitSats` |
+| `quoteChannelSend(address, amountSats, feeratePerkw)` | `Promise<ChannelSendQuote>` | Quote paying an address out of the channels (issue #1922): one channel when its splice-out bound covers amount + fee (the largest spendable balance), else one transaction out of several channels, debited largest first with the fee split in proportion. Amount + fee is checked against `maxPaymentSats` and `dailySpendLimitSats`. Nothing moves; the quote lasts two minutes |
+| `executeChannelSend(quoteId)` | `Promise<ChannelSendStatus>` | Run a quote: a single-channel splice-out (records amount + fee at once) or a composite (reserves amount + fee, charges it at RELEASED, releases it at ABORTED). The same quote id returns the first execution |
+| `getChannelSend(id)` | `ChannelSendStatus \| null` | A channel send by quote id, or a composite by record id |
+| `listChannelSends()` | `ChannelSendStatus[]` | Every channel send this node executed, plus composites it holds without a quote |
+| `abortChannelSend(id, reason?)` | `ChannelSendStatus` | Abort a composite before its signatures are released and return its status; refused past RELEASED and for a single-channel send |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
 | `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
@@ -393,6 +399,11 @@ Entries survive a restart. The queue dispatches the restored ones once some chan
 | `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
 | `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats`. The fee counts against `dailySpendLimitSats` |
 | `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day). The fees count against `dailySpendLimitSats` |
+| `listPrimaries()` | `PrimariesInfo` | The ranked receive primaries (issue #1922): each one's `rank`, address, `thresholdSat`, `balanceSat` (our local balance summed over our usable channels with it), `channelCount`, `belowThreshold`, `isReceiveTarget` and `selectionOrder`, plus `fillThresholdSat` and `receiveTarget`. The target is the first primary in rank order below the threshold; when every one is at or above it, the lowest balance, ties to the higher rank. `createJitInvoice`, `getJitQuote`, `createDirectFundingRequest` and the `/receive/*` routes walk `selectionOrder` when the caller names no peer |
+| `addPrimary({ pubkey, host?, port?, uri?, rank? })` | `PrimariesInfo` | Add a primary at `rank` (1-based, default last), reached by `host`/`port` or by a `uri` (`pubkey@address`, ws://, wss:// and iroh: included). Refuses a malformed pubkey, a duplicate, a bad port, a host without a port, an out-of-range rank or a 33rd entry with `INVALID_PARAMS`. Persisted |
+| `removePrimary(pubkey)` | `PrimariesInfo` | Drop a primary (`INVALID_PARAMS` when it is not one). Its channels are left as they are. Persisted |
+| `reorderPrimaries(pubkeys)` | `PrimariesInfo` | Re-rank: `pubkeys` names every primary once, highest rank first (`INVALID_PARAMS` otherwise). Persisted |
+| `setPrimariesFillThreshold(sats \| null)` | `PrimariesInfo` | Sats of local balance a primary is filled to before receives move on; `null` for no cap. A negative or fractional value is `INVALID_PARAMS`. Persisted |
 
 Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
@@ -957,14 +968,17 @@ The table is generated from `BeignetNodeEvents` by `npm run docs:tables`. The SS
 | `channel:voided` | `(data: { channelId: ChannelIdHex })` | no | The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. |
 | `splice:complete` | `(data: { channelId: ChannelIdHex; fundingTxid?: TxidHex })` | yes | splice_locked exchanged both ways: the channel runs on the new funding (fundingTxid, display order). |
 | `splice:aborted` | `(data: { channelId: ChannelIdHex; reason: string })` | yes | A splice negotiation was unwound by tx_abort before its point of no return. |
+| `channel-send:stage` | `(data: { id: string; compositeId?: string; stage: ChannelSendStage; txid?: TxidHex; reason?: string })` | yes | A channel send (issue #1922) reached a stage: a single-channel splice-out is STARTED, then LOCKED or ABORTED as its channel's splice completes or aborts; a composite reports its record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason), every stage from PLANNED on. `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the new funding transaction, for a composite from COMMITTED on. |
 | `splice:conflicted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex; inputIndex: number; height: number })` | yes | An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). |
 | `splice:reverted` | `(data: { channelId: ChannelIdHex; spliceTxid: TxidHex; conflictTxid: TxidHex })` | yes | Both sides verified the conflict on their own chain view and returned to the pre-splice funding; the channel is NORMAL on the old outpoint (issue #760). |
 | `htlc:forwarded` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountInMsat: string; amountOutMsat: string; feeMsat: string })` | `htlcEvents` | A forward through this node settled and earned feeMsat. Msat values are decimal strings. |
+| `htlc:forward-refused` | `(data: { inChannelId: ChannelIdHex; outChannelId: ChannelIdHex; amountMsat: string; paymentHash: PaymentHashHex; reason: string; channelErrorCode?: ChannelErrorCode })` | yes | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. |
 | `htlc:fulfilled` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `htlc:failed` | `(data: { channelId: ChannelIdHex; htlcId: string })` | `htlcEvents` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `peer:connect` | `(data: { pubkey: string })` | yes | A peer connected. |
 | `peer:disconnect` | `(data: { pubkey: string; closedBy?: 'peer' \| 'us'; reason?: string; direction?: 'inbound' \| 'outbound'; uptimeMs?: number })` | yes | A peer disconnected. When the transport knows the cause, `closedBy` says which side closed the connection, `reason` gives the transport or protocol error behind it (for example 'read ECONNRESET' or 'Pong timeout'), `direction` says who dialed, and `uptimeMs` how long it was up. A disconnect with no known cause carries only `pubkey`. |
 | `peer:error` | `(data: { pubkey: string; message: string })` | no | A peer connection reported an error. |
+| `peer:warning` | `(data: { pubkey: string; channelId: ChannelIdHex \| null; text: string })` | yes | A peer sent a BOLT 1 warning: the connection and its channels stay as they were, so it is not a `node:error`. channelId is null when the warning is about the connection rather than one channel; text is the peer's text as printable ASCII. |
 | `node:error` | `(data: { code: string; message: string; timestamp: number; channelId?: ChannelIdHex; txid?: TxidHex; retained?: boolean; channelErrorCode?: ChannelErrorCode })` | yes | An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. |
 | `node:ready` | `()` | yes | The node is fully operational: peers reconnected and channels restored. |
 | `graph:restored` | `(stats: IGraphRestoreStats)` | no | A deferred restore of the stored network map (deferGraphRestore) ended: how it went, as getGraphRestoreStats() returns it. An inline restore ends inside create(), before anyone can listen, so it is read from the getter instead. |
@@ -1505,6 +1519,7 @@ not repeat a 4xx unchanged.
 | `JIT_REFUSED` | Invoices | 400 | JIT receive: the LSP declined the intent, quoted above the wallet's ceiling, or answered with no intercept scid; the message carries the reason |
 | `SWAP_NOT_CANCELLABLE` | Swaps | 409 | Reverse swap provider: the swap is past CREATED/HELD, so it resolves on chain by claim or refund and cannot be cancelled |
 | `JIT_TIMEOUT` | Invoices | 504 | JIT receive: the LSP never answered the intent inside the ack window (retryable) |
+| `NO_PRIMARY_AVAILABLE` | Invoices | 503 | A receive that named no peer walked the ranked primaries and none took it: unreachable, timed out, declined, or not reached inside the budget; the message names each one's reason (retryable) |
 | `CONNECT_FAILED` | Peers | 502 | Dialing the peer failed |
 | `CONNECT_TIMEOUT` | Peers | 504 | The peer did not answer the dial in time |
 | `NODE_DESTROYED` | Node | 409 | Operation on destroyed node |
@@ -1615,6 +1630,8 @@ Node faults are still deliberately untyped, so they keep scrubbing to a generic 
 #### Splice Refusals
 
 A splice starts asynchronously, so a refusal is **returned**, not thrown: `spliceIn`/`spliceOut` answer `{ ok: false, error, code }`. The daemon converts that code at the route boundary, so `POST /channel/splice-in` and `POST /channel/splice-out` answer a refused splice as a failure envelope, never a 200 carrying `ok: false` under `result`.
+
+A channel send (issue #1922) pays an address out of the channels in two calls. `quoteChannelSend(address, amountSats, feeratePerkw)` returns a plan: `single`, naming the channel with the largest spendable balance whose splice-out bound covers amount + fee, or `composite`, one transaction out of several channels (debited largest spendable balance first, the fee split in proportion to each debit, rounded up per channel), with each channel's debit, fee share and new capacity, the channels left out and why, and a `quoteId` that lasts two minutes. Amount + fee is checked against `maxPaymentSats` and `dailySpendLimitSats` at quote and again at execute, where a composite is planned again on the current balances so the fee the ledger counts is the one priced then. `executeChannelSend(quoteId)` runs it: a single-channel send is a `spliceOut` and records amount + fee at once; a composite reserves amount + fee in the pending budget, charges it when the node's signatures are released (the point past which the money leaves) and releases it if the composite aborts first, so a composite that never releases costs nothing of the day's budget. Executing the same quote id again returns the first execution and runs nothing, also while the first is still starting, and `POST /channel-send/execute` is idempotent on top of that. `getChannelSend(id)` and `listChannelSends()` report the stage (a single is `STARTED`, then `LOCKED` or `ABORTED` as its channel's splice completes or aborts; a composite reports its record's stage) and the record, and keep a finished send for seven days, as the engine keeps its records; `abortChannelSend(id)` unwinds a composite before its release. The stages arrive on `channel-send:stage`. A node whose storage lacks the `compositeSplices` capability group, or that runs without the recovery journal, answers `NOT_PERSISTED` to a composite quote. See [docs/MULTI-CHANNEL-SPLICE-OUT.md](../../docs/MULTI-CHANNEL-SPLICE-OUT.md).
 
 | `SpliceRefusalCode` | Reaches the caller as | HTTP |
 |---|---|---|
@@ -1863,6 +1880,40 @@ usable channel, so it is also what makes an inbound zero-conf open acceptable.
 An acceptor that does not carry the opener refuses a zero_conf open outright
 rather than downgrading it to a confirmed one, which is why a wallet receiving
 through a JIT LSP has to carry that LSP here.
+
+### Receive primaries
+
+```bash
+beignet primaries add <pubkey> --host 10.0.0.2 --port 9735 [--rank 1]
+beignet primaries add <pubkey> --uri '<pubkey>@iroh:<endpoint-id>'
+beignet primaries threshold 1000000          # or: none
+beignet primaries reorder <pubkeyB> <pubkeyA>
+beignet primaries remove <pubkey>
+beignet primaries list
+# {"ok":true,"result":{"fillThresholdSat":1000000,"receiveTarget":"02ab...","primaries":[{"pubkey":"02ab...","rank":1,"balanceSat":400000,"isReceiveTarget":true,...}]}}
+```
+
+The list and the threshold are saved in the wallet database and survive a
+restart. A receive that names no peer is steered by them: `invoice jit` and
+`jit quote` without an LSP, and `GET /receive/quote` without a `peer`, walk
+the primaries in `selectionOrder`, dial one that is not connected by its
+stored address (JIT only), and pass over one that is unreachable, times out,
+declines or quotes above the fee ceilings, under one 18 s budget for the
+whole walk. The answer names the primary that took it in `lspPubkey` (or
+`peer`) and lists the others in `skipped`; 503 `NO_PRIMARY_AVAILABLE` names
+every reason when none took it, and 400 `INVALID_PARAMS` answers when no
+primary is configured. A call that names its peer never falls back.
+
+A direct-funding request is bound to the peer it is minted for: `POST
+/direct-funding/request` without `lspPubkey` binds to the first primary in
+`selectionOrder` with a known address, with `lspPubkey` binds to that peer when
+it is a configured primary or the policy's liquidity peer (400 `INVALID_PARAMS`
+for any other, since the route runs at invoice scope), and an automatic offline
+receive that falls back to direct funding binds to the peer its quote named. The envelope's
+relay descriptors name that peer and the receiver negotiates the funding with
+it when the offer arrives, whatever the direct-funding policy's liquidity peer
+is by then. Nothing is dialed for a mint: the payer reaches this node through
+that primary's relay later.
 
 ### Channels
 
@@ -2126,7 +2177,10 @@ a `mode` and `POST /receive/invoice` with a matching `kind`: `bolt11` when a
 channel that already exists with that peer can carry the payment offline, and
 `direct-funding` otherwise, which returns a direct-funding `request` instead of
 an invoice. Automatic receiving never opens a channel to obtain inbound
-liquidity. See
+liquidity. A quote with no `peer` is steered through the ranked primaries, and
+a create with no `peer` binds to the one its reviewed quote named. A
+direct-funding request is bound to the peer it was quoted at, whatever the
+direct-funding policy names. See
 [automatic receiving](../../docs/AUTOMATIC-OFFLINE-RECEIVE.md#daemon-api) for
 the durable invoice preparation and reconciliation API.
 
@@ -2447,7 +2501,7 @@ that matters.
 
 The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemonHost`/`daemonPort`). All POST endpoints accept JSON bodies. HTTPS is supported when started with `--tls-cert` and `--tls-key`. A malformed request (an unparseable request target, or a `Host` header that is not a valid host) answers `400 INVALID_PARAMS` and never terminates the process; `beignet start` also logs any unhandled rejection or uncaught exception with its stack and keeps running.
 
-These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. A thrown error is not cached, so a keyed retry after one runs again, with one exception: a keyed `/offer/pay` or `/keysend` that answered `PAYMENT_TIMEOUT` is remembered by its payment hash, because a rerun would pay under a fresh hash (a new invoice, a new preimage) and could pay twice (issues #1094, #1133). A retry of it answers `200` with the payment once it completed, `409 DUPLICATE_PAYMENT` carrying `paymentHash` while an HTLC for it can still settle, and runs again only once nothing sent for it can. Any other `POST` that carries the header answers `400 INVALID_PARAMS` without running. The cache is in memory, so it does not survive a daemon restart, except for these payment hashes: a keyed `/offer/pay` or `/keysend` stores its hash before the HTLC goes out and keeps it after a `PAYMENT_TIMEOUT`, so a retry after a restart or a crash is answered the same way (issues #1132, #1153). A hash that cannot be stored refuses the payment with `503 NOT_PERSISTED`, and nothing is sent.
+These endpoints support the `X-Idempotency-Key` header (24h cache): `/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`, `/l402/fetch`, `/rebalance`, `/advisor/execute-rebalances`, `/direct-funding/send`, `/send`, `/send-max`, `/offer/pay`, `/channel/splice-out`, `/channel-send/execute`, `/channel/open`, `/channel/open-v2`, `/channel/open-zeroconf`, `/channel/connect-and-open`. A repeat with the same key and body returns the cached response; the same key with a different body returns `409 IDEMPOTENCY_CONFLICT`. A thrown error is not cached, so a keyed retry after one runs again, with one exception: a keyed `/offer/pay` or `/keysend` that answered `PAYMENT_TIMEOUT` is remembered by its payment hash, because a rerun would pay under a fresh hash (a new invoice, a new preimage) and could pay twice (issues #1094, #1133). A retry of it answers `200` with the payment once it completed, `409 DUPLICATE_PAYMENT` carrying `paymentHash` while an HTLC for it can still settle, and runs again only once nothing sent for it can. Any other `POST` that carries the header answers `400 INVALID_PARAMS` without running. The cache is in memory, so it does not survive a daemon restart, except for these payment hashes: a keyed `/offer/pay` or `/keysend` stores its hash before the HTLC goes out and keeps it after a `PAYMENT_TIMEOUT`, so a retry after a restart or a crash is answered the same way (issues #1132, #1153). A hash that cannot be stored refuses the payment with `503 NOT_PERSISTED`, and nothing is sent.
 
 ### Authentication
 
@@ -2564,19 +2618,29 @@ The matching commands are `wallet sweep-prepare <requestJson|requestFile>`, `wal
 | POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds. A 2xx means the splice started; a refusal is a failure envelope (404 `CHANNEL_NOT_FOUND`, 409 `SPLICING_NOT_NEGOTIATED` / `FUNDING_PROVIDER_REQUIRED` / `SPLICE_REFUSED`, 503 `SPLICE_BUSY`, 400 `INVALID_PARAMS`) |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw, address? }` | Splice-out funds, optionally to an external address. Same refusal codes, plus 409 `INSUFFICIENT_BALANCE` |
+| POST | `/channel-send/quote` | `{ address, amountSats, feeratePerkw }` | Quote paying an address out of one channel or several in one transaction (issue #1922). 403 `SPENDING_LIMIT_EXCEEDED`, 409 `INSUFFICIENT_BALANCE` or `SPLICE_REFUSED` (with each channel's reason), 503 `SPLICE_BUSY` or `NOT_PERSISTED` |
+| POST | `/channel-send/execute` | `{ quoteId }` | Run a channel send quote; idempotent on the quote id. 404 `NOT_FOUND` for an unknown or consumed quote, 400 for an expired one |
+| GET | `/channel-send/status` | `?id=` | Stage and record of a channel send (quote id or composite id) |
+| GET | `/channel-send/list` | | Every channel send this node holds |
+| POST | `/channel-send/abort` | `{ id, reason? }` | Abort a composite before release. 409 `SPLICE_REFUSED` past RELEASED or for a single-channel send |
 | POST | `/invoice/create` | `{ amountSats?, description?, minFinalCltvExpiry? }` | Create invoice (omit amountSats for amount-less; `minFinalCltvExpiry` buys final-CLTV headroom for a receive an LSP may settle through a splice) |
-| POST | `/jit/invoice` | `{ lspPubkey, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `flatFeeSat` and `feePpm` |
+| POST | `/jit/invoice` | `{ lspPubkey?, amountSats?, description?, expirySecs?, targetRemainingInboundSat?, maxFlatFeeSat?, maxFeePpm? }` | Create an invoice payable with no channel: registers a receive intent with the LSP, which funds a channel mid-payment and deducts the quoted opening fee. Returns the invoice plus `lspPubkey`, `flatFeeSat` and `feePpm`. No `lspPubkey`: steered through `/primaries` in `selectionOrder`, with the passed-over ones in `skipped` (503 `NO_PRIMARY_AVAILABLE` when none takes it) |
 | GET | `/jit/status` | -- | The JIT receive role as it stands: `enabled`, the client ceilings, and (when on) `lsp` with the opening fee, the exposure caps, sats reserved and fronted, live intents, held HTLCs and fundings in flight. Readonly scope |
-| GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). Readonly scope |
+| GET | `/jit/quote` | `?lspPubkey=&amountSats=&targetRemainingInboundSat=` | Price a JIT receive at that LSP without registering an intent: `accepted`, a plain-language `reason` when declined, `flatFeeSat`, `feePpm`, `feeSats` on this amount, `fundingSats` the LSP would front, `maxClientFundingSats`, and `withinCeilings` against this node's own limits. The LSP must be connected (409 `PEER_NOT_CONNECTED`, 504 `JIT_TIMEOUT`). No `lspPubkey`: priced at the first ranked primary that would serve it, named in `lspPubkey`, the others in `skipped`. Readonly scope |
 | GET | `/swaps/status` | -- | Swap provider (issues #737 and #743): `enabled`, and when on the fee terms, exposure caps, timing, reverse swaps per state and `exposedSat` at risk on chain; `submarine` reports the on-chain to Lightning direction the same way (`enabled: false` when it is off). Readonly scope |
 | GET | `/swaps` | `?id=<hex>` | The swap ledger (or one swap) in both directions (`direction` is `reverse` or `submarine`): state, contract terms, funding, payment, claim, refund and resolution facts; amounts as decimal strings, no private key. Readonly scope |
 | POST | `/swaps/cancel` | `{ id }` | Cancel a swap before any funds moved: a reverse swap in CREATED or HELD (closes its hold invoice), a submarine swap before PAYING (the peer refunds its own coins at the refund height). Also ends a stranded reverse swap: EXPOSED, with `strandedHeight` set because this process found its funding absent past the refund height; the operator vouches the funding will not confirm, and spending its inputs makes sure. Answers `{ id, cancelled: true }`; past that a swap resolves on chain by claim or refund (409 `SWAP_NOT_CANCELLABLE`). Admin scope |
 | POST | `/direct-funding/configure` | `{ lspPubkey?, lspHost?, lspPort?, targetInboundSat?, trusted?, allowSplice?, allowUnpairedSplice?, unpairedSpliceDepth?, minAmountSat? }` | Set the direct-funding policy. A partial MERGE, never a replace: a field the body does not name keeps its value. `trusted` lets an open go zero-conf; `allowSplice` lets a paired payer grow the existing channel with the liquidity peer instead of opening a second one; `allowUnpairedSplice` lets an anonymous payer do the same when its coin is confirmed, with a splice that locks at `unpairedSpliceDepth` confirmations (1..2016, default 3) rather than at broadcast, whatever the channel type (an anonymous payer with an unconfirmed coin still gets a new confirmed channel). While a splice with the liquidity peer is still confirming, every further offer is declined before the payer's witness leaves, so the payer falls back to a plain send. The three switches must be booleans (400 `INVALID_PARAMS` otherwise). `minAmountSat` clamps up to the 5000 sat floor and the response reports the clamped value. Returns the full effective config |
-| GET | `/direct-funding/config` | -- | Read the effective policy, `allowUnpairedSplice` and `unpairedSpliceDepth` included; `lspPubkey` is null when no liquidity peer is set, in which case no offer is served |
+| GET | `/direct-funding/config` | -- | Read the effective policy, `allowUnpairedSplice` and `unpairedSpliceDepth` included; `lspPubkey` is null when no liquidity peer is set, in which case a request that bound no peer of its own is not served |
 | GET | `/direct-funding/received` | -- | The payments received against our requests, newest first: `receiptHash` (the request's `paymentHash`), `requestId`, `offerId`, `fundingTxid`, `channelId`, `splice`, `amountSat`, `status` (`PAID`, or `REVERTED` when the splice it went into was undone), `paidAt`, and `lockedAt` once this node saw the funding lock (channel_ready for an open, splice_locked for a splice, both sent and received; issue #1899). `lockedAt` stays after the channel closes; for a lock from before this version it is the first start that recorded it, and on a zero-conf channel it comes before the funding confirms. A direct-funding payment settles no invoice and pays no address, so this is how a client tells its request was paid. Kept 30 days from the payment (or its lock or revert), at most 512, outliving the request itself. Readonly scope |
-| POST | `/direct-funding/request` | `{ host?, port?, amountSats? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given |
+| POST | `/direct-funding/request` | `{ host?, port?, amountSats?, lspPubkey? }` | Mint a payment request: returns `{ paymentHash, expiresAt, request, lspPubkey, skipped? }`, where `request` is the base64url envelope a payer pays (BIP 21 parameter `bgnq`). `host`/`port` are the address a payer can reach this node on and are used exactly as given. `lspPubkey` binds the request to that peer (issue #1922), which must be a configured primary or the policy's liquidity peer (400 `INVALID_PARAMS` otherwise: this route runs at invoice scope, and that peer holds every payment the channel receives): its relay descriptors name it and the receiver negotiates the funding with it when the offer arrives, whatever the policy says by then. Omitted, the ranked primaries choose when any are configured: the first in `selectionOrder` with a known address (stored with the primary, or the TCP address this node dialed it at) is bound, the others are listed in `skipped`, and 503 `NO_PRIMARY_AVAILABLE` answers when none has one. Nothing is dialed. With no primaries the policy's liquidity peer serves, as before. Invoice scope |
 | POST | `/direct-funding/prepare` | `{ request }` | Decode a request and start connecting to the node a send would talk to first, without waiting for the dial. Returns `{ requestId, receiverNodeId, amountSat, expiresAt, connection, peerNodeId? }`, where `connection` is `connected`, `connecting`, `awaiting_receiver` or `none`. Spends nothing and writes no payment record; a later `send` joins a dial still in progress. Admin scope |
 | POST | `/direct-funding/send` | `{ request, amountSats?, maxTotalFeeSat?, recoverReceipt? }` | Pay a request from one of our coins. Set `recoverReceipt` to ask the receiver to replay a receipt that never arrived (issue #767): it acts only on a post-witness payment with no receipt yet, re-sends the recorded offer with no second coin, signature or freeze, and returns the recorded outcome plus a `caveat` if the receiver cannot be reached. **Rejects only before our witness leaves the device**; after that it resolves with what is known plus a `caveat`, because a client that falls back to a plain on-chain send on any error cannot tell a late rejection from an early one and would pay twice. Idempotent on the request id, sets no deadline of its own, and accepts `feeHeadroomSats` as an alias for `maxTotalFeeSat`. The money leaves for a stranger's channel, so amount + fee ceiling counts against the combined daily spend limit, and a draining node refuses it (both before the exchange opens, and neither for a request that already has an attempt: a duplicate call spends nothing new, and refusing one would be read as "nothing happened") |
+| GET | `/primaries` | -- | The ranked receive primaries with their balances and the current receive target, as `listPrimaries` returns them. Readonly scope |
+| POST | `/primaries/add` | `{ pubkey, host?, port?, uri?, rank? }` | Add a primary (400 `INVALID_PARAMS` on a malformed pubkey, a duplicate, a bad port or rank). Returns the whole list. Admin scope |
+| POST | `/primaries/remove` | `{ pubkey }` | Drop a primary. Returns the whole list. Admin scope |
+| POST | `/primaries/reorder` | `{ order }` | Re-rank: `order` names every primary once, highest rank first. Returns the whole list. Admin scope |
+| POST | `/primaries/threshold` | `{ fillThresholdSat }` | Set the fill threshold in sats, `null` for no cap (400 `INVALID_PARAMS` when negative or fractional). Returns the whole list. Admin scope |
 | POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry?, minFinalCltvExpiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel). `minFinalCltvExpiry` is 1..2016 blocks; on a swap leg it has to clear the on-chain refund timeout plus the 18-block hold cancellation margin and the refund's own resolution time |
 | POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
 | POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
@@ -2674,7 +2738,7 @@ The SSE column of the [Events](#events) table lists which events the stream and 
   | `SPLICE_BROADCAST_REFUSED` | The backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason, with the backend's reason in the message | always `true` |
 - The `hold:*` events carry `{paymentHash, state, heldAmountMsat, htlcCount, minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks, cancelHeight}`, plus `reason` (`api` or `expiry-scan`) on `hold:cancelled`. The amount, count and expiry fields describe the set acted on. Terminal events retain these totals even though a subsequent `GET /invoices/held` row has zero parked parts. `hold:accepted` fires once per new MPP part with the running total. Before funding, require `BigInt(heldAmountMsat)` to cover the full expected amount. For an amountless invoice, use the amount agreed with the payer.
 
-Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
+Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default. `htlc:forward-refused` is the exception and is always relayed: it is a forward the outgoing channel refused to add (failed back with `temporary_channel_failure`), which earlier versions reported as a `CHANNEL_ERROR` `node:error` with the same text a refused send of the node's own carries. The daemon also logs it at info as `HTLC forward refused`.
 
 A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
 
@@ -2799,7 +2863,8 @@ tests/cli/
 ## Tests
 
 ```bash
-# Run CLI unit tests (no infrastructure needed)
+# Run CLI unit tests (no infrastructure needed; the spawn tests run dist/cli/cli.js)
+npm run build
 npm run test:cli
 
 # Run daemon/Electrum integration tests (requires Electrum server)
@@ -2808,8 +2873,8 @@ npm run test:integration
 # Run lightning unit tests
 npm run test:lightning
 
-# Run everything
-npm run test:all
+# Run lightning and CLI unit tests at once (builds first)
+npm test
 
 # Interop suites against the Docker nodes. LND_REST_PORT / LND_REST_HOST (and
 # LND_TAPROOT_REST_PORT / LND_TAPROOT_REST_HOST) move the endpoints; a suite

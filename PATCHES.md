@@ -1,6 +1,56 @@
 # Portable fork patch map
 
-Baseline: `23a52a3e9525d7de993e143919930d60f5260dc4` (Beignet 0.36.1, npm's `gitHead` for the release, upstream's version bump #1912). Its `src/` is the same as `94f1a3f0`, the merge of #1911: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` is identical to a clean build of `23a52a3e`. `package.json` records the upstream source version and commit, and the portable build reports `0.36.1-portable`.
+Baseline: `0512b5f6271fd1d56f821abdae14b6e23a4b5878` (Beignet 0.37.0, npm's `gitHead` for the release, upstream's version bump #1964). Its `src/` is the same as `f0c1f03b`, the merge of #1963: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` and `package.json` are identical to a clean build of `0512b5f6`. `package.json` records the upstream source version and commit, and the portable build reports `0.37.0-portable`.
+
+The 0.36.1 to 0.37.0 resync (2026-11-04) keeps the platform patch, with two hunks merged by hand, and adds two events to the diagnostic hook.
+- **Backup.** The tracked 0.36.1 tree at `373b7fd` was archived to `beignet-engine-backup-0.36.1-2026-11-04.tar.gz` at the workspace root first.
+- **The patch before.** Against pristine `23a52a3e` it is 23 entries and 69 hunks, as recorded for 0.36.1.
+- **What upstream changed.** 57 files in `src/` (9,382 added and 404 removed lines), in 20 PRs: #1919, #1923, #1925, #1930, #1932, #1935, #1938, #1939, #1944, #1946 to #1951, #1958 and #1960 to #1963. 13 of the files are new. 11 are among the 22 upstream files the fork patches:
+  - `src/cli/beignet-node.ts`, `cli.ts`, `daemon.ts` and `types.ts`;
+  - `src/lightning/channel/channel-manager.ts` and `channel.ts`;
+  - `src/lightning/direct-funding/receiver/engine.ts` and `receiver/types.ts`;
+  - `src/lightning/node/lightning-node.ts` and `node/types.ts`;
+  - `src/lightning/storage/sqlite-storage.ts`.
+- **The reapply.** `src/` was replaced with pristine `0512b5f6` and the patch reapplied with `patch -p1 -F0`. 67 hunks landed with no fuzz: 47 at an offset and 20 at their recorded lines. The offsets fell in `lightning-node.ts` (18), `beignet-node.ts` (10), `sqlite-storage.ts` (10), `channel-manager.ts` (4), and one each in `cli.ts`, `daemon.ts`, `cli/types.ts`, `channel.ts` and the receiver engine.
+- **Two hunks were rejected, both on context upstream rewrote.** Both carry the fork's nullable liquidity address (a phone's primary may have no TCP address):
+  - In `BeignetNode.configureDirectFunding`, #1932 replaced the inline `lspPubkey` check above the `lspPort` guard with `checkLspPubkey(update.lspPubkey)`. The guard again reads `update.lspPort !== undefined && update.lspPort !== null`, one line below the new call.
+  - In `IDirectFundingPolicy`, #1935 reworded the doc comment above `liquidityPeer`. `liquidityHost` and `liquidityPort` are again `string | null` and `number | null`, under the new comment.
+
+  No other line in either hunk changed.
+- **The patch after.** Recaptured against pristine 0.37.0, it has the same 23 entries and 69 hunks and the same 326 sorted added and removed lines. The resynced `src/` changes the 0.36.1 fork by upstream's own change, line for line (9,382 added and 404 removed lines).
+
+What 0.37.0 changes for this fork:
+- **Peer warnings and refused forwards leave `node:error` (#1961, #1962).** The runtime's diagnostic hook listened to `node:error`, `peer:error`, `peer:connect` and `peer:disconnect`. A peer's BOLT 1 warning used to reach it as CHANNEL_ERROR "Remote warning: ...", and a forward the outgoing channel refused as CHANNEL_ERROR with the channel's refusal text. 0.37.0 emits those as `peer:warning` (`{ pubkey, channelId: hex | null, text }`) and `htlc:forward-refused` (`{ ..., amountMsat, reason, channelErrorCode? }`). Without a change, Chicory's diagnostic report would lose them. `portable/runtime.ts` now registers both events, and `portable/peer-diagnostics.cjs` words them the way the old text read, with the sender, channel or amount after it:
+  - `Remote warning: <text> (peer <16 hex>, channel <16 hex>)`
+  - `Forward refused: <reason> (<msat> msat)`, with the channel's error code as `code`
+
+  `portable-tests/peer-diagnostics.test.cjs` covers both, including odd payloads.
+- **Ranked receive primaries (#1923, #1932, #1939).** `BeignetNode` keeps an ordered list of primaries and steers a receive that names no peer through it. The portable router exposes no `/primaries` route and nothing in `portable/` adds one, so a phone persists none. A receive that names no peer, such as wallet-core's `POST /direct-funding/request`, therefore goes to the policy's peer, unbound, exactly as before, and one that names its peer (the offline and JIT receives) is unchanged. A multi-path payment now sizes each part to what its path can carry and may use one part per channel. A phone with one home channel sends as before (`regtest-send-max.cjs` passes every case).
+- **Direct-funding requests bind their peer (#1935).** `IDfRequestRecord.liquidityPeer` records the peer a request was minted for, and the receiver negotiates with it (`record.liquidityPeer ?? deps.liquidityPeer()`). A record from 0.36.1 has no bound peer and follows the policy, as before. The change in `receiver/engine.ts` replaces one line between the fork's two `newFundingRefused` fences and adds no await, so both still sit where they did: the first before the concurrency cap, the second after the last await of admission.
+- **Multi-channel splice-out (#1946 to #1951).**
+  - A channel row now keeps its funding transaction's bytes (`fundingTxHex`). Rows that predate the field are filled from the chain, through the wallet's own Electrum connection.
+  - The node advertises `option_composite_splice_inputs` (bit 455, optional) and, as an acceptor, admits a peer's input that spends another channel's 2-of-2 once both of its signatures verify.
+  - The composite engine, its `/channel-send` routes and the CLI live in `BeignetNode` and the daemon. The portable router exposes none of them, so a phone never starts one.
+- **Storage.** The SQLite schema moves from 19 to 20. `composite_splices` is created with the other tables on every SQL.js open, inside the fork's open transaction, and migration 19 to 20 is a no-op. The storage capability probe names `compositeSplices`, which `sqlite-storage.ts` implements, so nothing in `portable/` changes. Going back to the 0.36.1 fork keeps the data:
+  - it opens a schema-20 database, since migrations only run upward;
+  - it ignores the table and drops `fundingTxHex` on a row's next write.
+
+  A guardian restore of a channel whose recovery frame carries one of our adds in flight needs 0.37.0, because such a frame is written as version 4 (#1963).
+- **Guardians (#1958, #1963).** A guardian advertising a record limit under the 4 MiB floor is now sent nothing, and counts as unreachable for the quorum. Neither the runtime nor the Umbrel app sets a limit, and the host default is that floor, so the phone's guardians are unaffected. Settlement frames move payment labels out of an over-limit delta, and a pending add is journaled without a second copy of its onion.
+- **Not in the bundle.** The direct-funding payer SDK (`src/direct-funding/`, #1925) is not reachable from `portable/runtime.ts`, and the bundle has none of its modules. Taproot no longer advertising simple close (#1930) does not reach a phone, which sets no taproot bit.
+- **Dependencies.** None change: upstream's runtime dependencies are the same as 0.36.1's, and #1933 moves a dev-only package the fork does not have. `npm audit` reports no advisory.
+- **Upstream's suites.** Run in an upstream `0512b5f6` tree with this fork's `src/`:
+  - `test:cli` passes, 2,551 tests.
+  - `test:lightning` runs 10,163 passing and 20 failing. Nineteen are known:
+    - the four `agent-review` tests;
+    - the README tables test, which names this fork's own `irohFactory` option;
+    - the thirteen forwarding and policy tests whose fixtures write SCID aliases behind the private-channel index;
+    - mocha's BigInt reporting error.
+
+    The twentieth, `direct-funding-receiver`'s "falls back to the fixed default when the estimator does not answer in time", is a timing test that passed when its file was run alone (184 passing). `comment-paths` and the second `doc-tables` test, failures in earlier runs, did not fail in this one.
+- **Build.** The bundle grows from 7,361,130 to 7,518,356 bytes, with no esbuild warnings. A full `tsc --noEmit -p .` reports 21 errors, in the same files as the 0.36.1 tree.
+
+Previous baseline: `23a52a3e9525d7de993e143919930d60f5260dc4` (Beignet 0.36.1, npm's `gitHead` for the release, upstream's version bump #1912). Its `src/` is the same as `94f1a3f0`, the merge of #1911: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` is identical to a clean build of `23a52a3e`. `package.json` records the upstream source version and commit, and the portable build reports `0.36.1-portable`.
 
 The 0.36.0 to 0.36.1 resync (2026-10-28) retains the existing platform patch unchanged. The tracked 0.36.0 tree at `b45a559` was archived to `beignet-engine-backup-0.36.0-2026-10-28.tar.gz` at the workspace root first. Its patch against pristine `14cdfbbd` is 23 entries and 69 hunks, as recorded for 0.36.0. Upstream changed one file in `src/`, in two PRs (#1910, #1911): `src/lightning/node/lightning-node.ts`, which the fork patches. `src/` was replaced with pristine `23a52a3e` and the patch reapplied with `patch -p1 -F0`. All 69 hunks landed with no rejection and no fuzz: 6 at an offset, all in `lightning-node.ts`, and the other 63 at their recorded lines. The recaptured patch against pristine 0.36.1 has the same 23 entries and 69 hunks and the same sorted added and removed lines. The resynced tree's change from the 0.36.0 fork is upstream's own change, line for line (35 added and 2 removed lines). Nothing was ported by hand.
 

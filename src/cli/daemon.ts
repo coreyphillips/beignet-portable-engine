@@ -24,7 +24,10 @@ import {
 	parseRecoveryMode,
 	spliceRefusalError
 } from './beignet-node';
-import { parseGuardianEntry } from '../lightning/recovery';
+import {
+	GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
+	parseGuardianEntry
+} from '../lightning/recovery';
 import type { ILogger } from '../logger';
 import { createConsoleLogger } from '../logger';
 import type { BeignetErrorCodeValue } from './errors';
@@ -436,6 +439,9 @@ const STATUS_BY_ERROR_CODE: Partial<Record<BeignetErrorCodeValue, number>> = {
 	JIT_REFUSED: 400,
 	// Our own fence, not the LSP's policy: waiting genuinely changes it.
 	NEW_CHANNELS_REFUSED: 503,
+	// No ranked primary took a steered receive: down, slow or declining
+	// peers, so a later walk can end differently.
+	NO_PRIMARY_AVAILABLE: 503,
 	SWAP_NOT_CANCELLABLE: 409,
 	JIT_TIMEOUT: 504,
 	PAYMENT_FAILED: 502,
@@ -683,8 +689,19 @@ export function getRelayedEvents(
 		'splice:aborted',
 		'splice:conflicted',
 		'splice:reverted',
+		// A channel send (issue #1922): a client that executed a quote watches
+		// its composite through RELEASED, BROADCAST and LOCKED, or learns why it
+		// aborted.
+		'channel-send:stage',
 		'peer:connect',
 		'peer:disconnect',
+		// A peer's BOLT 1 warning, kept off node:error because nothing failed.
+		// Often the only clue to a protocol disagreement with that peer.
+		'peer:warning',
+		// A forward the outgoing channel turned away. Always on, unlike the
+		// other HTLC events: it used to arrive as a node:error, and it is how a
+		// dashboard tells a turned-away forward from a failed send of its own.
+		'htlc:forward-refused',
 		// Every channel failure reason (peer rejection, funding build/broadcast
 		// failure, disconnect mid-open) is reported as node:error. Without it on
 		// this list a failed open is invisible to clients: the pending channel
@@ -1155,24 +1172,28 @@ async function bootDaemon(
 	) {
 		throw new BeignetError('INVALID_PARAMS', 'guardianToken must be a string');
 	}
-	for (const [name, value, max] of [
+	// A hosted guardian below the record floor would be refused by every
+	// node that configures it (issue #1954), so it is a configuration error.
+	for (const [name, value, min, max] of [
 		[
 			'guardianMaxBytesPerSet',
 			opts.guardianMaxBytesPerSet,
+			1,
 			Number.MAX_SAFE_INTEGER
 		],
-		['guardianMaxSets', opts.guardianMaxSets, 65535],
+		['guardianMaxSets', opts.guardianMaxSets, 1, 65535],
 		[
 			'guardianMaxCiphertextBytes',
 			opts.guardianMaxCiphertextBytes,
+			GUARDIAN_RECORD_LIMIT_FLOOR_BYTES,
 			16 * 1024 * 1024
 		]
-	] as Array<[string, number | undefined, number]>) {
+	] as Array<[string, number | undefined, number, number]>) {
 		if (value === undefined) continue;
-		if (!Number.isInteger(value) || value < 1 || value > max) {
+		if (!Number.isInteger(value) || value < min || value > max) {
 			throw new BeignetError(
 				'INVALID_PARAMS',
-				`${name} must be an integer between 1 and ${max}`
+				`${name} must be an integer between ${min} and ${max}`
 			);
 		}
 	}
@@ -2196,7 +2217,8 @@ async function bootDaemon(
 				maxFeePpm?: number;
 				feeMode?: 'skim' | 'hop';
 			};
-			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			// No lspPubkey: steered through the ranked primaries (issue
+			// #1922), 400 INVALID_PARAMS when none is configured.
 			return success(
 				await node.createJitInvoice({
 					lspPubkey,
@@ -2219,8 +2241,9 @@ async function bootDaemon(
 		// The LSP's decline is an answer (accepted false, reason); only the
 		// transport failures are errors.
 		'GET /jit/quote': async (_body, query) => {
-			const lspPubkey = query.get('lspPubkey');
-			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			// No lspPubkey: priced at the first ranked primary that would serve
+			// the receive (issue #1922).
+			const lspPubkey = query.get('lspPubkey') || undefined;
 			return success(
 				await node.getJitQuote({
 					lspPubkey,
@@ -2279,6 +2302,53 @@ async function bootDaemon(
 			);
 		},
 		'GET /direct-funding/config': () => success(node.getDirectFundingConfig()),
+		// ── Ranked receive primaries (issue #1922) ──
+		//
+		// Every write answers with the whole list, balances and receive target
+		// included, the same shape GET /primaries reads.
+		'GET /primaries': () => success(node.listPrimaries()),
+		'POST /primaries/add': (body) => {
+			const {
+				pubkey,
+				host: primaryHost,
+				port: primaryPort,
+				uri,
+				rank
+			} = body as {
+				pubkey?: string;
+				host?: string;
+				port?: number;
+				uri?: string;
+				rank?: number;
+			};
+			return success(
+				node.addPrimary({
+					pubkey: pubkey as string,
+					...(primaryHost !== undefined ? { host: primaryHost } : {}),
+					...(primaryPort !== undefined ? { port: primaryPort } : {}),
+					...(uri !== undefined ? { uri } : {}),
+					...(rank !== undefined ? { rank } : {})
+				})
+			);
+		},
+		'POST /primaries/remove': (body) =>
+			success(
+				node.removePrimary((body as { pubkey?: string }).pubkey as string)
+			),
+		'POST /primaries/reorder': (body) =>
+			success(
+				node.reorderPrimaries((body as { order?: string[] }).order as string[])
+			),
+		'POST /primaries/threshold': (body) => {
+			const { fillThresholdSat } = body as { fillThresholdSat?: number | null };
+			if (fillThresholdSat === undefined) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					'fillThresholdSat is required (null for no cap)'
+				);
+			}
+			return success(node.setPrimariesFillThreshold(fillThresholdSat));
+		},
 		// What tells a client its request was paid: a direct-funding payment
 		// settles no invoice and pays no address (issue #1893).
 		'GET /direct-funding/received': () =>
@@ -2290,21 +2360,28 @@ async function bootDaemon(
 		// host and port come from the CALLER and are passed through untouched:
 		// the dashboard sends the browser's own hostname and the app's manager
 		// sends PUBLIC_HOST, and the daemon has no way to know which is right.
+		//
+		// lspPubkey binds the request to that peer (issue #1922); omitted, the
+		// ranked primaries choose when any are configured, else the policy's
+		// liquidity peer serves as before.
 		'POST /direct-funding/request': (body) => {
 			const {
 				host: dfHost,
 				port: dfPort,
-				amountSats
+				amountSats,
+				lspPubkey
 			} = body as {
 				host?: string;
 				port?: number;
 				amountSats?: number;
+				lspPubkey?: string;
 			};
 			return success(
 				node.createDirectFundingRequest({
 					...(dfHost !== undefined ? { host: dfHost } : {}),
 					...(dfPort !== undefined ? { port: dfPort } : {}),
-					...(amountSats !== undefined ? { amountSats } : {})
+					...(amountSats !== undefined ? { amountSats } : {}),
+					...(lspPubkey !== undefined ? { lspPubkey } : {})
 				})
 			);
 		},
@@ -2921,6 +2998,42 @@ async function bootDaemon(
 				node.spliceOut(channelId, amountSats, feeratePerkw, address)
 			);
 		},
+		// Channel send (issue #1922): pay an address out of one channel or
+		// several channels in one transaction. Refusals are thrown as
+		// BeignetErrors by the node, so they answer as failure envelopes.
+		'POST /channel-send/quote': async (body) => {
+			const { address, amountSats, feeratePerkw } = body as {
+				address?: string;
+				amountSats?: number;
+				feeratePerkw?: number;
+			};
+			if (!address || amountSats === undefined || feeratePerkw === undefined)
+				return failure(
+					'INVALID_PARAMS',
+					'address, amountSats and feeratePerkw required'
+				);
+			return success(
+				await node.quoteChannelSend(address, amountSats, feeratePerkw)
+			);
+		},
+		'POST /channel-send/execute': async (body) => {
+			const { quoteId } = body as { quoteId?: string };
+			if (!quoteId) return failure('INVALID_PARAMS', 'quoteId required');
+			return success(await node.executeChannelSend(quoteId));
+		},
+		'GET /channel-send/status': (body, query) => {
+			const id = query.get('id') || (body as { id?: string }).id;
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			const status = node.getChannelSend(id);
+			if (!status) return failure('NOT_FOUND', 'Channel send not found');
+			return success(status);
+		},
+		'GET /channel-send/list': () => success(node.listChannelSends()),
+		'POST /channel-send/abort': (body) => {
+			const { id, reason } = body as { id?: string; reason?: string };
+			if (!id) return failure('INVALID_PARAMS', 'id required');
+			return success(node.abortChannelSend(id, reason));
+		},
 
 		// ── Wait APIs ──
 		'POST /node/wait-ready': async (body) => {
@@ -3251,16 +3364,16 @@ async function bootDaemon(
 		'GET /receive/status': () => success(node.getOfflineReceive().status()),
 		'GET /receive/quote': async (_body, query) =>
 			success(
-				await node
-					.getOfflineReceive()
-					.quote(
-						query.get('peer') || '',
-						Number(query.get('amountSats')),
-						query.get('requestId') ?? undefined
-					)
+				await node.getOfflineReceive().quote(
+					// No peer: the ranked primaries choose (issue #1922).
+					query.get('peer') || undefined,
+					Number(query.get('amountSats')),
+					query.get('requestId') ?? undefined
+				)
 			),
 		'POST /receive/invoice': async (body) => {
-			const b = body as { peer: string };
+			// No peer: the one the reviewed quote named (issue #1922).
+			const b = body as { peer?: string };
 			return success(await node.getOfflineReceive().create(body, b.peer));
 		},
 		'GET /ffor/epochs': () => success(node.fforEpochs()),
