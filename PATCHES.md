@@ -1,6 +1,38 @@
 # Portable fork patch map
 
-Baseline: `0512b5f6271fd1d56f821abdae14b6e23a4b5878` (Beignet 0.37.0, npm's `gitHead` for the release, upstream's version bump #1964). Its `src/` is the same as `f0c1f03b`, the merge of #1963: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` and `package.json` are identical to a clean build of `0512b5f6`. `package.json` records the upstream source version and commit, and the portable build reports `0.37.0-portable`.
+Baseline: `954d034b13f57b38297406dd0d30dddc1208b192` (Beignet 0.38.0, npm's `gitHead` for the release, upstream's version bump #1968). Its `src/` is the same as `c1288be0`, the commit of #1967: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` and `package.json` are identical to a clean build of `954d034b`. `package.json` records the upstream source version and commit, and the portable build reports `0.38.0-portable`.
+
+The 0.37.0 to 0.38.0 resync (2026-11-05) keeps the platform patch unchanged. Nothing was merged by hand.
+- **Backup.** The tracked 0.37.0 tree at `73347d3` was archived to `beignet-engine-backup-0.37.0-2026-11-05.tar.gz` at the workspace root first.
+- **The patch before.** Against pristine `0512b5f6` it is 23 entries and 69 hunks, as recorded for 0.37.0.
+- **What upstream changed.** 5 files in `src/` (31 added and 5 removed lines), in two PRs: #1966 (`src/wallet/index.ts` and `src/types/wallet.ts`) and #1967 (`src/cli/beignet-node.ts`, `src/cli/types.ts` and `src/cli/openapi.ts`). The bump #1968 changes only versions. Two of the five are among the 22 upstream files the fork patches:
+  - `src/cli/beignet-node.ts`, where #1967 adds `dropped` to `toOnchainTxInfo`;
+  - `src/cli/types.ts`, where #1967 adds `dropped?: true` to `OnchainTxInfo`.
+
+  No fork hunk touches either change. The fork does not patch `src/cli/openapi.ts`, `src/types/wallet.ts` or `src/wallet/index.ts`.
+- **The reapply.** `src/` was replaced with pristine `954d034b` and the patch reapplied with `patch -p1 -F0`. All 69 hunks landed with no rejection and no fuzz: 5 at an offset and 64 at their recorded lines. The offsets sit below upstream's additions: four in `beignet-node.ts` (5 lines) and one in `cli/types.ts` (7 lines).
+- **The patch after.** Recaptured against pristine 0.38.0, it has the same 23 entries and 69 hunks and the same 326 sorted added and removed lines. The resynced `src/` changes the 0.37.0 fork by upstream's own change, line for line (31 added and 5 removed lines).
+
+What 0.38.0 changes for this fork:
+- **Dropped on-chain transactions (#1967).** `GET /transactions` marks a wallet transaction `dropped: true` when the wallet's server no longer has it and it has no height: it was replaced, a conflicting spend of its inputs confirmed, or the mempool evicted it. Before, such a transaction read as one waiting for a block.
+  - **The phone path.** Wallet-core's `EmbeddedWalletClient` reads `/wallets/<id>/api/transactions` through `runtime.request`. The drain fence passes a GET through, the wallet API path strips its prefix, and the router's `GET /transactions` case returns `BeignetNode.listOnchainTransactions()`, whose wallet rows go through `toOnchainTxInfo`. The answer is cloned through JSON, which keeps the field, so `dropped` reaches wallet-core. Wallet-core `d1d83e2` (coreyphillips/beignet-wallet-core#46) shows such a row as `failed`, not pending for good. A live check of this is in `VALIDATION.md`.
+  - **Rows without the flag.** The rows `listOnchainTransactions` adds for cooperative closes and on-chain sweeps are not wallet records, and never carry it, as upstream.
+  - **The drain.** `portable/drain.cjs` reads the list only to find a channel's cooperative-close payout, so the drain is unaffected. The sweep depth the runtime gives it already reads the wallet's `exists` flag.
+- **Gap scan UTXOs (#1966).** After a gap scan that extends past its first window, the refresh lists UTXOs on every address an extension round checked, not only the window around the stored index. Coins in the middle windows now stay in the balance. The phone runs the same `Wallet` code, so this reaches a restore whose history runs past the first window. The listing still runs once, after the scan.
+- **Dependencies.** None change: the bump touches only versions. `npm audit` reports no advisory.
+- **Storage.** The schema stays at 20, and nothing stored changes shape: `dropped` is read from the wallet's existing `exists` flag. Going back to the 0.37.0 fork keeps the data.
+- **Upstream's suites.** Run in an upstream `954d034b` tree with this fork's `src/`, after `npm run build`:
+  - `test:cli` passes, 2,555 tests.
+  - `test:lightning` runs 10,164 passing and 19 failing, the 19 known:
+    - the four `agent-review` tests;
+    - the README tables test, which names this fork's own `irohFactory` option;
+    - the thirteen forwarding and policy tests whose fixtures write SCID aliases behind the private-channel index;
+    - mocha's BigInt reporting error.
+
+    The direct-funding receiver's feerate timing test, the twentieth failure in the 0.37.0 run, passed in this one.
+- **Build.** The bundle grows from 7,518,356 to 7,518,861 bytes, with no esbuild warnings. A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.37.0 tree.
+
+Previous baseline: `0512b5f6271fd1d56f821abdae14b6e23a4b5878` (Beignet 0.37.0, npm's `gitHead` for the release, upstream's version bump #1964). Its `src/` is the same as `f0c1f03b`, the merge of #1963: the bump changes only `package.json` and `package-lock.json`. The tarball matches npm's integrity hash, and its `dist/` and `package.json` are identical to a clean build of `0512b5f6`. `package.json` records the upstream source version and commit, and the portable build reports `0.37.0-portable`.
 
 The 0.36.1 to 0.37.0 resync (2026-11-04) keeps the platform patch, with two hunks merged by hand, and adds two events to the diagnostic hook.
 - **Backup.** The tracked 0.36.1 tree at `373b7fd` was archived to `beignet-engine-backup-0.36.1-2026-11-04.tar.gz` at the workspace root first.
