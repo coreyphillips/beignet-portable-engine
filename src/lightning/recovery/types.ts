@@ -13,6 +13,7 @@
  */
 
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import type { IChannelState } from '../channel/channel-state';
 import type { IChainMonitorState } from '../chain/chain-monitor';
 import type { IPaymentInfo } from '../node/payment-types';
@@ -81,6 +82,12 @@ export type RecoveryDurability = 'local' | 'async-remote' | 'quorum';
  */
 export type RecoveryMutation =
 	| { type: 'ffor_voucher'; record: IFforVoucherArchive }
+	/**
+	 * A composite splice-out's record (issue #1922), replaced whole at every
+	 * stage change so RELEASED is on disk in the transaction that releases
+	 * the first tx_signatures. Not a snapshot table: see the record module.
+	 */
+	| { type: 'composite_splice'; record: ICompositeSpliceRecord }
 	| {
 			type: 'channel_state';
 			channelId: string;
@@ -203,7 +210,7 @@ export interface IRecoveryCommitResult {
  * frame's mutations list is empty; the snapshot IS the state.
  */
 export interface RecoveryFrame {
-	version: 1 | 2 | 3;
+	version: 1 | 2 | 3 | 4;
 	/** Changes only when a restored device takes ownership (Phase 5). */
 	writerEpoch: bigint;
 	/** Globally monotonic across the node, starting at 1. */

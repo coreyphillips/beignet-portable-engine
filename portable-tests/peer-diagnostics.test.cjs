@@ -112,3 +112,55 @@ test('connect, peer errors and node errors read as before', () => {
 	assert.equal(peerDiagnostic('peer:disconnect', PEER).message, PEER);
 	assert.equal(peerDiagnostic('node:error', undefined).message, 'node:error');
 });
+
+test('a peer warning reads as the CHANNEL_ERROR text it replaced, naming the peer and channel (Beignet 0.37.0)', () => {
+	const CHANNEL = '1f'.repeat(32);
+	assert.deepEqual(
+		peerDiagnostic('peer:warning', {
+			pubkey: PEER,
+			channelId: CHANNEL,
+			text: 'Unknown UTXO 504311x1993x0'
+		}),
+		{
+			phase: 'peer:warning',
+			message: `Remote warning: Unknown UTXO 504311x1993x0 (peer ${PEER.slice(0, 16)}, channel ${CHANNEL.slice(0, 16)})`,
+			code: undefined
+		}
+	);
+	// A connection-level warning has a null channel id.
+	assert.equal(
+		peerDiagnostic('peer:warning', { pubkey: PEER, channelId: null, text: 'slow down' })
+			.message,
+		`Remote warning: slow down (peer ${PEER.slice(0, 16)})`
+	);
+	for (const odd of [undefined, null, {}, { text: 42, pubkey: 7, channelId: 1n }]) {
+		assert.equal(peerDiagnostic('peer:warning', odd).message, 'Remote warning: ');
+	}
+});
+
+test('a refused forward carries its reason, amount and channel error code (Beignet 0.37.0)', () => {
+	assert.deepEqual(
+		peerDiagnostic('htlc:forward-refused', {
+			inChannelId: '01'.repeat(32),
+			outChannelId: '02'.repeat(32),
+			amountMsat: '150000000',
+			paymentHash: '03'.repeat(32),
+			reason: 'Insufficient balance for HTLC',
+			channelErrorCode: 'INSUFFICIENT_BALANCE'
+		}),
+		{
+			phase: 'htlc:forward-refused',
+			message: 'Forward refused: Insufficient balance for HTLC (150000000 msat)',
+			code: 'INSUFFICIENT_BALANCE'
+		}
+	);
+	assert.deepEqual(peerDiagnostic('htlc:forward-refused', { amountMsat: 'lots' }), {
+		phase: 'htlc:forward-refused',
+		message: 'Forward refused: refused',
+		code: undefined
+	});
+	assert.equal(
+		peerDiagnostic('htlc:forward-refused', undefined).message,
+		'Forward refused: refused'
+	);
+});

@@ -351,10 +351,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/invoice': {
 				post: {
 					summary:
-						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it',
+						'Create a JIT receive invoice: registers a receive intent with the LSP and returns an invoice payable through a channel that does not exist yet. The LSP intercepts the HTLC, funds the channel and forwards. The quoted opening fee (flatFeeSat + feePpm) is collected per feeMode: skim (default) deducts it from the delivery, hop puts it in the invoice routing hint so the sender pays it on top and the full amount is delivered. Requires the LSP peer to be connected and running the JIT receive engine. With no usable channel to that LSP the invoice is a promise that it may open one, so it is refused with NEW_CHANNELS_REFUSED (503) while this node would refuse a brand-new channel: a bare-seed boot that has not learned a chain tip yet, or an unresolved Recovery Capsule restore. Both lift on their own, and an invoice that routes over an existing usable channel is never refused for it. With no lspPubkey the receive is steered through the ranked primaries (GET /primaries): each is tried in selectionOrder, dialed by its stored address when not connected, and passed over when unreachable, timed out, declining, above the fee ceilings or fenced, under one 18 s budget for the whole walk. The answer then carries the lspPubkey that took it and the skipped primaries with their reasons; 503 NO_PRIMARY_AVAILABLE names every reason when none took it, 400 INVALID_PARAMS when no primary is configured. Naming lspPubkey never falls back',
 					tags: ['Invoices'],
 					requestBody: bodyContent({
-						lspPubkey: 'string',
+						lspPubkey: 'string?',
 						amountSats: 'number?',
 						description: 'string?',
 						expirySecs: 'number?',
@@ -373,9 +373,20 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									{
 										type: 'object',
 										properties: {
+											lspPubkey: {
+												type: 'string',
+												description:
+													'The LSP the intent was registered with: the one named, or the primary that took it'
+											},
 											flatFeeSat: { type: 'number' },
 											feePpm: { type: 'number' },
-											feeMode: { type: 'string', enum: ['skim', 'hop'] }
+											feeMode: { type: 'string', enum: ['skim', 'hop'] },
+											skipped: {
+												type: 'array',
+												description:
+													'Steered receives only: the primaries passed over before this one',
+												items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
+											}
 										}
 									}
 								]
@@ -413,7 +424,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/config': {
 				get: {
 					summary:
-						'Read the effective direct-funding policy. lspPubkey is null when no liquidity peer has been set, in which case this node serves no offers. Readonly scope',
+						'Read the effective direct-funding policy. lspPubkey is null when no liquidity peer has been set, in which case a request that bound no peer of its own is not served (one minted with lspPubkey, or steered to a primary, names its own peer, issue #1922). Readonly scope',
 					tags: ['DirectFunding'],
 					responses: {
 						'200': {
@@ -421,6 +432,105 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							content: jsonContent({
 								$ref: '#/components/schemas/DirectFundingConfig'
 							})
+						}
+					}
+				}
+			},
+			'/primaries': {
+				get: {
+					summary:
+						"Read the ranked receive primaries: each one's rank, address, the fill threshold that applies to it, our local balance summed over our usable channels with it, and whether a receive with no peer named would go to it. The target is the first primary in rank order below the threshold; when every one is at or above it, the one with the lowest balance, ties to the higher rank. selectionOrder is the order a receive tries them: POST /jit/invoice, GET /jit/quote, GET /receive/quote and POST /receive/invoice walk it when the caller names no peer. Readonly scope",
+					tags: ['Primaries'],
+					responses: {
+						'200': {
+							description: 'The list, the threshold and the receive target',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/add': {
+				post: {
+					summary:
+						'Add a receive primary at rank (1-based, default last). Reach it by host and port, or by uri (pubkey@address, for ws://, wss:// and iroh: peers), whose pubkey must match. A malformed pubkey, a pubkey already in the list, a bad port, a host without a port, a rank out of range, or a 33rd entry is refused with 400 INVALID_PARAMS. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						host: 'string?',
+						port: 'integer?',
+						uri: 'string?',
+						rank: 'integer?'
+					}),
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/remove': {
+				post: {
+					summary:
+						'Drop a receive primary. A pubkey not in the list is refused with 400 INVALID_PARAMS. Channels with it are left as they are. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: bodyContent({ pubkey: 'string' }),
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/reorder': {
+				post: {
+					summary:
+						'Re-rank the receive primaries. order names every primary exactly once, highest rank first; anything else is refused with 400 INVALID_PARAMS, so a reorder can neither add nor drop one. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										order: { type: 'array', items: { type: 'string' } }
+									},
+									required: ['order']
+								}
+							}
+						}
+					},
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
+						}
+					}
+				}
+			},
+			'/primaries/threshold': {
+				post: {
+					summary:
+						'Set the fill threshold: sats of local balance a primary is filled to before receives move to the next one. A non-negative integer, or null for no cap (the first-ranked primary always takes the receive); a negative or fractional value is refused with 400 INVALID_PARAMS. Persisted. Admin scope',
+					tags: ['Primaries'],
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										fillThresholdSat: { type: 'integer', nullable: true }
+									},
+									required: ['fillThresholdSat']
+								}
+							}
+						}
+					},
+					responses: {
+						'200': {
+							description: 'The whole list after the change',
+							content: jsonContent({ $ref: '#/components/schemas/Primaries' })
 						}
 					}
 				}
@@ -444,22 +554,29 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/direct-funding/request': {
 				post: {
 					summary:
-						'Mint a direct-funding payment request. Returns the receipt hash (its preimage stays here and is revealed to the payer after broadcast, as a delivery receipt) and `request`, the base64url envelope a payer pays; put it in a BIP 21 URI under the bgnq parameter. host and port are the address a payer can reach this node on and are used exactly as given: the daemon has no way to know which of a browser hostname and a public host is right. With neither, no direct-peer descriptor is emitted and the payer reaches this node through the liquidity peer. Invoice scope',
+						'Mint a direct-funding payment request. Returns the receipt hash (its preimage stays here and is revealed to the payer after broadcast, as a delivery receipt) and `request`, the base64url envelope a payer pays; put it in a BIP 21 URI under the bgnq parameter. host and port are the address a payer can reach this node on and are used exactly as given: the daemon has no way to know which of a browser hostname and a public host is right. With neither, no direct-peer descriptor is emitted and the payer reaches this node through the liquidity peer. lspPubkey binds the request to that peer (issue #1922), which must be a configured primary or the policy liquidity peer, else 400 INVALID_PARAMS, since this route runs at invoice scope and that peer holds every payment the channel receives: the relay descriptors name it, at the address the primaries list stores for it, else the policy address for it, else the one this node dialed it at, and the receiver negotiates the funding with it when the offer arrives, whatever the direct-funding policy says by then. Omitted, the ranked primaries choose when any are configured (GET /primaries): the first in selectionOrder with a known address is bound, the others are listed in skipped, and 503 NO_PRIMARY_AVAILABLE answers when none has one; nothing is dialed, since the payer reaches this node through that primary relay later. With no primaries the policy liquidity peer serves, as before. The answer names the peer in lspPubkey. Invoice scope',
 					tags: ['DirectFunding'],
 					requestBody: bodyContent({
 						host: 'string?',
 						port: 'number?',
-						amountSats: 'number?'
+						amountSats: 'number?',
+						lspPubkey: 'string?'
 					}),
 					responses: {
 						'200': {
-							description: 'The minted request',
+							description:
+								'The minted request, the peer it is bound to, and the primaries passed over when it was steered',
 							content: jsonContent({
 								type: 'object',
 								properties: {
 									paymentHash: { type: 'string' },
 									expiresAt: { type: 'number' },
-									request: { type: 'string' }
+									request: { type: 'string' },
+									lspPubkey: { type: 'string', nullable: true },
+									skipped: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
+									}
 								}
 							})
 						}
@@ -2234,7 +2351,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/quote': {
 				get: {
 					summary:
-						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way",
+						"Quote automatic offline receiving at a connected primary without reserving funds. Answers mode='bolt11' when a channel that ALREADY exists with this peer can carry the amount offline (NORMAL, usable, concurrent settlement negotiated or no spendable local balance, unreserved, no live epoch, inbound >= amountSats + 50000), otherwise mode='direct-funding', the fallback where a payer's on-chain payment becomes this node's channel funding. This route never opens a channel. The peer must be connected either way. With no peer the ranked primaries choose (GET /primaries): a requestId already under way keeps its own peer; otherwise the primaries are tried in selectionOrder and the first one that is connected, serves the amount on the route it would take, and could be created against (an address is known for its relay) is quoted, with the others listed in skipped. The answer's peer is what POST /receive/invoice binds to. 503 NO_PRIMARY_AVAILABLE names every reason when none qualifies, 400 INVALID_PARAMS when no primary is configured. A named peer is quoted as before, with no fallback",
 					tags: ['FFOR'],
 					parameters: [
 						{
@@ -2248,8 +2365,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						{
 							name: 'peer',
 							in: 'query',
-							required: true,
-							schema: { type: 'string' }
+							required: false,
+							schema: { type: 'string' },
+							description:
+								'The primary to quote at. Omitted: the ranked primaries choose'
 						},
 						{
 							name: 'amountSats',
@@ -2261,7 +2380,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: {
 						'200': {
 							description:
-								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default)',
+								'available, mode, peer, amountSats, feeSats and expiresAt (60s). bolt11 mode adds the sender fee terms and its minimum is the 354 sat dust limit; direct-funding mode adds minAmountSat, the configured direct-funding minimum (5000 by default). A steered quote adds skipped, the primaries passed over',
 							content: jsonContent({
 								type: 'object',
 								required: [
@@ -2298,17 +2417,26 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									minAmountSat: {
 										type: 'integer',
 										description: 'direct-funding mode'
+									},
+									skipped: {
+										type: 'array',
+										description: 'steered quotes only',
+										items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
 									}
 								}
 							})
 						},
 						'400': {
 							description:
-								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS'
+								'AMOUNT_TOO_SMALL naming the minimum of the applicable mode, or INVALID_PARAMS (also: no peer named and no primary configured)'
 						},
 						'409': {
 							description:
 								"RECEIVE_UNAVAILABLE: the peer is not connected, or in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'); RECEIVE_BUSY: too many receive requests in flight"
+						},
+						'503': {
+							description:
+								"NO_PRIMARY_AVAILABLE: no peer was named and no ranked primary qualified; the message names each one's reason"
 						}
 					}
 				}
@@ -2316,10 +2444,10 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/receive/invoice': {
 				post: {
 					summary:
-						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, configuring direct funding for this peer when nothing is configured (an existing config for the same peer is reused untouched, one for a different peer refuses) and minting a direct-funding request. It never opens a channel. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
+						'Prepare and durably save an offline payment request. Retry the same requestId after interrupted creation. With a suitable existing channel this reserves liquidity on it and returns a bolt11 invoice; with none it falls back to direct funding, minting a request bound to this peer (issue #1922): its relay descriptors name the peer and the receiver negotiates the funding with it, whatever the direct-funding policy says, so an existing policy is left untouched whichever peer it names, and with no policy yet the first such request still configures one for this peer. It never opens a channel. With no peer the one the reviewed quote named is used: the review bound it, and create never chooses another. Admin scope. Paid or expired reservations reconcile automatically after restart; a direct-funding request reserves nothing and simply expires.',
 					tags: ['FFOR'],
 					requestBody: bodyContent({
-						peer: 'string',
+						peer: 'string?',
 						requestId: 'string',
 						amountSats: 'number',
 						description: 'string',
@@ -2350,7 +2478,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						},
 						'409': {
 							description:
-								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or direct funding is configured for a different peer; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
+								"RECEIVE_UNAVAILABLE: the peer is not connected, in bolt11 mode did not answer within 15 s or refused (the message is the peer's own, e.g. 'Your node does not provide offline receiving.'), or no address is known for the peer's relay; RECEIVE_BUSY: another request is being prepared or too many receive requests are in flight"
 						}
 					}
 				}
@@ -4020,15 +4148,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/jit/quote': {
 				get: {
 					summary:
-						'Price a JIT receive at the named LSP without registering an intent: the opening fee it would deduct, the fee on this amount, what it would front, and whether it would serve the receive right now (a decline is an answer with a plain-language reason, not an error). Asked over the beignet custom message type, so the LSP peer must be connected and running the JIT receive engine; PEER_NOT_CONNECTED and JIT_TIMEOUT are the transport failures. Readonly scope',
+						'Price a JIT receive at the named LSP without registering an intent: the opening fee it would deduct, the fee on this amount, what it would front, and whether it would serve the receive right now (a decline is an answer with a plain-language reason, not an error). Asked over the beignet custom message type, so the LSP peer must be connected and running the JIT receive engine; PEER_NOT_CONNECTED and JIT_TIMEOUT are the transport failures. With no lspPubkey the ranked primaries choose (GET /primaries), the way POST /jit/invoice does: the answer prices the first primary in selectionOrder that would serve the receive within the fee ceilings, names it in lspPubkey, and lists the others in skipped, so a create naming that lspPubkey lands where the quote did. 503 NO_PRIMARY_AVAILABLE when none would serve it, 400 INVALID_PARAMS when no primary is configured. Readonly scope',
 					tags: ['Invoices'],
 					parameters: [
 						{
 							name: 'lspPubkey',
 							in: 'query',
-							required: true,
+							required: false,
 							schema: { type: 'string' },
-							description: 'The LSP peer, 33-byte compressed pubkey as hex'
+							description:
+								'The LSP peer, 33-byte compressed pubkey as hex. Omitted: the ranked primaries choose'
 						},
 						{
 							name: 'amountSats',
@@ -4125,7 +4254,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), peer:connect, peer:disconnect (pubkey, plus closedBy peer or us, reason, direction inbound or outbound and uptimeMs when the transport knows the cause), node:error, node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:slot-resolved (terminal concurrent slot outcome: channelId, epochId, k, paymentHash, amountMsat as a decimal string, outcome fulfilled or cancelled), ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, the hold-invoice lifecycle events hold:accepted, hold:settled, hold:cancelled (issue #746; each carries paymentHash, state, heldAmountMsat as a decimal string, htlcCount, and the GET /invoices/held expiry fields minFinalCltvExpiry, earliestExpiry, cancelMarginBlocks and cancelHeight (issue #770), hold:cancelled also the reason; hold:accepted fires per new parked part, including partial MPP payments: compare the total with the full expected msat before funding; terminal event totals describe the resolved set), transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, the splice lifecycle splice:complete, splice:aborted, splice:conflicted, splice:reverted (issue #760; channelId plus spliceTxid and conflictTxid where they exist, display order), the channel send stages channel-send:stage (issue #1922; id, compositeId, stage, txid in display order and the abort reason), peer:connect, peer:disconnect (pubkey, plus closedBy peer or us, reason, direction inbound or outbound and uptimeMs when the transport knows the cause), peer:warning (a BOLT 1 warning from a peer: pubkey, channelId or null for a connection-level warning, text; not an error, the connection and channels are unaffected), htlc:forward-refused (a forward the outgoing channel refused to add, failed back with temporary_channel_failure: inChannelId, outChannelId, amountMsat as a decimal string, paymentHash, reason and channelErrorCode when the channel gave one; relayed without htlcEvents, and not raised as node:error), node:error,node:ready, and the Recovery Protocol events recovery:durable, recovery:fenced, recovery:backfill-lost, recovery:reestablish-held, recovery:capsule-retrieved, recovery:guardian_unreachable, recovery:restore-progress, recovery:restored, the guardian hosting events guardian:set-registered, guardian:quota-refused, guardian:session-violation, the rotation events recovery:rotation-progress, recovery:rotated, recovery:rotation-followed, the JIT receive progress events jit:intent, jit:intent-superseded, jit:intercepted, jit:funding, jit:forwarded, jit:failed (LSP side, satoshi figures as decimal strings) and the direct-funding receiver events direct-funding:offer:accepted, direct-funding:offer:declined, direct-funding:offer:failed, direct-funding:offer:completed, the FFOR offline-receive events ffor:state, ffor:settled, ffor:slot-resolved (terminal concurrent slot outcome: channelId, epochId, k, paymentHash, amountMsat as a decimal string, outcome fulfilled or cancelled), ffor:delegated-failed, ffor:enforce (carries restoreRecencyUnproven: true for a capsule hold, reestablishRecencyUnproven: true for an unproven peer claim and reestablishSecretMissing: true for a missing local per-commitment secret, including several when several hold; either requires acceptStaleStateRisk: true on POST /ffor/enforce and on POST /ffor/recover with forceCloseIfUnreachable: true; issues #908 and #907), ffor:witness-provisioned, ffor:witness-recorded, ffor:witness-released, ffor:witness-refused, ffor:witness-closed, ffor:witness-expired, ffor:witness-audit (a fetched record that failed verification: channelId, witnessNodeId, k, reason), ffor:issuer-provisioned, ffor:issuer-issued, ffor:issuer-retired (issue #729; buffers as hex, amounts as decimal strings), the reverse swap provider events swap:created, swap:held, swap:funding, swap:funded, swap:claimed, swap:settled, swap:refund-broadcast, swap:refunded, swap:hold-cancelled, swap:exposed, swap:failed (issue #737), the submarine swap provider events swap:funding-seen, swap:funding-lost, swap:paying, swap:payment-unresolved, swap:preimage, swap:claim-broadcast, swap:claim-confirmed, swap:payment-failed, swap:cancelled (issue #743; every swap event carries direction); plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents). Every frame carries an `event:` name and a JSON `data:` object; node:ready has no fields and arrives as {}. node:error carries code, message, timestamp and, when the failure belongs to a channel, channelId: it is the only place a failed open reports its reason. The broadcast codes BROADCAST_FAILED (the chain watcher could not hand a transaction to the backend and will retry it on the next block), BROADCAST_PERMANENT_FAILURE (the watcher gave up after its retries) and SPLICE_BROADCAST_REFUSED (the backend refused a fully signed splice the node re-sends every block; raised once per transaction and reason) also carry txid, the transaction in display order, and retained: true when the node itself still holds that transaction and rebroadcasts it on every block until it confirms (a pending funding, an in-flight or adopted but unconfirmed splice), false when the watcher queue was its only driver, such as a close or a sweep (issue #1062).node:error code REESTABLISH_SECRET_MISSING is raised when this node cannot build its own channel_reestablish for a channel, because its shachain store holds no per-commitment secret at the index its revocation counter names: nothing is sent to the peer (all zeroes there is a protocol violation), the channel is failed and held, and the message names the channel, the revocation index and the acknowledged force close that is the exit. node:error code HTLC_DEADLINE_HELD is raised by each on-chain HTLC deadline backstop (HTLC_CLAIM_FORCE_CLOSE, FORWARD_TIMEOUT_FORCE_CLOSE, HTLC_EXPIRY_FORCE_CLOSE) that declines to force-close a channel held under restoreRecencyUnproven or reestablishRecencyUnproven, naming the channel, the HTLC and its payment hash, its cltv_expiry, the current height, which hold it is and the acknowledged force close (/channel/forceclose with acceptStaleStateRisk: true) that is the exit; throttled per HTLC per backstop, since only an operator can resolve such an HTLC before its deadline. node:error code LISTEN_FAILED is raised when the OS refuses a configured TCP or WebSocket listener bind (the port is taken or not permitted): the message names the listener, the port and the OS error, says inbound peers cannot connect and, for a guardian host, that its guardian is unreachable. It is not fatal and nothing retries it; GET /info carries the same failure as listenError or websocketListenError. A bind failure at startup is raised before this stream is wired, so read it from GET /info or GET /logs?category=error (issue #861)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -4700,6 +4829,137 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'503': {
 							description:
 								'SPLICE_BUSY: the channel is momentarily unable to splice (a splice already in progress, a previous abort awaiting its echo, a peer-owned quiescence session, another splice request already awaiting quiescence, HTLCs still settling, the peer reconnecting). Retry the same request.'
+						}
+					}
+				}
+			},
+			'/channel-send/quote': {
+				post: {
+					summary:
+						'Quote paying an address out of one channel, or out of several channels in one transaction (issue #1922)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						address: 'string',
+						amountSats: 'number',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description:
+								'The plan: kind single (one channel covers amount plus fee; the one with the largest spendable balance) or composite (several channels, debited largest spendable balance first, with the fee split in proportion), each channel debit and fee share, the total the spend limits count, the channels left out with the reason, and a quoteId that executeChannelSend accepts for two minutes. Nothing moves.',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendQuote'
+							})
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: missing or undecodable address, non-integer amount, feeratePerkw outside 253..100000, amount below the dust floor, or a fee at or above the amount'
+						},
+						'403': {
+							description:
+								'SPENDING_LIMIT_EXCEEDED: amount plus fee over maxPaymentSats or dailySpendLimitSats'
+						},
+						'409': {
+							description:
+								'INSUFFICIENT_BALANCE (no channel set covers amount plus fees at this feerate), SPLICE_REFUSED (no channel qualifies; the message names each channel and why)'
+						},
+						'503': {
+							description:
+								'SPLICE_BUSY (a composite is already live; one at a time), NOT_PERSISTED (the storage backend lacks the compositeSplices group or the recovery journal is off)'
+						}
+					}
+				}
+			},
+			'/channel-send/execute': {
+				post: {
+					summary: 'Execute a channel send quote',
+					tags: ['Channels'],
+					requestBody: bodyContent({ quoteId: 'string' }),
+					responses: {
+						'200': {
+							description:
+								"The send started: a single-channel splice-out (stage STARTED, then LOCKED or ABORTED on channel-send:stage as its channel's splice completes or aborts) or a composite (its record and stage, planned again on the current balances so the fee counted is the one priced now; watch channel-send:stage). The limits are checked again; a composite reserves amount plus fee until RELEASED charges it or ABORTED releases it. The same quoteId returns the first execution and runs nothing.",
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': {
+							description:
+								'INVALID_PARAMS: malformed quoteId, or an expired quote'
+						},
+						'403': { description: 'SPENDING_LIMIT_EXCEEDED' },
+						'404': {
+							description: 'NOT_FOUND: unknown or already executed quoteId'
+						},
+						'409': {
+							description:
+								'INSUFFICIENT_BALANCE, SPLICE_REFUSED or SPLICING_NOT_NEGOTIATED from the channel the plan named'
+						},
+						'503': { description: 'SPLICE_BUSY or NOT_PERSISTED' }
+					}
+				}
+			},
+			'/channel-send/status': {
+				get: {
+					summary: 'The stage and record of a channel send',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'id',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description:
+								'The quoteId the execute call returned, or a composite record id'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'The channel send',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': { description: 'INVALID_PARAMS: id is not 32-byte hex' },
+						'404': { description: 'NOT_FOUND' }
+					}
+				}
+			},
+			'/channel-send/list': {
+				get: {
+					summary:
+						'Every channel send this node executed, plus composites it holds without a quote (after a restart), oldest first',
+					tags: ['Channels'],
+					responses: {
+						'200': {
+							description: 'The channel sends',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelSendStatus' }
+							})
+						}
+					}
+				}
+			},
+			'/channel-send/abort': {
+				post: {
+					summary:
+						'Abort a composite channel send before its signatures are released',
+					tags: ['Channels'],
+					requestBody: bodyContent({ id: 'string', reason: 'string?' }),
+					responses: {
+						'200': {
+							description:
+								'Every session is being unwound with tx_abort and nothing was spent; the channel send at its ABORTED stage',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelSendStatus'
+							})
+						},
+						'400': { description: 'INVALID_PARAMS: id is not 32-byte hex' },
+						'404': { description: 'NOT_FOUND' },
+						'409': {
+							description:
+								'SPLICE_REFUSED: past RELEASED (the transaction may confirm), or a single-channel send'
 						}
 					}
 				}
@@ -5908,7 +6168,25 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								maxFlatFeeSat: { type: 'integer' },
 								maxFeePpm: { type: 'integer' }
 							}
+						},
+						skipped: {
+							type: 'array',
+							description:
+								'Steered quotes only: the primaries passed over before this one',
+							items: { $ref: '#/components/schemas/ReceiveSteerSkip' }
 						}
+					}
+				},
+				ReceiveSteerSkip: {
+					type: 'object',
+					description:
+						"Why a steered receive passed one ranked primary over. stage budget means it was not tried: the walk's budget ran out before it",
+					properties: {
+						pubkey: { type: 'string' },
+						rank: { type: 'integer', description: '1-based configured rank' },
+						stage: { type: 'string', enum: ['connect', 'attempt', 'budget'] },
+						code: { type: 'string' },
+						message: { type: 'string' }
 					}
 				},
 				DirectFundingConfig: {
@@ -5918,7 +6196,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'string',
 							nullable: true,
 							description:
-								'The liquidity peer every direct-funded channel is negotiated with. Null means this node serves no offers'
+								'The liquidity peer a direct-funded channel is negotiated with when the request bound no peer of its own (issue #1922). Null means those requests are not served'
 						},
 						lspHost: { type: 'string', nullable: true },
 						lspPort: { type: 'integer', nullable: true },
@@ -5950,6 +6228,59 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description:
 								'Smallest offer served, never below the 5000 sat protocol floor'
+						}
+					}
+				},
+				Primaries: {
+					type: 'object',
+					properties: {
+						fillThresholdSat: {
+							type: 'integer',
+							nullable: true,
+							description:
+								'Sats a primary is filled to before receives move on. Null means no cap'
+						},
+						primaries: {
+							type: 'array',
+							description: 'Rank order, highest first',
+							items: { $ref: '#/components/schemas/Primary' }
+						},
+						receiveTarget: {
+							type: 'string',
+							nullable: true,
+							description:
+								'The pubkey a receive with no peer named would go to. Null with no primaries'
+						}
+					}
+				},
+				Primary: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						rank: { type: 'integer', description: '1 is the highest rank' },
+						host: { type: 'string', nullable: true },
+						port: { type: 'integer', nullable: true },
+						uri: { type: 'string', nullable: true },
+						thresholdSat: {
+							type: 'integer',
+							nullable: true,
+							description: 'The fill threshold that applies to this primary'
+						},
+						balanceSat: {
+							type: 'integer',
+							description:
+								'Our local balance summed over our usable channels with it'
+						},
+						channelCount: {
+							type: 'integer',
+							description: 'Usable channels with it; 0 means none yet'
+						},
+						belowThreshold: { type: 'boolean' },
+						isReceiveTarget: { type: 'boolean' },
+						selectionOrder: {
+							type: 'integer',
+							description:
+								'1-based position in the order a receive tries the primaries'
 						}
 					}
 				},
@@ -6523,6 +6854,111 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'A started splice. Refusals are answered as failure envelopes with their own status, so `ok` is always true here.',
 					properties: {
 						ok: { type: 'boolean', enum: [true] }
+					}
+				},
+				ChannelSendQuoteChannel: {
+					type: 'object',
+					required: [
+						'channelId',
+						'debitSats',
+						'feeSats',
+						'oldCapacitySats',
+						'newCapacitySats'
+					],
+					properties: {
+						channelId: { type: 'string' },
+						debitSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						oldCapacitySats: { type: 'integer' },
+						newCapacitySats: { type: 'integer' }
+					}
+				},
+				ChannelSendQuote: {
+					type: 'object',
+					description:
+						'The plan a channel send would run (issue #1922), valid until expiresAt.',
+					required: [
+						'quoteId',
+						'kind',
+						'address',
+						'amountSats',
+						'feeSats',
+						'totalSats',
+						'feeratePerkw',
+						'channels',
+						'skipped',
+						'expiresAt'
+					],
+					properties: {
+						quoteId: { type: 'string' },
+						kind: { type: 'string', enum: ['single', 'composite'] },
+						address: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						totalSats: {
+							type: 'integer',
+							description: 'amountSats + feeSats, what the spend limits count'
+						},
+						feeratePerkw: { type: 'integer' },
+						channels: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/ChannelSendQuoteChannel' }
+						},
+						skipped: {
+							type: 'array',
+							items: {
+								type: 'object',
+								properties: {
+									channelId: { type: 'string' },
+									reason: { type: 'string' }
+								}
+							}
+						},
+						expiresAt: { type: 'integer' }
+					}
+				},
+				ChannelSendStatus: {
+					type: 'object',
+					description:
+						'A channel send that was executed, or a composite found without a quote after a restart (issue #1922).',
+					required: [
+						'id',
+						'kind',
+						'stage',
+						'amountSats',
+						'feeSats',
+						'startedAt'
+					],
+					properties: {
+						id: { type: 'string' },
+						kind: { type: 'string', enum: ['single', 'composite'] },
+						stage: {
+							type: 'string',
+							enum: [
+								'STARTED',
+								'PLANNED',
+								'NEGOTIATING',
+								'COMMITTED',
+								'PEERS_SIGNED',
+								'RELEASED',
+								'BROADCAST',
+								'LOCKED',
+								'ABORTED',
+								'CONFLICTED'
+							]
+						},
+						address: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						channelId: { type: 'string' },
+						compositeId: { type: 'string' },
+						txid: { type: 'string' },
+						reason: { type: 'string' },
+						startedAt: { type: 'integer' },
+						record: {
+							type: 'object',
+							description: 'The composite record, as stored'
+						}
 					}
 				},
 				BootstrapPeerInfo: {

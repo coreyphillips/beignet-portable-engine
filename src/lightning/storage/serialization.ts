@@ -50,6 +50,7 @@ import {
 	usesCompactHtlcHistory
 } from './htlc-history';
 import { unsavedRevokedHtlcSnapshots } from '../channel/htlc-snapshots';
+import { addWithoutOnion, restoreAddOnion } from './add-onion';
 
 // ─── Primitive helpers ───
 
@@ -390,6 +391,7 @@ export interface ISerializedChannelState {
 	pushMsat: string;
 	fundingTxid: string | null;
 	pendingFundingTxHex?: string;
+	fundingTxHex?: string;
 	fundingMissingSinceHeight?: number;
 	/**
 	 * Issue #593: the funding is unaccounted for on chain and the channel is
@@ -499,7 +501,16 @@ export interface ISerializedChannelState {
 	lastSentRevokeSecret: string | null;
 	lastSentRevokeNextPoint: string | null;
 	lastSentWasRevoke?: boolean | null;
-	pendingLocalUpdates?: Array<{ type: number; payloadHex: string }>;
+	/**
+	 * `onionFromHtlc` marks an update_add_htlc journaled without its onion,
+	 * which the offered HTLC entry it added carries (recovery frame version
+	 * 4). Local storage always writes the whole message.
+	 */
+	pendingLocalUpdates?: Array<{
+		type: number;
+		payloadHex: string;
+		onionFromHtlc?: true;
+	}>;
 	pendingLocalUpdatesSignedCount?: number;
 	preReestablishState: string | null;
 	lastProposedClosingFeeSat: string | null;
@@ -675,6 +686,7 @@ export interface ISerializedSpliceInFlight {
 	remoteRelativeSatoshis: string;
 	remoteFundingPubkey: string;
 	ourSharedInputSig: string;
+	remoteSharedInputSig?: string;
 	ourWalletWitnesses: string[][];
 	ourWalletInputIndices: number[];
 	// Issue #592: tx-input indices of externally owned splice inputs whose
@@ -717,6 +729,7 @@ export function serializeSpliceInFlight(
 		remoteRelativeSatoshis: bigintToStr(f.remoteRelativeSatoshis),
 		remoteFundingPubkey: f.remoteFundingPubkey.toString('hex'),
 		ourSharedInputSig: f.ourSharedInputSig.toString('hex'),
+		remoteSharedInputSig: f.remoteSharedInputSig?.toString('hex'),
 		ourWalletWitnesses: f.ourWalletWitnesses.map((w) =>
 			w.map((b) => b.toString('hex'))
 		),
@@ -757,6 +770,10 @@ export function deserializeSpliceInFlight(
 		remoteRelativeSatoshis: strToBigint(s.remoteRelativeSatoshis),
 		remoteFundingPubkey: Buffer.from(s.remoteFundingPubkey, 'hex'),
 		ourSharedInputSig: Buffer.from(s.ourSharedInputSig, 'hex'),
+		remoteSharedInputSig:
+			s.remoteSharedInputSig !== undefined
+				? Buffer.from(s.remoteSharedInputSig, 'hex')
+				: undefined,
 		ourWalletWitnesses: s.ourWalletWitnesses.map((w) =>
 			w.map((h) => Buffer.from(h, 'hex'))
 		),
@@ -927,6 +944,12 @@ export function serializeChannelState(
 		 * as additions to that table.
 		 */
 		htlcHistory?: 'all' | 'unsaved' | 'none';
+		/**
+		 * Journal a pending update_add_htlc of ours without the onion its
+		 * offered HTLC entry already holds. Only recovery frames of version 4
+		 * may carry that form.
+		 */
+		addOnionsByReference?: boolean;
 	} = {}
 ): ISerializedChannelState {
 	const htlcs: ISerializedHtlcEntry[] = [];
@@ -962,6 +985,7 @@ export function serializeChannelState(
 		pushMsat: bigintToStr(s.pushMsat),
 		fundingTxid: bufToHex(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingTxHex: s.fundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
@@ -1035,10 +1059,18 @@ export function serializeChannelState(
 		lastSentPartialSignatureWithNonce: bufToHex(
 			s.lastSentPartialSignatureWithNonce
 		),
-		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
-			type: u.type,
-			payloadHex: u.payload.toString('hex')
-		})),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => {
+			const rest = options.addOnionsByReference
+				? addWithoutOnion(s.htlcs, u.type, u.payload)
+				: null;
+			return rest
+				? {
+						type: u.type,
+						payloadHex: rest.toString('hex'),
+						onionFromHtlc: true as const
+				  }
+				: { type: u.type, payloadHex: u.payload.toString('hex') };
+		}),
 		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: s.lastSentHtlcSignatures.map((b) =>
 			b.toString('hex')
@@ -1595,6 +1627,7 @@ export function deserializeChannelState(
 		pushMsat: strToBigint(s.pushMsat),
 		fundingTxid: hexToBuf(s.fundingTxid),
 		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingTxHex: s.fundingTxHex,
 		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingUnaccounted: s.fundingUnaccounted,
 		hasBeenSpliced: s.hasBeenSpliced,
@@ -1680,7 +1713,10 @@ export function deserializeChannelState(
 		),
 		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
 			type: u.type,
-			payload: Buffer.from(u.payloadHex, 'hex')
+			payload:
+				u.onionFromHtlc === true
+					? restoreAddOnion(htlcs, u.type, u.payloadHex)
+					: Buffer.from(u.payloadHex, 'hex')
 		})),
 		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: (s.lastSentHtlcSignatures || []).map((h) =>

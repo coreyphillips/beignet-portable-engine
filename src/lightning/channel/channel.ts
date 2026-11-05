@@ -570,8 +570,12 @@ function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
  * 108 our own funding-side estimate reserves, and a P2TR key-spend witness
  * is 66 WU (64 byte Schnorr sig, default sighash). Charging the funding
  * estimate here refused every solo-funded eclair v2 open paying the exact
- * negotiated feerate (issue #359). Unknown or unparseable prevouts fall
- * back to the P2WPKH floor.
+ * negotiated feerate (issue #359). A P2WSH prevout is priced as the shared
+ * funding input is: the bare 2-of-2 spend is the only P2WSH form a splice
+ * acceptor admits (issue #1922), and its initiator sizes the fee with the
+ * same SHARED_FUNDING_INPUT_WEIGHT, so an audit at the P2WPKH floor would
+ * run lenient on it. Unknown or unparseable prevouts fall back to the P2WPKH
+ * floor.
  */
 function auditMinInputWeightWu(input: IInteractiveTxInput): number {
 	// outpoint(36) + scriptSig len(1) + sequence(4) = 41 bytes x4
@@ -589,12 +593,56 @@ function auditMinInputWeightWu(input: IInteractiveTxInput): number {
 				// P2TR key-spend: count(1) + Schnorr sig(1+64)
 				return base + 66;
 			}
+			if (
+				out &&
+				out.script.length === 34 &&
+				out.script[0] === 0x00 &&
+				out.script[1] === 0x20
+			) {
+				return SHARED_FUNDING_INPUT_WEIGHT;
+			}
 		}
 	} catch {
 		/* fall through to the P2WPKH floor */
 	}
 	// P2WPKH: count(1) + low-R DER sig(1+71) + pubkey(1+33)
 	return base + 107;
+}
+
+/**
+ * How a splice-in's wallet inputs are priced for estimateSpliceTxWeight. A
+ * wallet input spending a P2WSH output is another channel's 2-of-2 funding
+ * outpoint, the one P2WSH form a peer admits (issue #1922), and weighs what
+ * the shared funding input weighs; every other input is priced as P2WPKH, as
+ * before. An unreadable prevout is priced as P2WPKH and left for the
+ * negotiation to refuse.
+ */
+function spliceWalletInputCounts(inputs: readonly ISpliceWalletInput[]): {
+	walletInputCount: number;
+	fundingInputCount: number;
+} {
+	let fundingInputCount = 0;
+	for (const input of inputs) {
+		try {
+			const out = bitcoin.Transaction.fromBuffer(input.prevTx).outs[
+				input.prevOutputIndex
+			];
+			if (
+				out &&
+				out.script.length === 34 &&
+				out.script[0] === 0x00 &&
+				out.script[1] === 0x20
+			) {
+				fundingInputCount++;
+			}
+		} catch {
+			/* priced as P2WPKH */
+		}
+	}
+	return {
+		walletInputCount: inputs.length - fundingInputCount,
+		fundingInputCount
+	};
 }
 
 /** A force close this channel cannot perform, and why. */
@@ -755,6 +803,40 @@ export interface ISpliceWalletInput {
 	 * typically pass a throwing stub as signWitness.
 	 */
 	external?: boolean;
+}
+
+/**
+ * A composite splice-out's contribution to ONE of its sessions (issue #1922,
+ * docs/MULTI-CHANNEL-SPLICE-OUT.md section 2): the identical input and
+ * output lists every participating channel adds, with serial ids allocated
+ * once by the composite rather than by each session's builder. Exactly one
+ * input is `shared` (this channel's own funding outpoint, sent with
+ * shared_input_txid and an empty prev_tx); every other input is another
+ * channel's funding outpoint, contributed as an EXTERNAL input (#592) whose
+ * 2-of-2 witness the node assembles from both channels' shared-input
+ * signatures once every peer has signed. The session holds its splice
+ * commitment_signed after tx_complete until releaseCompositeSpliceCommitment,
+ * so the node can check every session negotiated the same transaction first.
+ */
+export interface ICompositeSpliceContribution {
+	/** The composite operation id (32 bytes). */
+	compositeId: Buffer;
+	inputs: Array<{
+		/** Even serial id, the same in every session. */
+		serialId: bigint;
+		/** Prevout txid in tx.getHash() internal byte order. */
+		prevTxid: Buffer;
+		prevOutputIndex: number;
+		/** Empty for the shared input; the full funding transaction otherwise. */
+		prevTx: Buffer;
+		valueSats: bigint;
+		shared: boolean;
+	}>;
+	outputs: Array<{
+		serialId: bigint;
+		scriptPubkey: Buffer;
+		amountSats: bigint;
+	}>;
 }
 
 /**
@@ -1130,6 +1212,16 @@ export class Channel {
 	// Splice-out only: where withdrawn funds are paid (wallet-owned script) and
 	// how much. Set by the node when it requests a splice-out.
 	private _spliceOutDestination: { script: Buffer; sats: bigint } | null = null;
+	/**
+	 * The composite splice this channel's next (or running) splice session is
+	 * part of (issue #1922). Set by the node before initiateSplice, in-memory
+	 * only: a negotiation does not survive a restart, and the durable facts
+	 * live in the node's composite record.
+	 */
+	private _compositeSplice: {
+		contribution: ICompositeSpliceContribution;
+		commitmentReleased: boolean;
+	} | null = null;
 	// Splice-in only: wallet inputs (each with its prevTx and a witness-signing
 	// closure) and the change script, provided by the node from its on-chain
 	// wallet. The closure lets the wallet sign its own inputs without the channel
@@ -6964,10 +7056,36 @@ export class Channel {
 	 * Retain the opener's funding tx with the channel state before
 	 * funding_created goes out, so the frame that records funding_signed
 	 * carries the bytes. A candidate only: nothing may broadcast it until the
-	 * authorization action.
+	 * authorization action. The same bytes become the channel's durable
+	 * `fundingTxHex`, which outlives the broadcast obligation.
 	 */
 	retainFundingPayload(txHex: string): void {
 		this._state.pendingFundingTxHex = txHex;
+		this._state.fundingTxHex = txHex;
+	}
+
+	/**
+	 * Record the funding transaction's bytes for a channel that lacks them
+	 * (issue #1922, step 5a). Refused, returning false, unless the hex parses
+	 * to the transaction whose hash is the current funding txid and that has
+	 * an output at the funding index: a composite splice would otherwise hand
+	 * a peer a prev_tx that does not create the outpoint it spends. Returns
+	 * true only when this call set or changed the field.
+	 */
+	setFundingTxHex(txHex: string): boolean {
+		if (!this._state.fundingTxid) return false;
+		let tx: import('bitcoinjs-lib').Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			return false;
+		}
+		if (!tx.getHash().equals(this._state.fundingTxid)) return false;
+		if (this._state.fundingOutputIndex >= tx.outs.length) return false;
+		const hex = tx.toHex();
+		if (this._state.fundingTxHex === hex) return false;
+		this._state.fundingTxHex = hex;
+		return true;
 	}
 
 	/**
@@ -9005,10 +9123,13 @@ export class Channel {
 	 * on reestablish (features are per-connection).
 	 */
 	setSimpleClose(simple: boolean): void {
-		// Simple-taproot channels always close via the legacy closing_signed
-		// flow carrying MuSig2 partial-sig TLVs; LND excludes taproot from
-		// option_simple_close/RBF close, so force the legacy path even when
-		// both peers advertise feature 60.
+		// Simple-taproot channels close via the legacy closing_signed flow
+		// carrying MuSig2 partial-sig TLVs: the taproot form of simple close
+		// (partial signatures and nonces in TLVs 5 to 7, next_closee_nonce in
+		// closing_sig) is not implemented, so the legacy path is forced even
+		// when both peers advertise feature 60. LND up to 0.20 made the same
+		// choice; LND 0.21 would pick closing_complete here, which is why the
+		// node never advertises 60 alongside taproot (issue #1929).
 		if (isTaprootChannel(this._state.channelType)) {
 			this._state.simpleClose = false;
 			return;
@@ -12773,7 +12894,7 @@ export class Channel {
 				}
 				const feeSats = spliceFeeSats(
 					estimateSpliceTxWeight({
-						walletInputCount: this._spliceInInputs.inputs.length,
+						...spliceWalletInputCounts(this._spliceInInputs.inputs),
 						fundingScriptLen: createFundingScript(
 							this._state.localBasepoints.fundingPubkey,
 							remoteFundingPubkey
@@ -13205,6 +13326,19 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
 		}
 
+		// A composite session takes nothing from the peer (issue #1922): a
+		// contribution would change the transaction this session must share
+		// with the others. Unwind before a single tx_add_input leaves.
+		if (this._compositeSplice && msg.relativeSatoshis !== 0n) {
+			const reason =
+				'peer contributed to a composite splice (splice_ack funding_contribution_satoshis is not zero)';
+			return [
+				this._txAbort(this._state.channelId!, reason),
+				...this.abortSplice(reason),
+				{ type: ChannelActionType.ERROR, message: `splice aborted: ${reason}` }
+			];
+		}
+
 		// A lock depth we asked for must come back (issue #760): a peer that
 		// does not know the TLV would lock a zero-conf channel at broadcast,
 		// putting the stranger's coin under the live funding. Unwind before a
@@ -13320,6 +13454,7 @@ export class Channel {
 	setSpliceOutDestination(script: Buffer, sats: bigint): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceInInputs = null;
+		this._compositeSplice = null;
 		// A splice-out never carries a lock depth (issue #760).
 		this._spliceLockAtDepth = null;
 		this._spliceOutDestination = { script, sats };
@@ -13338,6 +13473,7 @@ export class Channel {
 	): void {
 		if (this._state.state !== ChannelState.NORMAL) return;
 		this._spliceOutDestination = null;
+		this._compositeSplice = null;
 		// A splice that must confirm before it locks, whatever the channel
 		// type (issue #760): a stranger's coin never becomes the live funding
 		// of a zero-conf channel at broadcast. The depth belongs to THIS
@@ -13352,6 +13488,162 @@ export class Channel {
 				: {})
 		};
 		this._spliceLockAtDepth = null;
+	}
+
+	/**
+	 * Register this channel's part in a composite splice-out (issue #1922)
+	 * before the node calls initiateSplice. Refused (with the reason) when
+	 * the channel is not NORMAL, when the contribution does not name exactly
+	 * this channel's funding outpoint as its shared input, when a non-shared
+	 * input's prev_tx does not produce the outpoint and value it claims, or
+	 * when a serial id is odd or repeated. The other channels' funding inputs
+	 * are registered as EXTERNAL splice inputs so the existing #592 machinery
+	 * withholds our tx_signatures until the node delivers their witnesses.
+	 */
+	setCompositeSpliceContribution(
+		contribution: ICompositeSpliceContribution
+	): string | null {
+		if (this._state.state !== ChannelState.NORMAL) {
+			return 'channel is not NORMAL';
+		}
+		if (contribution.compositeId.length !== 32) {
+			return 'compositeId must be 32 bytes';
+		}
+		if (!this._state.fundingTxid) return 'channel has no funding outpoint';
+		const serials = new Set<string>();
+		const externals: ISpliceWalletInput[] = [];
+		let shared = 0;
+		for (const input of contribution.inputs) {
+			if (input.serialId < 0n || input.serialId % 2n !== 0n) {
+				return 'composite serial ids must be even';
+			}
+			const key = input.serialId.toString();
+			if (serials.has(key)) return `serial id ${key} repeated`;
+			serials.add(key);
+			if (input.shared) {
+				shared++;
+				if (
+					!input.prevTxid.equals(this._state.fundingTxid) ||
+					input.prevOutputIndex !== this._state.fundingOutputIndex ||
+					input.valueSats !== this._state.fundingSatoshis
+				) {
+					return 'shared input is not this channel funding outpoint';
+				}
+				continue;
+			}
+			let prev: import('bitcoinjs-lib').Transaction;
+			try {
+				prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+			} catch {
+				return 'composite input prev_tx is unreadable';
+			}
+			if (!Buffer.from(prev.getHash()).equals(input.prevTxid)) {
+				return 'composite input prev_tx does not match its txid';
+			}
+			const out = prev.outs[input.prevOutputIndex];
+			if (!out || BigInt(out.value) !== input.valueSats) {
+				return 'composite input prev_tx does not carry the claimed output';
+			}
+			externals.push({
+				prevTx: input.prevTx,
+				prevOutputIndex: input.prevOutputIndex,
+				value: input.valueSats,
+				sequence: 0xfffffffd,
+				confirmed: true,
+				external: true,
+				signWitness: (): Buffer[] => {
+					throw new Error(
+						'composite funding input: the witness is assembled by the node'
+					);
+				}
+			});
+		}
+		if (shared !== 1) return 'exactly one input must be the shared input';
+		for (const output of contribution.outputs) {
+			if (output.serialId < 0n || output.serialId % 2n !== 0n) {
+				return 'composite serial ids must be even';
+			}
+			const key = output.serialId.toString();
+			if (serials.has(key)) return `serial id ${key} repeated`;
+			serials.add(key);
+		}
+		if (contribution.outputs.length === 0) return 'no outputs';
+		this._spliceOutDestination = null;
+		this._spliceLockAtDepth = null;
+		// The other channels' funding inputs ride as our external inputs: the
+		// witness machinery of #592 leaves their slots empty, withholds our
+		// tx_signatures and accepts the node's delivery once verified. The
+		// change script is never used: a composite adds its outputs itself.
+		this._spliceInInputs = { inputs: externals, changeScript: Buffer.alloc(0) };
+		this._compositeSplice = { contribution, commitmentReleased: false };
+		return null;
+	}
+
+	/**
+	 * Forget an in-flight splice whose tx_signatures never left this side
+	 * (issue #1922, restore of a composite that ended before RELEASED). The
+	 * peer may have signed, but it holds one signature on a transaction that
+	 * lacks our witnesses, so nothing it has can confirm; we owe it a
+	 * tx_abort, which markForReestablish sends ahead of channel_reestablish
+	 * and the peer's echo acknowledges. Returns [] when there is nothing to
+	 * forget, and refuses (ERROR) once our signatures have left: the
+	 * transaction may confirm then and the record must stay.
+	 */
+	forgetUnsentSplice(reason: string): ChannelAction[] {
+		const inflight = this._state.spliceInFlight;
+		if (this._spliceSentTxSigs || inflight?.sentTxSignatures) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot forget splice: our tx_signatures left, the splice tx may confirm (${reason})`
+				}
+			];
+		}
+		if (!inflight && !this._spliceSession && !this._pendingSplice) return [];
+		this._spliceSession?.abort(reason);
+		this._spliceSession = null;
+		this._state.spliceInFlight = null;
+		this._resetSpliceDriver();
+		if (this._state.state === ChannelState.SPLICING) {
+			this._state.state = this._state.preSpliceState ?? ChannelState.NORMAL;
+			this._state.preSpliceState = null;
+		} else if (this._state.state === ChannelState.AWAITING_REESTABLISH) {
+			// Restored but not yet reconnected: the live state is parked in
+			// preReestablishState, and a SPLICING left there would come back as
+			// a spliceless SPLICING when reestablish completes, the trap
+			// initiateSpliceAbort steps around for the operator path.
+			if (this._state.preReestablishState === ChannelState.SPLICING) {
+				this._state.preReestablishState =
+					this._state.preSpliceState ?? ChannelState.NORMAL;
+			}
+			this._state.preSpliceState = null;
+		}
+		this._state.spliceAbortOwed = true;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			this._spliceAbortedAction(reason)
+		];
+	}
+
+	/** The composite splice this channel's splice belongs to, if any. */
+	getCompositeSpliceId(): Buffer | null {
+		return this._compositeSplice
+			? Buffer.from(this._compositeSplice.contribution.compositeId)
+			: null;
+	}
+
+	/**
+	 * Let a composite session send the splice commitment_signed it held at
+	 * tx_complete (issue #1922): the node calls this once every session of
+	 * the composite negotiated the same transaction. A no-op for a channel
+	 * that is not in a composite or already released.
+	 */
+	releaseCompositeSpliceCommitment(): ChannelAction[] {
+		if (!this._compositeSplice || this._compositeSplice.commitmentReleased) {
+			return [];
+		}
+		this._compositeSplice.commitmentReleased = true;
+		return this._maybeSendSpliceCommitment();
 	}
 
 	/**
@@ -13469,6 +13761,40 @@ export class Channel {
 			this._state.remoteBasepoints?.fundingPubkey;
 		if (!remoteFundingPubkey) return;
 
+		if (this._compositeSplice) {
+			// Composite (issue #1922): the node allocated every serial id and
+			// built the identical lists for every session; this channel's own
+			// funding outpoint is the shared input, the others ride with their
+			// funding transactions as prev_tx, and the outputs are the N new
+			// funding outputs plus the destination. Nothing is derived here.
+			const { contribution } = this._compositeSplice;
+			for (const input of contribution.inputs) {
+				this._spliceContributions.push({
+					kind: 'input',
+					...(input.shared ? { sharedInputTxid: input.prevTxid } : {}),
+					input: {
+						serialId: input.serialId,
+						prevTxid: input.prevTxid,
+						prevOutputIndex: input.prevOutputIndex,
+						sequence: 0xfffffffd,
+						prevTx: input.shared ? Buffer.alloc(0) : input.prevTx,
+						prevTxVout: input.prevOutputIndex
+					}
+				});
+			}
+			for (const output of contribution.outputs) {
+				this._spliceContributions.push({
+					kind: 'output',
+					output: {
+						serialId: output.serialId,
+						amountSats: output.amountSats,
+						scriptPubkey: output.scriptPubkey
+					}
+				});
+			}
+			return;
+		}
+
 		// Shared input: the channel's current funding output, signalled via the
 		// shared_input_txid TLV with an empty prevTx.
 		this._spliceContributions.push({
@@ -13492,7 +13818,9 @@ export class Channel {
 			remoteFundingPubkey
 		);
 		const txWeight = estimateSpliceTxWeight({
-			walletInputCount: this._spliceInInputs?.inputs.length ?? 0,
+			...(this._spliceInInputs
+				? spliceWalletInputCounts(this._spliceInInputs.inputs)
+				: { walletInputCount: 0 }),
 			fundingScriptLen: newFunding.p2wshOutput.length,
 			changeScriptLen: this._spliceInInputs?.changeScript.length,
 			destinationScriptLen: this._spliceInInputs
@@ -13913,6 +14241,9 @@ export class Channel {
 			remoteFundingPubkey,
 			oldWitnessScript
 		);
+		// Kept for a composite's other sessions (issue #1922), which need both
+		// halves of this input's 2-of-2 witness; harmless on a single splice.
+		this._syncSpliceInFlight({ remoteSharedInputSig: Buffer.from(remoteSig) });
 
 		// Apply the peer's wallet-input witnesses to the non-shared inputs we
 		// did not sign ourselves (in ascending input order). Exactly one stack
@@ -14144,10 +14475,16 @@ export class Channel {
 		// now could strand the channel on a spent funding output. (The in-flight
 		// record alone is not the threshold — it is created earlier, at the
 		// commitment round, for crash-safe persistence.)
+		// A composite session (issue #1922) that RECEIVED the peer's
+		// tx_signatures but did not send its own may still abort: the peer
+		// holds one signature on one input of a transaction missing our
+		// witnesses, so nothing it has can confirm. The single-channel refusal
+		// for that case stays outside composites.
 		if (
 			this._spliceSentTxSigs ||
 			this._state.spliceInFlight?.sentTxSignatures ||
-			this._state.spliceInFlight?.receivedTxSignatures
+			(this._state.spliceInFlight?.receivedTxSignatures &&
+				!this._compositeSplice)
 		) {
 			return [
 				{
@@ -14530,6 +14867,7 @@ export class Channel {
 		this._pendingBatch = null;
 		this._spliceOutDestination = null;
 		this._spliceInInputs = null;
+		this._compositeSplice = null;
 		this._spliceTx = null;
 		this._spliceCallerTxSigsSignaled = false;
 	}
@@ -14890,6 +15228,12 @@ export class Channel {
 			!this._state.channelId ||
 			!this._state.remoteCurrentPerCommitmentPoint
 		) {
+			return [];
+		}
+		// A composite session (issue #1922) holds its commitment until the
+		// node has seen every session negotiate the same transaction:
+		// releaseCompositeSpliceCommitment lifts the hold.
+		if (this._compositeSplice && !this._compositeSplice.commitmentReleased) {
 			return [];
 		}
 		// Build the splice tx (idempotent) so the new outpoint/capacity are known.
@@ -16174,6 +16518,24 @@ export class Channel {
 				];
 			}
 		}
+		// The adopted funding's own bytes (issue #1922, step 5a): a later
+		// composite splice spends this outpoint as an ordinary input and needs
+		// the whole transaction as prev_tx. Only a real swap writes the field,
+		// and only from a record holding every witness; a force-close adoption
+		// of a half-signed record leaves it for the chain to fill
+		// (LightningNode.getFundingTxHex).
+		if (
+			fields.fundingTxid &&
+			this._state.fundingTxid &&
+			!fields.fundingTxid.equals(this._state.fundingTxid)
+		) {
+			fields.fundingTxHex =
+				record?.fullySigned &&
+				record.spliceTxHex &&
+				record.spliceTxid.equals(fields.fundingTxid)
+					? record.spliceTxHex
+					: undefined;
+		}
 		fields.spliceInFlight = null;
 		return fields;
 	}
@@ -17201,6 +17563,26 @@ export class Channel {
 	}
 
 	/**
+	 * A composite session takes no interactive-tx item from its peer (issue
+	 * #1922): the N sessions must negotiate one identical transaction, and a
+	 * peer input, output or removal in any of them would make this one
+	 * differ. Fail the negotiation with tx_abort, the channel survives; the
+	 * node aborts the other sessions on the splice:aborted that follows.
+	 * Null when the channel is not in a composite.
+	 */
+	private _compositeSpliceRefusesPeerItem(
+		what: string
+	): ChannelAction[] | null {
+		if (!this._compositeSplice) return null;
+		const reason = `peer sent ${what} in a composite splice session`;
+		return [
+			this._txAbort(this._state.channelId!, reason),
+			...this.abortSplice(reason),
+			{ type: ChannelActionType.ERROR, message: `splice aborted: ${reason}` }
+		];
+	}
+
+	/**
 	 * Handle tx_add_input from peer during v2 opening. `prevTxBytesFree` is
 	 * what the manager's node-wide prev_tx budget has left (issue #1457).
 	 */
@@ -17211,6 +17593,9 @@ export class Channel {
 		// Splicing reuses the interactive-tx protocol. If a splice negotiation is
 		// in progress, route the peer's input into the splice session.
 		if (this._spliceTxNegotiationActive()) {
+			const compositeRefusal =
+				this._compositeSpliceRefusesPeerItem('tx_add_input');
+			if (compositeRefusal) return compositeRefusal;
 			// For the shared (existing funding) input the prevout txid arrives in the
 			// shared_input_txid TLV with an empty prevTx; use it so both sides build
 			// the identical transaction. For ordinary inputs the txid comes from the
@@ -17354,6 +17739,9 @@ export class Channel {
 	 */
 	handleTxAddOutput(msg: ITxAddOutputMessage): ChannelAction[] {
 		if (this._spliceTxNegotiationActive()) {
+			const compositeRefusal =
+				this._compositeSpliceRefusesPeerItem('tx_add_output');
+			if (compositeRefusal) return compositeRefusal;
 			// Peer outputs must respect the negotiated dust floor, not a flat 546:
 			// both sides' commitment dust limits are known on an active channel.
 			this._spliceSession!.getTxBuilder()?.setDustLimit(
@@ -17449,6 +17837,9 @@ export class Channel {
 	 */
 	handleTxRemoveInput(msg: ITxRemoveInputMessage): ChannelAction[] {
 		if (this._spliceTxNegotiationActive()) {
+			const compositeRefusal =
+				this._compositeSpliceRefusesPeerItem('tx_remove_input');
+			if (compositeRefusal) return compositeRefusal;
 			const err = this._spliceSession!.removePeerInput(msg.serialId);
 			if (err) {
 				return [{ type: ChannelActionType.ERROR, message: err }];
@@ -17515,6 +17906,9 @@ export class Channel {
 	 */
 	handleTxRemoveOutput(msg: ITxRemoveOutputMessage): ChannelAction[] {
 		if (this._spliceTxNegotiationActive()) {
+			const compositeRefusal =
+				this._compositeSpliceRefusesPeerItem('tx_remove_output');
+			if (compositeRefusal) return compositeRefusal;
 			const err = this._spliceSession!.removePeerOutput(msg.serialId);
 			if (err) {
 				return [{ type: ChannelActionType.ERROR, message: err }];
@@ -17984,6 +18378,40 @@ export class Channel {
 						}
 					];
 				}
+				if (
+					this._compositeSplice &&
+					!this._compositeSplice.commitmentReleased
+				) {
+					// Composite (issue #1922): build (and sign our shared input of)
+					// the negotiated transaction so its txid is known, but send no
+					// commitment yet; the node compares every session's txid and
+					// releases them together, or aborts them all.
+					const built = this.buildAndSignSpliceTx();
+					if (!built) {
+						const reason = 'failed to build the negotiated splice tx';
+						this._spliceAbortIgnoreCommitment = true;
+						return [
+							this._txAbort(this._state.channelId!, reason),
+							...this.abortSplice(reason),
+							{
+								type: ChannelActionType.ERROR,
+								message: `splice aborted: ${reason}`
+							}
+						];
+					}
+					return [
+						...driveActions,
+						{
+							type: ChannelActionType.SPLICE_TX_NEGOTIATED,
+							channelId: this._state.channelId!,
+							compositeId: Buffer.from(
+								this._compositeSplice.contribution.compositeId
+							),
+							spliceTxid: built.spliceTxid,
+							newFundingOutputIndex: built.newFundingOutputIndex
+						}
+					];
+				}
 			}
 			return [...driveActions, ...this._maybeSendSpliceCommitment()];
 		}
@@ -18145,14 +18573,15 @@ export class Channel {
 				ourExternalSpliceInput
 			) {
 				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
-				// prevouts; every other type would have to be accepted on
-				// shape alone. Refuse the negotiation HERE, before the
-				// commitment round signs anything for this transaction, rather
-				// than at tx_signatures when signatures may already be out.
-				// Splice checks REMOTE inputs and our own external ones: our
-				// closure-signed splice-in inputs (any script type) never pass
-				// through our witness validator.
-				const unsupported = this._v2CheckInputSpendable(input);
+				// prevouts, plus, in a splice, the bare 2-of-2 P2WSH form of a
+				// channel funding output (issue #1922); every other type would
+				// have to be accepted on shape alone. Refuse the negotiation
+				// HERE, before the commitment round signs anything for this
+				// transaction, rather than at tx_signatures when signatures may
+				// already be out. Splice checks REMOTE inputs and our own
+				// external ones: our closure-signed splice-in inputs (any
+				// script type) never pass through our witness validator.
+				const unsupported = this._v2CheckInputSpendable(input, kind);
 				if (unsupported) return unsupported;
 			}
 			weight += isShared
@@ -18578,6 +19007,7 @@ export class Channel {
 		const assembled = this._assembleV2FundingTx();
 		if (!assembled) return false;
 		this._state.pendingFundingTxHex = assembled.toString('hex');
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this._syncV2InFlight({
 			receivedTxSignatures: true,
 			fullySigned: true,
@@ -19048,7 +19478,18 @@ export class Channel {
 	 * cryptographically verified, and an unverifiable input must never make
 	 * it into the negotiated tx.
 	 */
-	private _v2CheckInputSpendable(input: IInteractiveTxInput): string | null {
+	/**
+	 * Whether a negotiated input's prevout is one whose witness this side can
+	 * verify at tx_signatures. A P2WSH program says nothing about the script
+	 * behind it, so it is admitted only in a splice session, where the one
+	 * form _validateWitnessForInput accepts (the bare 2-of-2 of a channel
+	 * funding output, issue #1922) has a reason to appear; a v2 open keeps
+	 * refusing it, and so does every other output type.
+	 */
+	private _v2CheckInputSpendable(
+		input: IInteractiveTxInput,
+		kind: 'v2' | 'splice'
+	): string | null {
 		if (!input.prevTx || input.prevTx.length < 32) {
 			return 'funding input carries no previous transaction';
 		}
@@ -19063,12 +19504,15 @@ export class Channel {
 		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+		const isP2wsh =
+			script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
 		const isP2tr =
 			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
-		if (!isP2wpkh && !isP2tr) {
-			return 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
-		}
-		return null;
+		if (isP2wpkh || isP2tr) return null;
+		if (isP2wsh && kind === 'splice') return null;
+		return kind === 'splice'
+			? 'funding input pays an unsupported output type (only P2WPKH, P2TR and 2-of-2 P2WSH witnesses can be verified)'
+			: 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
 	}
 
 	private _validateWitnessForInput(
@@ -19176,13 +19620,78 @@ export class Channel {
 			return 'P2TR script-path spends are not supported for funding inputs';
 		}
 		if (isP2wsh) {
-			// A P2WSH witness cannot be verified without executing the script
-			// (a hash-matched OP_FALSE spend would pass any structural check):
-			// fail closed. The negotiation-time check refuses P2WSH funding
-			// inputs before anything signs, so this is defense in depth.
-			return 'P2WSH peer funding inputs are not supported (the witness cannot be verified)';
+			// A general P2WSH witness cannot be verified without executing the
+			// script (a hash-matched OP_FALSE spend would pass any structural
+			// check), so exactly one form is admitted (issue #1922): the bare
+			// 2-of-2 of a channel funding output, OP_2 <key> <key> OP_2
+			// OP_CHECKMULTISIG, spent as [<>, sig, sig, script], whose
+			// semantics are fully known: both signatures must verify under
+			// BIP 143 against the key in the same position. Everything else
+			// stays refused here, which is where a splice session defers the
+			// judgment to (_v2CheckInputSpendable admits the program at
+			// tx_complete, where only the 32-byte hash is visible).
+			return this._validateBare2of2Witness(tx, index, stack, script, value);
 		}
 		return 'peer funding input is not a supported segwit output';
+	}
+
+	/**
+	 * The one P2WSH witness form a funding input may carry (issue #1922): a
+	 * bare 2-of-2 multisig in the canonical BOLT 3 funding form, with both
+	 * signatures present, SIGHASH_ALL, low-S, each verifying against the key
+	 * at its position. Returns the problem, or null when acceptable.
+	 */
+	private _validateBare2of2Witness(
+		tx: import('bitcoinjs-lib').Transaction,
+		index: number,
+		stack: Buffer[],
+		prevoutScript: Buffer,
+		value: bigint
+	): string | null {
+		if (stack.length !== 4 || stack[0].length !== 0) {
+			return 'P2WSH witness must be [<>, signature, signature, script] (bare 2-of-2)';
+		}
+		const script = stack[3];
+		if (!sha256(script).equals(prevoutScript.subarray(2))) {
+			return 'P2WSH witness script does not match the prevout program';
+		}
+		const chunks = bitcoin.script.decompile(script);
+		const isKey = (c: unknown): c is Buffer =>
+			Buffer.isBuffer(c) && c.length === 33 && (c[0] === 0x02 || c[0] === 0x03);
+		if (
+			!chunks ||
+			chunks.length !== 5 ||
+			chunks[0] !== bitcoin.opcodes.OP_2 ||
+			!isKey(chunks[1]) ||
+			!isKey(chunks[2]) ||
+			chunks[3] !== bitcoin.opcodes.OP_2 ||
+			chunks[4] !== bitcoin.opcodes.OP_CHECKMULTISIG ||
+			!bitcoin.script.compile(chunks).equals(script)
+		) {
+			return 'P2WSH witness script is not a bare 2-of-2 (OP_2 <key> <key> OP_2 OP_CHECKMULTISIG)';
+		}
+		const keys = [chunks[1], chunks[2]];
+		const sighash = tx.hashForWitnessV0(
+			index,
+			script,
+			Number(value),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		for (let k = 0; k < 2; k++) {
+			const decoded = this._decodeDerSighashAll(stack[1 + k]);
+			if (typeof decoded === 'string') return `2-of-2 ${decoded}`;
+			let valid = false;
+			try {
+				// strict: high-S signatures are refused (BIP 62 standardness).
+				valid = ecc.verify(sighash, keys[k], decoded, true);
+			} catch {
+				valid = false;
+			}
+			if (!valid) {
+				return `2-of-2 signature ${k + 1} does not verify against its key`;
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -21555,7 +22064,8 @@ export class Channel {
 				: null,
 			// A v2 opening commitment (#0) carries no HTLCs.
 			remoteHtlcSignatures: [],
-			pendingFundingTxHex: undefined
+			pendingFundingTxHex: undefined,
+			fundingTxHex: adopted.fullySigned ? adopted.fundingTxHex : undefined
 		};
 		// The amounts this attempt's commitment was signed at; absent on
 		// records predating per-attempt contributions, whose amounts are the
@@ -21619,6 +22129,7 @@ export class Channel {
 		this._state.pendingFundingTxHex = record.fullySigned
 			? record.fundingTxHex
 			: undefined;
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this.restoreV2InFlight();
 		this._state.state = this._v2StateForRecord(record);
 	}
@@ -21670,6 +22181,7 @@ export class Channel {
 		this._state.pendingFundingTxHex = adopted.fullySigned
 			? adopted.fundingTxHex
 			: undefined;
+		this._state.fundingTxHex = this._state.pendingFundingTxHex;
 		this.restoreV2InFlight();
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 		const actions: ChannelAction[] = [

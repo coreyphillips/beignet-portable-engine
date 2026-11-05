@@ -591,14 +591,18 @@ export async function createPortableRuntime(options: any) {
 				// diagnostic hook gets them. Registered before the primary is
 				// dialled, so the first connection is reported like every later
 				// one. BeignetNode emits each as one object; a disconnect names
-				// who closed it and why (peer-diagnostics.cjs).
+				// who closed it and why (peer-diagnostics.cjs). Since Beignet
+				// 0.37.0 a peer's BOLT 1 warning and a refused forward arrive as
+				// peer:warning and htlc:forward-refused instead of node:error.
 				const peerKey = (first: any): string =>
 					typeof first === 'string' ? first : String(first?.pubkey ?? '');
 				for (const event of [
 					'node:error',
 					'peer:error',
+					'peer:warning',
 					'peer:connect',
-					'peer:disconnect'
+					'peer:disconnect',
+					'htlc:forward-refused'
 				]) {
 					node.on(event, (first: any, second: any) => {
 						options.onDiagnostic?.(peerDiagnostic(event, first, second));

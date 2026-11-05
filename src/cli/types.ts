@@ -11,6 +11,10 @@ import type { IGuardianConfigEntry } from '../lightning/recovery/assembly';
 import type { IGraphRestoreStats } from '../lightning/node/types';
 import type { ChannelErrorCode } from '../lightning/channel/channel-actions';
 import type {
+	CompositeSpliceStage,
+	ICompositeSpliceRecord
+} from '../lightning/channel/composite-splice-record';
+import type {
 	HoldCancelReason,
 	SpliceRefusalCode
 } from '../lightning/node/types';
@@ -478,12 +482,37 @@ export interface JitStatusInfo {
 }
 
 /**
+ * Why a steered receive passed one ranked primary over (issue #1922). `budget`
+ * means it was not tried: the walk's budget ran out before it.
+ */
+export interface ReceiveSteerSkip {
+	pubkey: string;
+	/** 1-based configured rank. */
+	rank: number;
+	stage: 'connect' | 'attempt' | 'budget';
+	code: string;
+	message: string;
+}
+
+/** A JIT invoice: the invoice, the agreed opening fee, and the LSP behind it. */
+export interface JitInvoiceInfo extends InvoiceInfo {
+	/** The LSP the intent was registered with: the one named, or the primary that took it. */
+	lspPubkey: string;
+	flatFeeSat: number;
+	feePpm: number;
+	feeMode: 'skim' | 'hop';
+	/** Steered receives only: the primaries passed over before this one. */
+	skipped?: ReceiveSteerSkip[];
+}
+
+/**
  * GET /jit/quote (issue #687): what a just-in-time receive of this size
  * would cost at the named LSP and whether it would be served right now,
  * asked without registering an intent. A decline is an answer, not an
  * error: `accepted` false with `reason` in plain language.
  */
 export interface JitQuoteInfo {
+	/** The LSP priced: the one named, or the first primary that would serve the receive. */
 	lspPubkey: string;
 	/** The receive priced; null for an amount-less invoice (the cap is priced). */
 	amountSats: number | null;
@@ -504,10 +533,32 @@ export interface JitQuoteInfo {
 	withinCeilings: boolean;
 	/** Those ceilings, so a refusal on them can be explained. */
 	client: { maxFlatFeeSat: number; maxFeePpm: number };
+	/** Steered quotes only: the primaries passed over before this one. */
+	skipped?: ReceiveSteerSkip[];
+}
+
+/** A minted direct-funding request, and the peer it is bound to. */
+export interface DirectFundingRequestInfo {
+	/** The receipt hash; its preimage is revealed to the payer after broadcast. */
+	paymentHash: PaymentHashHex;
+	expiresAt: number;
+	/** The base64url envelope a payer pays (BIP 21 parameter `bgnq`). */
+	request: string;
+	/**
+	 * The peer the funding is negotiated with (issue #1922): the one named or
+	 * steered to, else the policy's liquidity peer, else null, when no relay
+	 * descriptor was emitted and no offer is served until a policy names one.
+	 */
+	lspPubkey: string | null;
+	/** The primaries passed over on the way to `lspPubkey`, when any were. */
+	skipped?: ReceiveSteerSkip[];
 }
 
 export interface DirectFundingConfigInfo {
-	/** The liquidity peer every direct-funded channel is negotiated with. */
+	/**
+	 * The liquidity peer a direct-funded channel is negotiated with when the
+	 * request bound no peer of its own (issue #1922).
+	 */
 	lspPubkey: string | null;
 	lspHost: string | null;
 	lspPort: number | null;
@@ -539,6 +590,36 @@ export interface DirectFundingConfigInfo {
 	unpairedSpliceDepth: number;
 	/** Smallest offer served, never below the 5000 sat protocol floor. */
 	minAmountSat: number;
+}
+
+/** One ranked receive primary as `listPrimaries` reports it (issue #1922). */
+export interface PrimaryInfo {
+	pubkey: string;
+	/** 1 is the highest rank. */
+	rank: number;
+	host: string | null;
+	port: number | null;
+	/** A `pubkey@address` peer URI, for ws://, wss:// and iroh: primaries. */
+	uri: string | null;
+	/** The fill threshold that applies to this primary; null means no cap. */
+	thresholdSat: number | null;
+	/** Our local balance summed over our usable channels with it. */
+	balanceSat: number;
+	/** How many of those channels there are; 0 means none yet. */
+	channelCount: number;
+	belowThreshold: boolean;
+	/** Whether a receive with no peer named would pick this primary. */
+	isReceiveTarget: boolean;
+	/** 1-based position in the order a receive tries the primaries. */
+	selectionOrder: number;
+}
+
+export interface PrimariesInfo {
+	fillThresholdSat: number | null;
+	/** Rank order. */
+	primaries: PrimaryInfo[];
+	/** The current receive target's pubkey, or null with no primaries. */
+	receiveTarget: string | null;
 }
 
 export interface HoldInvoiceInfo {
@@ -807,6 +888,71 @@ export interface SpliceResult {
 	code?: SpliceRefusalCode;
 }
 
+/**
+ * How a channel send (issue #1922) pays an address: one channel's splice-out,
+ * or one transaction that splices out of several channels at once.
+ */
+export type ChannelSendKind = 'single' | 'composite';
+
+/**
+ * The stage of a channel send: a single-channel splice-out is STARTED, then
+ * LOCKED (with the new funding txid) or ABORTED (with the reason) as its
+ * channel's splice completes or aborts; a composite reports its record's
+ * stage.
+ */
+export type ChannelSendStage = 'STARTED' | CompositeSpliceStage;
+
+export interface ChannelSendQuoteChannel {
+	channelId: ChannelIdHex;
+	/** What this channel pays into the destination. */
+	debitSats: number;
+	/** This channel's share of the on-chain fee. */
+	feeSats: number;
+	oldCapacitySats: number;
+	newCapacitySats: number;
+}
+
+/** The plan a channel send would run, valid until `expiresAt`. */
+export interface ChannelSendQuote {
+	/** 32-byte hex; the operation id once executed. */
+	quoteId: string;
+	kind: ChannelSendKind;
+	address: string;
+	amountSats: number;
+	/** The whole on-chain fee (sum of the channels' shares). */
+	feeSats: number;
+	/** amountSats + feeSats: what the per-payment and daily limits count. */
+	totalSats: number;
+	feeratePerkw: number;
+	channels: ChannelSendQuoteChannel[];
+	/** Channels considered for a composite and left out, with the reason. */
+	skipped: Array<{ channelId: ChannelIdHex; reason: string }>;
+	/** Epoch ms; executeChannelSend refuses the quote afterwards. */
+	expiresAt: number;
+}
+
+/** A channel send that was executed, or a composite found without a quote after a restart. */
+export interface ChannelSendStatus {
+	/** The quote id the execute call returned, or the composite id for a composite restored without one. */
+	id: string;
+	kind: ChannelSendKind;
+	stage: ChannelSendStage;
+	address?: string;
+	amountSats: number;
+	feeSats: number;
+	/** Single: the channel that spliced out. */
+	channelId?: ChannelIdHex;
+	/** Composite: the composite record id (hex). */
+	compositeId?: string;
+	/** Composite: the agreed transaction, display order, from COMMITTED on. */
+	txid?: TxidHex;
+	/** Why the operation ended in ABORTED or CONFLICTED. */
+	reason?: string;
+	startedAt: number;
+	/** Composite: the full record. */
+	record?: ICompositeSpliceRecord;
+}
+
 export interface BootstrapPeerInfo {
 	pubkey: string;
 	host: string;
@@ -1005,8 +1151,10 @@ export interface BeignetConfig extends IrohDaemonConfig, ElectrumTlsConfig {
 	/** Guardian sets this node will register (default 16). Env:
 	 *  BEIGNET_GUARDIAN_MAX_SETS. */
 	guardianMaxSets?: number;
-	/** Advertised per-record ciphertext limit (default 4194304, 4 MiB; the
-	 *  protocol cap is 16 MiB). Env: BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES. */
+	/** Advertised per-record ciphertext limit (default 4194304, 4 MiB, which
+	 *  is also the floor a node accepts from a guardian, so it can only be
+	 *  raised; the protocol cap is 16 MiB). Env:
+	 *  BEIGNET_GUARDIAN_MAX_CIPHERTEXT_BYTES. */
 	guardianMaxCiphertextBytes?: number;
 	/** Node-wide default routing fee policy advertised in channel_update
 	 *  (BOLT 7; base u32 msat, proportional u32 millionths, cltv delta u16).
@@ -1567,6 +1715,14 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
 	'splice:aborted': (data: { channelId: ChannelIdHex; reason: string }) => void;
+	/** A channel send (issue #1922) reached a stage: a single-channel splice-out is STARTED, then LOCKED or ABORTED as its channel's splice completes or aborts; a composite reports its record's stage (PLANNED, NEGOTIATING, COMMITTED, PEERS_SIGNED, RELEASED, BROADCAST, LOCKED, ABORTED or CONFLICTED, with the reason), every stage from PLANNED on. `id` is the quote id the execute call returned, or the composite id for a composite restored without one; `txid` (display order) is the new funding transaction, for a composite from COMMITTED on. */
+	'channel-send:stage': (data: {
+		id: string;
+		compositeId?: string;
+		stage: ChannelSendStage;
+		txid?: TxidHex;
+		reason?: string;
+	}) => void;
 	/** An input of an in-flight splice that this node does not vouch for was spent by conflictTxid, confirmed six deep while the splice is not on chain: the splice can never confirm, and the peer is being asked to revert (issue #760). */
 	'splice:conflicted': (data: {
 		channelId: ChannelIdHex;
@@ -1588,6 +1744,15 @@ export interface BeignetNodeEvents {
 		amountInMsat: string;
 		amountOutMsat: string;
 		feeMsat: string;
+	}) => void;
+	/** The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Someone else's payment was turned away, so it is not a `node:error`. `reason` is the channel's refusal text, `channelErrorCode` its code when it gave one (INSUFFICIENT_BALANCE, LIMIT_EXCEEDED, ...), `amountMsat` the amount it would have carried as a decimal string. */
+	'htlc:forward-refused': (data: {
+		inChannelId: ChannelIdHex;
+		outChannelId: ChannelIdHex;
+		amountMsat: string;
+		paymentHash: PaymentHashHex;
+		reason: string;
+		channelErrorCode?: ChannelErrorCode;
 	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:fulfilled': (data: { channelId: ChannelIdHex; htlcId: string }) => void;
@@ -1611,6 +1776,12 @@ export interface BeignetNodeEvents {
 	}) => void;
 	/** A peer connection reported an error. */
 	'peer:error': (data: { pubkey: string; message: string }) => void;
+	/** A peer sent a BOLT 1 warning: the connection and its channels stay as they were, so it is not a `node:error`. channelId is null when the warning is about the connection rather than one channel; text is the peer's text as printable ASCII. */
+	'peer:warning': (data: {
+		pubkey: string;
+		channelId: ChannelIdHex | null;
+		text: string;
+	}) => void;
 	/** An operational error (non-fatal), also passed to the onError option. `code` is a NodeErrorCode or one BeignetNode raises itself, such as ELECTRUM_FAILOVER_FAILED. */
 	'node:error': (data: {
 		code: string;

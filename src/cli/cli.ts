@@ -366,6 +366,8 @@ async function main(): Promise<void> {
 			return handleQueue();
 		case 'direct-funding':
 			return handleDirectFunding();
+		case 'primaries':
+			return handlePrimaries();
 		case 'l402':
 			return handleL402();
 		case 'auth':
@@ -1062,6 +1064,44 @@ async function handleChannel(): Promise<void> {
 				})
 			);
 		}
+		case 'send-quote': {
+			// Channel send (issue #1922): quote a payment to an address out of one
+			// channel, or several channels in one transaction.
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/quote', {
+					address: pos[2],
+					amountSats: parseInt(pos[3], 10),
+					feeratePerkw: parseInt(pos[4], 10)
+				})
+			);
+		}
+		case 'send': {
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/execute', {
+					quoteId: pos[2]
+				})
+			);
+		}
+		case 'send-status':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel-send/status?id=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'send-list':
+			return outputResult(await httpRequest('GET', '/channel-send/list'));
+		case 'send-abort': {
+			const pos = positionalArgs();
+			return outputResult(
+				await httpRequest('POST', '/channel-send/abort', {
+					id: pos[2],
+					...(pos[3] !== undefined ? { reason: pos[3] } : {})
+				})
+			);
+		}
 		case 'ensure-minimum':
 			return outputResult(
 				await httpRequest('POST', '/channels/ensure-minimum', {
@@ -1198,11 +1238,22 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|send-quote|send|send-status|send-list|send-abort|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
 	}
+}
+
+/**
+ * A leading positional that is a node pubkey, split off from the rest. The
+ * JIT commands take the LSP first and the amount after it; with the LSP left
+ * out (the ranked primaries choose), the amount moves up one place.
+ */
+function optionalPubkey(positional: string[]): [string | undefined, string[]] {
+	return /^0[23][0-9a-fA-F]{64}$/.test(positional[0] ?? '')
+		? [positional[0], positional.slice(1)]
+		: [undefined, positional];
 }
 
 async function handleJit(): Promise<void> {
@@ -1211,22 +1262,11 @@ async function handleJit(): Promise<void> {
 		case 'status':
 			return outputResult(await httpRequest('GET', '/jit/status'));
 		case 'quote': {
-			// What a JIT receive would cost, before any invoice exists.
-			const lspPubkey = filteredArgs[2];
-			if (!lspPubkey) {
-				output({
-					ok: false,
-					error: {
-						code: 'INVALID_PARAMS',
-						message:
-							'Usage: beignet jit quote <lspPubkey> [amountSats] [--target-inbound sats]'
-					}
-				});
-				process.exitCode = 1;
-				return;
-			}
-			const params = new URLSearchParams({ lspPubkey });
-			if (filteredArgs[3]) params.set('amountSats', filteredArgs[3]);
+			// What a JIT receive would cost, before any invoice exists. With no
+			// LSP named, the daemon prices it at the ranked primaries' choice.
+			const [lspPubkey, rest] = optionalPubkey(filteredArgs.slice(2));
+			const params = new URLSearchParams(lspPubkey ? { lspPubkey } : {});
+			if (rest[0]) params.set('amountSats', rest[0]);
 			const target = parseFlag('--target-inbound');
 			if (target !== undefined) params.set('targetRemainingInboundSat', target);
 			return outputResult(
@@ -1263,21 +1303,9 @@ async function handleInvoice(): Promise<void> {
 		case 'jit': {
 			// Payable with no channel: the LSP holds the HTLC, funds a channel
 			// and forwards, taking the quoted opening fee out of the delivery.
-			const lspPubkey = filteredArgs[2];
-			if (!lspPubkey) {
-				output({
-					ok: false,
-					error: {
-						code: 'INVALID_PARAMS',
-						message:
-							'Usage: beignet invoice jit <lspPubkey> [amountSats] [description] ' +
-							'[--expiry secs] [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n] ' +
-							'[--fee-mode skim|hop]'
-					}
-				});
-				process.exitCode = 1;
-				return;
-			}
+			// With no LSP named, the daemon steers it through the ranked
+			// primaries (beignet primaries).
+			const [lspPubkey, rest] = optionalPubkey(filteredArgs.slice(2));
 			const numberFlag = (name: string): number | undefined => {
 				const raw = parseFlag(name);
 				return raw === undefined ? undefined : parseInt(raw, 10);
@@ -1285,10 +1313,8 @@ async function handleInvoice(): Promise<void> {
 			return outputResult(
 				await httpRequest('POST', '/jit/invoice', {
 					lspPubkey,
-					amountSats: filteredArgs[3]
-						? parseInt(filteredArgs[3], 10)
-						: undefined,
-					description: filteredArgs[4] || '',
+					amountSats: rest[0] ? parseInt(rest[0], 10) : undefined,
+					description: rest[1] || '',
 					expirySecs: numberFlag('--expiry'),
 					targetRemainingInboundSat: numberFlag('--target-inbound'),
 					maxFlatFeeSat: numberFlag('--max-flat-fee-sat'),
@@ -2099,6 +2125,87 @@ async function handleQueue(): Promise<void> {
 	}
 }
 
+/** Ranked receive primaries and the fill threshold (issue #1922). */
+async function handlePrimaries(): Promise<void> {
+	const sub = filteredArgs[1];
+	const pos = positionalArgs(new Set(['--host', '--port', '--uri', '--rank']));
+	// Number(), not parseInt: "1.5" and "10k" must reach the daemon as the
+	// invalid values they are rather than as a truncated number.
+	const numberFlag = (name: string): number | undefined => {
+		const raw = parseFlag(name);
+		return raw === undefined ? undefined : Number(raw);
+	};
+	const usage = (message: string): void => {
+		output({ ok: false, error: { code: 'INVALID_PARAMS', message } });
+		process.exitCode = 1;
+	};
+	switch (sub) {
+		case undefined:
+		case 'list':
+			return outputResult(await httpRequest('GET', '/primaries'));
+		case 'add':
+			if (!pos[2]) {
+				return usage(
+					'Usage: beignet primaries add <pubkey> [--host H --port P | --uri U] [--rank N]'
+				);
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/add', {
+					pubkey: pos[2],
+					host: parseFlag('--host'),
+					port: numberFlag('--port'),
+					uri: parseFlag('--uri'),
+					rank: numberFlag('--rank')
+				})
+			);
+		case 'remove':
+			if (!pos[2]) return usage('Usage: beignet primaries remove <pubkey>');
+			return outputResult(
+				await httpRequest('POST', '/primaries/remove', { pubkey: pos[2] })
+			);
+		case 'reorder':
+			if (pos.length < 3) {
+				return usage('Usage: beignet primaries reorder <pubkey> [pubkey...]');
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/reorder', {
+					order: pos.slice(2)
+				})
+			);
+		case 'threshold': {
+			const rawThreshold = pos[2];
+			if (!rawThreshold)
+				return usage('Usage: beignet primaries threshold <sats|none>');
+			const fillThresholdSat =
+				rawThreshold === 'none' ? null : Number(rawThreshold);
+			// JSON turns non-finite numbers into null, which would remove the cap.
+			if (
+				fillThresholdSat !== null &&
+				(rawThreshold.trim() === '' ||
+					!Number.isSafeInteger(fillThresholdSat) ||
+					fillThresholdSat < 0)
+			) {
+				return usage(
+					'Threshold must be a non-negative safe integer in sats, or none'
+				);
+			}
+			return outputResult(
+				await httpRequest('POST', '/primaries/threshold', { fillThresholdSat })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet primaries [list|add|remove|reorder|threshold]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 /**
  * Third-party direct funding (issue #613): a payer's ordinary on-chain payment
  * becomes this node's channel funding.
@@ -2155,7 +2262,8 @@ async function handleDirectFunding(): Promise<void> {
 				await httpRequest('POST', '/direct-funding/request', {
 					host: parseFlag('--host'),
 					port: numberFlag('--port'),
-					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined
+					amountSats: pos[2] ? parseInt(pos[2], 10) : undefined,
+					lspPubkey: parseFlag('--lsp')
 				})
 			);
 		}
@@ -3122,6 +3230,13 @@ Channels:
   channel splice-out <id> <sats> <feerate> [address]
                                          Withdraw funds from channel, to the
                                          wallet or an external address
+  channel send-quote <address> <sats> <feerate>
+                                         Quote paying an address out of one
+                                         channel, or several in one transaction
+  channel send <quoteId>                 Execute a channel send quote
+  channel send-status <id>               Stage and record of a channel send
+  channel send-list                      Every channel send this node holds
+  channel send-abort <id> [reason]       Abort a composite send before release
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
   channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
                         [--htlc-min-msat N] [--htlc-max-msat N]
@@ -3141,20 +3256,24 @@ Channels:
 Invoices & Payments:
   invoice create <sats> [description] [--min-final-cltv blocks]
                                          Create BOLT 11 invoice
-  invoice jit <lspPubkey> [sats] [description] [--expiry secs]
+  invoice jit [lspPubkey] [sats] [description] [--expiry secs]
              [--target-inbound sats] [--max-flat-fee-sat n] [--max-fee-ppm n]
              [--fee-mode skim|hop]       Create an invoice payable with no
                                          channel: the LSP funds one mid-payment
                                          and takes the agreed opening fee out
                                          of the delivery (skim, default) or
-                                         from the sender via the hint (hop)
+                                         from the sender via the hint (hop).
+                                         No lspPubkey: the ranked primaries
+                                         choose (see primaries)
   jit status                             The JIT receive role as it stands:
                                          fee, exposure caps, sats reserved and
                                          fronted, live intents
-  jit quote <lspPubkey> [sats] [--target-inbound sats]
+  jit quote [lspPubkey] [sats] [--target-inbound sats]
                                          What a JIT receive would cost at that
                                          LSP and whether it would be served
-                                         right now; registers nothing
+                                         right now; registers nothing. No
+                                         lspPubkey: priced at the primary the
+                                         ranked list would steer it to
 
 Swaps (reverse: a peer pays us over Lightning, we fund an on-chain contract;
        submarine: a peer funds a contract, we pay its invoice and claim):
@@ -3255,6 +3374,17 @@ BOLT 12 Offers:
   offer decode <offer>                   Decode a BOLT 12 offer string
   offer pay <offer> [amountSats] [--max-fee <sats>]  Pay a BOLT 12 offer
 
+Receive primaries (ranked peers receives are steered to):
+  primaries [list]                       Rank, balance and receive target of
+                                         each primary, and the fill threshold
+  primaries add <pubkey> [--host H --port P | --uri U] [--rank N]
+                                         Add a primary, last unless --rank
+  primaries remove <pubkey>              Drop a primary
+  primaries reorder <pubkey> [pubkey...] Re-rank: name every primary once,
+                                         highest rank first
+  primaries threshold <sats|none>        Sats a primary is filled to before
+                                         receives move to the next one
+
 Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding configure [--lsp <pubkey>] [--lsp-host H] [--lsp-port P]
                            [--min-amount sats] [--trusted true|false]
@@ -3265,10 +3395,13 @@ Direct funding (a payer's on-chain payment IS this node's channel funding):
   direct-funding config                  Read the effective policy back
   direct-funding received                List the payments received against
                                          our requests
-  direct-funding request [sats] [--host H] [--port P]
+  direct-funding request [sats] [--host H] [--port P] [--lsp <pubkey>]
                                          Mint a payment request; the receipt
                                          preimage stays here. --host/--port are
-                                         where a payer can reach this node
+                                         where a payer can reach this node.
+                                         --lsp binds it to that peer, which is
+                                         a primary or the policy's; omitted,
+                                         the primaries choose, else the policy
   direct-funding prepare <request>       Decode a request and start connecting
                                          to the node a send would use, without
                                          spending anything

@@ -48,6 +48,11 @@ import type {
 } from '../utils/identifiers';
 import { txidToDisplayHex } from '../utils/identifiers';
 import type {
+	ChannelSendQuote,
+	ChannelSendQuoteChannel,
+	ChannelSendStatus
+} from './types';
+import type {
 	IFormattedTransaction,
 	IOnchainFees,
 	TMessageDataMap
@@ -83,6 +88,19 @@ import {
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../lightning/channel/splice-weight';
+import {
+	COMPOSITE_SPLICE_RETENTION_MS,
+	CompositeSpliceRefusalCode
+} from '../lightning/node/composite-splice-engine';
+import type {
+	ICompositeSpliceRefusal,
+	ICompositeSpliceStageEvent
+} from '../lightning/node/composite-splice-engine';
+import type { ICompositeSpliceRecord } from '../lightning/channel/composite-splice-record';
+import {
+	compositeSpliceStageAtLeast,
+	compositeSpliceStageIsTerminal
+} from '../lightning/channel/composite-splice-record';
 import type { IL402Credential, IL402RequestInit } from '../lightning/l402';
 import {
 	isPrivateNetworkUrl,
@@ -212,6 +230,21 @@ import {
 	DirectFundingSender,
 	chainHashForNetwork
 } from '../lightning/direct-funding';
+import {
+	PrimariesError,
+	PrimariesErrorCode,
+	PrimariesStore,
+	selectReceiveTargets
+} from '../lightning/liquidity/primaries';
+import {
+	JIT_STEER_CODES,
+	STEER_BUDGET_MS,
+	dialTargetOf,
+	noPrimaryAvailable,
+	relayAddressOf,
+	steerReceive
+} from './receive-steering';
+import type { ISteerCandidate, ISteerSkip } from './receive-steering';
 import { directFundingWallet } from './direct-funding';
 import {
 	AUTH_KEY_OVERRIDES_STORAGE_KEY,
@@ -320,6 +353,9 @@ import type {
 	TOnchainQuote,
 	TChannelFundingQuote,
 	DirectFundingConfigInfo,
+	DirectFundingRequestInfo,
+	PrimariesInfo,
+	JitInvoiceInfo,
 	JitStatusInfo,
 	SwapsStatusInfo,
 	JitQuoteInfo
@@ -767,7 +803,10 @@ export interface BeignetNodeOptions
 	guardianMaxBytesPerSet?: number;
 	/** Sets this node will register (default 16). */
 	guardianMaxSets?: number;
-	/** Advertised per-record ciphertext limit (default 4 MiB). */
+	/**
+	 * Advertised per-record ciphertext limit (default 4 MiB, which is also
+	 * the least a node accepts from a guardian).
+	 */
 	guardianMaxCiphertextBytes?: number;
 	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
@@ -1273,6 +1312,71 @@ const SPLICE_REFUSAL_CODES: Record<SpliceRefusalCode, BeignetErrorCode> = {
 	[SpliceRefusalCode.SPLICE_REFUSED]: BeignetErrorCode.SPLICE_REFUSED
 };
 
+/** How long a channel send quote (issue #1922) can be executed. */
+export const CHANNEL_SEND_QUOTE_TTL_MS = 2 * 60_000;
+/** The most an operator's abort reason may carry; it travels in tx_abort. */
+const CHANNEL_SEND_ABORT_REASON_MAX_BYTES = 1024;
+
+const COMPOSITE_REFUSAL_CODES: Record<
+	CompositeSpliceRefusalCode,
+	BeignetErrorCode
+> = {
+	[CompositeSpliceRefusalCode.INVALID_PARAMS]: BeignetErrorCode.INVALID_PARAMS,
+	[CompositeSpliceRefusalCode.BUSY]: BeignetErrorCode.SPLICE_BUSY,
+	[CompositeSpliceRefusalCode.STORAGE_REQUIRED]: BeignetErrorCode.NOT_PERSISTED,
+	[CompositeSpliceRefusalCode.CHANNEL_NOT_FOUND]:
+		BeignetErrorCode.CHANNEL_NOT_FOUND,
+	[CompositeSpliceRefusalCode.NO_ELIGIBLE_CHANNELS]:
+		BeignetErrorCode.SPLICE_REFUSED,
+	[CompositeSpliceRefusalCode.INSUFFICIENT_BALANCE]:
+		BeignetErrorCode.INSUFFICIENT_BALANCE,
+	[CompositeSpliceRefusalCode.SINGLE_CHANNEL_SUFFICES]:
+		BeignetErrorCode.SPLICE_REFUSED,
+	[CompositeSpliceRefusalCode.NOT_FOUND]: BeignetErrorCode.NOT_FOUND,
+	[CompositeSpliceRefusalCode.TOO_LATE]: BeignetErrorCode.SPLICE_REFUSED
+};
+
+/**
+ * A composite splice refusal as the BeignetError the daemon answers with: the
+ * engine's code mapped to the error code's status, and the per-channel
+ * reasons, when any, appended to the message so a client knows what to fix.
+ */
+export function compositeSpliceRefusalError(
+	refusal: ICompositeSpliceRefusal
+): BeignetError {
+	const skipped = refusal.skipped?.length
+		? `; skipped: ${refusal.skipped
+				.map((c) => `${c.channelId.toString('hex').slice(0, 12)}: ${c.reason}`)
+				.join(', ')}`
+		: '';
+	return new BeignetError(
+		COMPOSITE_REFUSAL_CODES[refusal.code] ?? BeignetErrorCode.SPLICE_REFUSED,
+		`${refusal.error}${skipped}`
+	);
+}
+
+/** A composite's reservation against the daily spend limit (issue #1922). */
+interface ICompositeSpendReservation {
+	totalSats: number;
+	/** Converted to a recorded spend at RELEASED. */
+	charged: boolean;
+	/** No longer counted in _pendingSpendSats (charged or released). */
+	released: boolean;
+}
+
+interface IStoredChannelSendQuote {
+	quote: ChannelSendQuote;
+	destinationScript: Buffer;
+	channelIds: Buffer[];
+}
+
+interface IChannelSendRun {
+	status: ChannelSendStatus;
+	reservation?: ICompositeSpendReservation;
+	/** When the run reached a terminal stage, for the retention sweep. */
+	endedAt?: number;
+}
+
 /**
  * A refusing SpliceResult as the error the daemon answers with, or null for a
  * splice that started. An untyped refusal (an older engine, a code this build
@@ -1555,6 +1659,22 @@ function requirePositiveSafeInteger(value: unknown, field: string): number {
 		);
 	}
 	return value;
+}
+
+/**
+ * Refuse an `lspPubkey` option that is not a compressed public key. The type
+ * is checked before the pattern: a regex alone reads an array holding one
+ * key as its string form and passes it, and the first `.toLowerCase()` on it
+ * then surfaces as a server error instead of INVALID_PARAMS.
+ */
+function checkLspPubkey(value: unknown): void {
+	if (value === undefined) return;
+	if (typeof value !== 'string' || !/^0[23][0-9a-fA-F]{64}$/.test(value)) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
+		);
+	}
 }
 
 /**
@@ -2180,9 +2300,13 @@ function listenerLabel(kind: ListenerKind): string {
 		: 'WebSocket listener';
 }
 
+/** How long `connectPeer` waits for a dial unless `connectTimeoutMs` says otherwise. */
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+
 export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private fforReceiveService?: FforReceiveService;
 	private offlineReceive?: OfflineReceive;
+	private _primaries?: { store: PrimariesStore; storage: unknown };
 	private offlineReceiveTimer?: ReturnType<typeof setInterval>;
 	getOfflineReceive(): OfflineReceive {
 		if (!this.offlineReceive)
@@ -2436,7 +2560,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * the node down), so an attempt that outlived its node records nothing.
 	 */
 	private _listenEpoch = 0;
-	private _connectTimeoutMs = 15_000;
+	private _connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
 	private _dailySpendLimitSats?: number;
 	// The daily ledger (issue #977). _dailySpentSats is the combined LN +
 	// onchain total; the two source counters below only feed the
@@ -2448,6 +2572,26 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
+	/**
+	 * Channel send (issue #1922): quotes by id until executed or expired,
+	 * executions by quote id, and the spend reservation of each composite by
+	 * its record id. Declared optional and created on first use: a BeignetNode
+	 * built with Object.create (several test fakes) runs no field
+	 * initializers.
+	 */
+	private _channelSendQuotes?: Map<string, IStoredChannelSendQuote>;
+	private _channelSends?: Map<string, IChannelSendRun>;
+	private _compositeReservations?: Map<string, ICompositeSpendReservation>;
+	/** Executions whose start has not returned yet, by quote id: a retry awaits the same one. */
+	private _channelSendInflight?: Map<string, Promise<ChannelSendStatus>>;
+	/**
+	 * Composite starts run one at a time through this node: the engine emits
+	 * PLANNED, NEGOTIATING and, when a session refuses to start, ABORTED
+	 * synchronously inside start(), before the id comes back, and
+	 * _onCompositeSpliceStage binds them to the one run that is starting.
+	 */
+	private _compositeStartChain?: Promise<void>;
+	private _startingChannelSend?: IChannelSendRun | null;
 	/**
 	 * paymentHash hex -> the budget claim of every Lightning payment attempt
 	 * dispatched for that hash, oldest first, whichever path sent it. A
@@ -3718,6 +3862,9 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					: undefined;
 				this.log('info', 'Splice complete', { channelId, fundingTxid });
 				this.emit('splice:complete', { channelId, fundingTxid });
+				this._onSingleChannelSendSpliceEvent(channelId, 'LOCKED', {
+					txid: fundingTxid
+				});
 			}
 		);
 		// The rest of the splice lifecycle (issue #760): an abort, a conflict
@@ -3730,7 +3877,17 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				const channelId = data.channelId.toString('hex');
 				this.log('info', 'Splice aborted', { channelId, reason: data.reason });
 				this.emit('splice:aborted', { channelId, reason: data.reason });
+				this._onSingleChannelSendSpliceEvent(channelId, 'ABORTED', {
+					reason: data.reason
+				});
 			}
+		);
+		// A composite channel send (issue #1922): its stages drive the spend
+		// reservation (charged at RELEASED, released at ABORTED) and are
+		// relayed as channel-send:stage under the quote id.
+		this.node.on(
+			'composite-splice:stage',
+			(event: ICompositeSpliceStageEvent) => this._onCompositeSpliceStage(event)
 		);
 		this.node.on(
 			'splice:conflicted',
@@ -3933,6 +4090,20 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				});
 			}
 		);
+		this.node.on('htlc:forward-refused', (data) => {
+			const info = {
+				inChannelId: data.inChannelId.toString('hex'),
+				outChannelId: data.outChannelId.toString('hex'),
+				amountMsat: data.amountMsat.toString(),
+				paymentHash: data.paymentHash.toString('hex'),
+				reason: data.reason,
+				...(data.channelErrorCode !== undefined
+					? { channelErrorCode: data.channelErrorCode }
+					: {})
+			};
+			this.log('info', 'HTLC forward refused', info);
+			this.emit('htlc:forward-refused', info);
+		});
 		this.node.on(
 			'htlc:fulfilled',
 			(data: { channelId: Buffer; htlcId: bigint }) => {
@@ -4026,6 +4197,14 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		this.node.on('peer:error', (pubkey: string, err: Error) => {
 			this.log('warn', 'Peer error', { pubkey, error: err.message });
 			this.emit('peer:error', { pubkey, message: err.message });
+		});
+		// The engine logs it already, through the same logger.
+		this.node.on('peer:warning', ({ pubkey, channelId, text }) => {
+			this.emit('peer:warning', {
+				pubkey,
+				channelId: channelId ? channelId.toString('hex') : null,
+				text
+			});
 		});
 
 		// Forward node:ready event
@@ -4667,27 +4846,32 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * A guardian that refuses a record as too large, or because its quota
 	 * is full, can take nothing after it, so in quorum mode the node stops
 	 * releasing channel updates and in async mode its backup stops
-	 * advancing. Neither shows up anywhere else.
+	 * advancing. One that advertises a record limit below the floor is sent
+	 * nothing at all (issue #1954). None of these shows up anywhere else.
 	 */
 	private relayRecordTooLarge(event: IGuardianReplicationEvent): void {
-		if (
-			event.type !== 'record:too-large' &&
-			event.type !== 'record:quota-refused'
-		) {
-			return;
-		}
-		const tooLarge = event.type === 'record:too-large';
-		this.log(
-			'error',
-			tooLarge
-				? 'Recovery guardian refused an oversized record'
-				: 'Recovery guardian refused a record: its quota is full',
-			{ detail: event.detail }
-		);
+		const relayed: Partial<
+			Record<IGuardianReplicationEvent['type'], [string, string]>
+		> = {
+			'record:too-large': [
+				'Recovery guardian refused an oversized record',
+				'RECOVERY_RECORD_TOO_LARGE'
+			],
+			'record:quota-refused': [
+				'Recovery guardian refused a record: its quota is full',
+				'RECOVERY_GUARDIAN_QUOTA_EXCEEDED'
+			],
+			'record:limit-too-small': [
+				'Recovery guardian refused: its record limit is too small for this node',
+				'RECOVERY_GUARDIAN_LIMIT_TOO_SMALL'
+			]
+		};
+		const entry = relayed[event.type];
+		if (!entry) return;
+		const [message, code] = entry;
+		this.log('error', message, { detail: event.detail });
 		const data = {
-			code: tooLarge
-				? 'RECOVERY_RECORD_TOO_LARGE'
-				: 'RECOVERY_GUARDIAN_QUOTA_EXCEEDED',
+			code,
 			message: event.detail,
 			timestamp: Date.now()
 		};
@@ -8062,6 +8246,27 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		port?: number,
 		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
+		return this.connectPeerWithin(
+			pubkey,
+			host,
+			port,
+			transport,
+			this._connectTimeoutMs
+		);
+	}
+
+	/**
+	 * `connectPeer` under a caller's own deadline. A steered receive passes
+	 * what its budget allows for this one dial; the public method passes the
+	 * node's connect timeout.
+	 */
+	private async connectPeerWithin(
+		pubkey: string,
+		host: string | undefined,
+		port: number | undefined,
+		transport: IPeerTransportOptions | undefined,
+		timeoutMs: number
+	): Promise<PeerInfo> {
 		// listPeers reports the lowercase key the node registers the peer under.
 		pubkey = normalizeHexPubkey(pubkey);
 		// Where we are dialing, for error messages: explicit host:port, or the
@@ -8080,10 +8285,10 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 					reject(
 						new BeignetError(
 							'CONNECT_TIMEOUT',
-							`connectPeer timed out after ${this._connectTimeoutMs}ms (is ${target} the peer's P2P address?)`
+							`connectPeer timed out after ${timeoutMs}ms (is ${target} the peer's P2P address?)`
 						)
 					),
-				this._connectTimeoutMs
+				timeoutMs
 			);
 		});
 		try {
@@ -8133,6 +8338,25 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			...(p.transport ? { transport: p.transport } : {}),
 			...(p.iroh ? { iroh: p.iroh } : {})
 		}));
+	}
+
+	/**
+	 * The address this node last dialed a peer at, if it ever did, in this run
+	 * or an earlier one (the last successful dial is persisted), and the
+	 * transport it used. A peer that only ever connected inbound has none:
+	 * `listPeers` then shows the far end of its socket, whose port is
+	 * ephemeral, so this is what to consult for an address others can dial.
+	 */
+	getPeerAddress(
+		pubkey: string
+	): Pick<PeerInfo, 'host' | 'port' | 'transport'> | undefined {
+		const addr = this.node.getPeerAddress(pubkey);
+		if (!addr) return undefined;
+		return {
+			host: addr.host,
+			port: addr.port,
+			...(addr.transport ? { transport: addr.transport.type } : {})
+		};
 	}
 
 	/**
@@ -9730,9 +9954,23 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * Needs the LSP peer connected and running the JIT receive engine. A
 	 * declined, timed-out or over-priced intent throws, and no invoice is
 	 * created: nothing then carries an allowance for a fee nobody agreed.
+	 *
+	 * With no `lspPubkey` the receive is steered through the ranked primaries
+	 * (issue #1922): each is tried in `listPrimaries` selection order, dialed
+	 * by its stored address when it is not connected, and passed over when
+	 * it is unreachable, times out, declines, quotes above the ceilings, or
+	 * is fenced by NEW_CHANNELS_REFUSED. One budget bounds the whole walk.
+	 * NO_PRIMARY_AVAILABLE names every primary's reason when none takes it;
+	 * INVALID_PARAMS when none is configured. Passing over a primary is safe
+	 * because the invoice is minted only after an LSP's ack: an intent that
+	 * timed out there expires on its own and is never advertised.
 	 */
 	async createJitInvoice(opts: {
-		lspPubkey: string;
+		/**
+		 * The LSP to register the intent with. Omitted: the ranked primaries
+		 * choose, as described above.
+		 */
+		lspPubkey?: string;
 		amountSats?: number;
 		description?: string;
 		expirySecs?: number;
@@ -9746,19 +9984,13 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		 * node receives; `hop` puts it in the invoice hint so the sender pays.
 		 */
 		feeMode?: 'skim' | 'hop';
-	}): Promise<
-		InvoiceInfo & {
-			flatFeeSat: number;
-			feePpm: number;
-			feeMode: 'skim' | 'hop';
-		}
-	> {
-		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		/**
+		 * Steered only: the budget for the whole walk over the primaries, in
+		 * ms (default 18 s). Ignored when `lspPubkey` is given.
+		 */
+		timeoutMs?: number;
+	}): Promise<JitInvoiceInfo> {
+		checkLspPubkey(opts.lspPubkey);
 		if (
 			opts.feeMode !== undefined &&
 			opts.feeMode !== 'skim' &&
@@ -9779,10 +10011,129 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		if (opts.expirySecs !== undefined)
 			requireInvoiceExpiry(opts.expirySecs, 'expirySecs');
 		requireInvoiceDescription(opts.description);
+		if (opts.lspPubkey !== undefined) {
+			return this.jitInvoiceAt(opts.lspPubkey, opts, amountMsat);
+		}
+		const budgetMs = this.steerBudget(opts.timeoutMs);
+		const { value, skipped } = await steerReceive({
+			candidates: this.receiveCandidates(),
+			isConnected: (pubkey) => this.isPeerConnected(pubkey),
+			connect: (candidate, timeoutMs) => this.dialPrimary(candidate, timeoutMs),
+			attempt: (candidate, timeoutMs) =>
+				this.jitInvoiceAt(candidate.pubkey, opts, amountMsat, timeoutMs),
+			candidateCodes: JIT_STEER_CODES,
+			budgetMs,
+			lastConnectCapMs: this._connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+			onSkip: (skip) => this.logSteerSkip('JIT invoice', skip)
+		});
+		return skipped.length ? { ...value, skipped } : value;
+	}
+
+	/**
+	 * The budget a steered receive walks under: the caller's, else the
+	 * default that fits inside a 20 s client timeout.
+	 */
+	private steerBudget(timeoutMs: number | undefined): number {
+		if (timeoutMs === undefined) return STEER_BUDGET_MS;
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'timeoutMs must be a positive whole number of milliseconds'
+			);
+		}
+		return timeoutMs;
+	}
+
+	private logSteerSkip(what: string, skip: ISteerSkip): void {
+		this.log(
+			'info',
+			`${what}: passed over primary ${skip.pubkey.slice(0, 16)}`,
+			{
+				rank: skip.rank,
+				stage: skip.stage,
+				code: skip.code,
+				message: skip.message
+			}
+		);
+	}
+
+	/** Whether the node has this peer up, init exchanged or at least transport up. */
+	private isPeerConnected(pubkey: string): boolean {
+		return this.listPeers().some(
+			(p) =>
+				p.pubkey === pubkey && (p.state === 'ready' || p.state === 'connected')
+		);
+	}
+
+	/**
+	 * The ranked primaries in the order a receive tries them, each with the
+	 * address it was configured with, for the dial. INVALID_PARAMS when none
+	 * is configured: a wallet without a policy names its peer, as before.
+	 */
+	private receiveCandidates(): ISteerCandidate[] {
+		const policy = this.primariesStore().get();
+		if (policy.primaries.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'lspPubkey is required when no primaries are configured (see listPrimaries)'
+			);
+		}
+		const byKey = new Map(policy.primaries.map((p) => [p.pubkey, p]));
+		const balances = this.primaryBalances();
+		return selectReceiveTargets(
+			policy,
+			new Map([...balances].map(([peer, b]) => [peer, b.sats]))
+		).map((c) => {
+			const stored = byKey.get(c.pubkey);
+			return {
+				pubkey: c.pubkey,
+				rank: c.rank,
+				balanceSat: c.balanceSat,
+				...(stored?.host !== undefined ? { host: stored.host } : {}),
+				...(stored?.port !== undefined ? { port: stored.port } : {}),
+				...(stored?.uri !== undefined ? { uri: stored.uri } : {})
+			};
+		});
+	}
+
+	/** Dial a primary by its stored address, under the walk's deadline. */
+	private async dialPrimary(
+		candidate: ISteerCandidate,
+		timeoutMs: number
+	): Promise<void> {
+		const { host, port, transport } = dialTargetOf(candidate);
+		await this.connectPeerWithin(
+			candidate.pubkey,
+			host,
+			port,
+			transport,
+			timeoutMs
+		);
+	}
+
+	/**
+	 * The JIT invoice at one LSP: the library call and its typed failures.
+	 * `timeoutMs` bounds the wait for the LSP's ack when a steered walk has
+	 * less than the ack window left.
+	 */
+	private async jitInvoiceAt(
+		lspPubkey: string,
+		opts: {
+			amountSats?: number;
+			description?: string;
+			expirySecs?: number;
+			targetRemainingInboundSat?: number;
+			maxFlatFeeSat?: number;
+			maxFeePpm?: number;
+			feeMode?: 'skim' | 'hop';
+		},
+		amountMsat: bigint | undefined,
+		timeoutMs?: number
+	): Promise<JitInvoiceInfo> {
 		let result: Awaited<ReturnType<typeof this.node.createJitInvoice>>;
 		try {
 			result = await this.node.createJitInvoice({
-				lspPubkeyHex: opts.lspPubkey,
+				lspPubkeyHex: lspPubkey,
 				amountMsat,
 				description: opts.description || '',
 				...(opts.expirySecs !== undefined ? { expiry: opts.expirySecs } : {}),
@@ -9810,20 +10161,18 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 							)
 					  }
 					: {}),
-				...(opts.feeMode !== undefined ? { feeMode: opts.feeMode } : {})
+				...(opts.feeMode !== undefined ? { feeMode: opts.feeMode } : {}),
+				...(timeoutMs !== undefined ? { timeoutMs } : {})
 			});
 		} catch (err) {
 			throw jitInvoiceError(err);
 		}
-		const info: InvoiceInfo & {
-			flatFeeSat: number;
-			feePpm: number;
-			feeMode: 'skim' | 'hop';
-		} = {
+		const info: JitInvoiceInfo = {
 			bolt11: result.bolt11,
 			paymentHash: result.paymentHash.toString('hex'),
 			paymentSecret: result.paymentSecret.toString('hex'),
 			amountSats: opts.amountSats || undefined,
+			lspPubkey,
 			flatFeeSat: Number(result.flatFeeSat),
 			feePpm: result.feePpm,
 			feeMode: result.feeMode
@@ -9910,15 +10259,7 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				`unpairedSpliceDepth must be an integer between 1 and ${DF_UNPAIRED_SPLICE_DEPTH_MAX}`
 			);
 		}
-		if (
-			update.lspPubkey !== undefined &&
-			!/^0[23][0-9a-fA-F]{64}$/.test(update.lspPubkey)
-		) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(update.lspPubkey);
 		if (update.lspPort !== undefined && update.lspPort !== null) {
 			if (
 				!Number.isInteger(update.lspPort) ||
@@ -10094,41 +10435,99 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * #687). Transport failures (peer not connected, no reply in time) are
 	 * typed the way POST /jit/invoice types them; the LSP's own decline is
 	 * carried in the answer.
+	 *
+	 * With no `lspPubkey` the quote is steered the way `createJitInvoice`
+	 * steers the invoice (issue #1922): the answer prices the first ranked
+	 * primary that would serve the receive within the ceilings, so a create
+	 * that names that `lspPubkey` lands where the quote did. A decline moves
+	 * on to the next primary; NO_PRIMARY_AVAILABLE carries every reason when
+	 * none would serve it.
 	 */
 	async getJitQuote(opts: {
-		lspPubkey: string;
+		/** The LSP to price. Omitted: the ranked primaries choose. */
+		lspPubkey?: string;
 		amountSats?: number;
 		targetRemainingInboundSat?: number;
+		/** Steered only: the budget for the whole walk, in ms (default 18 s). */
+		timeoutMs?: number;
 	}): Promise<JitQuoteInfo> {
-		if (!/^0[23][0-9a-fA-F]{64}$/.test(opts.lspPubkey)) {
-			throw new BeignetError(
-				BeignetErrorCode.INVALID_PARAMS,
-				'lspPubkey must be a 33-byte compressed public key (66 hex chars)'
-			);
-		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: null;
+		const targetRemainingInboundSat = BigInt(
+			requireNonNegativeSafeInteger(
+				opts.targetRemainingInboundSat ?? 0,
+				'targetRemainingInboundSat'
+			)
+		);
+		if (opts.lspPubkey !== undefined) {
+			return this.jitQuoteAt(
+				opts.lspPubkey,
+				amountSats,
+				targetRemainingInboundSat
+			);
+		}
+		const budgetMs = this.steerBudget(opts.timeoutMs);
+		const { value, skipped } = await steerReceive({
+			candidates: this.receiveCandidates(),
+			isConnected: (pubkey) => this.isPeerConnected(pubkey),
+			connect: (candidate, timeoutMs) => this.dialPrimary(candidate, timeoutMs),
+			attempt: async (candidate, timeoutMs) => {
+				const quote = await this.jitQuoteAt(
+					candidate.pubkey,
+					amountSats,
+					targetRemainingInboundSat,
+					timeoutMs
+				);
+				// A decline or an over-ceiling price is this primary's answer,
+				// and a create here would be refused the same way: on to the
+				// next one, so quote and create agree on the peer.
+				if (!quote.accepted) {
+					throw new BeignetError(
+						BeignetErrorCode.JIT_REFUSED,
+						`LSP declined the JIT receive: ${quote.reason ?? 'no reason given'}`
+					);
+				}
+				if (!quote.withinCeilings) {
+					throw new BeignetError(
+						BeignetErrorCode.JIT_REFUSED,
+						`LSP quote (${quote.flatFeeSat} sat + ${quote.feePpm} ppm) is above the accepted ceiling (${quote.client.maxFlatFeeSat} sat + ${quote.client.maxFeePpm} ppm)`
+					);
+				}
+				return quote;
+			},
+			candidateCodes: JIT_STEER_CODES,
+			budgetMs,
+			lastConnectCapMs: this._connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+			onSkip: (skip) => this.logSteerSkip('JIT quote', skip)
+		});
+		return skipped.length ? { ...value, skipped } : value;
+	}
+
+	/** The quote at one LSP: the library call and its typed failures. */
+	private async jitQuoteAt(
+		lspPubkey: string,
+		amountSats: number | null,
+		targetRemainingInboundSat: bigint,
+		timeoutMs?: number
+	): Promise<JitQuoteInfo> {
 		let quote: Awaited<ReturnType<typeof this.node.requestJitQuote>>;
 		try {
-			quote = await this.node.requestJitQuote(opts.lspPubkey, {
+			quote = await this.node.requestJitQuote(lspPubkey, {
 				...(amountSats !== null
 					? { maxAmountMsat: BigInt(amountSats) * 1000n }
 					: {}),
-				targetRemainingInboundSat: BigInt(
-					requireNonNegativeSafeInteger(
-						opts.targetRemainingInboundSat ?? 0,
-						'targetRemainingInboundSat'
-					)
-				)
+				targetRemainingInboundSat,
+				...(timeoutMs !== undefined ? { timeoutMs } : {})
 			});
 		} catch (err) {
 			throw jitInvoiceError(err);
 		}
 		const ceilings = this.node.getJitClientCeilings();
 		return {
-			lspPubkey: opts.lspPubkey,
+			lspPubkey,
 			amountSats,
 			accepted: quote.accepted,
 			reason: quote.reason ?? null,
@@ -10162,6 +10561,129 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 		};
 	}
 
+	// ───────── Ranked receive primaries (issue #1922) ─────────
+
+	/**
+	 * The store over the current storage, rebuilt when the storage is replaced
+	 * (a capsule restore swaps the database in-process).
+	 */
+	private primariesStore(): PrimariesStore {
+		const storage = this.storage;
+		if (!this._primaries || this._primaries.storage !== storage) {
+			const store = new PrimariesStore({ storage });
+			store.restore();
+			this._primaries = { store, storage };
+		}
+		return this._primaries.store;
+	}
+
+	/** Run a store write, mapping its refusals onto the node's error codes. */
+	private primariesWrite(
+		write: (store: PrimariesStore) => void
+	): PrimariesInfo {
+		try {
+			write(this.primariesStore());
+		} catch (err) {
+			if (err instanceof PrimariesError) {
+				throw new BeignetError(
+					err.code === PrimariesErrorCode.PERSIST_FAILED
+						? BeignetErrorCode.INTERNAL_ERROR
+						: BeignetErrorCode.INVALID_PARAMS,
+					err.message
+				);
+			}
+			throw err;
+		}
+		return this.listPrimaries();
+	}
+
+	/**
+	 * Local balance and channel count per peer, over the channels a routing
+	 * hint would be built for (looking through a reconnect), so a primary that
+	 * is briefly away keeps the balance it holds.
+	 */
+	private primaryBalances(): Map<string, { sats: number; channels: number }> {
+		const out = new Map<string, { sats: number; channels: number }>();
+		const manager = this.node.getChannelManager();
+		for (const channel of manager.listChannels()) {
+			if (!channel.acceptsNewHtlcs(true)) continue;
+			const channelId = channel.getChannelId();
+			const peer = channelId ? manager.getPeerForChannel(channelId) : null;
+			if (!peer) continue;
+			const entry = out.get(peer) ?? { sats: 0, channels: 0 };
+			entry.sats += Number(channel.getFullState().localBalanceMsat / 1000n);
+			entry.channels += 1;
+			out.set(peer, entry);
+		}
+		return out;
+	}
+
+	/**
+	 * The ranked primaries with their balances, and which one a receive with no
+	 * peer named goes to. `createJitInvoice`, `getJitQuote` and the automatic
+	 * offline receive routes walk this order when the caller names no peer.
+	 */
+	listPrimaries(): PrimariesInfo {
+		const policy = this.primariesStore().get();
+		const balances = this.primaryBalances();
+		const order = selectReceiveTargets(
+			policy,
+			new Map([...balances].map(([peer, b]) => [peer, b.sats]))
+		);
+		const position = new Map(order.map((c, i) => [c.pubkey, i]));
+		return {
+			fillThresholdSat: policy.fillThresholdSat,
+			primaries: policy.primaries.map((p, i) => {
+				const at = position.get(p.pubkey)!;
+				return {
+					pubkey: p.pubkey,
+					rank: i + 1,
+					host: p.host ?? null,
+					port: p.port ?? null,
+					uri: p.uri ?? null,
+					thresholdSat: policy.fillThresholdSat,
+					balanceSat: order[at].balanceSat,
+					channelCount: balances.get(p.pubkey)?.channels ?? 0,
+					belowThreshold: order[at].belowThreshold,
+					isReceiveTarget: at === 0,
+					selectionOrder: at + 1
+				};
+			}),
+			receiveTarget: order[0]?.pubkey ?? null
+		};
+	}
+
+	/**
+	 * Add a primary at `rank` (1-based, default last). Reach it by `host` and
+	 * `port`, or by `uri` for ws://, wss:// and iroh: peers.
+	 */
+	addPrimary(opts: {
+		pubkey: string;
+		host?: string;
+		port?: number;
+		uri?: string;
+		rank?: number;
+	}): PrimariesInfo {
+		const { rank, ...entry } = opts;
+		return this.primariesWrite((store) => store.add(entry, rank));
+	}
+
+	removePrimary(pubkey: string): PrimariesInfo {
+		return this.primariesWrite((store) => store.remove(pubkey));
+	}
+
+	/** Re-rank: `pubkeys` names every primary once, highest rank first. */
+	reorderPrimaries(pubkeys: string[]): PrimariesInfo {
+		return this.primariesWrite((store) => store.reorder(pubkeys));
+	}
+
+	/** Set the fill threshold in sats, or null for no cap. */
+	setPrimariesFillThreshold(fillThresholdSat: number | null): PrimariesInfo {
+		return this.primariesWrite((store) =>
+			store.setFillThreshold(fillThresholdSat)
+		);
+	}
+
 	/**
 	 * Mint a payment request: a receipt hash whose preimage stays here, and the
 	 * base64url envelope a payer pays.
@@ -10170,12 +10692,28 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	 * dashboard sends the browser's own hostname and the app's manager sends
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right.
+	 *
+	 * `lspPubkey` names the peer the funding is negotiated with (issue #1922).
+	 * It must be a configured primary or the policy's liquidity peer, else
+	 * INVALID_PARAMS: the route that names it runs at invoice scope, and the
+	 * peer a direct-funded channel opens with holds every payment it receives.
+	 * The envelope's relay descriptors name it, at the address the primaries
+	 * list stores for it, else the policy's address for it, else the one this
+	 * node dialed it at, and the receiver opens the channel with it when the
+	 * offer arrives, whatever the direct-funding policy says by then. Omitted,
+	 * the ranked primaries choose when any are configured: the first in
+	 * `listPrimaries` selection order with a known address is bound, the
+	 * others are listed in `skipped`, and NO_PRIMARY_AVAILABLE answers when
+	 * none has one. Nothing is dialed, since the request is paid later and
+	 * the payer reaches this node through that primary's relay. With no
+	 * primaries the policy's liquidity peer serves, as before.
 	 */
 	createDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSats?: number;
-	}): { paymentHash: PaymentHashHex; expiresAt: number; request: string } {
+		lspPubkey?: string;
+	}): DirectFundingRequestInfo {
 		if (opts.port !== undefined) {
 			if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
 				throw new BeignetError(
@@ -10184,20 +10722,58 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 				);
 			}
 		}
+		checkLspPubkey(opts.lspPubkey);
 		const amountSats =
 			opts.amountSats !== undefined && opts.amountSats !== 0
 				? requireNonNegativeSafeInteger(opts.amountSats, 'amountSats')
 				: undefined;
+		const base = {
+			...(opts.host !== undefined ? { host: opts.host } : {}),
+			...(opts.port !== undefined ? { port: opts.port } : {}),
+			...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+		};
+		if (opts.lspPubkey !== undefined) {
+			const pubkey = opts.lspPubkey.toLowerCase();
+			this.requireLiquidityPeerConfigured(pubkey);
+			return this.mintDirectFundingRequestAt(base, {
+				pubkey,
+				address: this.liquidityAddressOf(pubkey)
+			});
+		}
+		if (this.primariesStore().get().primaries.length > 0) {
+			return this.steeredDirectFundingRequest(base);
+		}
+		return this.mintDirectFundingRequestAt(base);
+	}
+
+	/** The mint at one peer, or at the policy's: the library call and its typed failures. */
+	private mintDirectFundingRequestAt(
+		base: { host?: string; port?: number; amountSat?: bigint },
+		bound?: { pubkey: string; address?: { host: string; port: number } }
+	): DirectFundingRequestInfo {
 		try {
 			const minted = this.node.mintDirectFundingRequest({
-				...(opts.host !== undefined ? { host: opts.host } : {}),
-				...(opts.port !== undefined ? { port: opts.port } : {}),
-				...(amountSats !== undefined ? { amountSat: BigInt(amountSats) } : {})
+				...base,
+				...(bound
+					? {
+							liquidityPeer: bound.pubkey,
+							...(bound.address
+								? {
+										liquidityHost: bound.address.host,
+										liquidityPort: bound.address.port
+								  }
+								: {})
+					  }
+					: {})
 			});
 			return {
 				paymentHash: minted.record.receiptHash,
 				expiresAt: minted.expiresAt,
-				request: minted.request
+				request: minted.request,
+				lspPubkey:
+					minted.record.liquidityPeer ??
+					this.node.getDirectFundingPolicy()?.liquidityPeer ??
+					null
 			};
 		} catch (err) {
 			// A mint that fails degrades to a plain BIP 21 URI in the app, silently,
@@ -10207,6 +10783,91 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 			});
 			throw this.directFundingFailure(err);
 		}
+	}
+
+	/**
+	 * Refuse a named liquidity peer the operator never configured. The route
+	 * that names one runs at invoice scope, and the peer a direct-funded
+	 * channel opens with holds every payment it receives, so which peers can
+	 * be named stays with the admin routes: the primaries, and the policy.
+	 */
+	private requireLiquidityPeerConfigured(pubkey: string): void {
+		if (
+			this.node.getDirectFundingPolicy()?.liquidityPeer?.toLowerCase() ===
+			pubkey
+		)
+			return;
+		if (
+			this.primariesStore()
+				.get()
+				.primaries.some((p) => p.pubkey === pubkey)
+		)
+			return;
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			'lspPubkey is neither a configured primary nor the direct-funding liquidity peer'
+		);
+	}
+
+	/**
+	 * Where a payer reaches this peer's relay: the address the primaries list
+	 * stores for it (host and port, or a TCP peer URI), else the address the
+	 * direct-funding policy names for it, else the one this node dialed it at.
+	 * Never the one it is merely up on: a peer that dialed us is listed at its
+	 * socket's source port, which is ephemeral.
+	 */
+	private liquidityAddressOf(
+		pubkey: string
+	): { host: string; port: number } | undefined {
+		const stored = this.primariesStore()
+			.get()
+			.primaries.find((p) => p.pubkey === pubkey);
+		const fromStored = relayAddressOf(stored, undefined);
+		if (fromStored) return fromStored;
+		const policy = this.node.getDirectFundingPolicy();
+		if (
+			policy?.liquidityPeer?.toLowerCase() === pubkey &&
+			policy.liquidityHost &&
+			policy.liquidityPort
+		) {
+			return { host: policy.liquidityHost, port: policy.liquidityPort };
+		}
+		return relayAddressOf(undefined, this.getPeerAddress(pubkey));
+	}
+
+	/**
+	 * The request bound to the first primary in selection order whose relay a
+	 * payer could be told how to reach. A primary with no known address is
+	 * passed over and listed in `skipped`; with none left, NO_PRIMARY_AVAILABLE.
+	 */
+	private steeredDirectFundingRequest(base: {
+		host?: string;
+		port?: number;
+		amountSat?: bigint;
+	}): DirectFundingRequestInfo {
+		const skipped: ISteerSkip[] = [];
+		for (const candidate of this.receiveCandidates()) {
+			const address = this.liquidityAddressOf(candidate.pubkey);
+			if (!address) {
+				const skip: ISteerSkip = {
+					pubkey: candidate.pubkey,
+					rank: candidate.rank,
+					stage: 'attempt',
+					code: BeignetErrorCode.RECEIVE_UNAVAILABLE,
+					message:
+						'no address is known for this primary: store its host and port with it, or dial it over TCP'
+				};
+				skipped.push(skip);
+				this.logSteerSkip('direct-funding request', skip);
+				continue;
+			}
+			const minted = this.mintDirectFundingRequestAt(base, {
+				pubkey: candidate.pubkey,
+				address
+			});
+			return skipped.length ? { ...minted, skipped } : minted;
+		}
+		throw noPrimaryAvailable(skipped);
 	}
 
 	/**
@@ -13350,6 +14011,685 @@ export class BeignetNode extends TypedEmitter<BeignetNodeEvents> {
 	}
 
 	// ─────────────── BOLT 12 Offers ───────────────
+
+	// ─── Channel send (issue #1922) ───
+
+	private channelSendQuotes(): Map<string, IStoredChannelSendQuote> {
+		return (this._channelSendQuotes ??= new Map());
+	}
+
+	private channelSendRuns(): Map<string, IChannelSendRun> {
+		return (this._channelSends ??= new Map());
+	}
+
+	private compositeReservations(): Map<string, ICompositeSpendReservation> {
+		return (this._compositeReservations ??= new Map());
+	}
+
+	private channelSendInflight(): Map<string, Promise<ChannelSendStatus>> {
+		return (this._channelSendInflight ??= new Map());
+	}
+
+	/**
+	 * Quote paying `address` out of this node's channels (issue #1922,
+	 * docs/MULTI-CHANNEL-SPLICE-OUT.md section 7). One channel whose
+	 * splice-out bound covers amount plus fee takes the single-channel path,
+	 * from the channel with the largest spendable balance; otherwise the
+	 * composite engine plans one transaction out of several channels, debited
+	 * largest spendable balance first, with the fee split in proportion. The
+	 * amount plus the whole fee is checked against the per-payment and daily
+	 * limits here, so a refusal comes before anything is reserved. Nothing
+	 * moves: the quote is executed with executeChannelSend within
+	 * CHANNEL_SEND_QUOTE_TTL_MS.
+	 */
+	async quoteChannelSend(
+		address: string,
+		amountSats: number,
+		feeratePerkw: number
+	): Promise<ChannelSendQuote> {
+		if (typeof address !== 'string' || address.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'address required'
+			);
+		}
+		requirePositiveSafeInteger(amountSats, 'amountSats');
+		requireU32(feeratePerkw, 'feeratePerkw', 253, MAX_SPLICE_FEERATE_PERKW);
+		const destinationScript = this._decodeSpliceDestination(address);
+		if (!destinationScript) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'address required'
+			);
+		}
+		const quoteId = crypto.randomBytes(32).toString('hex');
+		const expiresAt = Date.now() + CHANNEL_SEND_QUOTE_TTL_MS;
+		let quote: ChannelSendQuote;
+		let channelIds: Buffer[];
+		const single = this._singleChannelSend(
+			amountSats,
+			feeratePerkw,
+			destinationScript
+		);
+		if (single) {
+			channelIds = [single.channelId];
+			quote = {
+				quoteId,
+				kind: 'single',
+				address,
+				amountSats,
+				feeSats: single.feeSats,
+				totalSats: amountSats + single.feeSats,
+				feeratePerkw,
+				channels: [
+					{
+						channelId: single.channelId.toString('hex'),
+						debitSats: amountSats,
+						feeSats: single.feeSats,
+						oldCapacitySats: single.oldCapacitySats,
+						newCapacitySats:
+							single.oldCapacitySats - amountSats - single.feeSats
+					}
+				],
+				skipped: [],
+				expiresAt
+			};
+		} else {
+			const planned = await this.node.planCompositeSpliceOut({
+				destinationScript,
+				amountSats: BigInt(amountSats),
+				fundingFeeratePerkw: feeratePerkw
+			});
+			if (!planned.ok) throw compositeSpliceRefusalError(planned);
+			const plan = planned.plan;
+			channelIds = plan.channels.map((c) => c.channelId);
+			const channels: ChannelSendQuoteChannel[] = plan.channels.map((c) => ({
+				channelId: c.channelId.toString('hex'),
+				debitSats: Number(c.debitSats),
+				feeSats: Number(c.feeSats),
+				oldCapacitySats: Number(c.oldCapacitySats),
+				newCapacitySats: Number(c.newCapacitySats)
+			}));
+			quote = {
+				quoteId,
+				kind: 'composite',
+				address,
+				amountSats,
+				feeSats: Number(plan.feeSats),
+				totalSats: amountSats + Number(plan.feeSats),
+				feeratePerkw,
+				channels,
+				skipped: plan.skipped.map((c) => ({
+					channelId: c.channelId.toString('hex'),
+					reason: c.reason
+				})),
+				expiresAt
+			};
+		}
+		this._checkMaxPayment(quote.totalSats, amountSats, {
+			name: 'on-chain fees',
+			param: 'feeratePerkw'
+		});
+		this._checkSpendLimit(quote.totalSats);
+		this.pruneChannelSendQuotes();
+		this.channelSendQuotes().set(quoteId, {
+			quote,
+			destinationScript,
+			channelIds
+		});
+		return quote;
+	}
+
+	/**
+	 * The channel with the largest spendable balance whose single splice-out
+	 * bound covers the amount plus its fee, or null when none does. The same
+	 * predicate spliceOut applies (spliceQuote), on channels that are NORMAL,
+	 * not busy, not pending a lock, and whose peer splices.
+	 */
+	private _singleChannelSend(
+		amountSats: number,
+		feeratePerkw: number,
+		destinationScript: Buffer
+	): {
+		channelId: Buffer;
+		feeSats: number;
+		oldCapacitySats: number;
+		spendableSats: number;
+	} | null {
+		let best: {
+			channelId: Buffer;
+			feeSats: number;
+			oldCapacitySats: number;
+			spendableSats: number;
+		} | null = null;
+		const manager = this.node.getChannelManager();
+		for (const channel of manager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (channel.getState() !== ChannelState.NORMAL) continue;
+			if (channel.spliceBusyReason()) continue;
+			if (channel.getFullState().spliceInFlight) continue;
+			const peer = manager.getPeerForChannel(channelId);
+			if (peer && this.node.peerSupportsSplicing(peer) === false) continue;
+			let quote: ReturnType<LightningNode['spliceQuote']>;
+			try {
+				quote = this.node.spliceQuote(
+					channelId,
+					'out',
+					feeratePerkw,
+					destinationScript
+				);
+			} catch {
+				continue;
+			}
+			if (quote.maxAmountSats < amountSats) continue;
+			// The amount-specific preflight spliceOut runs: the destination is an
+			// interactive-tx output that must clear this channel's negotiated
+			// dust floor, and a fee at or above the amount is refused as a
+			// footgun. A channel that would refuse at execute is not ranked.
+			if (BigInt(amountSats) < channel.spliceInteractiveTxDustFloor()) {
+				continue;
+			}
+			if (quote.feeSats >= amountSats) continue;
+			if (!best || quote.spendableSats > best.spendableSats) {
+				best = {
+					channelId,
+					feeSats: quote.feeSats,
+					oldCapacitySats: Number(channel.getFundingSatoshis()),
+					spendableSats: quote.spendableSats
+				};
+			}
+		}
+		return best;
+	}
+
+	private pruneChannelSendQuotes(): void {
+		const now = Date.now();
+		for (const [id, stored] of this.channelSendQuotes()) {
+			if (stored.quote.expiresAt < now) this.channelSendQuotes().delete(id);
+		}
+	}
+
+	/**
+	 * Run a quoted channel send (issue #1922). The limits are checked again
+	 * against the current ledger. A single-channel quote runs spliceOut and
+	 * records amount plus fee at once, as an address-targeted splice-out does.
+	 * A composite reserves amount plus fee in _pendingSpendSats at PLANNED,
+	 * records it at RELEASED (the point past which the money leaves) and
+	 * releases it at ABORTED or CONFLICTED, so a composite that never
+	 * releases costs nothing of the day's budget. Executing the same quote id
+	 * again returns the first execution and runs nothing (the daemon route is
+	 * idempotent on top of this). A stale or unknown quote is refused before
+	 * any side effect.
+	 */
+	async executeChannelSend(quoteId: string): Promise<ChannelSendStatus> {
+		requireChannelIdHex(quoteId, 'quoteId');
+		const existing = this.channelSendRuns().get(quoteId);
+		if (existing) return this.channelSendStatus(existing);
+		// A retry that arrives while the first execution is still starting
+		// awaits that execution instead of entering the engine again.
+		const inflight = this.channelSendInflight().get(quoteId);
+		if (inflight) return inflight;
+		const execution = this._executeChannelSendOnce(quoteId).finally(() =>
+			this.channelSendInflight().delete(quoteId)
+		);
+		this.channelSendInflight().set(quoteId, execution);
+		return execution;
+	}
+
+	private async _executeChannelSendOnce(
+		quoteId: string
+	): Promise<ChannelSendStatus> {
+		const stored = this.channelSendQuotes().get(quoteId);
+		if (!stored) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'channel send quote not found (unknown, expired or already executed)'
+			);
+		}
+		if (Date.now() > stored.quote.expiresAt) {
+			this.channelSendQuotes().delete(quoteId);
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'channel send quote expired; quote again'
+			);
+		}
+		const { quote, destinationScript, channelIds } = stored;
+		this._checkMaxPayment(quote.totalSats, quote.amountSats, {
+			name: 'on-chain fees',
+			param: 'feeratePerkw'
+		});
+		this._checkSpendLimit(quote.totalSats);
+
+		if (quote.kind === 'single') {
+			const result = fundingOrRefuse(() =>
+				this.node.spliceOut(
+					channelIds[0],
+					BigInt(quote.amountSats),
+					quote.feeratePerkw,
+					destinationScript
+				)
+			);
+			if (!result.ok) throw spliceRefusalError(result)!;
+			this._recordSpend(quote.totalSats, 'onchain');
+			this.channelSendQuotes().delete(quoteId);
+			const run: IChannelSendRun = {
+				status: {
+					id: quoteId,
+					kind: 'single',
+					stage: 'STARTED',
+					address: quote.address,
+					amountSats: quote.amountSats,
+					feeSats: quote.feeSats,
+					channelId: quote.channels[0].channelId,
+					startedAt: Date.now()
+				}
+			};
+			this.channelSendRuns().set(quoteId, run);
+			this.emit('channel-send:stage', { id: quoteId, stage: 'STARTED' });
+			return this.channelSendStatus(run);
+		}
+
+		// Composite. The quote may be two minutes old: plan again on the current
+		// balances over the quoted channel set, so the fee the engine prices now
+		// is what the limits see and the ledger counts (a channel that no longer
+		// qualifies refuses the plan).
+		const replanned = await this.node.planCompositeSpliceOut({
+			destinationScript,
+			amountSats: BigInt(quote.amountSats),
+			fundingFeeratePerkw: quote.feeratePerkw,
+			channelIds
+		});
+		if (!replanned.ok) throw compositeSpliceRefusalError(replanned);
+		const feeSats = Number(replanned.plan.feeSats);
+		const totalSats = quote.amountSats + feeSats;
+		if (totalSats !== quote.totalSats) {
+			this._checkMaxPayment(totalSats, quote.amountSats, {
+				name: 'on-chain fees',
+				param: 'feeratePerkw'
+			});
+			this._checkSpendLimit(totalSats);
+		}
+		const reservation: ICompositeSpendReservation = {
+			totalSats,
+			charged: false,
+			released: false
+		};
+		const run: IChannelSendRun = {
+			status: {
+				id: quoteId,
+				kind: 'composite',
+				stage: 'PLANNED',
+				address: quote.address,
+				amountSats: quote.amountSats,
+				feeSats,
+				startedAt: Date.now()
+			},
+			reservation
+		};
+		await this._withCompositeStartLock(async () => {
+			// Reserve before the engine runs, so a concurrent spend cannot
+			// double-count the day's budget while the sessions negotiate, and
+			// register the run before the await, so a stage the engine emits
+			// inside start() is relayed under the quote id.
+			this._pendingSpendSats += totalSats;
+			this._startingChannelSend = run;
+			this.channelSendRuns().set(quoteId, run);
+			let started: Awaited<
+				ReturnType<LightningNode['startCompositeSpliceOut']>
+			>;
+			try {
+				started = await this.node.startCompositeSpliceOut({
+					destinationScript,
+					amountSats: BigInt(quote.amountSats),
+					fundingFeeratePerkw: quote.feeratePerkw,
+					channelIds
+				});
+			} catch (err) {
+				this._releaseCompositeReservation(reservation);
+				this.channelSendRuns().delete(quoteId);
+				throw err;
+			} finally {
+				this._startingChannelSend = null;
+			}
+			if (!started.ok) {
+				this._releaseCompositeReservation(reservation);
+				this.channelSendRuns().delete(quoteId);
+				throw compositeSpliceRefusalError(started);
+			}
+			const compositeId = started.id.toString('hex');
+			run.status.compositeId = compositeId;
+			this.compositeReservations().set(compositeId, reservation);
+			this.channelSendQuotes().delete(quoteId);
+			// The fee the engine priced at start is what leaves. A balance that
+			// moved between the plan above and the start changes it: the
+			// reservation follows, and a total the limits no longer admit
+			// unwinds the composite before any commitment.
+			const startedTotal = quote.amountSats + Number(started.plan.feeSats);
+			if (startedTotal !== reservation.totalSats && !reservation.charged) {
+				if (startedTotal > reservation.totalSats) {
+					try {
+						this._checkMaxPayment(startedTotal, quote.amountSats, {
+							name: 'on-chain fees',
+							param: 'feeratePerkw'
+						});
+						this._checkSpendLimit(startedTotal - reservation.totalSats);
+					} catch (err) {
+						this.node.abortCompositeSplice(
+							started.id,
+							'fee priced at start exceeds the spend limits'
+						);
+						this._releaseCompositeReservation(reservation);
+						this.channelSendRuns().delete(quoteId);
+						throw err;
+					}
+				}
+				if (!reservation.released) {
+					this._pendingSpendSats += startedTotal - reservation.totalSats;
+				}
+				reservation.totalSats = startedTotal;
+				run.status.feeSats = Number(started.plan.feeSats);
+			}
+			// Stages the engine emitted inside start() were bound to this run by
+			// _onCompositeSpliceStage; the record settles anything that was not.
+			this._reconcileCompositeReservation(run, started.id);
+		});
+		return this.channelSendStatus(run);
+	}
+
+	private _withCompositeStartLock<T>(fn: () => Promise<T>): Promise<T> {
+		const previous = this._compositeStartChain ?? Promise.resolve();
+		const next = previous.then(fn, fn);
+		this._compositeStartChain = next.then(
+			() => undefined,
+			() => undefined
+		);
+		return next;
+	}
+
+	/**
+	 * Settle a composite's reservation from its record: RELEASED or later
+	 * charges it, ABORTED or CONFLICTED before any charge releases it. Covers
+	 * a stage the engine emitted before the run was bound to its id, and
+	 * brings the run's status up to the record.
+	 */
+	private _reconcileCompositeReservation(
+		run: IChannelSendRun,
+		compositeId: Buffer
+	): void {
+		const record = this.node.getCompositeSplice(compositeId);
+		if (!record) return;
+		const reservation = run.reservation;
+		if (reservation && !reservation.charged) {
+			if (compositeSpliceStageAtLeast(record.stage, 'RELEASED')) {
+				this._chargeCompositeReservation(reservation);
+			} else if (record.stage === 'ABORTED' || record.stage === 'CONFLICTED') {
+				this._releaseCompositeReservation(reservation);
+			}
+		}
+		run.status.stage = record.stage;
+		if (record.txid) {
+			run.status.txid = txidToDisplayHex(Buffer.from(record.txid, 'hex'));
+		}
+		if (record.reason) run.status.reason = record.reason;
+		if (compositeSpliceStageIsTerminal(record.stage)) {
+			run.endedAt ??= Date.now();
+		}
+	}
+
+	/** The reservation becomes a recorded on-chain spend, once. */
+	private _chargeCompositeReservation(
+		reservation: ICompositeSpendReservation
+	): void {
+		if (reservation.charged) return;
+		reservation.charged = true;
+		this._releaseCompositeReservation(reservation);
+		this._recordSpend(reservation.totalSats, 'onchain');
+	}
+
+	/**
+	 * A single-channel send is a splice-out on one channel, so its outcome is
+	 * the channel's: splice:complete moves the run to LOCKED with the new
+	 * funding txid, splice:aborted to ABORTED with the reason, each relayed on
+	 * channel-send:stage. A run already past STARTED is left alone (a later
+	 * splice on the same channel is not this send).
+	 */
+	private _onSingleChannelSendSpliceEvent(
+		channelId: string,
+		stage: 'LOCKED' | 'ABORTED',
+		detail: { txid?: string; reason?: string }
+	): void {
+		for (const run of this.channelSendRuns().values()) {
+			if (run.status.kind !== 'single') continue;
+			if (run.status.channelId !== channelId) continue;
+			if (run.status.stage !== 'STARTED') continue;
+			run.status.stage = stage;
+			if (detail.txid) run.status.txid = detail.txid;
+			if (detail.reason) run.status.reason = detail.reason;
+			run.endedAt = Date.now();
+			const data = {
+				id: run.status.id,
+				stage,
+				...(detail.txid ? { txid: detail.txid } : {}),
+				...(detail.reason ? { reason: detail.reason } : {})
+			};
+			this.log('info', 'Channel send stage', data);
+			this.emit('channel-send:stage', data);
+		}
+	}
+
+	/**
+	 * Drop runs that ended longer ago than the engine keeps its records
+	 * (COMPOSITE_SPLICE_RETENTION_MS), so a long-lived daemon's list does not
+	 * grow without end. A run still under way is never dropped.
+	 */
+	private pruneChannelSendRuns(): void {
+		const cutoff = Date.now() - COMPOSITE_SPLICE_RETENTION_MS;
+		for (const [id, run] of this.channelSendRuns()) {
+			if (run.endedAt === undefined || run.endedAt >= cutoff) continue;
+			this.channelSendRuns().delete(id);
+			if (run.status.compositeId) {
+				this.compositeReservations().delete(run.status.compositeId);
+			}
+		}
+	}
+
+	private _releaseCompositeReservation(
+		reservation: ICompositeSpendReservation
+	): void {
+		if (reservation.released) return;
+		reservation.released = true;
+		this._pendingSpendSats = Math.max(
+			0,
+			this._pendingSpendSats - reservation.totalSats
+		);
+	}
+
+	/**
+	 * A composite's stage (issue #1922). RELEASED converts the reservation into
+	 * a recorded on-chain spend; ABORTED or CONFLICTED before the charge
+	 * releases it (a charge that already happened stays: CONFLICTED follows
+	 * RELEASED, and the budget treats an uncertain outcome as spent, as the
+	 * Lightning claims do). The stage is relayed under the quote id, or the
+	 * composite id for a composite this node did not quote (a restart).
+	 */
+	private _onCompositeSpliceStage(event: ICompositeSpliceStageEvent): void {
+		const compositeId = event.id.toString('hex');
+		let run: IChannelSendRun | undefined;
+		for (const candidate of this.channelSendRuns().values()) {
+			if (candidate.status.compositeId === compositeId) {
+				run = candidate;
+				break;
+			}
+		}
+		// PLANNED is the first stage of a new composite and the engine emits it
+		// inside start(), before the id comes back: it belongs to the one run
+		// that is starting (starts are serialized), which learns its id here.
+		const starting = this._startingChannelSend;
+		if (
+			!run &&
+			event.stage === 'PLANNED' &&
+			starting &&
+			!starting.status.compositeId
+		) {
+			run = starting;
+			run.status.compositeId = compositeId;
+			if (run.reservation) {
+				this.compositeReservations().set(compositeId, run.reservation);
+			}
+		}
+		const reservation = this.compositeReservations().get(compositeId);
+		if (reservation) {
+			if (event.stage === 'RELEASED') {
+				this._chargeCompositeReservation(reservation);
+			} else if (
+				(event.stage === 'ABORTED' || event.stage === 'CONFLICTED') &&
+				!reservation.charged
+			) {
+				this._releaseCompositeReservation(reservation);
+			}
+		}
+		const txid = event.txid ? txidToDisplayHex(event.txid) : undefined;
+		if (run) {
+			run.status.stage = event.stage;
+			if (txid) run.status.txid = txid;
+			if (event.reason) run.status.reason = event.reason;
+			if (compositeSpliceStageIsTerminal(event.stage)) {
+				run.endedAt ??= Date.now();
+			}
+		}
+		const data = {
+			id: run?.status.id ?? compositeId,
+			compositeId,
+			stage: event.stage,
+			...(txid ? { txid } : {}),
+			...(event.reason ? { reason: event.reason } : {})
+		};
+		this.log('info', 'Channel send stage', data);
+		this.emit('channel-send:stage', data);
+	}
+
+	private channelSendStatus(run: IChannelSendRun): ChannelSendStatus {
+		const status: ChannelSendStatus = { ...run.status };
+		if (status.compositeId) {
+			const record = this.node.getCompositeSplice(
+				Buffer.from(status.compositeId, 'hex')
+			);
+			if (record) {
+				status.record = record;
+				status.stage = record.stage;
+				if (record.txid) {
+					status.txid = txidToDisplayHex(Buffer.from(record.txid, 'hex'));
+				}
+				if (record.reason) status.reason = record.reason;
+			}
+		}
+		return status;
+	}
+
+	private channelSendStatusFromRecord(
+		record: ICompositeSpliceRecord
+	): ChannelSendStatus {
+		return {
+			id: record.id,
+			kind: 'composite',
+			stage: record.stage,
+			amountSats: Number(record.amountSats),
+			feeSats: Number(record.feeSats),
+			compositeId: record.id,
+			...(record.txid
+				? { txid: txidToDisplayHex(Buffer.from(record.txid, 'hex')) }
+				: {}),
+			...(record.reason ? { reason: record.reason } : {}),
+			startedAt: record.createdAt,
+			record
+		};
+	}
+
+	/**
+	 * A channel send by its quote id, or a composite by its record id (one
+	 * this node restored without having quoted it). Null when unknown.
+	 */
+	getChannelSend(id: string): ChannelSendStatus | null {
+		requireChannelIdHex(id, 'id');
+		this.pruneChannelSendRuns();
+		const run = this.channelSendRuns().get(id);
+		if (run) return this.channelSendStatus(run);
+		const record = this.node.getCompositeSplice(Buffer.from(id, 'hex'));
+		return record ? this.channelSendStatusFromRecord(record) : null;
+	}
+
+	/** Every channel send this node executed, plus composites it holds without a quote, oldest first. */
+	listChannelSends(): ChannelSendStatus[] {
+		this.pruneChannelSendRuns();
+		const out: ChannelSendStatus[] = [];
+		const seen = new Set<string>();
+		for (const run of this.channelSendRuns().values()) {
+			out.push(this.channelSendStatus(run));
+			if (run.status.compositeId) seen.add(run.status.compositeId);
+		}
+		for (const record of this.node.listCompositeSplices()) {
+			if (seen.has(record.id)) continue;
+			out.push(this.channelSendStatusFromRecord(record));
+		}
+		return out.sort((a, b) => a.startedAt - b.startedAt);
+	}
+
+	/**
+	 * Abort a composite channel send before RELEASED (issue #1922) and return
+	 * its status. A single-channel send is a splice-out already under way and
+	 * is not aborted from here; past RELEASED the transaction may confirm and
+	 * the engine refuses.
+	 */
+	abortChannelSend(id: string, reason?: string): ChannelSendStatus {
+		requireChannelIdHex(id, 'id');
+		// The reason rides every session's tx_abort; a value that cannot be
+		// encoded would stop the unwind between channels.
+		if (reason !== undefined) {
+			if (typeof reason !== 'string') {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'reason must be a string'
+				);
+			}
+			if (
+				Buffer.byteLength(reason, 'utf8') > CHANNEL_SEND_ABORT_REASON_MAX_BYTES
+			) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`reason must be at most ${CHANNEL_SEND_ABORT_REASON_MAX_BYTES} bytes of UTF-8`
+				);
+			}
+		}
+		const run = this.channelSendRuns().get(id);
+		if (run && run.status.kind === 'single') {
+			throw new BeignetError(
+				BeignetErrorCode.SPLICE_REFUSED,
+				'a single-channel send is a splice-out already under way; it cannot be aborted here'
+			);
+		}
+		const compositeId = run?.status.compositeId ?? id;
+		const result = this.node.abortCompositeSplice(
+			Buffer.from(compositeId, 'hex'),
+			reason
+		);
+		if (!result.ok) {
+			throw new BeignetError(
+				result.code === CompositeSpliceRefusalCode.NOT_FOUND
+					? BeignetErrorCode.NOT_FOUND
+					: BeignetErrorCode.SPLICE_REFUSED,
+				result.error ?? 'composite splice cannot be aborted'
+			);
+		}
+		const status = this.getChannelSend(id);
+		if (!status) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'channel send not found after the abort'
+			);
+		}
+		return status;
+	}
 
 	decodeOfferString(offerStr: string): OfferInfo {
 		const offer = decodeOfferInput(offerStr);

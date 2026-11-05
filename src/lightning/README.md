@@ -45,7 +45,7 @@ src/lightning/
 ├── offer/           BOLT 12 offers, TLV encode/decode, Schnorr, merkle tree
 ├── async-payments/  AsyncPaymentManager, held-forward ledger, release capability
 ├── ffor/            FFOR Variant D offline receive: epochs, voucher book, witness and issuer
-├── liquidity/       JIT channel receive (LSP and wallet roles)
+├── liquidity/       JIT channel receive (LSP and wallet roles), ranked receive primaries
 ├── direct-funding/  Third-party funding: request envelopes, transport lanes, receiver and payer
 ├── swaps/           Reverse and submarine swap providers, HTLC contract, ledger, chain resolver
 ├── l402/            L402 (HTTP 402) client: challenges, macaroons, paid credentials
@@ -716,7 +716,14 @@ const outResult = node.spliceOut(channelId, 50_000n, 253);
 
 An input someone else owns can fund a v2 open or a splice-in. It is contributed
 and negotiated like any of ours, but its `signWitness` is never called, our
-`tx_signatures` is withheld, and the finished witness arrives out of band.
+`tx_signatures` is withheld, and the finished witness arrives out of band. The
+delivered witness is verified before it is stored, so the input must pay a
+P2WPKH or P2TR output (key-spend), or, in a splice only, the bare 2-of-2 P2WSH
+of a channel funding output, whose witness `[<>, sig, sig, script]` is checked
+signature by signature (issue #1922); every other prevout is refused before the
+negotiation commits to it. A peer that admits such a 2-of-2 input advertises
+`Feature.OPTION_COMPOSITE_SPLICE_INPUTS` (bits 454/455), which beignet sets by
+default.
 
 ```typescript
 // Register the inputs ahead of the negotiation, bypassing wallet selection.
@@ -730,6 +737,9 @@ node.spliceInWithInputs(channelId, amountSats, inputs, changeScript, 253);
 // full prevout set BIP 341 commits to, and the outpoints still owed.
 node.getPendingV2FundingTx(channelId);  // v2 open,   issue #612
 node.getPendingSpliceTx(channelId);     // splice-in, issue #592
+// The bytes of a channel's current funding transaction, fetched from the
+// chain and persisted the first time a channel lacks them (issue #1922).
+await node.getFundingTxHex(channelId);
 
 // Where the witness goes back. The last one released the withheld
 // tx_signatures; `sendsWithheld` says it did not actually reach the peer.
@@ -740,6 +750,66 @@ node.provideSpliceExternalWitness(channelId, prevTxid, prevOutputIndex, witness)
 // resident under its temporary id).
 node.getRawChannel(channelId);
 ```
+
+### Composite splice-out (library only)
+
+One transaction can splice out of several channels at once and pay one
+destination (issue #1922, [docs/MULTI-CHANNEL-SPLICE-OUT.md](../../docs/MULTI-CHANNEL-SPLICE-OUT.md)):
+every participating channel's funding outpoint is an input, every channel
+gets a new funding output at `old - debit - fee`, and the destination
+receives `sum(debit)`. The node is the initiator in N ordinary splice
+sessions that negotiate the identical transaction, holds every
+`commitment_signed` until all N agree on the txid, and releases its
+`tx_signatures` in every session only once every peer has signed. Before that
+release nothing is spent and the operation can be aborted; after it the
+transaction is broadcast and each channel locks on its own.
+
+```typescript
+// Pure: which channels would take part, debited largest spendable balance
+// first, with the fee split in proportion to each debit.
+const plan = await node.planCompositeSpliceOut({
+  destinationScript,          // optional; the wallet's own address otherwise
+  amountSats: 1_500_000n,
+  fundingFeeratePerkw: 1000,
+  channelIds,                 // optional: use exactly these channels
+  budgetMs                    // optional: time to every peer's signature
+});
+// plan.ok ? plan.plan.channels[i].{channelId, debitSats, feeSats, newCapacitySats}
+//         : plan.code (INVALID_PARAMS, BUSY, STORAGE_REQUIRED, CHANNEL_NOT_FOUND,
+//                      NO_ELIGIBLE_CHANNELS, INSUFFICIENT_BALANCE,
+//                      SINGLE_CHANNEL_SUFFICES) and plan.skipped[] with a reason per channel
+
+// Plan and start. Resolves once every session has started; the operation
+// then reports on 'composite-splice:stage' and through its record.
+const started = await node.startCompositeSpliceOut({ destinationScript, amountSats, fundingFeeratePerkw });
+node.getCompositeSplice(started.id);      // the record: stage, channels, txid, txHex
+node.listCompositeSplices();              // every record this node holds
+node.abortCompositeSplice(started.id);    // until RELEASED; TOO_LATE afterwards
+node.peerSupportsCompositeSpliceInputs(peerPubkey); // bits 454/455, or Core Lightning
+```
+
+Stages: `PLANNED`, `NEGOTIATING`, `COMMITTED` (every session negotiated the
+same transaction; the commitments are released), `PEERS_SIGNED`, `RELEASED`
+(our `tx_signatures` left in every session; the record is on disk first),
+`BROADCAST`, `LOCKED`, `ABORTED` with a reason, or `CONFLICTED` when a
+participating channel force closed, errored, closed or reverted after the
+release, so the transaction can no longer confirm whole. One composite runs
+at a time; a second request is refused with `BUSY`, not queued. A channel in
+a live composite refuses a single splice and a cooperative close. A peer
+disconnect before `RELEASED` aborts the composite at once. The record is a
+`composite_splice` recovery mutation and needs a storage backend with the
+`compositeSplices` capability group plus a recovery journal; at boot a
+record that never reached `RELEASED` is marked `ABORTED` and its unsent
+sessions are forgotten (owing the peer a `tx_abort`), a `RELEASED` or
+`BROADCAST` one is tracked to `LOCKED` (the channels' own splice rebroadcast
+path republishes it through the durability barrier), and channels sharing an
+in-flight splice that no record describes get a synthesized record.
+Terminal records are kept for seven days. A peer is selected
+only when it advertises `option_composite_splice_inputs` or is Core
+Lightning (which admits the inputs without the bit, see the design note's
+section 8); a peer that signed before the composite aborted keeps its splice
+until an operator acts, as BOLT 2 requires of a side that sent
+`tx_signatures` (section 4 of the note).
 
 None of this has a daemon or CLI surface, deliberately. `POST /channel/open-v2`
 and `POST /channel/splice-in` take no `fundingUtxos` and no `contribution`, and
@@ -1139,6 +1209,8 @@ signatures). Pass `{ verified: true }` only for signature-checked messages that
 re-encode byte-identically to the signed wire payload, or
 `{ verified: 'deferred' }` for signed-but-unchecked ones. Rapid Gossip Sync
 entries are always unverified because RGS strips signatures.
+`applyChannelUpdate` refuses an update with `dont_forward` set, whatever its
+provenance: BOLT 7 meant it for the channel peer alone.
 
 A full mainnet RGS snapshot (about 28k channels and twice as many updates)
 holds the event loop for hundreds of milliseconds when applied in one pass
@@ -1311,12 +1383,14 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `channel:voided` | `(data: { channelId: Buffer })` | Unfunded or abandoned channel discarded. |
 | `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement. |
 | `splice:complete` | `(data: { channelId: Buffer; fundingTxid: Buffer \| null \| undefined })` | splice_locked exchanged both ways: the channel runs on the new funding. |
+| `composite-splice:stage` | `(data: ICompositeSpliceStageEvent)` | A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. |
 | `splice:aborted` | `(data: { channelId: Buffer; reason: string })` | A splice negotiation was unwound by tx_abort before its point of no return. |
 | `splice:conflicted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string; inputIndex: number; height: number })` | An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. |
 | `splice:reverted` | `(data: { channelId: Buffer; spliceTxid: string; conflictTxid: string })` | A conflicted splice was unwound by agreement: both sides verified the conflict on their own chain view and returned to the pre-splice funding, which both still hold valid commitments for. The channel is NORMAL on the old outpoint, its watch re-armed; a `spliceInAndWait` on that splice rejects, and a direct-funding request behind it is failed (`direct-funding:offer:failed`, "the payer spent the offered coin elsewhere"), or, when its receipt already went out, its received record is marked REVERTED. |
 | `htlc:forward` | `(inChannelId: Buffer, outChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)` | An HTLC was relayed to the next hop. |
 | `htlc:forwarded` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountInMsat: bigint; amountOutMsat: bigint; feeMsat: bigint })` | A forwarded HTLC settled: the fee was earned. |
 | `htlc:forward-failed` | `(data: { inChannelId: Buffer; outChannelId: Buffer })` | A forwarded HTLC failed downstream. |
+| `htlc:forward-refused` | `(data: { inChannelId: Buffer; outChannelId: Buffer; amountMsat: bigint; paymentHash: Buffer; reason: string; channelErrorCode?: ChannelErrorCode })` | The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Not a `node:error`: someone else's payment was turned away, nothing of this node's failed. `reason` is the channel's refusal ('Insufficient balance for HTLC', 'Max pending HTLCs exceeded', ...) and `channelErrorCode` its code, when the refusing arm gave one. |
 | `htlc:fulfilled` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `htlc:failed` | `(data: { channelId: Buffer; htlcId: bigint })` | The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. |
 | `broadcast:tx` | `(tx: Buffer)` | Transaction to broadcast on chain. |
@@ -1327,6 +1401,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `peer:disconnect` | `(pubkey: string, info?: IPeerDisconnectInfo)` | Peer disconnected (networking mode). `info` says who closed the connection and why, when known. |
 | `peer:disconnect-requested` | `(pubkey: string)` | The node needs this peer's connection severed but holds no socket for it (event-transport mode, or an unconnected peer): the host must close its transport. The protocol side (channels marked for reestablish) is already applied; reconnect and reestablish as usual. |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode). |
+| `peer:warning` | `(warning: { pubkey: string; channelId: Buffer \| null; text: string })` | A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. |
 | `custom-message` | `(message: { peerPubkey: string; version: number; subtype: number; payload: Buffer })` | A beignet custom message (type 44069) arrived from a peer. |
 | `peer_storage:retrieved` | `(peerPubkey: string, blob: Buffer)` | A peer returned the blob it stores for this node (BOLT 1 peer storage), unpadded. |
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513). |
@@ -1469,7 +1544,7 @@ One row per namespace `beignet/lightning` exports (a test checks this table agai
 | `offer` | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
 | `async-payments` | `AsyncPaymentManager`, `HeldForwardLedger`, release capability (held forward, notice, release, wake) | 4, 11 |
 | `ffor` | `FforWitnessService`, `FforIssuerService`, epoch messages, voucher book checks, transcript hashes | -- |
-| `liquidity` | `JitReceiveManager`, JIT quote/ack/authorization messages, intercept SCIDs | -- |
+| `liquidity` | `JitReceiveManager`, JIT quote/ack/authorization messages, intercept SCIDs, `PrimariesStore` and `selectReceiveTargets` (ranked receive primaries) | -- |
 | `direct-funding` | Request envelopes, sealed frames, `DirectFundingRequestStore`, `DirectFundingReceiver`, `DirectFundingSender`, transport lanes | -- |
 | `swaps` | P2WSH HTLC contract, claim/refund transactions, swap ledger, chain resolver, `ReverseSwapProvider`, `SubmarineSwapProvider` | -- |
 | `l402` | `l402Fetch`, `parseL402Challenge`, macaroon reading, credentials | -- |
@@ -1496,8 +1571,8 @@ npm run test:conformance
 # Interop tests against LND/CLN/Eclair (requires Docker)
 npm run test:interop
 
-# Lightning + CLI + interop
-npm run test:all
+# Lightning and CLI unit tests at once (builds first)
+npm test
 
 # A single module's tests
 npx mocha --exit -r ts-node/register 'tests/lightning/node.test.ts'

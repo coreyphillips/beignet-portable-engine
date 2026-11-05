@@ -2,6 +2,7 @@ import type { IReceiverGrant } from '../async-payments/receiver-grant';
 import type { IHeldForwardRecord } from '../async-payments/held-forward-ledger';
 import type { IHeldForwardNotice } from '../async-payments/types';
 import type { ISweepUneconomicChainAction } from '../chain/types';
+import type { ChannelErrorCode } from '../channel/channel-actions';
 import type { FforState, IFforEpochRecord } from '../ffor/types';
 import type { FforIssuerEvents } from '../ffor/issuer-service';
 import type { FforWitnessEvents } from '../ffor/witness-service';
@@ -69,6 +70,8 @@ export type NodeErrorCode =
 	| 'SPLICE_INPUT_CONFLICT'
 	| 'SPLICE_IN_FAILED'
 	| 'SPLICE_OUT_FAILED'
+	| 'COMPOSITE_SPLICE_ABORTED'
+	| 'COMPOSITE_SPLICE_RESTORE_FAILED'
 	| 'STARTUP_RECONNECT_FAILED'
 	| 'STARTUP_REPAIR_COMPLETION_FAILED'
 	| 'STARTUP_REPAIR_UNRECEIPTED'
@@ -196,6 +199,10 @@ export interface LightningNodeEvents
 		channelId: Buffer;
 		fundingTxid: Buffer | null | undefined;
 	}) => void;
+	/** A composite splice-out (issue #1922) reached a stage; ABORTED carries the reason. */
+	'composite-splice:stage': (
+		data: import('./composite-splice-engine').ICompositeSpliceStageEvent
+	) => void;
 	/** A splice negotiation was unwound by tx_abort before its point of no return. */
 	'splice:aborted': (data: { channelId: Buffer; reason: string }) => void;
 	/** An input of an in-flight splice that this node does not vouch for (a depth-locked splice carrying a stranger's coin, issue #760) was spent by another transaction, confirmed six deep while the splice is not on chain: the splice can never confirm. The node records it durably, raises `node:error` code `SPLICE_INPUT_CONFLICT`, and asks the peer to verify and revert; the request is re-sent every block and on reconnect until agreed. */
@@ -235,6 +242,15 @@ export interface LightningNodeEvents
 		inChannelId: Buffer;
 		outChannelId: Buffer;
 	}) => void;
+	/** The outgoing channel refused to add a forward, so it was failed back to the sender with temporary_channel_failure. Not a `node:error`: someone else's payment was turned away, nothing of this node's failed. `reason` is the channel's refusal ('Insufficient balance for HTLC', 'Max pending HTLCs exceeded', ...) and `channelErrorCode` its code, when the refusing arm gave one. */
+	'htlc:forward-refused': (data: {
+		inChannelId: Buffer;
+		outChannelId: Buffer;
+		amountMsat: bigint;
+		paymentHash: Buffer;
+		reason: string;
+		channelErrorCode?: ChannelErrorCode;
+	}) => void;
 	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
@@ -268,6 +284,12 @@ export interface LightningNodeEvents
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */
 	'peer:error': (pubkey: string, error: Error) => void;
+	/** A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. */
+	'peer:warning': (warning: {
+		pubkey: string;
+		channelId: Buffer | null;
+		text: string;
+	}) => void;
 	/** A beignet custom message (type 44069) arrived from a peer. */
 	'custom-message': (message: {
 		peerPubkey: string;

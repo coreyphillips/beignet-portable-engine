@@ -83,6 +83,16 @@ import {
 	MAX_SPLICE_FEERATE_PERKW,
 	spliceFeeSats
 } from '../channel/splice-weight';
+import { CompositeSpliceEngine } from './composite-splice-engine';
+import type {
+	CompositeSpliceRefusalCode,
+	ICompositeSpliceEngineDeps,
+	ICompositeSpliceOutRequest,
+	ICompositeSplicePlanResult,
+	ICompositeSpliceStageEvent,
+	ICompositeSpliceStartResult
+} from './composite-splice-engine';
+import type { ICompositeSpliceRecord } from '../channel/composite-splice-record';
 import type { IHtlcEntry } from '../channel/types';
 import {
 	ChannelState,
@@ -1122,6 +1132,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
+	/** Composite splice-out engine (issue #1922); built once the manager exists. */
+	private compositeSplices: CompositeSpliceEngine | null = null;
 	/**
 	 * Issue #906: true from a birth boot (decided in restoreFromStorage)
 	 * until the chain-tip floor on the next channel key index has fired and
@@ -2013,6 +2025,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
+		// Taproot channels only close through closing_signed here (MuSig2
+		// partial signature in TLV 6), while LND 0.21 runs its RBF close
+		// (closing_complete / closing_sig, partial signatures in TLVs 5 to 7)
+		// on every taproot channel once both inits carry option_simple_close.
+		// The two forms do not meet: the close stalls, or an undecodable TLV
+		// fails the channel. LND reads the bit from the init of each
+		// connection, so it comes off the whole advertisement while taproot is
+		// on; a caller-supplied set is masked too. Non-taproot channels with
+		// those peers lose RBF close until the taproot form of simple close
+		// lands (issue #1929).
+		if (localFeatures.hasFeature(Feature.OPTION_TAPROOT)) {
+			localFeatures.clearBit(Feature.SIMPLE_CLOSE);
+			localFeatures.clearBit(Feature.SIMPLE_CLOSE + 1);
+		}
 		// Async receive service (issue #709): the odd bit is advertised in init
 		// and node_announcement ONLY while the service is enabled. A receiver
 		// reads it before asking for a grant, so it never marks a path
@@ -2161,6 +2187,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
+		this.compositeSplices = new CompositeSpliceEngine(
+			this.compositeSpliceDeps()
+		);
+		this.compositeSplices.attach();
 		// A wallet-owned sweep destination handed in at CONSTRUCTION must reach
 		// the channel manager too: its shutdown-script logic only learned the
 		// wallet address through setSweepDestinationScript, a path taken when
@@ -3748,6 +3778,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// runs whether or not the lanes are ever attached.
 		this.restoreDirectFundingPolicy();
 		this.directFunding?.requests.restore();
+		// Composite splice records (issue #1922): abort what never released its
+		// signatures, keep tracking what did. Channels are restored by now.
+		this.compositeSplices?.restore();
 
 		// Scan for expiring HTLCs immediately on restore (may have missed blocks while down)
 		if (this.currentBlockHeight > 0) {
@@ -5927,6 +5960,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				};
 				if (code !== undefined) err.channelErrorCode = code;
 				this.emit('node:error', err);
+			}
+		);
+
+		this.channelManager.on(
+			'peer:warning',
+			(pubkey: string, channelId: Buffer | null, text: string) => {
+				const data = {
+					pubkey,
+					...(channelId ? { channelId: channelId.toString('hex') } : {}),
+					text
+				};
+				this.logger.warn('Peer warning', data);
+				this.emitStructuredLog('peer', 'warning', data);
+				this.emit('peer:warning', { pubkey, channelId, text });
 			}
 		);
 
@@ -9902,6 +9949,33 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The address this node last dialed a peer at, if it ever did: the one
+	 * `listPeers` reports for it while it is up, and the first a reconnect
+	 * tries. Read from the live dial cache, else from the address the last
+	 * successful dial persisted, which is all a peer dialed in an earlier run
+	 * and not yet in this one has. A peer that has only ever connected inbound
+	 * has neither, since its TCP source port is ephemeral, and `listPeers`
+	 * then shows that port.
+	 */
+	getPeerAddress(
+		pubkey: string
+	):
+		| { host: string; port: number; transport?: IPeerTransportOptions }
+		| undefined {
+		const live = this.peerManager?.getPeerAddress(pubkey);
+		if (live) return live;
+		if (!this.storage) return undefined;
+		const key = normalizeHexPubkey(pubkey);
+		const saved = this.loadPeerAddresses().find((a) => a.pubkey === key);
+		if (!saved) return undefined;
+		return {
+			host: saved.host,
+			port: saved.port,
+			...(saved.transport ? { transport: saved.transport } : {})
+		};
+	}
+
+	/**
 	 * Connected peers advertising option_provide_storage (BOLT 1 peer
 	 * storage): the set a restore can expect a Recovery Capsule from.
 	 */
@@ -11584,6 +11658,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	destroy(): void {
 		this._destroyed = true;
+		this.compositeSplices?.detach();
 		// A restore of the stored map ends here, before its storage closes.
 		if (this.graphRestore) this.cancelGraphRestore(this.graphRestore);
 		this.guardianHost?.close();
@@ -11681,6 +11756,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (this.peerManager) {
 			this.peerManager.destroy();
 		}
+		// ChannelManager timers would outlive the node otherwise: a quiescence
+		// watchdog re-arms itself for as long as its channel stays quiescent, and
+		// the held unknown-reestablish timer waits on a peer that is gone (#1937).
+		this.channelManager.detachFromPeerManager();
 		this.onionMessageManager.destroy();
 		this.offerManager.destroy();
 		// Persist mission control on destroy
@@ -12653,6 +12732,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// times out into a force-close, that path relabels with the terminal
 		// reason.
 		const channel = this.channelManager.getChannel(channelId);
+		if (this.compositeSplices?.isChannelReserved(channelId)) {
+			const error =
+				'channel is part of a live composite splice (issue #1922); wait for it to lock or abort it before closing';
+			this.emit('node:error', {
+				code: 'CLOSE_CHANNEL_FAILED',
+				channelId,
+				message: error,
+				timestamp: Date.now()
+			});
+			return { ok: false, error };
+		}
 		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason('user') ?? false;
 		const result = this.channelManager.initiateShutdown(
@@ -12873,6 +12963,39 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			pending.sentTxSignatures = false;
 		}
 		return pending;
+	}
+
+	/**
+	 * The transaction that created a channel's current funding outpoint, as
+	 * hex (issue #1922, step 5a). Channels opened or spliced since the field
+	 * existed carry it in their state; for one that does not (a v1 fundee, a
+	 * channel from before the field, a force-close adoption of a half-signed
+	 * splice) the chain backend is asked once, the bytes are checked against
+	 * the funding txid and output index, written to the channel and
+	 * persisted. Null when the channel is unknown, has no funding txid yet,
+	 * or the backend is missing, fails or returns a different transaction;
+	 * nothing is thrown, since a caller planning a composite splice treats
+	 * null as "this channel cannot take part".
+	 * @param channelId - 32-byte channel ID
+	 */
+	async getFundingTxHex(channelId: Buffer): Promise<string | null> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return null;
+		const state = channel.getFullState();
+		if (state.fundingTxHex) return state.fundingTxHex;
+		if (!state.fundingTxid || !this._chainBackend) return null;
+		const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
+		let raw: Buffer;
+		try {
+			raw = await this._chainBackend.getTransaction(txidHex);
+		} catch {
+			return null;
+		}
+		if (!channel.setFundingTxHex(raw.toString('hex'))) return null;
+		this.persistChannel(channelId);
+		return channel.getFullState().fundingTxHex ?? null;
 	}
 
 	/**
@@ -14254,17 +14377,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			if (input.external) {
 				// Its witness will be judged by _validateWitnessForInput on
-				// delivery, which can only verify P2WPKH and P2TR key-spends.
-				// Refuse here rather than after the negotiation has committed to
-				// a transaction whose witness we could never accept.
+				// delivery, which verifies P2WPKH, P2TR key-spends and the bare
+				// 2-of-2 P2WSH form of a channel funding output (issue #1922).
+				// Refuse any other prevout here rather than after the
+				// negotiation has committed to a transaction whose witness we
+				// could never accept.
 				const script = prevTx.outs[input.prevOutputIndex].script;
 				const isP2wpkh =
 					script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+				const isP2wsh =
+					script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
 				const isP2tr =
 					script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
-				if (!isP2wpkh && !isP2tr) {
+				if (!isP2wpkh && !isP2wsh && !isP2tr) {
 					throw new InvalidSpliceError(
-						`${where} is external and pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)`
+						`${where} is external and pays an unsupported output type (only P2WPKH, P2TR and 2-of-2 P2WSH witnesses can be verified)`
 					);
 				}
 			}
@@ -14883,6 +15010,116 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * Whether a peer admits a bare 2-of-2 P2WSH initiator input in a splice
+	 * (issue #1922, docs/MULTI-CHANNEL-SPLICE-OUT.md section 8): it advertises
+	 * option_composite_splice_inputs (bits 454/455), or it is Core Lightning,
+	 * which admits such inputs without the bit (CLN matrix tier C3) and is
+	 * told apart by its own shutdown_wrong_funding pair (104/105), a bit no
+	 * other implementation uses. CLN sets that pair only when started with
+	 * its experimental shutdown-wrong-funding flag: a default CLN v26.06.1
+	 * advertises no init bit above 63 (regtest, 2026-11-03), so it is not
+	 * recognised here and its channels are left out of a composite by name.
+	 * Null when the peer's init is not known.
+	 */
+	peerSupportsCompositeSpliceInputs(peerPubkey: string): boolean | null {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return null;
+		return (
+			init.features.hasFeature(Feature.OPTION_COMPOSITE_SPLICE_INPUTS) ||
+			init.features.hasBit(104) ||
+			init.features.hasBit(105)
+		);
+	}
+
+	/**
+	 * Plan a composite splice-out (issue #1922): one transaction that pays
+	 * `amountSats` to the destination out of several channels' funding
+	 * outpoints, debited largest spendable balance first, with the fee split
+	 * in proportion to each debit. Pure: no message leaves and nothing is
+	 * reserved. A refusal names the code and, per channel left out, why.
+	 */
+	planCompositeSpliceOut(
+		request: ICompositeSpliceOutRequest
+	): Promise<ICompositeSplicePlanResult> {
+		return this.compositeSplice().plan(request);
+	}
+
+	/**
+	 * Plan and start a composite splice-out (issue #1922). Resolves once every
+	 * session has been started (or the plan was refused); the operation then
+	 * reports its stages on 'composite-splice:stage' and its record through
+	 * getCompositeSplice. One composite at a time per node; a second request
+	 * is refused with BUSY, not queued. Until RELEASED (our first
+	 * tx_signatures), abortCompositeSplice unwinds every session with
+	 * tx_abort and nothing is spent.
+	 */
+	startCompositeSpliceOut(
+		request: ICompositeSpliceOutRequest
+	): Promise<ICompositeSpliceStartResult> {
+		if (this._destroyed) throw new Error('Node destroyed');
+		return this.compositeSplice().start(request);
+	}
+
+	/** Abort a live composite splice before RELEASED (issue #1922). */
+	abortCompositeSplice(
+		id: Buffer,
+		reason?: string
+	): { ok: boolean; error?: string; code?: CompositeSpliceRefusalCode } {
+		const idErr = validateBuffer(id, 32, 'id');
+		if (idErr) throw new Error(idErr);
+		return this.compositeSplice().abort(id, reason);
+	}
+
+	/** The record of a composite splice (issue #1922), or null. */
+	getCompositeSplice(id: Buffer): ICompositeSpliceRecord | null {
+		const idErr = validateBuffer(id, 32, 'id');
+		if (idErr) throw new Error(idErr);
+		return this.compositeSplice().get(id);
+	}
+
+	/** Every composite splice record this node holds, oldest first. */
+	listCompositeSplices(): ICompositeSpliceRecord[] {
+		return this.compositeSplice().list();
+	}
+
+	private compositeSplice(): CompositeSpliceEngine {
+		if (!this.compositeSplices) {
+			throw new Error('composite splice engine is not available');
+		}
+		return this.compositeSplices;
+	}
+
+	private compositeSpliceDeps(): ICompositeSpliceEngineDeps {
+		return {
+			channelManager: this.channelManager,
+			recordsSupported: () =>
+				!!this.storage?.saveCompositeSplice &&
+				!!this.storage?.loadAllCompositeSplices &&
+				!!this.recovery,
+			loadAllRecords: () => this.storage!.loadAllCompositeSplices!(),
+			withMutations: (mutations, fn) => this.withStagedMutations(mutations, fn),
+			fundingTxHex: (channelId) => this.getFundingTxHex(channelId),
+			peerSupportsSplicing: (peer) => this.peerSupportsSplicing(peer),
+			peerSupportsCompositeSpliceInputs: (peer) =>
+				this.peerSupportsCompositeSpliceInputs(peer),
+			resolveDestination: (script) => this._spliceOutDestination(script),
+			currentHeight: () => this.currentBlockHeight,
+			deleteRecord: (id) => this.storage?.deleteCompositeSplice?.(id),
+			emitStage: (event: ICompositeSpliceStageEvent) =>
+				this.emit('composite-splice:stage', event),
+			emitError: (code, message, channelId) =>
+				this.emit('node:error', {
+					code,
+					message,
+					...(channelId ? { channelId } : {}),
+					timestamp: Date.now()
+				}),
+			log: (event, fields) => this.emitStructuredLog('channel', event, fields),
+			now: () => Date.now()
+		};
+	}
+
+	/**
 	 * Shared splice pre-flight checks: dust-level amounts and peer feature
 	 * support (option_splice + option_quiesce). Returns an error string or null.
 	 */
@@ -14898,6 +15135,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return {
 				error: `splice amount ${amountSats} sats is below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`,
 				code: SpliceRefusalCode.INVALID_PARAMS
+			};
+		}
+		if (this.compositeSplices?.isChannelReserved(channelId)) {
+			return {
+				error:
+					'channel is part of a live composite splice (issue #1922); wait for it to lock or abort it',
+				code: SpliceRefusalCode.SPLICE_BUSY
 			};
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
@@ -19490,7 +19734,21 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// refused part cannot be rolled back once earlier parts are out.
 			// Same selection rule as sendPaymentToRoute.
 			const outChannel = this.firstHopChannelFor(partRoute);
-			if (!outChannel) continue;
+			if (!outChannel) {
+				// No channel to the first hop takes new HTLCs any more: a close,
+				// void or disconnect landed between planning and dispatch. The
+				// part cannot leave, so the payment is over here, like a part the
+				// channel refuses below. Skipping the part instead sent the rest
+				// for the payee to hold until its MPP timeout, and with every part
+				// skipped left a PENDING record nothing could resolve (#1941).
+				this.failMppDispatch(
+					payment,
+					`Local failure: MPP part's first-hop channel is gone (${hops[0].shortChannelId.toString(
+						'hex'
+					)})`
+				);
+				return payment;
+			}
 
 			const channelId = outChannel.getChannelId()!;
 			const cltvExpiry = hops[0].outgoingCltvValue + baseHeight;
@@ -19545,37 +19803,14 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					  )
 					: { ok: false as const, error: ceilingProblem };
 			if (!result.ok) {
-				// No rollback of the parts already dispatched: BOLT 2 gives no way to
-				// withdraw an update_add_htlc we have sent. Only the downstream peer
-				// can fail it back, or it times out. The loop that used to stand here
-				// called failHtlc with these OFFERED ids and the default RECEIVED
-				// direction, which at best errored and at worst cancelled an unrelated
-				// inbound HTLC that happened to share the numeric id. It was
-				// unreachable until addHtlc started reporting refusals honestly.
-				//
-				// The dispatched parts settle themselves: the payee cannot claim an
-				// incomplete MPP set, so it fails them back on its own MPP timeout.
-				this.htlcPaymentMap.delete(mppHtlcKey);
 				mppState.parts.pop();
-
-				// Part failed to dispatch — mark payment failed
-				payment.status = PaymentStatus.FAILED;
-				payment.completedAt = Date.now();
-				payment.failureReason = boundedFailureReason(
+				this.failMppDispatch(
+					payment,
 					`Local failure: MPP part could not be dispatched (${
 						result.error ?? 'unknown reason'
-					})`
+					})`,
+					mppHtlcKey
 				);
-				this.outboundMppPayments.delete(hashHex);
-				// The mapping release and the FAILED record are one journaled
-				// transition, mirroring the single-path local-failure cleanup.
-				const mppFailMutations: RecoveryMutation[] = [
-					{ type: 'delete_htlc_payment_mapping', htlcKey: mppHtlcKey }
-				];
-				const mppFailPayment = this.paymentMutation(paymentHash);
-				if (mppFailPayment) mppFailMutations.push(mppFailPayment);
-				this.commitMutations('release failed MPP mapping', mppFailMutations);
-				this.emit('payment:failed', payment);
 				return payment;
 			}
 		}
@@ -19589,6 +19824,69 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		return payment;
+	}
+
+	/**
+	 * End an MPP payment whose part cannot leave: no channel to its first hop
+	 * takes HTLCs, the CLTV ceiling refuses it, or the channel declines the
+	 * add. The record is FAILED with `reason`, journaled in one transition
+	 * with the release of `htlcKey` (the mapping written for a part the
+	 * channel refused; a part that never resolved a channel wrote none), and
+	 * payment:failed fires once. A dispatched part can resolve before this one
+	 * is reached (synchronously, on a loopback transport): a fulfil completed
+	 * the record, and the preimage stands over this failure; a fail-back ended
+	 * it first, and its timestamp and event stand.
+	 *
+	 * No rollback of the parts already dispatched: BOLT 2 gives no way to
+	 * withdraw an update_add_htlc we have sent. Only the downstream peer can
+	 * fail it back, or it times out. The loop that used to stand here called
+	 * failHtlc with these OFFERED ids and the default RECEIVED direction,
+	 * which at best errored and at worst cancelled an unrelated inbound HTLC
+	 * that happened to share the numeric id. It was unreachable until addHtlc
+	 * started reporting refusals honestly.
+	 *
+	 * The dispatched parts settle themselves: the payee cannot claim an
+	 * incomplete MPP set, so it fails them back on its own MPP timeout. Each
+	 * lands in settleOwnPaymentFailure, which releases its mapping and leaves
+	 * an already FAILED record's status, timestamp and event alone. The MPP
+	 * state stays until the last of them resolves, as after a full dispatch:
+	 * each part's failure decrypts only with that part's secrets, and while
+	 * the state stands no part is auto-retried, so a temporary code coming
+	 * back cannot redispatch the whole invoice after this payment reported
+	 * FAILED. The retry context stays: a later send of the hash sizes its
+	 * settled row against that context's invoice (issue #1189), and the
+	 * give-up path drops the context when the last dispatched part fails back.
+	 */
+	private failMppDispatch(
+		payment: IPaymentInfo,
+		reason: string,
+		htlcKey?: string
+	): void {
+		const hashHex = payment.paymentHash.toString('hex');
+		const firstFailure = payment.status === PaymentStatus.PENDING;
+		if (payment.status !== PaymentStatus.COMPLETED) {
+			payment.status = PaymentStatus.FAILED;
+			if (firstFailure) payment.completedAt = Date.now();
+			payment.failureReason = boundedFailureReason(reason);
+		}
+		const mppState = this.outboundMppPayments.get(hashHex);
+		if (mppState) {
+			mppState.dispatchComplete = true;
+			if (
+				mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)
+			) {
+				this.outboundMppPayments.delete(hashHex);
+			}
+		}
+		const mutations: RecoveryMutation[] = [];
+		if (htlcKey !== undefined) {
+			this.htlcPaymentMap.delete(htlcKey);
+			mutations.push({ type: 'delete_htlc_payment_mapping', htlcKey });
+		}
+		const paymentMutation = this.paymentMutation(payment.paymentHash);
+		if (paymentMutation) mutations.push(paymentMutation);
+		this.commitMutations('fail MPP dispatch', mutations);
+		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
 	// ─────────────── HTLC Event Handlers ───────────────
@@ -25477,7 +25775,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					part.forwardCltv,
 					nextOnionBuf,
 					part.nextBlindingPoint,
-					part.skimmedFeeMsat
+					part.skimmedFeeMsat,
+					// Reported below as htlc:forward-refused. As a node:error it
+					// read exactly like a refused send of the user's own.
+					{ emitRefusal: false }
 				);
 			}
 		);
@@ -25521,6 +25822,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					}
 				}
 			);
+			if (placement === 'refused') {
+				this.reportForwardRefused(
+					outChannelId,
+					part,
+					result as ChannelResult | null
+				);
+			}
 			return placement;
 		}
 
@@ -25532,6 +25840,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			part.paymentHash
 		);
 		return 'forwarded';
+	}
+
+	/**
+	 * Report a forward its outgoing channel refused to add. It already failed
+	 * back; this is the record of it, in the action log and as an event, so
+	 * the refusal is not mistaken for a send of this node's own.
+	 */
+	private reportForwardRefused(
+		outChannelId: Buffer,
+		part: IHeldJitPart,
+		result: ChannelResult | null
+	): void {
+		const reason = result?.error ?? 'outgoing add refused';
+		this.emitStructuredLog('htlc', 'forward_refused', {
+			paymentHash: part.paymentHash.toString('hex'),
+			inChannelId: part.inChannelId.toString('hex'),
+			inHtlcId: Number(part.inHtlcId),
+			outChannelId: outChannelId.toString('hex'),
+			amountMsat: part.forwardAmountMsat.toString(),
+			reason,
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+		});
+		this.emit('htlc:forward-refused', {
+			inChannelId: part.inChannelId,
+			outChannelId,
+			amountMsat: part.forwardAmountMsat,
+			paymentHash: part.paymentHash,
+			reason,
+			...(result?.code !== undefined ? { channelErrorCode: result.code } : {})
+		});
 	}
 
 	/**
@@ -28471,21 +28809,48 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * PUBLIC_HOST, both with this wallet's listen port, and this node has no way
 	 * to know which is right. With neither, no direct-peer descriptor is emitted
 	 * and the payer reaches us through the liquidity peer.
+	 *
+	 * `liquidityPeer` binds the request to that peer (issue #1922): its onion
+	 * and relay descriptors name it, at `liquidityHost` and `liquidityPort` (or
+	 * the policy's address when the policy names the same peer), and the
+	 * receiver negotiates the funding with it when the offer arrives, whatever
+	 * the policy's liquidity peer is by then. Without it the request follows
+	 * the policy, as before.
 	 */
 	mintDirectFundingRequest(opts: {
 		host?: string;
 		port?: number;
 		amountSat?: bigint;
 		ttlMs?: number;
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
 	}): { record: IDfRequestRecord; request: string; expiresAt: number } {
 		const df = this.directFunding;
 		if (!df) throw new Error('direct funding is not configured on this node');
 		const record = df.requests.mint({
 			ttlMs: opts.ttlMs ?? df.requestTtlMs,
-			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {})
+			...(opts.amountSat !== undefined ? { amountSat: opts.amountSat } : {}),
+			...(opts.liquidityPeer !== undefined
+				? { liquidityPeer: opts.liquidityPeer }
+				: {})
 		});
 		let envelope: string;
 		try {
+			// Resolved after the mint, from the record's bound peer: validated and
+			// lower-cased by the store, so a malformed one is refused typed there
+			// rather than tripping on a string method here.
+			const relay = this.directFundingRelay({
+				...(record.liquidityPeer !== undefined
+					? { liquidityPeer: record.liquidityPeer }
+					: {}),
+				...(opts.liquidityHost !== undefined
+					? { liquidityHost: opts.liquidityHost }
+					: {}),
+				...(opts.liquidityPort !== undefined
+					? { liquidityPort: opts.liquidityPort }
+					: {})
+			});
 			envelope = encodeRequestEnvelope(
 				mintRequestEnvelope(
 					{
@@ -28498,7 +28863,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 							: {}),
 						receiptHash: Buffer.from(record.receiptHash, 'hex'),
 						encryptionKey: requestEncryptionPublicKey(record),
-						transports: this.directFundingTransports(record, opts)
+						transports: this.directFundingTransports(record, opts, relay)
 					},
 					(message) => this.signMessage(message)
 				)
@@ -28513,9 +28878,36 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * The peer a request's onion and relay descriptors go through, with the
+	 * address a payer dials it at: the peer the mint bound, at the address
+	 * given with it or, when it is the policy's own peer, the policy's address;
+	 * else the policy's peer at the policy's address. Null when there is no
+	 * such peer or no address for it, and then no relay descriptor is emitted.
+	 */
+	private directFundingRelay(opts: {
+		liquidityPeer?: string;
+		liquidityHost?: string;
+		liquidityPort?: number;
+	}): { peer: string; host: string; port: number } | null {
+		const policy = this.directFunding?.policy ?? {};
+		const peer = opts.liquidityPeer ?? policy.liquidityPeer;
+		if (!peer) return null;
+		const policyPeer =
+			policy.liquidityPeer !== undefined &&
+			policy.liquidityPeer.toLowerCase() === peer.toLowerCase();
+		const host =
+			opts.liquidityHost ?? (policyPeer ? policy.liquidityHost : undefined);
+		const port =
+			opts.liquidityPort ?? (policyPeer ? policy.liquidityPort : undefined);
+		if (!host || !port) return null;
+		return { peer, host, port };
+	}
+
+	/**
 	 * The descriptors one request publishes, in the order a payer should try
 	 * them: the direct peer connection when the caller told us where we are, then
-	 * a blinded path through the liquidity peer.
+	 * a blinded path through the relay peer (the one the request is bound to,
+	 * else the policy's liquidity peer).
 	 *
 	 * Only ONE onion descriptor is emitted where the fork emitted an onion and a
 	 * relay: the registry synthesizes the relay fall-back from the onion's
@@ -28524,7 +28916,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 */
 	private directFundingTransports(
 		record: IDfRequestRecord,
-		opts: { host?: string; port?: number }
+		opts: { host?: string; port?: number },
+		relay: { peer: string; host: string; port: number } | null
 	): DfTransportDescriptor[] {
 		const df = this.directFunding;
 		if (!df) return [];
@@ -28536,8 +28929,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				port: opts.port
 			});
 		}
-		const { liquidityPeer, liquidityHost, liquidityPort } = df.policy;
-		if (!liquidityPeer || !liquidityHost || !liquidityPort) return transports;
+		if (!relay) return transports;
+		const {
+			peer: liquidityPeer,
+			host: liquidityHost,
+			port: liquidityPort
+		} = relay;
 		try {
 			const path = mintDfBlindedPath(
 				Buffer.from(liquidityPeer, 'hex'),
@@ -28573,8 +28970,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * Build the request store, the lanes and the receiver, and route inbound
 	 * frames into it.
 	 *
-	 * Constructed but inert: with no liquidity peer named the receiver declines
-	 * every offer, and with no request minted every frame is dropped as unknown.
+	 * Constructed but inert: with no liquidity peer named, by the policy or by
+	 * the request an offer answers, the receiver declines every offer, and with
+	 * no request minted every frame is dropped as unknown.
 	 * What this does at construction is make sure a request minted later can be
 	 * ANSWERED, which needs the lanes subscribed before the first frame arrives.
 	 */
@@ -30826,6 +31224,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		flags.setOptional(Feature.KEYSEND);
 		flags.setOptional(Feature.QUIESCE);
 		flags.setOptional(Feature.SPLICE);
+		// Composite splice inputs (issue #1922): as a splice acceptor this node
+		// admits a bare 2-of-2 P2WSH initiator input once both of its
+		// signatures verify, so the capability is always advertised. An
+		// initiator selects only peers that advertise it.
+		flags.setOptional(Feature.OPTION_COMPOSITE_SPLICE_INPUTS);
 		// Anchors are the default channel type (LND/CLN/Eclair all default to them).
 		// Advertised so peers may propose anchor channels and so we negotiate them.
 		flags.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
@@ -30865,7 +31268,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		//  - ROUTE_BLINDING (24): advertised per-invoice (see invoiceFeatures),
 		//    not in the init set.
 		//  - OPTION_TAPROOT (180/181): negotiated via channel_type when
-		//    preferTaproot is set; staging bits are not init-advertised.
+		//    preferTaproot is set; staging bits are not init-advertised. A
+		//    caller that adds them loses SIMPLE_CLOSE: the constructor clears
+		//    it while taproot is advertised (issue #1929).
 		return flags;
 	}
 
