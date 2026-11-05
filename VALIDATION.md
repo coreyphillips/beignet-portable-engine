@@ -1,3 +1,31 @@
+# Portable engine validation, 2026-11-05 addendum for 0.38.0
+
+The fork tracks Beignet **0.38.0** at `954d034b13f57b38297406dd0d30dddc1208b192`, npm's `gitHead` for the release. That is the version bump #1968, whose `src/` is the same as #1967's commit `c1288be0`. This addendum supersedes the baseline statement of the 0.37.0 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 232 of 232 pass.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.37.0 tree.
+- The built bundle reports `0.38.0-portable` and is 7,518,861 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.38.0` tarball matches npm's integrity hash (`sha512-f/TujKsM...KmIJatA==`), and its `dist/` and `package.json` are identical to a clean build of `954d034b`.
+- Upstream's offline suites ran in an upstream `954d034b` tree with this fork's `src/` in place of its own:
+  - `test:cli` passes, 2,555 tests.
+  - `test:lightning` runs 10,164 passing and 19 failing: the 19 known failures listed in `PATCHES.md`.
+- The live scripts ran against a regtest Bitcoin Core 31.0 (`txindex=1`) and electrs pair in Docker. The primary was the published `beignet@0.38.0` package, unpacked, with `npm install --omit=dev`. The shared client was wallet-core `d1d83e2`, which is `fdbe9dc` (what Chicory pins) plus #46. The relay was a stand-in byte relay. Both sat beside a scratch copy of this tree, whose scripts were pointed at that pair's Electrum port and `bitcoin-cli`.
+  - `scripts/regtest.cjs` exits 0 with all 13 steps reporting PASS.
+  - `scripts/regtest-channelize.cjs` exits 0 with 19 checks reporting PASS.
+  - `scripts/regtest-send-max.cjs` exits 0 with the six cases other than `cln` passing, 69 PASS lines.
+  - `scripts/regtest-ffor.cjs` exits 0 with all 17 checks reporting PASS, in 3 of 3 runs. The DISCONNECT race of the 0.37.0 runs did not occur.
+- A scratch script checked #1967 on the phone path. Bitcoin Core paid a device wallet, the device listed the payment unconfirmed, and `bumpfee` replaced it.
+  - `GET /transactions`, read through `runtime.request`, then listed the replaced txid with `dropped: true` and the replacement without it.
+  - Wallet-core's `snapshot()` showed the replaced payment as `failed` and the replacement as `pending`.
+  - Once a block confirmed the replacement, the replaced row was still `dropped: true`.
+
+Not run:
+- The `cln` case of `regtest-send-max.cjs`: the local Core Lightning container follows a different bitcoind.
+- `smoke-regtest.cjs`: it dials a fixed Core Lightning identity (`028c6651...`) that is not on this chain.
+- `regtest-ffor-worker.cjs`, `regtest-ffor-native.cjs`, and a start of the production app on a device.
+
 # Portable engine validation, 2026-11-04 addendum for 0.37.0
 
 The fork tracks Beignet **0.37.0** at `0512b5f6271fd1d56f821abdae14b6e23a4b5878`, npm's `gitHead` for the release. That is the version bump #1964, whose `src/` is the same as #1963's merge `f0c1f03b`. This addendum supersedes the baseline statement of the 0.36.1 addendum below. Two hunks were merged by hand, on context upstream rewrote, and the diagnostic hook gains `peer:warning` and `htlc:forward-refused` (see `PATCHES.md`).
