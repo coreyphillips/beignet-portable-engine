@@ -98,3 +98,40 @@ test('sweep routes retain the reviewed coin set, fee cap and durable request ide
 	assert.equal(api['GET /tx/sweep']({}, new URLSearchParams({ requestId: approved.requestId })), prepared);
 	assert.throws(() => api['GET /tx/sweep']({}, new URLSearchParams({ requestId: 'missing' })), error => error.code === 'NOT_FOUND');
 });
+
+test('a channel send is quoted, executed, read and aborted through the engine with the daemon\'s bodies', async () => {
+	const quote = { quoteId: 'q1', kind: 'composite', address: 'bcrt1q-destination', amountSats: 150000, feeSats: 900, totalSats: 150900, feeratePerkw: 2500, channels: [{ channelId: 'a' }, { channelId: 'b' }], skipped: [], expiresAt: 1 };
+	const status = { id: 'q1', kind: 'composite', stage: 'NEGOTIATING', amountSats: 150000, feeSats: 900, startedAt: 2, record: { amounts: '150000' } };
+	const calls = [];
+	const api = routes({
+		quoteChannelSend: async (...args) => { calls.push(['quote', args]); return quote; },
+		executeChannelSend: async (id) => { calls.push(['execute', id]); return status; },
+		getChannelSend: (id) => (id === 'q1' ? status : null),
+		listChannelSends: () => [status],
+		abortChannelSend: (...args) => { calls.push(['abort', args]); return { ...status, stage: 'ABORTED', reason: args[1] }; }
+	});
+	assert.equal(await api['POST /channel-send/quote']({ address: quote.address, amountSats: 150000, feeratePerkw: 2500 }), quote);
+	assert.equal(await api['POST /channel-send/execute']({ quoteId: 'q1' }), status);
+	assert.equal(api['GET /channel-send/status']({}, new URLSearchParams({ id: 'q1' })), status);
+	assert.equal(api['GET /channel-send/status']({ id: 'q1' }, new URLSearchParams()), status);
+	assert.deepEqual(api['GET /channel-send/list'](), [status]);
+	assert.equal(api['POST /channel-send/abort']({ id: 'q1', reason: 'changed my mind' }).reason, 'changed my mind');
+	assert.deepEqual(calls, [
+		['quote', [quote.address, 150000, 2500]],
+		['execute', 'q1'],
+		['abort', ['q1', 'changed my mind']]
+	]);
+	assert.throws(() => api['GET /channel-send/status']({}, new URLSearchParams({ id: 'unknown' })), (error) => error.code === 'NOT_FOUND' && error.status === 404);
+});
+
+test('incomplete channel-send requests are refused before reaching the engine', () => {
+	let touched = 0;
+	const api = routes({ quoteChannelSend: () => { touched++; }, executeChannelSend: () => { touched++; }, abortChannelSend: () => { touched++; } });
+	for (const body of [{}, { address: 'x' }, { address: 'x', amountSats: 1 }, { amountSats: 1, feeratePerkw: 253 }])
+		assert.throws(() => api['POST /channel-send/quote'](body), (error) => error.code === 'INVALID_PARAMS');
+	assert.throws(() => api['POST /channel-send/execute']({}), (error) => error.code === 'INVALID_PARAMS');
+	assert.throws(() => api['POST /channel-send/abort']({}), (error) => error.code === 'INVALID_PARAMS');
+	assert.throws(() => api['GET /channel-send/status']({}, new URLSearchParams()), (error) => error.code === 'INVALID_PARAMS');
+	assert.equal(touched, 0);
+});
+
