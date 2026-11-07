@@ -39,6 +39,31 @@ function sendRoutes({ node, channelsWithFunding, failure }) {
 			address: body.address, amountSats: body.amountSats, satsPerVbyte: body.satsPerVbyte,
 			max: body.max, channelFunding: body.channelFunding
 		}),
+		// A channel send pays an address out of one channel or several channels
+		// in one transaction (coreyphillips/beignet#1922). The engine decides
+		// which, prices it, counts it once against the spend limits and keeps
+		// the composite record; refusals are its BeignetErrors.
+		'POST /channel-send/quote': (body) => {
+			if (!body.address || body.amountSats === undefined || body.feeratePerkw === undefined)
+				failure('INVALID_PARAMS', 'address, amountSats and feeratePerkw required');
+			return node.quoteChannelSend(body.address, body.amountSats, body.feeratePerkw);
+		},
+		'POST /channel-send/execute': (body) => {
+			if (!body.quoteId) failure('INVALID_PARAMS', 'quoteId required');
+			return node.executeChannelSend(body.quoteId);
+		},
+		'GET /channel-send/status': (body, query) => {
+			const id = query.get('id') || body.id;
+			if (!id) failure('INVALID_PARAMS', 'id required');
+			const status = node.getChannelSend(id);
+			if (!status) failure('NOT_FOUND', 'Channel send not found', 404);
+			return status;
+		},
+		'GET /channel-send/list': () => node.listChannelSends(),
+		'POST /channel-send/abort': (body) => {
+			if (!body.id) failure('INVALID_PARAMS', 'id required');
+			return node.abortChannelSend(body.id, body.reason);
+		},
 		'POST /invoice/pay-all/quote': (body) => {
 			if (typeof body.bolt11 !== 'string' || !body.bolt11 || body.maxFeeMsat === undefined)
 				failure('INVALID_PARAMS', 'bolt11 and maxFeeMsat required');

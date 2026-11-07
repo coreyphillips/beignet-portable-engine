@@ -15,6 +15,7 @@ import { verifyElectrumNetwork } from './network';
 import * as rules from './lfbw.cjs';
 import { runChannelize } from './channelize.cjs';
 import { sendRoutes } from './send-routes.cjs';
+import { primariesRoutes } from './primaries-routes.cjs';
 import { channelizePause } from './channelize-pause.cjs';
 import { drainCoordinator } from './drain.cjs';
 import { drainFence } from './drain-fence.cjs';
@@ -1043,6 +1044,8 @@ export async function createPortableRuntime(options: any) {
 		const q = url.searchParams;
 		const sendRoute = sendRoutes({ node: n, channelsWithFunding, failure })[route];
 		if (sendRoute) return sendRoute(b, q);
+		const primariesRoute = primariesRoutes({ node: n, failure })[route];
+		if (primariesRoute) return primariesRoute(b, q);
 		switch (route) {
 			case 'POST /drain/quote':
 				return drain.quote(b);
@@ -1166,7 +1169,9 @@ export async function createPortableRuntime(options: any) {
 				return durableInvoice(await n.createJitInvoice(b));
 			case 'GET /jit/quote':
 				return n.getJitQuote({
-					lspPubkey: q.get('lspPubkey')!,
+					// Absent means "the ranked primaries choose" (beignet #1932);
+					// a null here would be refused as a malformed pubkey.
+					lspPubkey: q.get('lspPubkey') || undefined,
 					amountSats: q.has('amountSats')
 						? Number(q.get('amountSats'))
 						: undefined,
@@ -1433,6 +1438,10 @@ export async function createPortableRuntime(options: any) {
 				recoveryAvailable: true,
 				recoveryAutoApplyAvailable: true,
 				drainAvailable: ['closeQuote', 'prepareOnchainSweep', 'submitOnchainSweep']
+					.every((name) => typeof (BeignetNode.prototype as any)?.[name] === 'function'),
+				// An address can be paid out of one channel or several channels in
+				// one transaction through /channel-send (beignet #1922).
+				channelSendAvailable: ['quoteChannelSend', 'executeChannelSend', 'getChannelSend']
 					.every((name) => typeof (BeignetNode.prototype as any)?.[name] === 'function'),
 				engineVersion: ENGINE_VERSION,
 				embedded: true

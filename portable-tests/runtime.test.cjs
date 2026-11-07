@@ -205,3 +205,57 @@ test('the config flag says the engine implements offline receiving; the record s
 		await runtime.close();
 	}
 });
+
+test('the config advertises channel sends and not ranked primaries yet; the policy routes need a started wallet', async () => {
+	const volume = memory();
+	volume.write(
+		'/wallet/registry.json',
+		Buffer.from(
+			JSON.stringify({
+				record: {
+					id: 'stopped',
+					network: 'regtest',
+					name: 'Stopped fixture',
+					lfbw: {
+						enabled: true,
+						mode: 'external',
+						primaryPubkey: '02' + '33'.repeat(32),
+						setup: 'ready'
+					}
+				},
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+			})
+		)
+	);
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		const config = await runtime.request({ path: '/api/config' });
+		// The engine in this bundle pays an address out of one or several
+		// channels through /channel-send, and the router serves those routes.
+		assert.equal(config.channelSendAvailable, true);
+		// Routing the engine's primaries list is not the same as honouring it:
+		// nothing in this runtime yet keeps the list, dials every entry or
+		// steers offline receives by it, so a client must not present ranked
+		// primaries against this build (coreyphillips/beignet#1924).
+		assert.equal('primariesAvailable' in config, false);
+		// The policy lives in the engine, so with the wallet stopped there is
+		// nothing to read or write; the refusal is the one every daemon route
+		// gives, and nothing is persisted.
+		const before = volume.read('/wallet/registry.json').toString();
+		for (const [method, path, body] of [
+			['GET', '/wallets/stopped/api/primaries'],
+			['POST', '/wallets/stopped/api/primaries/add', { pubkey: '02' + '44'.repeat(32), host: 'b.example', port: 9735 }],
+			['POST', '/wallets/stopped/api/channel-send/quote', { address: 'bcrt1q', amountSats: 1000, feeratePerkw: 253 }]
+		]) {
+			await assert.rejects(
+				runtime.request({ method, path, body }),
+				(error) => error.code === 'WALLET_STOPPED' && error.status === 409
+			);
+		}
+		assert.equal(volume.read('/wallet/registry.json').toString(), before);
+	} finally {
+		await runtime.close();
+	}
+});
+
