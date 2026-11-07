@@ -210,12 +210,86 @@ async function createHarness({
 		});
 	};
 	const extraRelays = [];
+	/**
+	 * Plain TCP sockets, the phone's Native networking: every peer the engine
+	 * dials is reached at its own address, so a device on this factory can
+	 * hold several primaries (coreyphillips/beignet#1924). Electrum is reached
+	 * at the local electrs directly.
+	 */
+	const nativeSocketFactory = () => (target) => {
+		if (target.tls) throw new Error('the regtest stack serves no TLS');
+		return net.connect({ host: target.host, port: target.port });
+	};
+	const nativeElectrum = { host: '127.0.0.1', port: 60001, tls: false };
+	const extraPrimaries = [];
+	/** Another disposable upstream primary, funded like the first, on its own port and data dir. */
+	const secondPrimary = async (name = 'second') => {
+		const port = await freePort();
+		const node = await BeignetNode.create({
+			network: 'regtest',
+			dataDir: path.join(temp, name),
+			allowMultipleInstances: true,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			listenPort: port,
+			autoBootstrap: false,
+			autoGossipSync: false,
+			forwardingEnabled: true,
+			jitReceive: { enabled: true, flatFeeSat: 0, feePpm: 0 },
+			waiveClientReserve,
+			dfRelay: true,
+			fforSettle: { enabled: ffor },
+			fforReceiveFunding: {
+				enabled: ffor,
+				maxChannels: 10,
+				maxChannelsPerPeer: 5,
+				maxChannelSats: 500000,
+				maxTotalSats: 2000000
+			},
+			logger: {
+				debug() {},
+				info() {},
+				warn: (...args) =>
+					process.env.HARNESS_ENGINE_LOG &&
+					console.log(`[${name} warn]`, ...args),
+				error: (...args) =>
+					process.env.HARNESS_ENGINE_LOG &&
+					console.log(`[${name} error]`, ...args)
+			}
+		});
+		await node.refreshWallet();
+		btc('sendtoaddress', await node.getNewAddress(), '0.05000000');
+		btc('-generate', '1');
+		await delay(2000);
+		await node.refreshWallet();
+		await wait(
+			`disposable primary ${name} funded with regtest coins`,
+			() => node.getBalance().onchain >= 5000000
+		);
+		extraPrimaries.push(node);
+		return {
+			node,
+			port,
+			uri: `${node.getInfo().nodeId}@127.0.0.1:${port}`,
+			pubkey: node.getInfo().nodeId
+		};
+	};
 	const primaryUri = `${primary.getInfo().nodeId}@127.0.0.1:${peerPort}`;
 	const devices = [];
 	/** A portable runtime on its own volume, with a wallet created on the primary. */
 	const device = async (
 		name,
-		{ onDiagnostic, socketFactory: factory, primaryUri: uri = primaryUri } = {}
+		{
+			onDiagnostic,
+			socketFactory: factory,
+			primaryUri: uri = primaryUri,
+			// A native factory reaches the local electrs itself; the relay's
+			// logical Electrum host selects its fixed target.
+			electrum: electrumTarget = factory && !factory.fixedUpstream
+				? nativeElectrum
+				: electrum
+		} = {}
 	) => {
 		const volume = makeVolume(path.join(temp, name));
 		const databaseFactory = await createSqlJsDatabaseFactory({
@@ -226,7 +300,7 @@ async function createHarness({
 			volume,
 			databaseFactory,
 			socketFactory: factory ?? socketFactory,
-			electrum,
+			electrum: electrumTarget,
 			...(onDiagnostic ? { onDiagnostic } : {}),
 			...(process.env.HARNESS_ENGINE_LOG
 				? {
@@ -281,7 +355,7 @@ async function createHarness({
 			name,
 			network: 'regtest',
 			primaryUri: uri,
-			electrum
+			electrum: electrumTarget
 		});
 		const id = created.id;
 		const rpc = (route, method = 'GET', body) =>
@@ -308,6 +382,8 @@ async function createHarness({
 			await dev.runtime.close().catch(() => {});
 		for (const other of extraRelays) await other.close().catch(() => {});
 		await relay.close().catch(() => {});
+		for (const other of extraPrimaries)
+			await other.gracefulShutdown(5000).catch(() => {});
 		await primary.gracefulShutdown(5000).catch(() => {});
 		fs.rmSync(temp, { recursive: true, force: true });
 	};
@@ -317,6 +393,9 @@ async function createHarness({
 		peerPort,
 		relayPort: relayAddress.port,
 		freshTransport,
+		nativeSocketFactory,
+		nativeElectrum,
+		secondPrimary,
 		token,
 		electrum,
 		device,

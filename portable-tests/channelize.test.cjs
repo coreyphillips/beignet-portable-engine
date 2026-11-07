@@ -233,3 +233,27 @@ for (const state of ['ACTIVE', 'DRAINING']) {
   assert.deepEqual(node.calls, []);
  });
 }
+
+test('funds move toward the primary a receive would go to, which need not be rank 1', async () => {
+	const OTHER = 'cd'.repeat(33);
+	const toward = () => ({ ...primary(), pubkey: OTHER, connectHost: '10.0.0.2', connectPort: 9736 });
+	// A home channel with rank 1 exists, but the receive target is another
+	// primary with no channel yet: that is an open with the target, not a
+	// splice into rank 1's channel.
+	const node = fakeNode({ channels: [home] });
+	const result = await runChannelize({ node, record, primary: toward, toward: { pubkey: OTHER, trusted: true }, rules });
+	assert.equal(result.last.action, 'open');
+	const open = node.calls.find((c) => c[0] === 'connectAndOpenChannel');
+	assert.deepEqual(open.slice(1, 4), [OTHER, '10.0.0.2', 9736]);
+	assert.equal(open[5].pubkey, OTHER);
+	assert.equal(node.calls.some((c) => c[0] === 'spliceIn'), false);
+	// With a channel at the target, the move is a splice into that channel.
+	const targeted = fakeNode({ channels: [home, { channelId: 'other-home', peerPubkey: OTHER, state: 'NORMAL', htlcUsable: true }] });
+	const spliced = await runChannelize({ node: targeted, record, primary: toward, toward: { pubkey: OTHER, trusted: true }, rules });
+	assert.equal(spliced.last.action, 'splice-in');
+	assert.equal(targeted.calls.find((c) => c[0] === 'spliceIn')[1], 'other-home');
+	// Without a target the record's scalar primary (rank 1) is the home, as before.
+	const legacy = fakeNode({ channels: [home] });
+	assert.equal((await runChannelize({ node: legacy, record, primary, rules })).last.action, 'splice-in');
+});
+

@@ -130,3 +130,10 @@ test('a local destroy reports close at once, even when the relay never acknowled
 		assert.deepEqual(events, ['close']);
 	}
 });
+
+test('the relay factory says it reaches one fixed upstream peer, so the runtime can keep one primary behind it', () => {
+	const factory = createRelaySocketFactory({ ...config, WebSocket: TestWebSocket });
+	assert.equal(factory.fixedUpstream, true);
+	assert.equal(typeof factory, 'function');
+});
+

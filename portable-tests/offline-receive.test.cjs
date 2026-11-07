@@ -353,3 +353,122 @@ test('probes in flight for one primary share a request, and a stopped coordinato
 	assert.equal((await p.coordinator.probe(peer)).available, true);
 	assert.equal(p.requests, 1);
 });
+
+// Ranked primaries (coreyphillips/beignet#1924): a quote that names no peer
+// walks the engine's list. The fake node ranks the peers, says who is
+// connected, and gives each a receive channel or not.
+const peerB = '03' + '44'.repeat(32),
+	peerC = '02' + '55'.repeat(32);
+function ranked({ order = [peer, peerB], connected = order, channels = {}, answer } = {}) {
+	let now = 1000;
+	const asked = [];
+	const node = {
+		listPrimaries: () => ({
+			fillThresholdSat: null,
+			primaries: order.map((pubkey, i) => ({
+				pubkey,
+				rank: i + 1,
+				selectionOrder: i + 1,
+				balanceSat: 0,
+				host: 'h',
+				port: 9735,
+				uri: null
+			})),
+			receiveTarget: order[0] ?? null
+		}),
+		listPeers: () => connected.map((pubkey) => ({ pubkey, state: 'connected' })),
+		listChannels: () =>
+			Object.entries(channels).map(([pubkey, remoteBalanceSats]) => ({
+				channelId: pubkey.slice(2, 66),
+				peerPubkey: pubkey,
+				state: 'NORMAL',
+				htlcUsable: true,
+				localBalanceSats: 0,
+				remoteBalanceSats,
+				htlcCount: 0
+			})),
+		fforEpochs: () => [],
+		getFforReceiveService: () => ({
+			request: async (p) => {
+				asked.push(p);
+				return answer ? answer(p) : { version: 1, feeBaseMsat: 0, feePpm: 0 };
+			}
+		})
+	};
+	const coordinator = new OfflineReceive(node, () => {}, [], () => now);
+	return { coordinator, asked, node };
+}
+test('a quote that names no peer goes to the first ranked primary that can hold it, and names the ones passed over', async () => {
+	// Rank 1 can hold 10,000 sats (inbound 80,000 less the 50,000 headroom) but not 100,000.
+	const r = ranked({ channels: { [peer]: 80000, [peerB]: 200000 } });
+	const quote = await r.coordinator.quote(undefined, 100000);
+	assert.equal(quote.peer, peerB);
+	assert.equal(quote.available, true);
+	assert.deepEqual(r.asked, [peerB], 'a primary with no eligible channel is not asked for terms');
+	assert.equal(quote.skipped.length, 1);
+	assert.equal(quote.skipped[0].pubkey, peer);
+	assert.equal(quote.skipped[0].rank, 1);
+	assert.equal(quote.skipped[0].stage, 'attempt');
+	assert.equal(quote.skipped[0].code, 'RECEIVE_UNAVAILABLE');
+	const first = await r.coordinator.quote(undefined, 10000);
+	assert.equal(first.peer, peer);
+	assert.equal('skipped' in first, false, 'nothing passed over, nothing listed');
+});
+test('the walk follows the engine\'s selection order, not the configured rank', async () => {
+	const r = ranked({ channels: { [peer]: 200000, [peerB]: 200000 } });
+	const policy = r.node.listPrimaries();
+	policy.primaries[0].selectionOrder = 2;
+	policy.primaries[1].selectionOrder = 1;
+	r.node.listPrimaries = () => policy;
+	assert.equal((await r.coordinator.quote(undefined, 10000)).peer, peerB);
+});
+test('an unconnected primary is passed over without a dial, and a primary that does not answer in time is passed over too', async () => {
+	const r = ranked({ connected: [peerB], channels: { [peer]: 200000, [peerB]: 200000 } });
+	const quote = await r.coordinator.quote(undefined, 10000);
+	assert.equal(quote.peer, peerB);
+	assert.deepEqual(quote.skipped.map((s) => [s.stage, s.code]), [['connect', 'PEER_NOT_CONNECTED']]);
+	assert.deepEqual(r.asked, [peerB]);
+});
+test('a bad answer from one primary falls through to the next and is recorded against the one that gave it', async () => {
+	const r = ranked({
+		channels: { [peer]: 200000, [peerB]: 200000 },
+		answer: (p) => (p === peer ? { version: 3 } : { version: 1, feeBaseMsat: 0, feePpm: 0 })
+	});
+	const quote = await r.coordinator.quote(undefined, 10000);
+	assert.equal(quote.peer, peerB);
+	assert.equal(quote.skipped[0].code, 'RECEIVE_UNAVAILABLE');
+	assert.match(quote.skipped[0].message, /unsupported receive terms/);
+	assert.equal(r.coordinator.availability(peer).available, false);
+	assert.equal(r.coordinator.availability(peerB).available, true);
+	assert.deepEqual(r.coordinator.availability(peerC), unprobed);
+});
+test('when no primary takes it the refusal names every reason with a 503, and with none configured it is a 400', async () => {
+	const r = ranked({ channels: {} });
+	await assert.rejects(r.coordinator.quote(undefined, 10000), (error) => {
+		assert.equal(error.code, 'NO_PRIMARY_AVAILABLE');
+		assert.equal(error.status, 503);
+		assert.match(error.message, new RegExp(peer.slice(0, 16)));
+		assert.match(error.message, new RegExp(peerB.slice(0, 16)));
+		return true;
+	});
+	const none = ranked({ order: [], channels: {} });
+	await assert.rejects(none.coordinator.quote(undefined, 10000), (error) => error.code === 'INVALID_PARAMS' && error.status === 400);
+	assert.deepEqual(none.asked, []);
+});
+test('a named peer is never walked, a request under way keeps its peer, and the amount is checked before any primary is asked', async () => {
+	const r = ranked({ channels: { [peer]: 200000, [peerB]: 200000 } });
+	await assert.rejects(r.coordinator.quote(peerC, 10000), { code: 'RECEIVE_UNAVAILABLE' });
+	assert.deepEqual(r.asked, []);
+	await assert.rejects(r.coordinator.quote(undefined, 0), { code: 'AMOUNT_REQUIRED' });
+	await assert.rejects(r.coordinator.quote(undefined, 100), { code: 'AMOUNT_TOO_SMALL' });
+	assert.deepEqual(r.asked, []);
+	// A job quoted at rank 2 stays there when quoted again with no peer named.
+	const held = ranked({ channels: { [peer]: 20000, [peerB]: 200000 } });
+	const first = await held.coordinator.quote(undefined, 100000, 'req-1');
+	assert.equal(first.peer, peerB);
+	await held.coordinator.create({ requestId: 'req-1', amountSats: 100000, quote: first }, peerB).catch(() => {});
+	const again = await held.coordinator.quote(undefined, 100000, 'req-1');
+	assert.equal(again.peer, peerB);
+	assert.equal('skipped' in again, false);
+});
+

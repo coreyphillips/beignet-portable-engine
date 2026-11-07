@@ -5,14 +5,19 @@
  * be tested without a registry, a process or a daemon (the same shape as
  * recovery.js).
  *
- * A lightning-first wallet (LFBW) has one balance the user sees and one
- * "primary node" it keeps a single home channel with. Everything that lands
- * on-chain moves into that channel once it confirms, inbound capacity is
- * provisioned by the primary just in time (the engine's JIT receive), and
- * sending to a bitcoin address is a splice-out of the home channel. The
- * primary is either a sibling wallet under this manager (internal, paired
- * both ways, zero-conf by default) or an external node given as
- * pubkey@host:port.
+ * A lightning-first wallet (LFBW) has one balance the user sees and one or
+ * more "primary nodes", ranked, it keeps home channels with. Everything that
+ * lands on-chain moves into the channel with the primary a receive would go
+ * to once it confirms, inbound capacity is provisioned by a primary just in
+ * time (the engine's JIT receive), and sending to a bitcoin address is a
+ * splice-out of a home channel. A primary is either a sibling wallet under
+ * this manager (internal, paired both ways, zero-conf by default) or an
+ * external node given as pubkey@host:port or pubkey@iroh:endpoint. The ranked
+ * list, its order and the fill threshold live in the engine
+ * (coreyphillips/beignet#1922); the record keeps a mirror of that list with
+ * the per-peer facts the engine does not hold (trust, setup state, an onion
+ * fallback), and the rank-1 entry's fields under the scalar names older
+ * readers look at (`primaryUri`, `primaryPubkey`, `setup`, ...).
  *
  * Numbers here are the prototype's, kept because they were exercised on a
  * live regtest pair: a channel below 20k sats trips common peer minimums, a
@@ -21,6 +26,10 @@
  */
 
 const NODE_URI_RE = /^([0-9a-fA-F]{66})@([^:\s]+):(\d+)$/;
+
+// Most primaries a wallet ranks: the engine's own cap on its list
+// (src/lightning/liquidity/primaries.ts, coreyphillips/beignet#1922).
+const MAX_PRIMARIES = 32;
 
 // On-chain funds below this wait; at or above it they move into the home
 // channel once every UTXO has confirmed.
@@ -176,38 +185,87 @@ function normalizeLfbw(
 			initialChannelSats
 		};
 	} else {
-		let parsed;
-		let fallback;
-		try {
-			parsed = parseNodeUri(input.primaryUri);
-			fallback = parsePrimaryFallback(
-				parsed,
-				input.primaryFallbackUri !== undefined
-					? input.primaryFallbackUri
-					: parsed.uri === existing?.primaryUri
-					? existing?.primaryFallbackUri
-					: undefined
+		// One entry per ranked primary: the list a client sends, else the one
+		// scalar primary a legacy client (or the create route) names.
+		const listed =
+			Array.isArray(input.primaries) && input.primaries.length > 0
+				? input.primaries
+				: [
+						{
+							uri: input.primaryUri,
+							fallbackUri: input.primaryFallbackUri,
+							trusted: input.trusted
+						}
+				  ];
+		if (listed.length > MAX_PRIMARIES)
+			throw httpError(
+				400,
+				'BAD_LFBW_PEER',
+				`At most ${MAX_PRIMARIES} primary nodes can be ranked`
 			);
-		} catch (err) {
-			throw httpError(400, 'BAD_LFBW_PEER', err.message);
+		const previous = existingPrimaries(existing);
+		const defaultTrusted = input.trusted === undefined ? true : !!input.trusted;
+		const entries = [];
+		for (const item of listed) {
+			const raw = item && typeof item === 'object' ? item : { uri: item };
+			let parsed;
+			let fallback;
+			try {
+				parsed = parseNodeUri(raw.uri);
+				const prior = previous.find((e) => e.pubkey === parsed.pubkey);
+				fallback = parsePrimaryFallback(
+					parsed,
+					raw.fallbackUri !== undefined
+						? raw.fallbackUri
+						: prior && prior.uri === parsed.uri
+						? prior.fallbackUri
+						: undefined
+				);
+			} catch (err) {
+				throw httpError(400, 'BAD_LFBW_PEER', err.message);
+			}
+			if (entries.some((e) => e.pubkey === parsed.pubkey))
+				throw httpError(
+					400,
+					'BAD_LFBW_PEER',
+					'The same primary node is listed twice'
+				);
+			// The per-entry state (the one-time initial open, setup) is kept
+			// when the entry names the same node at the same address, so an
+			// edit that only touches trust or rank does not re-run a first open.
+			const same = previous.find(
+				(e) => e.pubkey === parsed.pubkey && e.uri === parsed.uri
+			);
+			entries.push({
+				pubkey: parsed.pubkey,
+				uri: parsed.uri,
+				fallbackUri: fallback?.uri,
+				// The wallet's trust toward its primary is what lets the primary's
+				// zero-conf channel (a JIT open) be used the moment the payment
+				// arrives; without it the primary cannot provision inbound just in
+				// time (its open is refused as untrusted), only deposits and
+				// direct funding work, and they confirm first. On by default in
+				// both modes; the external node's trust toward us is its own.
+				trusted: raw.trusted === undefined ? defaultTrusted : !!raw.trusted,
+				initialChannelOpened: same ? !!same.initialChannelOpened : false,
+				setup: same ? same.setup || 'pending' : 'pending',
+				setupError: same ? same.setupError || null : null,
+				setupAt: same ? same.setupAt || null : null
+			});
 		}
-		block = {
+		return {
 			enabled: true,
 			mode: 'external',
 			primaryWalletId: null,
-			primaryUri: parsed.uri,
-			primaryFallbackUri: fallback?.uri,
-			primaryPubkey: parsed.pubkey,
-			// The wallet's trust toward its primary is what lets the primary's
-			// zero-conf channel (a JIT open) be used the moment the payment
-			// arrives; without it the primary cannot provision inbound just in
-			// time (its open is refused as untrusted), only deposits and
-			// direct funding work, and they confirm first. On by default in
-			// both modes; the external node's trust toward us is its own.
-			trusted: input.trusted === undefined ? true : !!input.trusted,
+			primaries: entries,
+			primariesThresholdSat:
+				input.primariesThresholdSat !== undefined
+					? checkThreshold(input.primariesThresholdSat)
+					: existing?.primariesThresholdSat ?? null,
 			// A starting channel is opened FROM the primary, which we cannot
 			// command on an external node.
-			initialChannelSats: 0
+			initialChannelSats: 0,
+			...primariesMirror(entries)
 		};
 	}
 	const samePrimary =
@@ -224,6 +282,163 @@ function normalizeLfbw(
 		setupAt: samePrimary ? existing.setupAt || null : null,
 		previousPrimary: previousPrimaryAfterEdit(existing, block, samePrimary)
 	};
+}
+
+/** The fill threshold a client sends: a whole number of sats, or null for no cap. */
+function checkThreshold(value) {
+	if (value === null) return null;
+	if (!Number.isSafeInteger(value) || value < 0)
+		throw httpError(
+			400,
+			'INVALID_PARAMS',
+			'primariesThresholdSat must be a whole number of sats, or null for no cap'
+		);
+	return value;
+}
+
+/**
+ * The ranked entries an existing block holds: its list, or the one entry
+ * its scalar primary describes when it predates the list. Lenient: a block
+ * whose scalar does not parse yields no entry rather than a throw.
+ */
+function existingPrimaries(existing) {
+	if (!existing || !existing.enabled) return [];
+	if (Array.isArray(existing.primaries)) return existing.primaries;
+	return migrateLfbw(existing).primaries || [];
+}
+
+/**
+ * A stored block from before the ranked list, read as a one-entry list. The
+ * scalar fields stay as they were (they are the rank-1 mirrors now), so a
+ * reader of either shape sees the same primary; `previousPrimary` is no
+ * longer stored, the runtime derives it from the channels. A block whose
+ * scalar primary does not parse (a fixture, a stopped wallet from an older
+ * build) gets an empty list and is otherwise untouched. Idempotent.
+ */
+function migrateLfbw(lfbw) {
+	if (!lfbw || !lfbw.enabled || Array.isArray(lfbw.primaries)) return lfbw;
+	const { previousPrimary, ...base } = lfbw;
+	const threshold = Number.isSafeInteger(base.primariesThresholdSat) &&
+		base.primariesThresholdSat >= 0
+		? base.primariesThresholdSat
+		: null;
+	let parsed;
+	try {
+		parsed = parseNodeUri(lfbw.primaryUri);
+	} catch {
+		return { ...base, primaries: [], primariesThresholdSat: threshold };
+	}
+	let fallbackUri;
+	try {
+		fallbackUri = parsePrimaryFallback(parsed, lfbw.primaryFallbackUri)?.uri;
+	} catch {
+		fallbackUri = undefined;
+	}
+	const entry = {
+		pubkey: parsed.pubkey,
+		uri: parsed.uri,
+		fallbackUri,
+		trusted: lfbw.trusted === undefined ? true : !!lfbw.trusted,
+		initialChannelOpened: !!lfbw.initialChannelOpened,
+		setup: lfbw.setup || 'pending',
+		setupError: lfbw.setupError || null,
+		setupAt: lfbw.setupAt || null
+	};
+	return {
+		...base,
+		primaries: [entry],
+		primariesThresholdSat: threshold,
+		...primariesMirror([entry])
+	};
+}
+
+/**
+ * The rank-1 entry's fields under the scalar names, for readers that look
+ * there: `primaryUri`, `primaryFallbackUri`, `primaryPubkey`, `trusted`,
+ * `initialChannelOpened`, and the setup trio aggregated over the list. With
+ * one entry every field is that entry's, byte for byte.
+ */
+function primariesMirror(entries) {
+	const first = entries[0];
+	return {
+		primaryUri: first ? first.uri : null,
+		primaryFallbackUri: first ? first.fallbackUri : undefined,
+		primaryPubkey: first ? first.pubkey : null,
+		trusted: first ? first.trusted !== false : true,
+		initialChannelOpened: first ? !!first.initialChannelOpened : false,
+		...aggregateSetup(entries)
+	};
+}
+
+/**
+ * The setup state of the list as one state: ready when any entry is ready
+ * (a receive can be steered to it), failed when every entry failed, pending
+ * otherwise. A reader of the scalar fields that refuses receives while the
+ * wallet is not ready therefore refuses only when no primary is reachable.
+ * The error is rank 1's, else the first failed entry's. One entry: its own
+ * three fields unchanged.
+ */
+function aggregateSetup(entries) {
+	if (entries.length === 0)
+		return { setup: 'pending', setupError: null, setupAt: null };
+	if (entries.length === 1) {
+		const [only] = entries;
+		return {
+			setup: only.setup || 'pending',
+			setupError: only.setupError || null,
+			setupAt: only.setupAt || null
+		};
+	}
+	const ready = entries.filter((e) => e.setup === 'ready');
+	const failed = entries.filter((e) => e.setup === 'failed');
+	const erred = entries[0].setup === 'failed' ? entries[0] : failed[0];
+	return {
+		setup: ready.length
+			? 'ready'
+			: failed.length === entries.length
+			? 'failed'
+			: 'pending',
+		setupError: erred ? erred.setupError || null : null,
+		setupAt: ready.length
+			? ready.reduce((at, e) => Math.max(at, e.setupAt || 0), 0) || null
+			: entries[0].setupAt || null
+	};
+}
+
+/**
+ * The peers this wallet still holds live channels with that are no longer
+ * (or never were) ranked primaries: a primary that was removed or replaced
+ * keeps its channel, and that balance must stay visible and spendable
+ * (umbrel #86, chicory #89). Largest balance first.
+ */
+function retainedPeers(entries, channels) {
+	const configured = new Set((entries || []).map((e) => e.pubkey));
+	const byPeer = new Map();
+	for (const c of channels || []) {
+		if (typeof c.peerPubkey !== 'string' || configured.has(c.peerPubkey) || !isLive(c))
+			continue;
+		const row = byPeer.get(c.peerPubkey) || {
+			pubkey: c.peerPubkey,
+			channelCount: 0,
+			balanceSat: 0
+		};
+		row.channelCount += 1;
+		row.balanceSat += Number(c.localBalanceSats) || 0;
+		byPeer.set(c.peerPubkey, row);
+	}
+	return [...byPeer.values()].sort(
+		(a, b) => b.balanceSat - a.balanceSat || a.pubkey.localeCompare(b.pubkey)
+	);
+}
+
+/**
+ * What older readers knew as the previous primary, derived from the channels
+ * instead of stored: the retained peer with the most to show, in the shape
+ * `previousPrimaryAfterEdit` used to write. Null with none.
+ */
+function derivedPreviousPrimary(retained) {
+	const top = (retained || [])[0];
+	return top ? { pubkey: top.pubkey, walletId: null, at: null } : null;
 }
 
 /**
@@ -610,9 +825,16 @@ module.exports = {
 	MAX_LEASE_RATES,
 	JIT_DEFAULTS,
 	OPERATOR_PASSTHROUGH,
+	MAX_PRIMARIES,
 	parseNodeUri,
 	isLfbw,
 	normalizeLfbw,
+	migrateLfbw,
+	existingPrimaries,
+	primariesMirror,
+	aggregateSetup,
+	retainedPeers,
+	derivedPreviousPrimary,
 	previousPrimaryAfterEdit,
 	previousPrimaryDone,
 	previousPrimaryChannels,

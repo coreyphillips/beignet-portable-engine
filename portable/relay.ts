@@ -59,7 +59,7 @@ export function createRelaySocketFactory(config: {
 	}
 	if (!/^[A-Za-z0-9_-]{32,128}$/.test(config.token))
 		throw new Error('Relay token must be base64url');
-	return (target: { host: string; port: number; tls: boolean }) => {
+	const factory = (target: { host: string; port: number; tls: boolean }) => {
 		const emitter: any = new EventEmitter();
 		const isElectrum = config.electrum
 			? target.host === config.electrum.host &&
@@ -149,4 +149,8 @@ export function createRelaySocketFactory(config: {
 			emitter[method] = () => emitter;
 		return emitter;
 	};
+	// Every non-Electrum socket reaches the relay's one fixed upstream peer,
+	// whatever host and port the engine dials, so one primary is reachable
+	// through it; the runtime refuses a second (coreyphillips/beignet#1924).
+	return Object.assign(factory, { fixedUpstream: true as const });
 }

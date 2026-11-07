@@ -11,8 +11,11 @@ export type NoRouteFacts = {
 	amountSats: number | null;
 	destination: string | null;
 	hasRoutingHints: boolean;
-	primaryPubkey: string | null;
-	primaryConnected: boolean;
+	/**
+	 * The ranked primaries and whether each is a connected peer now; empty
+	 * when none is configured. One entry reads as the one primary did.
+	 */
+	primaries: Array<{ pubkey: string; connected: boolean }>;
 	/** GET /channels rows. `htlcUsable` is the channel's own new-HTLC gate. */
 	channels: any[];
 	/** GET /liquidity sendableSats: balance above the reserve, summed. */
@@ -33,17 +36,21 @@ export function explainNoRoute(f: NoRouteFacts): {
 			message: 'The wallet could not read the amount or recipient of this invoice.'
 		};
 	const open = f.channels.filter((c) => !CLOSING.test(String(c.state)));
+	const several = f.primaries.length > 1;
+	const nodes = several ? 'primary nodes' : 'primary node';
+	const connected = f.primaries.filter((p) => p.connected);
 	if (open.length === 0)
 		return {
 			code: 'NO_CHANNEL',
 			message: 'This wallet has no Lightning channel to send from yet.'
 		};
 	if (!open.some((c) => c.htlcUsable)) {
-		if (f.primaryPubkey && !f.primaryConnected)
+		if (f.primaries.length > 0 && connected.length === 0)
 			return {
 				code: 'PRIMARY_DOWN',
-				message:
-					'Your primary node is not connected, so this wallet cannot send over Lightning right now.'
+				message: several
+					? 'None of your primary nodes is connected, so this wallet cannot send over Lightning right now.'
+					: 'Your primary node is not connected, so this wallet cannot send over Lightning right now.'
 			};
 		if (open.some((c) => c.fundingUnaccounted))
 			return {
@@ -63,7 +70,7 @@ export function explainNoRoute(f: NoRouteFacts): {
 			return {
 				code: 'CHANNEL_NOT_READY',
 				message:
-					'Your channel is on hold until its state is confirmed with your primary node, so it cannot send yet.'
+					`Your channel is on hold until its state is confirmed with your ${nodes}, so it cannot send yet.`
 			};
 		return {
 			code: 'CHANNEL_NOT_READY',
@@ -75,11 +82,13 @@ export function explainNoRoute(f: NoRouteFacts): {
 			code: 'INSUFFICIENT_FUNDS',
 			message: `This wallet can send up to ${f.sendableSats.toLocaleString('en-US')} sats over Lightning right now, which does not cover this payment and its routing fee. Part of the channel balance is held back as a reserve.`
 		};
-	if (f.primaryPubkey && !f.graphChannelCount(f.primaryPubkey))
+	// The map must reach past at least one primary a payment can leave
+	// through: a connected one when any is, else any configured one.
+	const past = connected.length > 0 ? connected : f.primaries;
+	if (past.length > 0 && past.every((p) => !f.graphChannelCount(p.pubkey)))
 		return {
 			code: 'NO_ROUTE',
-			message:
-				"No route found. This wallet's map of the Lightning network has no public channels for your primary node, so it cannot find a way past it. Try again once the map has synced."
+			message: `No route found. This wallet's map of the Lightning network has no public channels for your ${nodes}, so it cannot find a way past ${several ? 'them' : 'it'}. Try again once the map has synced.`
 		};
 	if (!f.hasRoutingHints && f.graphChannelCount(f.destination) === null)
 		return {
@@ -90,6 +99,6 @@ export function explainNoRoute(f: NoRouteFacts): {
 	return {
 		code: 'NO_ROUTE',
 		message:
-			'No route to the recipient was found through your primary node with enough capacity for this amount.'
+			`No route to the recipient was found through your ${nodes} with enough capacity for this amount.`
 	};
 }

@@ -24,8 +24,7 @@ function facts(overrides = {}) {
 		amountSats: 24425,
 		destination: payee,
 		hasRoutingHints: false,
-		primaryPubkey: primary,
-		primaryConnected: true,
+		primaries: [{ pubkey: primary, connected: true }],
 		channels: [usable],
 		sendableSats: 29000,
 		graphChannelCount: (pubkey) => (pubkey === primary ? 1 : 40),
@@ -41,7 +40,7 @@ test('no channel, or only a closing one, says there is nothing to send from', ()
 });
 test('a channel that takes no new payment names why', () => {
 	const held = { state: 'NORMAL', htlcUsable: false };
-	assert.equal(code({ channels: [held], primaryConnected: false }), 'PRIMARY_DOWN');
+	assert.equal(code({ channels: [held], primaries: [{ pubkey: primary, connected: false }] }), 'PRIMARY_DOWN');
 	assert.match(
 		message({ channels: [{ ...held, fundingUnaccounted: true }] }),
 		/Electrum server has not seen its funding transaction/
@@ -86,3 +85,25 @@ test('an unreadable invoice is not blamed on the channel', () => {
 	assert.equal(code({ amountSats: null }), 'INVALID_INVOICE');
 	assert.equal(code({ destination: null }), 'INVALID_INVOICE');
 });
+test('with several primaries one connected primary is enough, none connected is PRIMARY_DOWN in the plural, and the map must reach past a connected one', () => {
+	const other = '02' + '33'.repeat(32);
+	const held = { state: 'NORMAL', htlcUsable: false };
+	const two = (a, b) => [{ pubkey: primary, connected: a }, { pubkey: other, connected: b }];
+	assert.equal(code({ channels: [held], primaries: two(false, true) }), 'CHANNEL_NOT_READY');
+	assert.equal(code({ channels: [held], primaries: two(false, false) }), 'PRIMARY_DOWN');
+	assert.match(message({ channels: [held], primaries: two(false, false) }), /None of your primary nodes is connected/);
+	assert.match(message({ channels: [held], primaries: [{ pubkey: primary, connected: false }] }), /Your primary node is not connected/);
+	// The map lacks the connected primary but has the other: no way past.
+	assert.match(
+		message({ primaries: two(true, false), graphChannelCount: (pubkey) => (pubkey === primary ? null : 40) }),
+		/no public channels for your primary nodes, so it cannot find a way past them/
+	);
+	// The map has the connected one: the recipient is the question.
+	assert.match(
+		message({ primaries: two(false, true), graphChannelCount: (pubkey) => (pubkey === other ? 1 : null), hasRoutingHints: true }),
+		/through your primary nodes with enough capacity/
+	);
+	assert.equal(code({ primaries: [] }), 'NO_ROUTE');
+	assert.equal(code({ channels: [held], primaries: [] }), 'CHANNEL_NOT_READY');
+});
+
