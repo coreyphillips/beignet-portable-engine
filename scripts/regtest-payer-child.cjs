@@ -10,10 +10,14 @@ const root = path.join(__dirname, '..');
 const { createPortableRuntime, createRelaySocketFactory } = require(path.join(root, 'dist/portable.cjs'));
 const { createSqlJsDatabaseFactory } = require(path.join(root, 'dist/sqljs.cjs'));
 const { btc, delay, makeVolume } = require('./regtest-harness.cjs');
-const WebSocket = require(path.join(root, '../beignet-relay/node_modules/ws'));
+// The sibling checkouts the harness takes from the environment, with the
+// same defaults it has (BEIGNET_RELAY_DIR, BEIGNET_WALLET_CORE_DIR).
+const relayDir = process.env.BEIGNET_RELAY_DIR || path.join(root, '../beignet-relay');
+const walletCoreDir = process.env.BEIGNET_WALLET_CORE_DIR || path.join(root, '../shared');
+const WebSocket = require(path.join(relayDir, 'node_modules/ws'));
 const say = (step, value) => console.log(`CHILD ${step} ${JSON.stringify(value)}`);
 (async () => {
-	const { EmbeddedWalletClient } = await import('../../shared/src/index.js');
+	const { EmbeddedWalletClient } = await import(path.join(walletCoreDir, 'src/index.js'));
 	const electrum = { host: 'electrum.relay', port: 50001, tls: false };
 	const socketFactory = createRelaySocketFactory({
 		electrumUrl: `ws://127.0.0.1:${process.env.RELAY_PORT}/electrum`,
