@@ -42,7 +42,14 @@ export interface SocketLike {
 	setNoDelay?(enabled?: boolean): any;
 }
 /** Returns an already connecting socket, emitting connect/data/error/close asynchronously. */
-export type SocketFactory = (target: TransportTarget) => SocketLike;
+export type SocketFactory = ((target: TransportTarget) => SocketLike) & {
+	/**
+	 * Set by createRelaySocketFactory: every non-Electrum socket reaches the
+	 * relay's one fixed upstream peer, so one primary is reachable through
+	 * it and the runtime refuses a second (TRANSPORT_SINGLE_PEER).
+	 */
+	fixedUpstream?: boolean;
+};
 export interface PortableRuntimeOptions {
 	/** Optional local development diagnostics; never persisted or sent to the relay. */
 	onDiagnostic?(error: {

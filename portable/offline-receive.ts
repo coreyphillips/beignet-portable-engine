@@ -2,6 +2,12 @@ import { Buffer } from 'buffer';
 import { randomBytes } from './crypto';
 import type { BeignetNode } from '../src/cli/beignet-node';
 import { DEFAULT_CHANNEL_CONFIG } from '../src/lightning/channel/types';
+import { BeignetError, BeignetErrorCode } from '../src/cli/errors';
+import {
+	OFFLINE_RECEIVE_STEER_CODES,
+	steerReceive
+} from '../src/cli/receive-steering';
+import type { ISteerCandidate } from '../src/cli/receive-steering';
 
 type Job = {
 	id: string;
@@ -47,16 +53,11 @@ export class OfflineReceive {
 	private creating = false;
 	private syncing = false;
 	private stopped = false;
-	// The last receive-terms answer, and whose it was: a wallet that moves to
-	// another primary starts over at unprobed rather than carrying the old
-	// primary's answer across.
-	private probed: OfflineReceiveAvailability & { peer: string | null } = {
-		...UNPROBED,
-		peer: null
-	};
-	private probing:
-		| { peer: string; done: Promise<OfflineReceiveAvailability> }
-		| undefined;
+	// The last receive-terms answer per peer: a primary that was just added is
+	// unprobed until its first connection, and one peer's answer never speaks
+	// for another (coreyphillips/beignet#1924 ranks several).
+	private probed = new Map<string, OfflineReceiveAvailability>();
+	private probing = new Map<string, Promise<OfflineReceiveAvailability>>();
 	constructor(
 		private node: BeignetNode,
 		private save: (jobs: Job[]) => void,
@@ -199,8 +200,15 @@ export class OfflineReceive {
 				`Enter at least ${MINIMUM_SATS} sats for this payment request.`
 			);
 	}
+	/**
+	 * Quote an offline receive at `peer`. With no peer named, a request
+	 * already under way keeps the peer it was quoted at, and a new one is
+	 * steered through the ranked primaries (coreyphillips/beignet#1922): the
+	 * first, in the engine's selection order, that is connected and quotes it
+	 * takes it, and the answer lists the others under `skipped`.
+	 */
 	async quote(
-		peer: string,
+		peer: string | undefined,
 		amountSats: number,
 		requestId?: string
 	): Promise<any> {
@@ -216,6 +224,10 @@ export class OfflineReceive {
 		)
 			fail('INVALID_REVIEW', 'A valid request ID is required.');
 		const job = this.jobs.find((j) => j.id === requestId);
+		if (peer === undefined) {
+			if (job) peer = job.peer;
+			else return this.steeredQuote(amountSats, requestId);
+		}
 		if (job && (job.peer !== peer || job.amountSats !== amountSats))
 			fail('INVALID_REVIEW', 'This payment request changed.');
 		if (
@@ -248,8 +260,106 @@ export class OfflineReceive {
 	 * its mind is still refused before an invoice is shared.
 	 */
 	availability(peer: string): OfflineReceiveAvailability {
-		const { peer: answered, ...state } = this.probed;
-		return answered === peer ? state : { ...UNPROBED };
+		return this.probed.get(peer) ?? { ...UNPROBED };
+	}
+	/**
+	 * The walk over the ranked primaries for a quote that names no peer. The
+	 * engine's walker holds the budget and the order; this supplies what it
+	 * needs: who is connected (the runtime dials, so an unconnected primary is
+	 * passed over rather than dialled here) and one bounded quote attempt per
+	 * candidate. A candidate's own refusal (no eligible channel, the amount
+	 * under its minimum, no answer in time) moves the walk on; anything else
+	 * ends it. With no primary configured the engine refuses INVALID_PARAMS,
+	 * and when none takes it NO_PRIMARY_AVAILABLE names every reason.
+	 */
+	private async steeredQuote(amountSats: number, requestId?: string): Promise<any> {
+		const policy: any = this.node.listPrimaries();
+		const candidates: ISteerCandidate[] = (policy.primaries as any[])
+			.slice()
+			.sort((a, b) => a.selectionOrder - b.selectionOrder)
+			.map((p) => ({
+				pubkey: p.pubkey,
+				rank: p.rank,
+				balanceSat: p.balanceSat,
+				...(p.host != null ? { host: p.host } : {}),
+				...(p.port != null ? { port: p.port } : {}),
+				...(p.uri != null ? { uri: p.uri } : {})
+			}));
+		const connected = new Set(
+			this.node
+				.listPeers()
+				.filter((p: any) => p.state === 'connected' || p.state === 'ready')
+				.map((p: any) => p.pubkey)
+		);
+		try {
+			const { value, skipped } = await steerReceive({
+				candidates,
+				isConnected: (pubkey) => connected.has(pubkey),
+				attempt: (candidate, capMs) =>
+					this.attemptQuote(candidate.pubkey, amountSats, requestId, capMs),
+				candidateCodes: OFFLINE_RECEIVE_STEER_CODES,
+				lastAttemptCapMs: QUOTE_TIMEOUT_MS
+			});
+			return skipped.length > 0 ? { ...value, skipped } : value;
+		} catch (error: any) {
+			// The daemon answers these with a status; the embedded client reads
+			// the same one off the error.
+			if (error instanceof BeignetError) {
+				if (error.code === BeignetErrorCode.NO_PRIMARY_AVAILABLE)
+					throw Object.assign(error, { status: 503 });
+				if (error.code === BeignetErrorCode.INVALID_PARAMS)
+					throw Object.assign(error, { status: 400 });
+			}
+			throw error;
+		}
+	}
+	/**
+	 * One candidate's quote, bounded by the walk's cap. This coordinator's own
+	 * refusals are plain errors with a code; the walker moves on only for a
+	 * BeignetError whose code it was told is a candidate's own, so they are
+	 * rethrown as that, keeping their code when it is one of those and reading
+	 * as RECEIVE_UNAVAILABLE otherwise (a primary that did not answer, one
+	 * that returned bad terms). A node fault is left as it is and ends the walk.
+	 */
+	private async attemptQuote(
+		peer: string,
+		amountSats: number,
+		requestId: string | undefined,
+		capMs: number
+	): Promise<any> {
+		let timer: any;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(
+						new BeignetError(
+							BeignetErrorCode.RECEIVE_UNAVAILABLE,
+							`Your primary node did not answer within ${Math.max(
+								1,
+								Math.round(capMs / 1000)
+							)} seconds.`
+						)
+					),
+				capMs
+			);
+		});
+		try {
+			return await Promise.race([
+				this.quote(peer, amountSats, requestId),
+				timeout
+			]);
+		} catch (error: any) {
+			if (error instanceof BeignetError) throw error;
+			const code = OFFLINE_RECEIVE_STEER_CODES.has(error?.code)
+				? error.code
+				: BeignetErrorCode.RECEIVE_UNAVAILABLE;
+			throw Object.assign(
+				new BeignetError(code, String(error?.message ?? error)),
+				{ status: error?.status ?? 409 }
+			);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 	/**
 	 * Ask the primary for its receive terms and keep the answer, so the wallet
@@ -259,14 +369,15 @@ export class OfflineReceive {
 	 */
 	probe(peer: string): Promise<OfflineReceiveAvailability> {
 		if (this.stopped) return Promise.resolve(this.availability(peer));
-		if (this.probing?.peer === peer) return this.probing.done;
+		const running = this.probing.get(peer);
+		if (running) return running;
 		const settled = () => this.availability(peer);
 		const done = this.fetchTerms(peer)
 			.then(settled, settled)
 			.finally(() => {
-				if (this.probing?.done === done) this.probing = undefined;
+				if (this.probing.get(peer) === done) this.probing.delete(peer);
 			});
-		this.probing = { peer, done };
+		this.probing.set(peer, done);
 		return done;
 	}
 	private answered(
@@ -278,13 +389,12 @@ export class OfflineReceive {
 		// A stop rejects every pending request with its own text; that is not
 		// the primary's answer.
 		if (this.stopped) return;
-		this.probed = {
-			peer,
+		this.probed.set(peer, {
 			available,
 			reason,
 			probedAt: this.now(),
 			...(concurrentVersion ? { concurrentVersion } : {})
-		};
+		});
 	}
 	/**
 	 * The primary's receive terms, or a RECEIVE_UNAVAILABLE refusal. Every

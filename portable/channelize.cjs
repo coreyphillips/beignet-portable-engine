@@ -25,8 +25,11 @@ function decided(now, order) {
 /**
  * @param {object} deps
  * @param {object} deps.node the running BeignetNode
- * @param {object} deps.record the wallet record (reads lfbw.primaryPubkey, lfbw.trusted)
+ * @param {object} deps.record the wallet record (reads lfbw.primaryPubkey, lfbw.trusted when no `toward` is given)
  * @param {() => object} deps.primary parsed primary with connectHost/connectPort
+ * @param {{ pubkey: string, trusted?: boolean }} [deps.toward] the primary the funds
+ *   move to: the one a receive would go to (the engine's receive target); defaults
+ *   to the record's scalar primary, which is rank 1
  * @param {object} deps.rules the lfbw.cjs module
  * @param {boolean} [deps.force] skip the fee wait and the retry backoff
  * @param {number} [deps.now]
@@ -38,6 +41,7 @@ async function runChannelize({
 	node,
 	record,
 	primary,
+	toward,
 	rules,
 	force = false,
 	now = Date.now(),
@@ -55,7 +59,7 @@ async function runChannelize({
 			utxos: node.listUtxos(),
 			// Reservations do not make an existing home disappear.
 			channels: node.listChannels(),
-			primaryPubkey: record.lfbw.primaryPubkey
+			primaryPubkey: toward?.pubkey ?? record.lfbw.primaryPubkey
 		});
 		if (target.action === 'splice-in' && excludeChannelIds.has(target.channelId))
 			return { last: decided(now, { action: 'wait', reason: 'offline-receive' }), retryAt };
@@ -88,7 +92,7 @@ async function runChannelize({
 				feeNormal,
 				force,
 				mode: 'external',
-				trusted: record.lfbw.trusted,
+				trusted: toward?.trusted ?? record.lfbw.trusted,
 				blockHeight: node.getInfo().blockHeight,
 				primary: primary(),
 				// The primary provides inbound by JIT; see channelizeOrder.

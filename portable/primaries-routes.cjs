@@ -7,11 +7,15 @@
 // (`order` for a reorder, `fillThresholdSat` for the threshold, null meaning no
 // cap). Admin calls are allowed here because the phone owns its engine.
 //
-// `onWrite(info, { kind, body })` runs after a successful engine write, before
-// the answer is returned, so the runtime can mirror the list onto the wallet
-// record. Engine refusals propagate untouched, as every other route's do.
-function primariesRoutes({ node, failure, onWrite }) {
+// `beforeWrite(kind, body)` runs before the engine is touched, for the
+// runtime's own checks (an address this transport cannot reach, a second
+// primary behind a relay that reaches one); `onWrite(info, { kind, body })`
+// runs after a successful engine write, before the answer is returned, so the
+// runtime can mirror the list onto the wallet record. Engine refusals
+// propagate untouched, as every other route's do.
+function primariesRoutes({ node, failure, beforeWrite, onWrite }) {
 	const write = async (kind, body, apply) => {
+		if (beforeWrite) await beforeWrite(kind, body);
 		const info = apply();
 		if (onWrite) await onWrite(info, { kind, body });
 		return info;

@@ -206,7 +206,7 @@ test('the config flag says the engine implements offline receiving; the record s
 	}
 });
 
-test('the config advertises channel sends and not ranked primaries yet; the policy routes need a started wallet', async () => {
+test('the config advertises channel sends and ranked primaries; the policy routes need a started wallet', async () => {
 	const volume = memory();
 	volume.write(
 		'/wallet/registry.json',
@@ -234,11 +234,10 @@ test('the config advertises channel sends and not ranked primaries yet; the poli
 		// The engine in this bundle pays an address out of one or several
 		// channels through /channel-send, and the router serves those routes.
 		assert.equal(config.channelSendAvailable, true);
-		// Routing the engine's primaries list is not the same as honouring it:
-		// nothing in this runtime yet keeps the list, dials every entry or
-		// steers offline receives by it, so a client must not present ranked
-		// primaries against this build (coreyphillips/beignet#1924).
-		assert.equal('primariesAvailable' in config, false);
+		// The runtime keeps the engine's list, dials every primary and steers
+		// receives by it, so a client may present ranked primaries against this
+		// build (coreyphillips/beignet#1924).
+		assert.equal(config.primariesAvailable, true);
 		// The policy lives in the engine, so with the wallet stopped there is
 		// nothing to read or write; the refusal is the one every daemon route
 		// gives, and nothing is persisted.
@@ -254,6 +253,232 @@ test('the config advertises channel sends and not ranked primaries yet; the poli
 			);
 		}
 		assert.equal(volume.read('/wallet/registry.json').toString(), before);
+	} finally {
+		await runtime.close();
+	}
+});
+
+const KEY_A = '02' + 'aa'.repeat(32);
+const KEY_B = '03' + 'bb'.repeat(32);
+const URI_A = `${KEY_A}@a.example:9735`;
+const URI_B = `${KEY_B}@b.example:9736`;
+const MNEMONIC =
+	'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+/** A volume that counts its writes, so a load that changes nothing can be seen to write nothing. */
+const counting = () => {
+	const volume = memory();
+	const write = volume.write;
+	volume.writes = 0;
+	volume.write = (p, b) => {
+		volume.writes += 1;
+		return write(p, b);
+	};
+	return volume;
+};
+const legacyRegistry = (lfbw = {}) =>
+	Buffer.from(
+		JSON.stringify({
+			record: {
+				id: 'legacy',
+				network: 'regtest',
+				name: 'Legacy fixture',
+				lfbw: {
+					enabled: true,
+					mode: 'external',
+					primaryWalletId: null,
+					primaryUri: URI_A,
+					primaryPubkey: KEY_A,
+					trusted: true,
+					initialChannelSats: 0,
+					initialChannelOpened: false,
+					setup: 'ready',
+					setupError: null,
+					setupAt: 1700000000000,
+					previousPrimary: { pubkey: KEY_B, walletId: null, at: 1 },
+					...lfbw
+				}
+			},
+			mnemonic: MNEMONIC
+		})
+	);
+
+test('a record from before ranked primaries is read as a one-entry list, written back once, and left alone by the next load', async () => {
+	const volume = counting();
+	volume.write('/wallet/registry.json', legacyRegistry());
+	volume.writes = 0;
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		assert.equal(volume.writes, 1, 'the migrated record is written back at load');
+		const [record] = await runtime.request({ path: '/api/wallets' });
+		assert.deepEqual(record.lfbw.primaries, [
+			{
+				pubkey: KEY_A,
+				uri: URI_A,
+				trusted: true,
+				initialChannelOpened: false,
+				setup: 'ready',
+				setupError: null,
+				setupAt: 1700000000000,
+				connected: false,
+				offlineReceiveAvailable: null,
+				offlineReceiveReason: null
+			}
+		]);
+		// The scalar fields older readers look at are the rank-1 entry's.
+		assert.equal(record.lfbw.primaryUri, URI_A);
+		assert.equal(record.lfbw.primaryPubkey, KEY_A);
+		assert.equal(record.lfbw.setup, 'ready');
+		assert.equal(record.lfbw.setupAt, 1700000000000);
+		assert.equal(record.lfbw.primariesThresholdSat, null);
+		assert.equal(record.lfbw.receiveTarget, KEY_A);
+		// Derived from the channels now, and there are none with a stopped node.
+		assert.equal(record.lfbw.previousPrimary, null);
+		assert.deepEqual(record.lfbw.retainedPeers, []);
+		assert.equal(JSON.stringify(record).includes('abandon'), false);
+		const stored = JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString());
+		assert.equal(stored.mnemonic, MNEMONIC);
+		assert.equal('previousPrimary' in stored.record.lfbw, false);
+		assert.equal('primariesSyncedAt' in stored.record.lfbw, false, 'unsynced: the first start seeds the engine');
+	} finally {
+		await runtime.close();
+	}
+	volume.writes = 0;
+	const again = await createPortableRuntime(options(volume));
+	try {
+		await again.request({ path: '/api/wallets' });
+		assert.equal(volume.writes, 0, 'an already migrated record is not rewritten');
+	} finally {
+		await again.close();
+	}
+});
+
+test('a primary edit on a stopped wallet is kept, as one list or as a rank-1 replacement, before the start it needs is refused', async () => {
+	const volume = memory();
+	volume.write('/wallet/registry.json', legacyRegistry({ setup: 'pending', setupAt: null }));
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		const stored = () => JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString()).record.lfbw;
+		// The legacy manager shape: one primary replaces rank 1.
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { primaryNodeUri: URI_B } }),
+			(e) => e.code === 'ELECTRUM_REQUIRED'
+		);
+		let lf = stored();
+		assert.deepEqual(lf.primaries.map((e) => e.pubkey), [KEY_B]);
+		assert.equal(lf.primaryUri, URI_B);
+		assert.equal(lf.primaryPubkey, KEY_B);
+		assert.equal(lf.primariesSyncedAt, null);
+		// The list shape: every entry, ranked.
+		await assert.rejects(
+			runtime.request({
+				method: 'PATCH',
+				path: '/api/wallets/legacy',
+				body: { lfbw: { enabled: true, primaries: [{ uri: URI_A, trusted: false }, { uri: URI_B }], primariesThresholdSat: 250000 } }
+			}),
+			(e) => e.code === 'ELECTRUM_REQUIRED'
+		);
+		lf = stored();
+		assert.deepEqual(lf.primaries.map((e) => [e.pubkey, e.trusted]), [[KEY_A, false], [KEY_B, true]]);
+		assert.equal(lf.primariesThresholdSat, 250000);
+		assert.equal(lf.primaryPubkey, KEY_A);
+		assert.equal(lf.trusted, false);
+		// A rank-1 replacement (the one-primary client's edit) keeps the rest
+		// of the list, and a node already listed lower is listed once.
+		const KEY_C = '02' + 'cc'.repeat(32);
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { primaryNodeUri: `${KEY_C}@c.example:1` } }),
+			(e) => e.code === 'ELECTRUM_REQUIRED'
+		);
+		lf = stored();
+		assert.deepEqual(lf.primaries.map((e) => e.pubkey), [KEY_C, KEY_B]);
+		assert.equal(lf.primaries[1].trusted, true, 'the kept entry is untouched');
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { primaryNodeUri: `${KEY_B}@moved.example:1` } }),
+			(e) => e.code === 'ELECTRUM_REQUIRED'
+		);
+		lf = stored();
+		assert.deepEqual(lf.primaries.map((e) => e.uri), [`${KEY_B}@moved.example:1`]);
+		// A malformed list leaves the record as it was.
+		const before = JSON.stringify(stored());
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { lfbw: { enabled: true, primaries: [{ uri: URI_A }, { uri: URI_A }] } } }),
+			(e) => e.code === 'BAD_LFBW_PEER'
+		);
+		assert.equal(JSON.stringify(stored()), before);
+	} finally {
+		await runtime.close();
+	}
+});
+
+test('behind a relay that reaches one fixed upstream peer a wallet keeps one primary', async () => {
+	const relayed = (volume) => {
+		const o = options(volume);
+		o.socketFactory = Object.assign(() => {
+			throw Error('No network should be opened');
+		}, { fixedUpstream: true });
+		return o;
+	};
+	const volume = memory();
+	volume.write('/wallet/registry.json', legacyRegistry());
+	const runtime = await createPortableRuntime(relayed(volume));
+	try {
+		const before = Buffer.from(volume.read('/wallet/registry.json')).toString();
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { lfbw: { enabled: true, primaries: [{ uri: URI_A }, { uri: URI_B }] } } }),
+			(e) => e.code === 'TRANSPORT_SINGLE_PEER' && e.status === 409
+		);
+		assert.equal(Buffer.from(volume.read('/wallet/registry.json')).toString(), before, 'nothing was written');
+		// Replacing the one primary is still allowed.
+		await assert.rejects(
+			runtime.request({ method: 'PATCH', path: '/api/wallets/legacy', body: { primaryNodeUri: URI_B } }),
+			(e) => e.code === 'ELECTRUM_REQUIRED'
+		);
+		const lf = JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString()).record.lfbw;
+		assert.deepEqual(lf.primaries.map((e) => e.pubkey), [KEY_B]);
+	} finally {
+		await runtime.close();
+	}
+	const fresh = await createPortableRuntime(relayed(memory()));
+	try {
+		await assert.rejects(
+			fresh.request({
+				method: 'POST',
+				path: '/api/wallets',
+				body: {
+					network: 'regtest',
+					electrum: { host: '127.0.0.1', port: 60001, tls: false },
+					lfbw: { enabled: true, primaries: [{ uri: URI_A }, { uri: URI_B }] }
+				}
+			}),
+			(e) => e.code === 'TRANSPORT_SINGLE_PEER'
+		);
+	} finally {
+		await fresh.close();
+	}
+});
+
+test('a wallet created with a ranked list keeps every entry, unsynced until its engine first runs', async () => {
+	const volume = memory();
+	const runtime = await createPortableRuntime(options(volume));
+	try {
+		const created = await runtime.request({
+			method: 'POST',
+			path: '/api/wallets',
+			body: {
+				network: 'regtest',
+				electrum: { host: '127.0.0.1', port: 60001, tls: false },
+				lfbw: { enabled: true, primaries: [{ uri: URI_B }, { uri: URI_A }], primariesThresholdSat: 1000 }
+			}
+		});
+		// No network in this test: the start fails and the record says so,
+		// exactly as a one-primary creation did.
+		assert.equal(created.record.lfbw.setup, 'failed');
+		assert.deepEqual(created.record.lfbw.primaries.map((e) => e.pubkey), [KEY_B, KEY_A]);
+		assert.equal(created.record.lfbw.primaryPubkey, KEY_B);
+		assert.equal(created.record.lfbw.primariesThresholdSat, 1000);
+		const stored = JSON.parse(Buffer.from(volume.read('/wallet/registry.json')).toString()).record.lfbw;
+		assert.equal(stored.primariesSyncedAt, null);
+		assert.equal(stored.primaries.length, 2);
 	} finally {
 		await runtime.close();
 	}

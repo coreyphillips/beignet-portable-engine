@@ -12,7 +12,7 @@ const failure = (code, message, status = 400) => {
 const coin = { txid: 'ab'.repeat(32), vout: 1, valueSats: 2000, frozen: false };
 const request = { requestId: 'review-drain-001', address: 'external-address' };
 
-function harness({ home = true, coins = true } = {}) {
+function harness({ home = true, coins = true, primaries = ['primary'] } = {}) {
 	let journal = null,
 		hold = null,
 		time = 1000;
@@ -137,7 +137,7 @@ function harness({ home = true, coins = true } = {}) {
 				journal = copy(next);
 			},
 			node: () => engine,
-			primary: () => 'primary',
+			primaries: () => primaries,
 			ready: () => {
 				if (unavailable) failure('RECOVERY_HELD', 'Recovery is pending', 409);
 			},
@@ -1014,3 +1014,27 @@ test('one unavailable payout does not prevent another from confirming, but persi
 		}
 	}
 });
+
+test('channels at two ranked primaries refuse a drain by name, and a lone channel at a lower-ranked primary is the home a drain closes', async () => {
+	const two = harness({ primaries: ['primary', 'second'] });
+	two.state.channels.push({ ...two.state.channels[0], channelId: 'second-home', peerPubkey: 'second' });
+	two.state.peers.push({ pubkey: 'second', state: 'connected' });
+	await assert.rejects(two.create().quote(request), (error) => {
+		assert.equal(error.code, 'DRAIN_UNAVAILABLE');
+		assert.match(error.message, /more than one primary/);
+		return true;
+	});
+	assert.deepEqual(two.calls, []);
+	// One channel, held with rank 2 while rank 1 is away: the drain binds to
+	// the channel's peer, so rank 1 being offline does not refuse it.
+	const lower = harness({ primaries: ['primary', 'second'] });
+	lower.state.channels[0].peerPubkey = 'second';
+	lower.state.peers = [{ pubkey: 'second', state: 'connected' }];
+	const review = await lower.create().quote(request);
+	assert.equal(review.requestId, request.requestId);
+	// A channel at a peer that is no ranked primary is still foreign.
+	const foreign = harness({ primaries: ['primary', 'second'] });
+	foreign.state.channels[0].peerPubkey = 'other';
+	await assert.rejects(foreign.create().quote(request), (error) => error.code === 'DRAIN_UNAVAILABLE' && /Only the home channel/.test(error.message));
+});
+

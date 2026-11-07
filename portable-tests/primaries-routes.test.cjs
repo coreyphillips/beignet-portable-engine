@@ -94,3 +94,26 @@ test('onWrite sees the engine\'s answer and the write it came from, and its fail
 	const broken = primariesRoutes({ node, failure, onWrite: async () => { throw Object.assign(new Error('disk'), { code: 'DURABILITY_FAILED' }); } });
 	await assert.rejects(broken['POST /primaries/remove']({ pubkey: PK_A }), (error) => error.code === 'DURABILITY_FAILED');
 });
+
+test('beforeWrite runs before the engine is touched and its refusal is the route\'s answer; reads skip it', async () => {
+	const { node, calls } = recording();
+	const seen = [];
+	const api = primariesRoutes({
+		node,
+		failure,
+		beforeWrite: (kind, body) => {
+			seen.push([kind, body]);
+			if (kind === 'add' && body.pubkey === PK_B) failure('TRANSPORT_SINGLE_PEER', 'one primary over the relay', 409);
+		}
+	});
+	api['GET /primaries']({}, new URLSearchParams());
+	await assert.rejects(api['POST /primaries/add']({ pubkey: PK_B, host: 'b.example', port: 9735 }), (error) => error.code === 'TRANSPORT_SINGLE_PEER' && error.status === 409);
+	assert.deepEqual(calls, [], 'the engine saw no write');
+	await api['POST /primaries/threshold']({ fillThresholdSat: 5 });
+	assert.deepEqual(seen, [
+		['add', { pubkey: PK_B, host: 'b.example', port: 9735 }],
+		['threshold', { fillThresholdSat: 5 }]
+	]);
+	assert.deepEqual(calls, [['setPrimariesFillThreshold', 5]]);
+});
+

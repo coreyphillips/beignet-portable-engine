@@ -71,7 +71,7 @@ function drainCoordinator({
 	read,
 	write,
 	node,
-	primary,
+	primaries,
 	ready,
 	busy,
 	offline,
@@ -270,7 +270,17 @@ function drainCoordinator({
 				409
 			);
 		const engine = node();
-		const peer = primary();
+		const configured = primaries();
+		const channels = engine
+			.listChannels()
+			.filter((entry) => !isHistoricalClose(entry));
+		// The channel a drain closes is the one home channel. With several
+		// ranked primaries it is whichever of them holds that channel; with no
+		// channel yet, the first-ranked one is the peer the review is bound to.
+		const peer =
+			channels.length === 1 && configured.includes(channels[0].peerPubkey)
+				? channels[0].peerPubkey
+				: configured[0];
 		if (
 			!engine
 				.listPeers()
@@ -315,18 +325,27 @@ function drainCoordinator({
 				'Resolve offline receive reservations before emptying the wallet',
 				409
 			);
-		const channels = engine
-			.listChannels()
-			.filter((entry) => !isHistoricalClose(entry));
 		if (
 			channels.length > 1 ||
 			channels.some((entry) => entry.peerPubkey !== peer)
-		)
+		) {
+			// Channels at two or more ranked primaries is the one multi-channel
+			// shape a wallet reaches on purpose; say so rather than "home
+			// channel" (coreyphillips/beignet#1924, a drain plan for it is not
+			// built).
+			const atPrimaries = new Set(
+				channels
+					.map((entry) => entry.peerPubkey)
+					.filter((pubkey) => configured.includes(pubkey))
+			);
 			failure(
 				'DRAIN_UNAVAILABLE',
-				'Only the home channel can be emptied from this wallet',
+				atPrimaries.size > 1
+					? 'Emptying a wallet with channels at more than one primary is not supported yet. Close the other channels first.'
+					: 'Only the home channel can be emptied from this wallet',
 				409
 			);
+		}
 		const channel = channels[0] ?? null;
 		if (
 			channel &&

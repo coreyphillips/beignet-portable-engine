@@ -16,6 +16,12 @@ import * as rules from './lfbw.cjs';
 import { runChannelize } from './channelize.cjs';
 import { sendRoutes } from './send-routes.cjs';
 import { primariesRoutes } from './primaries-routes.cjs';
+import {
+	anyIroh,
+	engineToEntries,
+	entryToEngine,
+	planPrimariesSync
+} from './primaries-record.cjs';
 import { channelizePause } from './channelize-pause.cjs';
 import { drainCoordinator } from './drain.cjs';
 import { drainFence } from './drain-fence.cjs';
@@ -94,6 +100,23 @@ export async function createPortableRuntime(options: any) {
 	};
 	const registry = load('/wallet/registry.json', null);
 	let record: any = registry?.record ?? null;
+	// A record from before ranked primaries names one scalar primary. It is
+	// read as a one-entry list, the scalar fields staying as the rank-1
+	// mirrors readers still look at, and written back once the volume writer
+	// below exists (coreyphillips/beignet#1924).
+	const migratedRecord =
+		!!record?.lfbw?.enabled && !Array.isArray(record.lfbw.primaries);
+	if (migratedRecord)
+		record = { ...record, lfbw: rules.migrateLfbw(record.lfbw) };
+	/** The ranked primaries as the record mirrors them, rank 1 first. */
+	const primaries = (): any[] =>
+		Array.isArray(record?.lfbw?.primaries) ? record.lfbw.primaries : [];
+	const rank1 = (): any => primaries()[0];
+	const entryOf = (pubkey: unknown): any =>
+		typeof pubkey === 'string'
+			? primaries().find((e) => e.pubkey === pubkey)
+			: undefined;
+	const anySetupFailed = () => primaries().some((e) => e.setup === 'failed');
 	let storedMnemonic: string | null = registry?.mnemonic ?? null;
 	const recoveryImport = readRecoveryImport(registry?.recoveryImport);
 	const importPending = () => recoveryImport.autoApply && !recoveryImport.complete;
@@ -155,6 +178,13 @@ export async function createPortableRuntime(options: any) {
 	const enginePerf = engineDiagnostics({ onDiagnostic: options.onDiagnostic });
 	const persist = () =>
 		save('/wallet/registry.json', { record, mnemonic: storedMnemonic, recoveryImport });
+	if (migratedRecord) {
+		try {
+			persist();
+		} catch {
+			// save() fenced the runtime; the migrated record stays in memory.
+		}
+	}
 	const channelizeHold = channelizePause({
 		read: () => record?.channelizePause,
 		write: (value) => {
@@ -183,7 +213,7 @@ export async function createPortableRuntime(options: any) {
 		read: () => load('/wallet/drains.json', null),
 		write: (value: any) => save('/wallet/drains.json', value),
 		node: () => node,
-		primary: () => record?.lfbw?.primaryPubkey,
+		primaries: () => primaries().map((e: any) => e.pubkey),
 		ready: () => {
 			requireRecoveryReady();
 			if (closed || stopPromise || durabilityFailed || !healthy())
@@ -271,48 +301,106 @@ export async function createPortableRuntime(options: any) {
 		persist();
 	};
 	/**
-	 * Whether this wallet's primary settles offline receives, as it last
-	 * answered the probe: true, false with the refusal, or null before an
-	 * answer (the wallet is stopped, the primary has not connected yet, or it
-	 * was just changed). GET /api/config's offlineReceiveAvailable says the
-	 * engine implements the feature; this pair says whether the primary serves
-	 * it, which is what the receive screen needs before offering it.
+	 * Whether a primary settles offline receives, as it last answered the
+	 * probe: true, false with the refusal, or null before an answer (the
+	 * wallet is stopped, the primary has not connected yet, or it was just
+	 * added). GET /api/config's offlineReceiveAvailable says the engine
+	 * implements the feature; this pair says whether the primary serves it,
+	 * which is what the receive screen needs before offering it. Named for no
+	 * pubkey, it speaks for the receive target: the primary a receive that
+	 * names no peer goes to.
 	 */
-	const offlineReceiveAvailability = () => {
-		const pk = record?.lfbw?.primaryPubkey;
+	const availabilityOf = (pubkey: unknown) => {
 		const state =
-			offlineReceive && typeof pk === 'string'
-				? offlineReceive.availability(pk)
+			offlineReceive && typeof pubkey === 'string'
+				? offlineReceive.availability(pubkey)
 				: { available: null, reason: null };
 		return {
 			offlineReceiveAvailable: state.available,
 			offlineReceiveReason: state.reason
 		};
 	};
-	const publicRecord = () =>
-		record
-			? clone({
-					...record,
-					lfbw: {
-						...record.lfbw,
-						lastChannelize: record.lfbwLast ?? null,
-						lastSplice,
-						unpairedFunding,
-						lastOffer,
-						...offlineReceiveAvailability()
-					},
-					status: node ? 'running' : 'stopped',
-					healthy: healthy(),
-					runtime: {
-						status: node ? 'running' : 'stopped',
-						healthy: healthy(),
-						lfbwLast: record.lfbwLast ?? null
-					}
-				})
-			: null;
-	const primary = () => {
-		const p = rules.parseNodeUri(record.lfbw.primaryUri);
-		const fallback = parsePrimaryFallback(p, record.lfbw.primaryFallbackUri);
+	const offlineReceiveAvailability = () =>
+		availabilityOf(receiveTargetEntry()?.pubkey);
+	/** The engine's ranked list, or null while there is no node to ask. */
+	const enginePrimaries = (): any | null => {
+		if (!node) return null;
+		try {
+			return node.listPrimaries();
+		} catch {
+			return null;
+		}
+	};
+	/**
+	 * The entry a receive that names no peer goes to: the engine's receive
+	 * target (rank order, then the lowest balance once every primary is at
+	 * its fill threshold), else rank 1 while the engine is not running.
+	 */
+	const receiveTargetEntry = (): any =>
+		entryOf(enginePrimaries()?.receiveTarget) ?? rank1();
+	const publicRecord = () => {
+		if (!record) return null;
+		const policy = enginePrimaries();
+		const figures = new Map<string, any>(
+			((policy?.primaries ?? []) as any[]).map((p) => [p.pubkey, p])
+		);
+		let channels: any[] = [];
+		try {
+			channels = node && !nodeUnavailable() ? node.listChannels() : [];
+		} catch {
+			channels = [];
+		}
+		const retained = rules.retainedPeers(primaries(), channels);
+		return clone({
+			...record,
+			lfbw: {
+				...record.lfbw,
+				// Each ranked primary with what the runtime and the engine know
+				// of it now: connected, its offline-receive answer, and the
+				// engine's balance, channel count and place in the receive order.
+				primaries: primaries().map((entry) => {
+					const f = figures.get(entry.pubkey);
+					return {
+						...entry,
+						connected: peerConnected(entry.pubkey),
+						...availabilityOf(entry.pubkey),
+						...(f
+							? {
+									balanceSat: f.balanceSat,
+									channelCount: f.channelCount,
+									belowThreshold: f.belowThreshold,
+									isReceiveTarget: f.isReceiveTarget,
+									selectionOrder: f.selectionOrder
+							  }
+							: {})
+					};
+				}),
+				...(policy ? { primariesThresholdSat: policy.fillThresholdSat } : {}),
+				receiveTarget: policy?.receiveTarget ?? rank1()?.pubkey ?? null,
+				// Channels at peers that are not ranked primaries any more: their
+				// balance stays in the total and must stay visible. The shape
+				// older readers knew is derived from them, never stored.
+				retainedPeers: retained,
+				previousPrimary: rules.derivedPreviousPrimary(retained),
+				lastChannelize: record.lfbwLast ?? null,
+				lastSplice,
+				unpairedFunding,
+				lastOffer,
+				...offlineReceiveAvailability()
+			},
+			status: node ? 'running' : 'stopped',
+			healthy: healthy(),
+			runtime: {
+				status: node ? 'running' : 'stopped',
+				healthy: healthy(),
+				lfbwLast: record.lfbwLast ?? null
+			}
+		});
+	};
+	/** A stored entry's address as the engine dials it, with its relay address for direct funding. */
+	const parsedPrimary = (entry: any) => {
+		const p = rules.parseNodeUri(entry.uri);
+		const fallback = parsePrimaryFallback(p, entry.fallbackUri);
 		return {
 			...p,
 			connectHost: p.host,
@@ -329,31 +417,36 @@ export async function createPortableRuntime(options: any) {
 			relayPort: fallback?.port ?? p.port
 		};
 	};
-	/** Whether the primary is a connected peer right now. */
-	const primaryConnected = () =>
+	/** Rank 1: the direct-funding policy's liquidity peer, the path a request the list cannot bind falls back to. */
+	const primary = () => parsedPrimary(rank1());
+	/** Whether a primary is a connected peer right now. */
+	const peerConnected = (pubkey: unknown) =>
+		typeof pubkey === 'string' &&
 		!!node &&
 		!nodeUnavailable() &&
 		node
 			.listPeers()
 			.some(
 				(peer) =>
-					peer.pubkey === record?.lfbw?.primaryPubkey &&
+					peer.pubkey === pubkey &&
 					(peer.state === 'connected' || peer.state === 'ready')
 			);
 	/**
-	 * Dial the primary again after it was lost. The engine drops a peer for a
+	 * Dial a primary again after it was lost. The engine drops a peer for a
 	 * transport error without telling its peer manager, which then keeps a
 	 * disconnected entry, schedules no reconnect and lets connectPeer return
-	 * early on the entry it holds; disconnecting first clears it.
+	 * early on the entry it holds; disconnecting first clears it. One redial
+	 * at a time per primary.
 	 */
-	let redialing = false;
-	const redialPrimary = async (opts: { force?: boolean } = {}) => {
-		if (redialing || closed || !node || record?.lfbw?.setup !== 'ready') return;
+	const redialing = new Set<string>();
+	const redialPrimary = async (entry: any, opts: { force?: boolean } = {}) => {
+		if (!entry || redialing.has(entry.pubkey) || closed || !node) return;
+		if (entry.setup !== 'ready') return;
 		if (recoveryHold()) return;
-		if (!opts.force && primaryConnected()) return;
-		redialing = true;
+		if (!opts.force && peerConnected(entry.pubkey)) return;
+		redialing.add(entry.pubkey);
 		try {
-			const p = primary();
+			const p = parsedPrimary(entry);
 			try {
 				node.disconnectPeer(p.pubkey);
 			} catch {}
@@ -369,23 +462,40 @@ export async function createPortableRuntime(options: any) {
 				message: String(error?.message ?? error)
 			});
 		} finally {
-			redialing = false;
+			redialing.delete(entry.pubkey);
 		}
 	};
+	/** Every ready primary that is not connected, dialled again. */
+	const redialPrimaries = () =>
+		Promise.all(
+			primaries()
+				.filter((e) => e.setup === 'ready' && !peerConnected(e.pubkey))
+				.map((e) => redialPrimary(e))
+		);
 	/**
-	 * Ask the primary whether it settles offline receives, off the connect
+	 * Ask a primary whether it settles offline receives, off the connect
 	 * path: the connect handler runs inside the peer manager's bring-up, and
 	 * the answer only informs the receive screen. The coordinator bounds the
-	 * ask like a review's quote and keeps the answer per peer, so a changed
-	 * primary is asked afresh on its first connection.
+	 * ask like a review's quote and keeps the answer per peer, so a primary
+	 * that was just added is asked afresh on its first connection. Named for
+	 * no pubkey, every connected primary that has not answered yet is asked.
 	 */
-	const probeOfflineReceive = () => {
+	const probeOfflineReceive = (pubkey?: string) => {
 		const pending = setTimeout(() => {
 			pendingTimers.delete(pending);
 			if (closed || !node || !offlineReceive || recoveryHold()) return;
-			const pk = record?.lfbw?.primaryPubkey;
-			if (typeof pk !== 'string' || !primaryConnected()) return;
-			void offlineReceive.probe(pk).catch(() => {});
+			const asked =
+				pubkey !== undefined
+					? [pubkey]
+					: primaries()
+							.map((e) => e.pubkey)
+							.filter(
+								(pk) => offlineReceive!.availability(pk).available === null
+							);
+			for (const pk of asked) {
+				if (!peerConnected(pk)) continue;
+				void offlineReceive.probe(pk).catch(() => {});
+			}
 		}, 0);
 		pendingTimers.add(pending);
 	};
@@ -401,12 +511,12 @@ export async function createPortableRuntime(options: any) {
 		if (closed || attempt >= SETUP_RETRY_MS.length) return;
 		const pending = setTimeout(() => {
 			pendingTimers.delete(pending);
-			if (closed || !node || !record || record.lfbw.setup !== 'failed') return;
+			if (closed || !node || !record || !anySetupFailed()) return;
 			if (recoveryHold()) return;
 			if (startPromise) return;
 			void setup().then(async () => {
 				if (closed) return;
-				if (record.lfbw.setup === 'ready') await channelize();
+				if (!anySetupFailed()) await channelize();
 				else retrySetupSoon(attempt + 1);
 			});
 		}, SETUP_RETRY_MS[attempt]);
@@ -427,21 +537,52 @@ export async function createPortableRuntime(options: any) {
 		// The initial recovery connection retrieves storage only. Leave direct
 		// funding disabled until the existing channel state has been installed.
 		if (held && (held.code !== 'NODE_RESTORE_PENDING' || nodeUnavailable())) return;
+		const entries = primaries();
+		for (const entry of entries) entry.setup = 'pending';
 		record.lfbw.setup = 'pending';
 		persist();
+		if (entries.length === 0) {
+			record.lfbw.setup = 'failed';
+			record.lfbw.setupError = 'No primary node is configured';
+			persist();
+			return;
+		}
+		// The policy names the liquidity peer every offer is negotiated with
+		// and signs its address into every request: the first-ranked primary,
+		// which is also where a request the ranked list could not bind falls
+		// back to (the engine binds each request to the primary it steers to,
+		// beignet #1935). It goes on before any connection is attempted: a
+		// primary that is down at start used to leave the policy unset, every
+		// offer declined with "no liquidity peer", and every request minted
+		// with no way to reach this wallet, until the next restart.
+		if (!held) {
+			try {
+				node.configureDirectFunding(
+					rules.directFundingConfig(record.lfbw, parsedPrimary(entries[0]))
+				);
+			} catch (error: any) {
+				options.onDiagnostic?.({
+					phase: 'primary-connect',
+					message: error.message,
+					stack: error.cause?.stack ?? error.stack
+				});
+			}
+		}
+		// Every primary is trusted (or not) and dialled, each on its own: one
+		// that is down marks only its own entry failed, and the list is ready
+		// as soon as any of them answers.
+		await Promise.all(entries.map((entry) => setupEntry(entry, held)));
+		Object.assign(record.lfbw, rules.aggregateSetup(entries));
+		persist();
+	};
+	const setupEntry = async (entry: any, held: any) => {
+		if (!node) return;
 		try {
-			const p = primary();
+			const p = parsedPrimary(entry);
 			if (!held) {
-				if (record.lfbw.trusted) node.addTrustedPeer(p.pubkey);
+				if (entry.trusted !== false) node.addTrustedPeer(p.pubkey);
 				else node.removeTrustedPeer(p.pubkey);
 			}
-			// The policy names the liquidity peer every offer is negotiated with
-			// and signs its address into every request. It goes on before the
-			// connection is attempted: a primary that is down at start used to
-			// leave the policy unset, every offer declined with "no liquidity
-			// peer", and every request minted with no way to reach this wallet,
-			// until the next restart.
-			if (!held) node.configureDirectFunding(rules.directFundingConfig(record.lfbw, p));
 			try {
 				await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
 			} catch (error) {
@@ -455,19 +596,197 @@ export async function createPortableRuntime(options: any) {
 				)
 					throw error;
 			}
-			record.lfbw.setup = 'ready';
-			record.lfbw.setupError = null;
-			record.lfbw.setupAt = Date.now();
+			entry.setup = 'ready';
+			entry.setupError = null;
+			entry.setupAt = Date.now();
 		} catch (error: any) {
 			options.onDiagnostic?.({
 				phase: 'primary-connect',
-				message: error.message,
+				message:
+					primaries().length > 1
+						? `${error.message} (primary ${String(entry.pubkey).slice(0, 16)})`
+						: error.message,
 				stack: error.cause?.stack ?? error.stack
 			});
-			record.lfbw.setup = 'failed';
-			record.lfbw.setupError = error.message;
+			entry.setup = 'failed';
+			entry.setupError = error.message;
+		}
+	};
+	/**
+	 * Make the engine's ranked list and the record's mirror agree
+	 * (coreyphillips/beignet#1924). The record is the authority while it is
+	 * marked unsynced (a legacy record read as a list, a wallet created or
+	 * edited while stopped, a write the engine could not persist): its entries
+	 * are written to the engine, removes first, then adds, one reorder and
+	 * the threshold. Otherwise the engine is the authority and the mirror is
+	 * refreshed from it, carrying each node's trust, setup and fallback over.
+	 * Never throws: an add the engine refuses as malformed drops that entry
+	 * with a diagnostic, and a write it cannot persist leaves the record
+	 * unsynced so the poll tries again.
+	 */
+	const convergePrimaries = () => {
+		if (!node || !record?.lfbw?.enabled) return;
+		let policy: any;
+		try {
+			policy = node.listPrimaries();
+		} catch (error: any) {
+			options.onDiagnostic?.({
+				phase: 'primaries-sync',
+				message: String(error?.message ?? error)
+			});
+			return;
+		}
+		if (record.lfbw.primariesSyncedAt == null) {
+			let failed = false;
+			const ops = planPrimariesSync(
+				policy,
+				primaries(),
+				record.lfbw.primariesThresholdSat ?? null
+			);
+			for (const op of ops) {
+				try {
+					if (op.op === 'remove') node.removePrimary(op.pubkey);
+					else if (op.op === 'add') node.addPrimary(entryToEngine(op.entry));
+					else if (op.op === 'reorder') node.reorderPrimaries(op.order);
+					else node.setPrimariesFillThreshold(op.fillThresholdSat);
+				} catch (error: any) {
+					options.onDiagnostic?.({
+						phase: 'primaries-sync',
+						message: `${op.op}: ${String(error?.message ?? error)}`
+					});
+					if (error?.code !== 'INVALID_PARAMS') {
+						failed = true;
+					} else if (op.op === 'add') {
+						// A node the engine will not list (an address it cannot
+						// read, its cap) cannot be kept as a primary here either.
+						let listed = false;
+						try {
+							listed = node
+								.listPrimaries()
+								.primaries.some((p: any) => p.pubkey === op.entry.pubkey);
+						} catch {}
+						if (!listed)
+							record.lfbw.primaries = primaries().filter(
+								(e) => e.pubkey !== op.entry.pubkey
+							);
+					}
+				}
+			}
+			try {
+				policy = node.listPrimaries();
+			} catch {
+				failed = true;
+			}
+			if (!failed) {
+				mirrorFromEngine(policy);
+				record.lfbw.primariesSyncedAt = Date.now();
+			}
+		} else {
+			mirrorFromEngine(policy);
 		}
 		persist();
+	};
+	/** The record's mirror from the engine's list, rank 1's fields under the scalar names. */
+	const mirrorFromEngine = (policy: any) => {
+		const next = engineToEntries(policy, primaries());
+		record.lfbw = {
+			...record.lfbw,
+			primaries: next,
+			primariesThresholdSat: policy.fillThresholdSat ?? null,
+			...rules.primariesMirror(next)
+		};
+	};
+	const SINGLE_PEER_RELAY =
+		'The relay reaches one primary node. Switch to Native networking to add another.';
+	/**
+	 * The runtime's own checks on a policy write, before the engine is
+	 * touched: an added address must be one this transport can dial (the
+	 * engine admits peer URI forms the phone has no transport for), an Iroh
+	 * primary needs the host's Iroh, an onion fallback must name the same
+	 * node, and a relay that reaches one fixed upstream peer reaches one
+	 * primary (coreyphillips/beignet#1924).
+	 */
+	const beforePrimariesWrite = (kind: string, body: any) => {
+		if (kind !== 'add') return;
+		if (typeof body?.pubkey !== 'string')
+			failure('INVALID_PARAMS', 'pubkey required');
+		const uri =
+			typeof body.uri === 'string'
+				? body.uri
+				: `${body.pubkey}@${body.host}:${body.port}`;
+		let parsed: any;
+		try {
+			parsed = rules.parseNodeUri(uri);
+			parsePrimaryFallback(parsed, body.fallbackUri);
+		} catch (error: any) {
+			failure('BAD_LFBW_PEER', error.message);
+		}
+		if (parsed.transport?.type === 'iroh' && !options.iroh)
+			failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+		if (
+			options.socketFactory?.fixedUpstream === true &&
+			primaries().some((e) => e.pubkey !== parsed.pubkey)
+		)
+			failure('TRANSPORT_SINGLE_PEER', SINGLE_PEER_RELAY, 409);
+	};
+	/**
+	 * After the engine wrote: mirror its list onto the record (with the
+	 * fallback and trust an add named), set a new primary up, re-arm the
+	 * direct-funding policy when rank 1 changed, and restart the engine when
+	 * the list gained or lost its first Iroh primary, as a primary edit does.
+	 */
+	const afterPrimariesWrite = async (info: any, { kind, body }: any) => {
+		const before = primaries();
+		const beforeRank1 = before[0]?.pubkey;
+		const beforeIroh = anyIroh(before);
+		mirrorFromEngine(info);
+		const addedKey =
+			kind === 'add' ? String(body.pubkey).toLowerCase() : undefined;
+		if (addedKey !== undefined) {
+			const added = entryOf(addedKey);
+			if (added) {
+				if (typeof body.fallbackUri === 'string' && body.fallbackUri.trim()) {
+					try {
+						added.fallbackUri = parsePrimaryFallback(
+							rules.parseNodeUri(added.uri),
+							body.fallbackUri
+						)?.uri;
+					} catch {}
+				}
+				if (body.trusted !== undefined) added.trusted = !!body.trusted;
+			}
+		}
+		Object.assign(record.lfbw, rules.primariesMirror(primaries()));
+		record.lfbw.primariesSyncedAt = Date.now();
+		persist();
+		const after = primaries();
+		if (anyIroh(after) !== beforeIroh) {
+			await stop();
+			await start();
+			return;
+		}
+		if (!node) return;
+		if (addedKey !== undefined) {
+			const added = entryOf(addedKey);
+			if (added) {
+				await setupEntry(added, recoveryHold());
+				Object.assign(record.lfbw, rules.aggregateSetup(after));
+				persist();
+				probeOfflineReceive(added.pubkey);
+			}
+		}
+		if (after[0] && after[0].pubkey !== beforeRank1 && !recoveryHold()) {
+			try {
+				node.configureDirectFunding(
+					rules.directFundingConfig(record.lfbw, parsedPrimary(after[0]))
+				);
+			} catch (error: any) {
+				options.onDiagnostic?.({
+					phase: 'primary-connect',
+					message: error.message
+				});
+			}
+		}
 	};
 	const channelize = async (force = false) => {
 		if (
@@ -478,17 +797,21 @@ export async function createPortableRuntime(options: any) {
 			channelizeHold.status().paused ||
 			drain.blocksWallet() ||
 			busy ||
-			directFundingInFlight > 0 ||
-			record.lfbw.setup !== 'ready'
+			directFundingInFlight > 0
 		)
 			return null;
+		// Funds move toward the primary a receive would go to, once that
+		// primary is set up; a target that is not answering waits.
+		const toward = receiveTargetEntry();
+		if (!toward || toward.setup !== 'ready') return null;
 		busy = true;
 		try {
 			const { last, retryAt } = await runChannelize({
 				node,
 				excludeChannelIds: offlineReceive?.reservedIds(),
 				record,
-				primary,
+				primary: () => parsedPrimary(toward),
+				toward: { pubkey: toward.pubkey, trusted: toward.trusted !== false },
 				rules,
 				force,
 				retryAt: channelizeRetryAt,
@@ -530,7 +853,7 @@ export async function createPortableRuntime(options: any) {
 				node = await enginePerf.time('create', () => BeignetNode.create({
 					...options.nodeOptions,
 					mnemonic,
-					iroh: !!options.iroh && primary().transport?.type === 'iroh',
+					iroh: !!options.iroh && anyIroh(primaries()),
 					irohFactory: options.iroh?.factory,
 					irohRelays: options.iroh?.relays,
 					irohDiscovery: options.iroh?.discovery,
@@ -629,14 +952,13 @@ export async function createPortableRuntime(options: any) {
 				// primary that genuinely cannot reestablish is not hammered.
 				const REESTABLISH_WATCHDOG_MS = 8000;
 				const REESTABLISH_REDIALS_MAX = 3;
-				let reestablishRedials = 0;
-				const homeChannelUsable = (): boolean => {
-					const primaryPubkey = record?.lfbw?.primaryPubkey;
+				const reestablishRedials = new Map<string, number>();
+				const channelsUsableWith = (pubkey: string): boolean => {
 					const mine = node!
 						.listChannels()
 						.filter(
 							(c: any) =>
-								c.peerPubkey === primaryPubkey &&
+								c.peerPubkey === pubkey &&
 								c.state !== 'CLOSED' &&
 								c.state !== 'FORCE_CLOSED'
 						);
@@ -646,37 +968,40 @@ export async function createPortableRuntime(options: any) {
 					);
 				};
 				node.on('peer:connect', (first: any) => {
-					if (peerKey(first) !== record?.lfbw?.primaryPubkey) return;
-					probeOfflineReceive();
+					const pubkey = peerKey(first);
+					if (!entryOf(pubkey)) return;
+					probeOfflineReceive(pubkey);
 					const pending = setTimeout(() => {
 						pendingTimers.delete(pending);
 						if (closed || !node) return;
 						if (recoveryHold()) return;
-						if (homeChannelUsable()) {
-							reestablishRedials = 0;
+						if (channelsUsableWith(pubkey)) {
+							reestablishRedials.delete(pubkey);
 							return;
 						}
+						const redials = reestablishRedials.get(pubkey) ?? 0;
 						if (
-							!primaryConnected() ||
-							reestablishRedials >= REESTABLISH_REDIALS_MAX
+							!peerConnected(pubkey) ||
+							redials >= REESTABLISH_REDIALS_MAX
 						)
 							return;
-						reestablishRedials += 1;
+						reestablishRedials.set(pubkey, redials + 1);
 						options.onDiagnostic?.({
 							phase: 'primary-redial',
-							message: `channel not usable ${REESTABLISH_WATCHDOG_MS / 1000}s after connecting, dialling again (${reestablishRedials}/${REESTABLISH_REDIALS_MAX})`
+							message: `channel not usable ${REESTABLISH_WATCHDOG_MS / 1000}s after connecting, dialling again (${redials + 1}/${REESTABLISH_REDIALS_MAX})`
 						});
-						void redialPrimary({ force: true });
+						void redialPrimary(entryOf(pubkey), { force: true });
 					}, REESTABLISH_WATCHDOG_MS);
 					pendingTimers.add(pending);
 				});
-				// A transport error on the primary's connection is followed by a
+				// A transport error on a primary's connection is followed by a
 				// redial after a short pause, rather than waiting for the poll.
 				node.on('peer:error', (first: any) => {
-					if (peerKey(first) !== record?.lfbw?.primaryPubkey) return;
+					const pubkey = peerKey(first);
+					if (!entryOf(pubkey)) return;
 					const pending = setTimeout(() => {
 						pendingTimers.delete(pending);
-						void redialPrimary();
+						void redialPrimary(entryOf(pubkey));
 					}, 2000);
 					pendingTimers.add(pending);
 				});
@@ -694,19 +1019,23 @@ export async function createPortableRuntime(options: any) {
 					(jobs) => save(`/wallet/offline-receive-${record.id}.json`, jobs),
 					load(`/wallet/offline-receive-${record.id}.json`, [])
 				);
+				// The engine's list and the record's mirror agree before any
+				// primary is dialled: a legacy record seeds the engine with its
+				// one primary, a record edited while stopped is applied, and an
+				// engine list the record never saw is taken as read.
+				convergePrimaries();
 				await setup();
-				// The engine's own reconnect can bring the primary up before the
+				// The engine's own reconnect can bring a primary up before the
 				// coordinator exists, and setup() joins a dial already in flight,
 				// so a primary that is connected but unasked by now is asked here.
-				if (offlineReceiveAvailability().offlineReceiveAvailable === null)
-					probeOfflineReceive();
+				probeOfflineReceive();
 				receiveTimer = setInterval(() => {
 					if (!closed && !durabilityFailed && !recoveryHold()) void offlineReceive?.sync().catch(() => {});
 					void syncDrain().catch(() => {});
 				}, 2000);
 				void syncDrain().catch(() => {});
 				if (!recoveryHold()) void offlineReceive.sync().catch(() => {});
-				if (record.lfbw.setup === 'failed') retrySetupSoon();
+				if (anySetupFailed()) retrySetupSoon();
 				lastSplice = null;
 				unpairedFunding = null;
 				lastOffer = null;
@@ -763,17 +1092,26 @@ export async function createPortableRuntime(options: any) {
 				timer = setInterval(() => {
 					if (closed || !node) return;
 					if (recoveryHold()) return;
-					if (record.lfbw.setup === 'failed' && !startPromise) {
+					// A list the engine could not persist is written again.
+					if (record.lfbw.primariesSyncedAt == null && primaries().length > 0)
+						convergePrimaries();
+					if (anySetupFailed() && !startPromise) {
 						void setup().then(() => channelize());
 						return;
 					}
-					// A phone that has lost its primary has lost receiving, direct
-					// funding and every move; the engine's own reconnect does not
-					// cover a peer it dropped for a transport error, so the poll
-					// dials again. connectPeer is idempotent for a live connection.
-					if (record.lfbw.setup === 'ready' && !primaryConnected()) {
-						void redialPrimary();
-						return;
+					// A phone that has lost a primary has lost receiving through it,
+					// direct funding and every move toward it; the engine's own
+					// reconnect does not cover a peer it dropped for a transport
+					// error, so the poll dials again. connectPeer is idempotent for
+					// a live connection. Funds keep moving while the primary they
+					// move toward is up.
+					const lost = primaries().filter(
+						(e) => e.setup === 'ready' && !peerConnected(e.pubkey)
+					);
+					if (lost.length > 0) {
+						void redialPrimaries();
+						if (lost.some((e) => e.pubkey === receiveTargetEntry()?.pubkey))
+							return;
 					}
 					void channelize();
 				}, rules.CHANNELIZE_POLL_MS);
@@ -1044,7 +1382,12 @@ export async function createPortableRuntime(options: any) {
 		const q = url.searchParams;
 		const sendRoute = sendRoutes({ node: n, channelsWithFunding, failure })[route];
 		if (sendRoute) return sendRoute(b, q);
-		const primariesRoute = primariesRoutes({ node: n, failure })[route];
+		const primariesRoute = primariesRoutes({
+			node: n,
+			failure,
+			beforeWrite: beforePrimariesWrite,
+			onWrite: afterPrimariesWrite
+		})[route];
 		if (primariesRoute) return primariesRoute(b, q);
 		switch (route) {
 			case 'POST /drain/quote':
@@ -1072,27 +1415,51 @@ export async function createPortableRuntime(options: any) {
 				return n.listInvoices();
 			case 'GET /receive/offline': {
 				// Capacity is the channel's side of the answer; whether the primary
-				// settles at all is the probed side, repeated here beside it.
-				const probed = offlineReceiveAvailability();
+				// settles at all is the probed side, repeated here beside it. The
+				// legacy keys speak for the receive target (or the one primary
+				// named by ?peer=); `peers` says the same for every ranked
+				// primary, in the order a receive tries them.
+				const target = q.get('peer') || receiveTargetEntry()?.pubkey;
+				const probed = availabilityOf(target);
+				const forPeer = (pubkey: unknown) =>
+					offlineReceive && typeof pubkey === 'string'
+						? {
+								...offlineReceive.capacity(pubkey),
+								...offlineReceive.availability(pubkey)
+						  }
+						: { maxSats: 0 };
+				const order: string[] = ((enginePrimaries()?.primaries ?? []) as any[])
+					.slice()
+					.sort((a, b) => a.selectionOrder - b.selectionOrder)
+					.map((p) => p.pubkey);
 				return {
-					...(offlineReceive?.capacity(record.lfbw.primaryPubkey) ?? {
-						maxSats: 0
-					}),
+					...forPeer(target),
 					...offlineReceive?.status(),
-					...offlineReceive?.availability(record.lfbw.primaryPubkey),
 					available: probed.offlineReceiveAvailable,
-					reason: probed.offlineReceiveReason
+					reason: probed.offlineReceiveReason,
+					peers: (order.length > 0 ? order : primaries().map((e) => e.pubkey)).map(
+						(pubkey) => ({ pubkey, ...forPeer(pubkey) })
+					)
 				};
 			}
 			case 'GET /receive/quote':
+				// A named peer is quoted as before; with none the coordinator
+				// steers through the engine's ranked list, and while that list is
+				// empty (a seed the engine has not taken yet) rank 1 serves.
 				return offlineReceive!.quote(
-					record.lfbw.primaryPubkey,
+					q.get('peer') ||
+						(enginePrimaries()?.primaries?.length > 0
+							? undefined
+							: rank1()?.pubkey),
 					Number(q.get('amountSats')),
 					q.get('requestId') ?? undefined
 				);
 			case 'POST /receive/invoice':
 				return durableInvoice(
-					await offlineReceive!.create(b, record.lfbw.primaryPubkey)
+					await offlineReceive!.create(
+						b,
+						b.peer ?? b.quote?.peer ?? rank1()?.pubkey
+					)
 				);
 			case 'GET /ffor/epochs':
 				return n.fforEpochs('R');
@@ -1189,23 +1556,23 @@ export async function createPortableRuntime(options: any) {
 					} catch {
 						decoded = null;
 					}
-					const primary: string | null = record?.lfbw?.primaryPubkey ?? null;
+					const peers = n.listPeers();
 					const why = explainNoRoute({
 						amountSats:
 							decoded?.amountSats ??
 							(Number.isSafeInteger(b.amountSats) ? b.amountSats : null),
 						destination: decoded?.payeeNodeKey ?? null,
 						hasRoutingHints: !!decoded?.routingHints?.length,
-						primaryPubkey: primary,
-						primaryConnected: n
-							.listPeers()
-							.some(
+						primaries: primaries().map((e) => ({
+							pubkey: e.pubkey,
+							connected: peers.some(
 								(p: any) =>
-									p.pubkey === primary &&
+									p.pubkey === e.pubkey &&
 									(p.connected === true ||
 										p.state === 'ready' ||
 										p.state === 'connected')
-							),
+							)
+						})),
 						channels: n.listChannels(),
 						sendableSats: Number(n.getLiquiditySnapshot().sendableSats) || 0,
 						graphChannelCount: (pubkey) =>
@@ -1443,6 +1810,9 @@ export async function createPortableRuntime(options: any) {
 				// one transaction through /channel-send (beignet #1922).
 				channelSendAvailable: ['quoteChannelSend', 'executeChannelSend', 'getChannelSend']
 					.every((name) => typeof (BeignetNode.prototype as any)?.[name] === 'function'),
+				// The runtime keeps the engine's ranked list, dials every primary
+				// and steers receives by it (coreyphillips/beignet#1924).
+				primariesAvailable: true,
 				engineVersion: ENGINE_VERSION,
 				embedded: true
 			};
@@ -1493,22 +1863,28 @@ export async function createPortableRuntime(options: any) {
 					enabled: true,
 					primaryUri: uri,
 					primaryFallbackUri: body.lfbw?.primaryFallbackUri,
-					trusted: body.lfbw?.trusted ?? true
+					trusted: body.lfbw?.trusted ?? true,
+					...(Array.isArray(body.lfbw?.primaries)
+						? { primaries: body.lfbw.primaries }
+						: {}),
+					...(body.lfbw?.primariesThresholdSat !== undefined
+						? { primariesThresholdSat: body.lfbw.primariesThresholdSat }
+						: {})
 				},
 				{ network, available: true }
 			);
-			if (
-				rules.parseNodeUri(lf.primaryUri).transport?.type === 'iroh' &&
-				!options.iroh
-			)
+			if (anyIroh(lf.primaries) && !options.iroh)
 				failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+			if (options.socketFactory?.fixedUpstream === true && lf.primaries.length > 1)
+				failure('TRANSPORT_SINGLE_PEER', SINGLE_PEER_RELAY, 409);
 			record = {
 				electrum,
 				id: randomBytes(16).toString('hex'),
 				name: body.name ?? 'My wallet',
 				network,
 				createdAt: Date.now(),
-				lfbw: lf,
+				// Unsynced: the first start writes the list to the engine.
+				lfbw: { ...lf, primariesSyncedAt: null },
 				onchainOnly: false
 			};
 			storedMnemonic = mnemonic;
@@ -1570,34 +1946,53 @@ export async function createPortableRuntime(options: any) {
 					enabled: true,
 					primaryUri: body.primaryNodeUri ?? body.primaryUri
 				};
-				const previousPrimary = rules.parseNodeUri(record.lfbw.primaryUri);
-				const previousFallback = record.lfbw.primaryFallbackUri;
+				const before = primaries();
+				const replaced = before[0];
+				const beforeIroh = anyIroh(before);
 				const nextLfbw = rules.normalizeLfbw(input, {
 					network: record.network,
 					available: true,
 					existing: record.lfbw
 				});
-				if (
-					rules.parseNodeUri(nextLfbw.primaryUri).transport?.type === 'iroh' &&
-					!options.iroh
-				)
+				// A client that names one primary replaces rank 1 and keeps the
+				// rest of the list; one that sends the list replaces the list.
+				const entries =
+					Array.isArray(input.primaries) && input.primaries.length > 0
+						? nextLfbw.primaries
+						: [
+								nextLfbw.primaries[0],
+								...before
+									.slice(1)
+									.filter((e) => e.pubkey !== nextLfbw.primaries[0].pubkey)
+						  ];
+				if (anyIroh(entries) && !options.iroh)
 					failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
-				record.lfbw = nextLfbw;
+				if (options.socketFactory?.fixedUpstream === true && entries.length > 1)
+					failure('TRANSPORT_SINGLE_PEER', SINGLE_PEER_RELAY, 409);
+				// The record is written first and marked unsynced, then the engine
+				// is brought to it: a crash between the two leaves a record the
+				// next start applies, never a list the user did not ask for.
+				record.lfbw = {
+					...nextLfbw,
+					primaries: entries,
+					...rules.primariesMirror(entries),
+					primariesSyncedAt: null
+				};
 				if (body.name) record.name = body.name;
 				persist();
-				const nextPrimary = rules.parseNodeUri(nextLfbw.primaryUri);
-				if (
-					(previousPrimary.transport?.type === 'iroh') !==
-					(nextPrimary.transport?.type === 'iroh')
-				) {
+				if (node) convergePrimaries();
+				const next = primaries()[0];
+				if (anyIroh(primaries()) !== beforeIroh) {
 					await stop();
 				} else if (
 					node &&
-					previousPrimary.pubkey === nextPrimary.pubkey &&
-					(previousPrimary.uri !== nextPrimary.uri ||
-						previousFallback !== nextLfbw.primaryFallbackUri)
+					replaced &&
+					next &&
+					replaced.pubkey === next.pubkey &&
+					(replaced.uri !== next.uri ||
+						replaced.fallbackUri !== next.fallbackUri)
 				) {
-					node.disconnectPeer(previousPrimary.pubkey);
+					node.disconnectPeer(replaced.pubkey);
 				}
 				if (!node) return start();
 				await setup();
