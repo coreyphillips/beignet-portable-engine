@@ -563,3 +563,30 @@ test('drain retries and cancellation are refused when requested after stop begin
   await stopping;
   await f.runtime.close();
 });
+
+// A primary's setup follows its connection, not only the dial setup made
+// (coreyphillips/beignet#1924): a node added while Tor was still starting
+// fails its first dial on the engine's fixed budget, and the engine's own
+// redial connects it later. The record must not keep that first failure.
+test('a primary whose setup dial failed is marked ready, its error cleared, as it connects', async () => {
+	const f = await fixture();
+	f.node.connectPeer = async () => { f.calls.push('connect'); throw Error('connect ETIMEDOUT'); };
+	try {
+		const { record } = await create(f);
+		let stored = f.registry().record;
+		assert.equal(stored.lfbw.setup, 'failed');
+		assert.equal(stored.lfbw.setupError, 'connect ETIMEDOUT');
+		assert.equal(stored.lfbw.primaries[0].setup, 'failed');
+		f.node.emit('peer:connect', PK);
+		stored = f.registry().record;
+		assert.equal(stored.lfbw.setup, 'ready');
+		assert.equal(stored.lfbw.setupError, null);
+		assert.equal(stored.lfbw.primaries[0].setup, 'ready');
+		assert.equal(stored.lfbw.primaries[0].setupError, null);
+		const shown = (await f.runtime.request({ path: '/api/wallets' })).find(r => r.id === record.id);
+		assert.equal(shown.lfbw.setup, 'ready');
+		// A stranger's connection changes nothing.
+		f.node.emit('peer:connect', '03' + '22'.repeat(32));
+		assert.equal(f.registry().record.lfbw.primaries.length, 1);
+	} finally { await f.runtime.close(); }
+});

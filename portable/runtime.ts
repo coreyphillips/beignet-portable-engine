@@ -969,7 +969,25 @@ export async function createPortableRuntime(options: any) {
 				};
 				node.on('peer:connect', (first: any) => {
 					const pubkey = peerKey(first);
-					if (!entryOf(pubkey)) return;
+					const entry = entryOf(pubkey);
+					if (!entry) return;
+					// A primary that connects is set up, whichever dial got it
+					// there. The first dial of a node added while Tor was still
+					// starting fails on the engine's fixed budget and marks the
+					// entry failed; the engine's own redial then connects it, and
+					// without this the record kept the stale failure under a
+					// connected peer until a later setup pass.
+					if (entry.setup !== 'ready' || entry.setupError) {
+						entry.setup = 'ready';
+						entry.setupError = null;
+						entry.setupAt = Date.now();
+						Object.assign(
+							record.lfbw,
+							rules.primariesMirror(primaries()),
+							rules.aggregateSetup(primaries())
+						);
+						persist();
+					}
 					probeOfflineReceive(pubkey);
 					const pending = setTimeout(() => {
 						pendingTimers.delete(pending);
