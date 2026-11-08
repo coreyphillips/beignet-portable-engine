@@ -1,3 +1,17 @@
+# Portable engine validation, 2026-11-07 addendum for 0.38.1
+
+The fork tracks Beignet **0.38.1** at `79c6848f9d99f37881d31ea80db82b8b1178bc03`, npm's `gitHead` for the release. That is the version bump #1970, whose `src/` is the same as the merge of #1969, `bb79d9b7`. This addendum supersedes the baseline statement of the 0.38.0 addendum below; the rest of that addendum still holds, since the one upstream change is confined to `estimatePayment`.
+
+All on Node 24.22.1:
+- `npm test`: 267 of 267 pass (the 0.38.0 figure predates fork #60 and #61).
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- The built bundle reports `0.38.1-portable` and is 7,550,106 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.38.1` tarball matches npm's integrity hash, and its `dist/` and `package.json` are identical to a clean build of `79c6848f`.
+- Upstream's offline suites for the change ran in an upstream `79c6848f` tree with this fork's `src/` in place of its own: `mpp-sending`, `payment-intelligence`, `mpp` and `pay-invoice-max-fee-msat`, 71 passing, the three new estimate cases among them.
+
+Not run:
+- The full `test:cli` and `test:lightning` runs, and the live regtest scripts: the change is one function of the payment estimate, which the suites above cover, and nothing in `portable/` moved.
+
 # Portable engine validation, 2026-11-05 addendum for 0.38.0
 
 The fork tracks Beignet **0.38.0** at `954d034b13f57b38297406dd0d30dddc1208b192`, npm's `gitHead` for the release. That is the version bump #1968, whose `src/` is the same as #1967's commit `c1288be0`. This addendum supersedes the baseline statement of the 0.37.0 addendum below. The patch reapplies with every hunk in place and no hand merge (see `PATCHES.md`).
