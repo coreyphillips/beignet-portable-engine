@@ -53,3 +53,41 @@ test('a usable sibling channel or a reestablished channel in FFOR keeps its live
 	t.mock.timers.tick(8000);
 	assert.deepEqual(redials, []);
 });
+
+test('a suspended reestablishment gets a new foreground deadline for its buffered reply', t => {
+	const { channels, redials, watchdog, pendingTimers } = fixture(t, ['AWAITING_REESTABLISH']);
+	watchdog.connected('primary');
+	t.mock.timers.tick(7000);
+	watchdog.setAppBackgrounded(true);
+	assert.equal(pendingTimers.size, 0);
+	t.mock.timers.tick(600000);
+	watchdog.setAppBackgrounded(false);
+	t.mock.timers.tick(7999);
+	assert.deepEqual(redials, []);
+	channels[0].state = 'NORMAL';
+	t.mock.timers.tick(1);
+	assert.deepEqual(redials, []);
+	assert.equal(pendingTimers.size, 0);
+});
+
+test('only connections still awaiting a check on return are armed, and a close cancels them', t => {
+	const { redials, watchdog, pendingTimers } = fixture(t, ['AWAITING_REESTABLISH']);
+	watchdog.setAppBackgrounded(true);
+	watchdog.connected('old');
+	watchdog.disconnected('old');
+	watchdog.connected('primary');
+	t.mock.timers.tick(600000);
+	assert.equal(pendingTimers.size, 0);
+	watchdog.setAppBackgrounded(false);
+	assert.equal(pendingTimers.size, 1);
+	t.mock.timers.tick(7999);
+	watchdog.setAppBackgrounded(false);
+	t.mock.timers.tick(1);
+	assert.deepEqual(redials, ['primary']);
+	watchdog.connected('primary');
+	watchdog.setAppBackgrounded(true);
+	watchdog.close();
+	watchdog.setAppBackgrounded(false);
+	watchdog.connected('primary');
+	assert.equal(pendingTimers.size, 0);
+});

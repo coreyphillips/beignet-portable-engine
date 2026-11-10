@@ -47,6 +47,7 @@ async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.tes
 	});
 	const node = new EventEmitter();
 	const peers = new Set();
+	const channels = [];
 	const attempts = rows.map(() => deferred());
 	const dialled = [];
 	const seen = [];
@@ -54,11 +55,12 @@ async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.tes
 	Object.assign(node, {
 		getHealth: () => ({ electrumConnected: true }),
 		getInfo: () => ({ nodeId: rows[0].pubkey }),
+		getNode: () => ({ getPeerManager: () => undefined }),
 		getRecoverySurfaceStatus: () => recovery ? { state: 'restore-required' } : {},
 		waitForInitialSync: async () => {},
 		listPrimaries: () => policy,
 		listPeers: () => [...peers].map(pubkey => ({ pubkey, state: 'connected' })),
-		listChannels: () => [],
+		listChannels: () => channels,
 		configureDirectFunding: () => {},
 		addTrustedPeer: () => {},
 		gracefulShutdown: async () => {},
@@ -86,7 +88,8 @@ async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.tes
 		socketFactory() { throw Error('Unexpected socket'); }
 	});
 	return {
-		attempts, dialled, seen, storage,
+		attempts, dialled, seen, storage, channels,
+		setAppBackgrounded: backgrounded => runtime.setAppBackgrounded(backgrounded),
 		start: () => runtime.request({ method: 'POST', path: '/api/wallets/test/start' }),
 		record: () => runtime.request({ path: '/api/wallets/test' }),
 		close: () => runtime.close()
@@ -177,4 +180,25 @@ test('a pending secondary dial cannot overwrite wallet storage after the runtime
 	f.attempts[1].resolve();
 	await settle();
 	assert.equal(f.storage.get('/wallet/registry.json'), saved);
+});
+
+test('the runtime gives a reestablish reply buffered during suspension time to arrive', async t => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const f = await fixture({ hosts: ['peer.test'] });
+	try {
+		const started = f.start();
+		f.attempts[0].resolve();
+		const record = await started;
+		const channel = { peerPubkey: record.lfbw.primaries[0].pubkey, state: 'AWAITING_REESTABLISH' };
+		f.channels.push(channel);
+		t.mock.timers.tick(7000);
+		f.setAppBackgrounded(true);
+		t.mock.timers.tick(600000);
+		f.setAppBackgrounded(false);
+		t.mock.timers.tick(7999);
+		channel.state = 'NORMAL';
+		t.mock.timers.tick(1);
+		assert.deepEqual(f.seen.filter(event => event.phase === 'primary-redial'), []);
+		assert.deepEqual(f.dialled, ['peer.test']);
+	} finally { await f.close(); }
 });

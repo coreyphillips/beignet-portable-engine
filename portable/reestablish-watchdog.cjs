@@ -7,16 +7,23 @@ const MAX_REDIALS = 3;
 function reestablishWatchdog({ node, pendingTimers, canRedial, redial }) {
 	const timers = new Map();
 	const attempts = new Map();
+	let backgrounded = false;
+	let closed = false;
 	function disconnected(pubkey) {
 		const previous = timers.get(pubkey);
-		if (previous !== undefined) {
+		if (previous != null) {
 			clearTimeout(previous);
 			pendingTimers.delete(previous);
-			timers.delete(pubkey);
 		}
+		timers.delete(pubkey);
 	}
 	function connected(pubkey) {
+		if (closed) return;
 		disconnected(pubkey);
+		if (backgrounded) {
+			timers.set(pubkey, null);
+			return;
+		}
 		const timer = setTimeout(() => {
 			if (timers.get(pubkey) !== timer) return;
 			timers.delete(pubkey);
@@ -38,7 +45,19 @@ function reestablishWatchdog({ node, pendingTimers, canRedial, redial }) {
 		timers.set(pubkey, timer);
 		pendingTimers.add(timer);
 	}
-	return { connected, disconnected };
+	function setAppBackgrounded(value) {
+		if (closed || value === backgrounded) return;
+		backgrounded = value;
+		// Keep only the connections with an outstanding check. A return gives
+		// their queued channel_reestablish replies a full foreground deadline.
+		for (const pubkey of [...timers.keys()]) connected(pubkey);
+	}
+	function close() {
+		closed = true;
+		for (const pubkey of timers.keys()) disconnected(pubkey);
+		attempts.clear();
+	}
+	return { connected, disconnected, setAppBackgrounded, close };
 }
 
 module.exports = { reestablishWatchdog };

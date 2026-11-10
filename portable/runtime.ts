@@ -133,6 +133,7 @@ export async function createPortableRuntime(options: any) {
 	};
 	let node: BeignetNode | undefined;
 	let appBackgrounded = false;
+	let activeWatchdog: ReturnType<typeof reestablishWatchdog> | undefined;
 	let offlineReceive: OfflineReceive | undefined;
 	let receiveTimer: any;
 	let closed = false,
@@ -148,6 +149,8 @@ export async function createPortableRuntime(options: any) {
 	// A stop or close releases requests waiting for graph restore or primary transport.
 	const stopWaits = new Set<() => void>();
 	const endWaits = () => {
+		activeWatchdog?.close();
+		activeWatchdog = undefined;
 		for (const end of stopWaits) end();
 		stopWaits.clear();
 	};
@@ -994,6 +997,8 @@ export async function createPortableRuntime(options: any) {
 						void redialPrimary(entryOf(pubkey), { force: true });
 					}
 				});
+				activeWatchdog = watchdog;
+				watchdog.setAppBackgrounded(appBackgrounded);
 				node.on('peer:disconnect', (peer: any) => watchdog.disconnected(peerKey(peer)));
 				node.on('peer:connect', (first: any) => {
 					if (closed || stopPromise || node !== connectedNode) return;
@@ -2050,6 +2055,7 @@ export async function createPortableRuntime(options: any) {
 		setAppBackgrounded(backgrounded: boolean) {
 			if (closed || appBackgrounded === backgrounded) return;
 			appBackgrounded = backgrounded;
+			activeWatchdog?.setAppBackgrounded(backgrounded);
 			node?.getNode().getPeerManager()?.setAppBackgrounded(backgrounded);
 		},
 		async close() {
