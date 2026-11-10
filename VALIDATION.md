@@ -1,3 +1,22 @@
+# Portable engine validation, 2026-11-10 addendum for 0.38.4
+
+The fork tracks Beignet **0.38.4** at `5970f941a067b252e19214db47971260c93dcd95`, npm's `gitHead` for the release. That is the version bump #1979, whose `src/` is the same as the merge of #1977, `b346727f`. This addendum supersedes the baseline statement of the 0.38.1 addendum below. The patch reapplies with every hunk at its recorded line and no hand merge (see `PATCHES.md`).
+
+All on Node 24.22.1:
+- `npm test`: 267 of 267 pass.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 21 errors, the same as the 0.38.1 tree.
+- The built bundle reports `0.38.4-portable` and is 7,552,456 bytes. The build prints no esbuild warnings.
+- The published `beignet@0.38.4` tarball matches npm's integrity hash (`sha512-arCoqiXB...qGFIUew==`), and its `dist/` and `package.json` are identical to a clean build of `5970f941`.
+- Upstream's offline suites ran in an upstream `5970f941` tree with this fork's `src/` in place of its own, after `npm run build`:
+  - `test:cli` passes, 2,559 tests.
+  - `test:lightning` runs 10,175 passing and 19 failing: the 19 known failures listed in `PATCHES.md`. The three new pong deadline cases pass.
+  - The isolated watch-only and PSBT suites (the ones upstream's CI runs apart from live Electrum) pass, 326 tests.
+- Upstream's CI ran its on-chain regtest suites on bitcoinjs-lib 6.1.10 (#1978) and on the pong deadline change (#1977), both green before they merged.
+
+Not run:
+- The live regtest scripts (`regtest.cjs`, `regtest-channelize.cjs`, `regtest-send-max.cjs`, `regtest-ffor.cjs`): the stand-in byte relay the earlier runs used is no longer on this machine. The change that touches live connections, the pong deadline, is covered by its own cases above and by upstream's CI.
+
 # Portable engine validation, 2026-11-07 addendum for 0.38.1
 
 The fork tracks Beignet **0.38.1** at `79c6848f9d99f37881d31ea80db82b8b1178bc03`, npm's `gitHead` for the release. That is the version bump #1970, whose `src/` is the same as the merge of #1969, `bb79d9b7`. This addendum supersedes the baseline statement of the 0.38.0 addendum below; the rest of that addendum still holds, since the one upstream change is confined to `estimatePayment`.
