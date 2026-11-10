@@ -145,11 +145,21 @@ export async function createPortableRuntime(options: any) {
 	let activity: any[] = load('/wallet/activity.json', []);
 	let startPromise: Promise<any> | undefined;
 	let stopPromise: Promise<any> | undefined;
-	// Requests waiting for the network map; a close or stop ends their wait.
-	const graphWaits = new Set<() => void>();
-	const endGraphWaits = () => {
-		for (const end of graphWaits) end();
-		graphWaits.clear();
+	// A stop or close releases requests waiting for graph restore or primary transport.
+	const stopWaits = new Set<() => void>();
+	const endWaits = () => {
+		for (const end of stopWaits) end();
+		stopWaits.clear();
+	};
+	const waitWhileRunning = async (work: Promise<unknown>) => {
+		let end!: () => void;
+		const ended = new Promise<void>((resolve) => { end = resolve; });
+		stopWaits.add(end);
+		try {
+			await Promise.race([work, ended]);
+		} finally {
+			stopWaits.delete(end);
+		}
 	};
 	let drainGeneration = 0;
 	// The home channel's last splice conflict or revert (beignet #760), and
@@ -224,7 +234,7 @@ export async function createPortableRuntime(options: any) {
 		busy: () => {
 			const engine = node?.getNode();
 			const requests = engine?.getDirectFundingRequests();
-			return busy || setupRunning || directFundingInFlight > 0 ||
+			return busy || !!setupRunning || directFundingInFlight > 0 ||
 				mutations.pending() > 0 ||
 				(engine?.getDirectFundingReceiver()?.inflightCount() ?? 0) > 0 ||
 				(requests?.activeFundings().length ?? 0) > 0 ||
@@ -495,7 +505,7 @@ export async function createPortableRuntime(options: any) {
 		}, 0);
 		pendingTimers.add(pending);
 	};
-	let setupRunning = false;
+	let setupRunning: Promise<void> | undefined;
 	/**
 	 * A primary that did not answer at start (Tor still bootstrapping, a relay
 	 * not yet up) used to wait for the next poll, a minute away, before the
@@ -518,17 +528,19 @@ export async function createPortableRuntime(options: any) {
 		}, SETUP_RETRY_MS[attempt]);
 		pendingTimers.add(pending);
 	};
-	const setup = async () => {
-		if (!node || !record || setupRunning) return;
-		setupRunning = true;
+	const setup = async (onReady?: () => void) => {
+		if (!node || !record || closed || stopPromise) return;
+		if (setupRunning) return setupRunning;
+		setupRunning = runSetup(onReady);
 		try {
-			await runSetup();
+			await setupRunning;
 		} finally {
-			setupRunning = false;
+			setupRunning = undefined;
 		}
 	};
-	const runSetup = async () => {
+	const runSetup = async (onReady?: () => void) => {
 		if (!node || !record) return;
+		const owner = node;
 		const held = recoveryHold();
 		// The initial recovery connection retrieves storage only. Leave direct
 		// funding disabled until the existing channel state has been installed.
@@ -567,24 +579,49 @@ export async function createPortableRuntime(options: any) {
 		// Every primary is trusted (or not) and dialled, each on its own: one
 		// that is down marks only its own entry failed, and the list is ready
 		// as soon as any of them answers.
-		await Promise.all(entries.map((entry) => setupEntry(entry, held)));
-		Object.assign(record.lfbw, rules.aggregateSetup(entries));
+		await Promise.all(entries.map(async (entry) => {
+			await setupEntry(entry, held);
+			if (onReady && entries.length > 1 && !closed && !stopPromise && node === owner &&
+				!held && !recoveryHold() &&
+				entryOf(entry.pubkey)?.setup === 'ready' && peerConnected(entry.pubkey)) {
+				if (record.lfbw.setup !== 'ready') {
+					Object.assign(record.lfbw, rules.aggregateSetup(primaries()));
+					persist();
+				}
+				onReady();
+				onReady = undefined;
+			}
+		}));
+		if (closed || stopPromise || node !== owner) return;
+		Object.assign(record.lfbw, rules.aggregateSetup(primaries()));
 		persist();
 	};
 	const setupEntry = async (entry: any, held: any) => {
-		if (!node) return;
+		const owner = node;
+		if (!owner || closed || stopPromise) return;
+		// An edit can reorder, remove or replace an entry during a slow dial.
+		const currentEntry = () => {
+			const current = entryOf(entry.pubkey);
+			return !closed && !stopPromise && node === owner && current?.uri === entry.uri
+				? current : undefined;
+		};
 		try {
 			const p = parsedPrimary(entry);
 			if (!held) {
-				if (entry.trusted !== false) node.addTrustedPeer(p.pubkey);
-				else node.removeTrustedPeer(p.pubkey);
+				if (entry.trusted !== false) owner.addTrustedPeer(p.pubkey);
+				else owner.removeTrustedPeer(p.pubkey);
 			}
 			try {
-				await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
+				if (options.preparePrimaryDial) {
+					await waitWhileRunning(options.preparePrimaryDial(p.host));
+					if (!currentEntry()) return;
+					if (!held && recoveryHold()) return;
+				}
+				await waitWhileRunning(owner.connectPeer(p.pubkey, p.host, p.port, p.transport));
 			} catch (error) {
-				if (nodeUnavailable()) return;
+				if (!currentEntry() || nodeUnavailable()) return;
 				if (
-					!node
+					!owner
 						.listPeers()
 						.some(
 							(peer) => peer.pubkey === p.pubkey && peer.state === 'connected'
@@ -592,10 +629,14 @@ export async function createPortableRuntime(options: any) {
 				)
 					throw error;
 			}
+			entry = currentEntry();
+			if (!entry) return;
 			entry.setup = 'ready';
 			entry.setupError = null;
 			entry.setupAt = Date.now();
 		} catch (error: any) {
+			entry = currentEntry();
+			if (!entry) return;
 			options.onDiagnostic?.({
 				phase: 'primary-connect',
 				message:
@@ -766,7 +807,8 @@ export async function createPortableRuntime(options: any) {
 			const added = entryOf(addedKey);
 			if (added) {
 				await setupEntry(added, recoveryHold());
-				Object.assign(record.lfbw, rules.aggregateSetup(after));
+				if (closed || stopPromise || !node) return;
+				Object.assign(record.lfbw, rules.aggregateSetup(primaries()));
 				persist();
 				probeOfflineReceive(added.pubkey);
 			}
@@ -954,6 +996,7 @@ export async function createPortableRuntime(options: any) {
 				});
 				node.on('peer:disconnect', (peer: any) => watchdog.disconnected(peerKey(peer)));
 				node.on('peer:connect', (first: any) => {
+					if (closed || stopPromise || node !== connectedNode) return;
 					const pubkey = peerKey(first);
 					const entry = entryOf(pubkey);
 					if (!entry) return;
@@ -980,6 +1023,7 @@ export async function createPortableRuntime(options: any) {
 				// A transport error on a primary's connection is followed by a
 				// redial after a short pause, rather than waiting for the poll.
 				node.on('peer:error', (first: any) => {
+					if (closed || stopPromise || node !== connectedNode) return;
 					const pubkey = peerKey(first);
 					if (!entryOf(pubkey)) return;
 					const pending = setTimeout(() => {
@@ -1007,7 +1051,17 @@ export async function createPortableRuntime(options: any) {
 				// one primary, a record edited while stopped is applied, and an
 				// engine list the record never saw is taken as read.
 				convergePrimaries();
-				await setup();
+				const setupNode = node;
+				let ready!: () => void;
+				const firstReady = new Promise<void>((resolve) => { ready = resolve; });
+				// Finish startup after the first usable primary. The full setup keeps
+				// running and owns the retry for any peer whose dial later fails.
+				const allSettled = setup(ready).then(() => {
+					if (!closed && !stopPromise && node === setupNode && anySetupFailed())
+						retrySetupSoon();
+				});
+				await Promise.race([firstReady, allSettled]);
+				if (closed || stopPromise) return publicRecord();
 				// The engine's own reconnect can bring a primary up before the
 				// coordinator exists, and setup() joins a dial already in flight,
 				// so a primary that is connected but unasked by now is asked here.
@@ -1018,7 +1072,6 @@ export async function createPortableRuntime(options: any) {
 				}, 2000);
 				void syncDrain().catch(() => {});
 				if (!recoveryHold()) void offlineReceive.sync().catch(() => {});
-				if (anySetupFailed()) retrySetupSoon();
 				lastSplice = null;
 				unpairedFunding = null;
 				lastOffer = null;
@@ -1114,7 +1167,7 @@ export async function createPortableRuntime(options: any) {
 				// network map resumes onto the node being torn down.
 				const old = node;
 				node = undefined;
-				endGraphWaits();
+				endWaits();
 				if (old) await old.destroy().catch(() => {});
 				throw error;
 			}
@@ -1128,7 +1181,7 @@ export async function createPortableRuntime(options: any) {
 	const stop = async () => {
 		if (stopPromise) return stopPromise;
 		drainGeneration++;
-		endGraphWaits();
+		endWaits();
 		stopPromise = (async () => {
 			const deadline = Date.now() + STOP_DEADLINE_MS;
 			// A start in flight may be waiting on a cold Tor bootstrap, which is
@@ -1329,16 +1382,7 @@ export async function createPortableRuntime(options: any) {
 		if (ROUTE_FINDING.has(route) && n.isGraphRestoring?.()) {
 			// A stop already under way has ended the waits it found.
 			if (stopPromise) failure('WALLET_STOPPED', 'Start your wallet first', 409);
-			let end!: () => void;
-			const ended = new Promise<void>((resolve) => {
-				end = resolve;
-			});
-			graphWaits.add(end);
-			try {
-				await Promise.race([n.whenGraphRestored(), ended]);
-			} finally {
-				graphWaits.delete(end);
-			}
+			await waitWhileRunning(n.whenGraphRestored());
 			// The wallet may have closed, stopped or been held for recovery
 			// while this waited, and its node with it.
 			if (closed) failure('WALLET_CLOSED', 'Wallet runtime closed', 409);
@@ -1978,6 +2022,7 @@ export async function createPortableRuntime(options: any) {
 					node.disconnectPeer(replaced.pubkey);
 				}
 				if (!node) return start();
+				if (setupRunning) await setupRunning;
 				await setup();
 				return publicRecord();
 			}
@@ -2012,7 +2057,7 @@ export async function createPortableRuntime(options: any) {
 			if (closing) return closing;
 			closed = true;
 			drainGeneration++;
-			endGraphWaits();
+			endWaits();
 			closing = (async () => {
 				try {
 					await Promise.allSettled(Array.from(inFlight));
