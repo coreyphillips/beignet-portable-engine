@@ -29,6 +29,7 @@ import { closeNotStarted } from './drain-close-state.cjs';
 import { reconcileSpliceRow, watchBroadcastErrors } from './splice-status.cjs';
 import { engineDiagnostics } from './engine-diagnostics.cjs';
 import { peerDiagnostic } from './peer-diagnostics.cjs';
+import { reestablishWatchdog } from './reestablish-watchdog.cjs';
 import { readRecoveryImport, validateRecoveryImport, recoveryRefusal, hasInstalledRecovery } from './recovery';
 export { createRelaySocketFactory } from './relay';
 export { IrohTransport, IROH_ALPN } from '../src/lightning/transport/iroh';
@@ -939,31 +940,19 @@ export async function createPortableRuntime(options: any) {
 					activity,
 					save: () => save('/wallet/activity.json', activity)
 				});
-				// A first connection after a cold start has been seen to come up
-				// dead: the handshake completes, the primary never answers
-				// channel_reestablish, and nothing notices until the first ping
-				// fails thirty seconds later. Reestablishment gets
-				// REESTABLISH_WATCHDOG_MS after a connect; a home channel still not
-				// usable by then, with the peer still listed as connected, is
-				// dialled again rather than waited on. Bounded per start so a
-				// primary that genuinely cannot reestablish is not hammered.
-				const REESTABLISH_WATCHDOG_MS = 8000;
-				const REESTABLISH_REDIALS_MAX = 3;
-				const reestablishRedials = new Map<string, number>();
-				const channelsUsableWith = (pubkey: string): boolean => {
-					const mine = node!
-						.listChannels()
-						.filter(
-							(c: any) =>
-								c.peerPubkey === pubkey &&
-								c.state !== 'CLOSED' &&
-								c.state !== 'FORCE_CLOSED'
-						);
-					return (
-						mine.length === 0 ||
-						mine.some((c: any) => c.htlcUsable ?? c.state === 'NORMAL')
-					);
-				};
+				const connectedNode = node;
+				const watchdog = reestablishWatchdog({
+					node,
+					pendingTimers,
+					canRedial: (pubkey: string) =>
+						!closed && !stopPromise && node === connectedNode &&
+						!recoveryHold() && peerConnected(pubkey),
+					redial: (pubkey: string, message: string) => {
+						options.onDiagnostic?.({ phase: 'primary-redial', message });
+						void redialPrimary(entryOf(pubkey), { force: true });
+					}
+				});
+				node.on('peer:disconnect', (peer: any) => watchdog.disconnected(peerKey(peer)));
 				node.on('peer:connect', (first: any) => {
 					const pubkey = peerKey(first);
 					const entry = entryOf(pubkey);
@@ -986,28 +975,7 @@ export async function createPortableRuntime(options: any) {
 						persist();
 					}
 					probeOfflineReceive(pubkey);
-					const pending = setTimeout(() => {
-						pendingTimers.delete(pending);
-						if (closed || !node) return;
-						if (recoveryHold()) return;
-						if (channelsUsableWith(pubkey)) {
-							reestablishRedials.delete(pubkey);
-							return;
-						}
-						const redials = reestablishRedials.get(pubkey) ?? 0;
-						if (
-							!peerConnected(pubkey) ||
-							redials >= REESTABLISH_REDIALS_MAX
-						)
-							return;
-						reestablishRedials.set(pubkey, redials + 1);
-						options.onDiagnostic?.({
-							phase: 'primary-redial',
-							message: `channel not usable ${REESTABLISH_WATCHDOG_MS / 1000}s after connecting, dialling again (${redials + 1}/${REESTABLISH_REDIALS_MAX})`
-						});
-						void redialPrimary(entryOf(pubkey), { force: true });
-					}, REESTABLISH_WATCHDOG_MS);
-					pendingTimers.add(pending);
+					watchdog.connected(pubkey);
 				});
 				// A transport error on a primary's connection is followed by a
 				// redial after a short pause, rather than waiting for the poll.
