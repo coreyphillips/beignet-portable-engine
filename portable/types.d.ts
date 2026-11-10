@@ -68,6 +68,8 @@ export interface PortableRuntimeOptions {
 	electrum?: TransportTarget;
 }
 export interface PortableRuntime {
+	/** Notify synchronously at background and foreground transitions so peer deadlines survive suspension. */
+	setAppBackgrounded(backgrounded: boolean): void;
 	request(input: {
 		method?: string;
 		path: string;

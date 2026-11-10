@@ -169,6 +169,42 @@ async function create(f, extra = {}) {
 }
 const statusPath = id => `/wallets/${id}/api/recovery/status`;
 
+test('the runtime forwards background state across node creation and stops on close', async () => {
+	const f = await fixture();
+	const states = [];
+	f.node.getNode = () => ({
+		getPeerManager: () => ({ setAppBackgrounded: value => states.push(value) })
+	});
+	try {
+		f.runtime.setAppBackgrounded(true);
+		await create(f);
+		f.runtime.setAppBackgrounded(false);
+		f.runtime.setAppBackgrounded(false);
+		assert.deepEqual(states, [true, false]);
+	} finally {
+		await f.runtime.close();
+	}
+	f.runtime.setAppBackgrounded(true);
+	assert.deepEqual(states, [true, false]);
+});
+
+test('a transport-error retry joins an absent peer dial and clears a stale registered peer', async () => {
+	for (const stale of [false, true]) {
+		const f = await fixture();
+		try {
+			await create(f);
+			f.calls.length = 0;
+			f.node.listPeers = () => stale ? [{ pubkey: PK, state: 'disconnected' }] : [];
+			f.node.emit('peer:error', { pubkey: PK, message: 'Pong timeout' });
+			await f.tick();
+			const dials = f.calls.filter(call => call === 'disconnect' || call === 'connect');
+			assert.deepEqual(dials, stale ? ['disconnect', 'connect'] : ['connect']);
+		} finally {
+			await f.runtime.close();
+		}
+	}
+});
+
 test('peer recovery requires a boolean opt-in and an explicit valid phrase before persistence or network', async () => {
 	for (const extra of [
 		{ recoveryAutoApply: 'true' }, { recoveryAutoApply: null },

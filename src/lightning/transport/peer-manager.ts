@@ -379,6 +379,7 @@ export class PeerManager extends EventEmitter {
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private peers: Map<string, Peer> = new Map();
+	private appBackgrounded = false;
 	private peerAddresses: Map<
 		string,
 		{ host: string; port: number; transport?: IPeerTransportOptions }
@@ -802,6 +803,7 @@ export class PeerManager extends EventEmitter {
 		this.setupPeerListeners(pubkey, peer);
 		// Visible to freezeConnections() while establishing: a freeze aborts
 		// the handshake instead of letting it complete and register later.
+		peer.setAppBackgrounded(this.appBackgrounded);
 		this.pendingPeers.add(peer);
 		// Visible to disconnectPeer() while establishing: an explicit
 		// cancellation aborts the handshake NOW instead of leaving the
@@ -1468,6 +1470,15 @@ export class PeerManager extends EventEmitter {
 		peer.sendMessage(type, payload);
 	}
 
+	/** Forward the mobile lifecycle to established peers and unfinished handshakes. */
+	setAppBackgrounded(backgrounded: boolean): void {
+		if (this.appBackgrounded === backgrounded) return;
+		this.appBackgrounded = backgrounded;
+		for (const peer of this.peers.values()) peer.setAppBackgrounded(backgrounded);
+		for (const peer of this.lanePeers.values()) peer.setAppBackgrounded(backgrounded);
+		for (const peer of this.pendingPeers) peer.setAppBackgrounded(backgrounded);
+	}
+
 	/**
 	 * Get a connected peer by pubkey.
 	 */
@@ -1874,6 +1885,7 @@ export class PeerManager extends EventEmitter {
 		});
 
 		// Visible to freezeConnections() while the handshake is in flight.
+		peer.setAppBackgrounded(this.appBackgrounded);
 		this.pendingPeers.add(peer);
 		this.pendingInbound.set(peer, addressKey);
 

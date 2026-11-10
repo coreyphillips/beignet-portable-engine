@@ -131,6 +131,7 @@ export async function createPortableRuntime(options: any) {
 		}));
 	};
 	let node: BeignetNode | undefined;
+	let appBackgrounded = false;
 	let offlineReceive: OfflineReceive | undefined;
 	let receiveTimer: any;
 	let closed = false,
@@ -419,25 +420,15 @@ export async function createPortableRuntime(options: any) {
 	};
 	/** Rank 1: the direct-funding policy's liquidity peer, the path a request the list cannot bind falls back to. */
 	const primary = () => parsedPrimary(rank1());
-	/** Whether a primary is a connected peer right now. */
-	const peerConnected = (pubkey: unknown) =>
-		typeof pubkey === 'string' &&
-		!!node &&
-		!nodeUnavailable() &&
-		node
-			.listPeers()
-			.some(
-				(peer) =>
-					peer.pubkey === pubkey &&
-					(peer.state === 'connected' || peer.state === 'ready')
-			);
-	/**
-	 * Dial a primary again after it was lost. The engine drops a peer for a
-	 * transport error without telling its peer manager, which then keeps a
-	 * disconnected entry, schedules no reconnect and lets connectPeer return
-	 * early on the entry it holds; disconnecting first clears it. One redial
-	 * at a time per primary.
-	 */
+	const registeredPeer = (pubkey: unknown) =>
+		typeof pubkey === 'string' && node && !nodeUnavailable()
+			? node.listPeers().find((peer) => peer.pubkey === pubkey)
+			: undefined;
+	const peerConnected = (pubkey: unknown) => {
+		const state = registeredPeer(pubkey)?.state;
+		return state === 'connected' || state === 'ready';
+	};
+	/** Join a pending dial when the manager has already removed the lost peer. */
 	const redialing = new Set<string>();
 	const redialPrimary = async (entry: any, opts: { force?: boolean } = {}) => {
 		if (!entry || redialing.has(entry.pubkey) || closed || !node) return;
@@ -447,9 +438,13 @@ export async function createPortableRuntime(options: any) {
 		redialing.add(entry.pubkey);
 		try {
 			const p = parsedPrimary(entry);
-			try {
-				node.disconnectPeer(p.pubkey);
-			} catch {}
+			// A stale registered entry makes connectPeer return immediately.
+			// With no entry, disconnectPeer would abort a viable pending dial.
+			if (registeredPeer(p.pubkey)) {
+				try {
+					node.disconnectPeer(p.pubkey);
+				} catch {}
+			}
 			await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
 			options.onDiagnostic?.({
 				phase: 'primary-redial',
@@ -889,6 +884,7 @@ export async function createPortableRuntime(options: any) {
 						if (error.code === 'PERSISTENCE_ERROR') durabilityFailed = true;
 					}
 				}));
+				if (appBackgrounded) node.getNode().getPeerManager()?.setAppBackgrounded(true);
 				// How the stored network map came back inside create().
 				enginePerf.graphRestored(node);
 				// On mainnet create() starts the boot Rapid Gossip Sync in the
@@ -899,6 +895,7 @@ export async function createPortableRuntime(options: any) {
 				if (importPending() && hasInstalledRecovery(node)) completeRecoveryImport();
 				node.on('recovery:restored', () => {
 					try {
+						if (appBackgrounded) node?.getNode().getPeerManager()?.setAppBackgrounded(true);
 						completeRecoveryImport();
 						// The native wrapper rebuilt its node and policy in process.
 						const pending = setTimeout(() => {
@@ -2037,6 +2034,11 @@ export async function createPortableRuntime(options: any) {
 	}
 	return {
 		request,
+		setAppBackgrounded(backgrounded: boolean) {
+			if (closed || appBackgrounded === backgrounded) return;
+			appBackgrounded = backgrounded;
+			node?.getNode().getPeerManager()?.setAppBackgrounded(backgrounded);
+		},
 		async close() {
 			if (released) return;
 			if (closing) return closing;
