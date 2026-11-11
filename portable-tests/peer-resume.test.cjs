@@ -111,3 +111,61 @@ test('foreground pings still expire sixty seconds after the oldest unanswered pi
 	tick(1);
 	assert.deepEqual(errors, ['Pong timeout']);
 });
+
+test('repeated short visits keep the first ping and its original deadline', t => {
+	const { peer, tick, sent, errors } = livePeer(t);
+	for (let visit = 0; visit < 4; visit++) {
+		for (let second = 0; second < 24; second++) tick(1000);
+		peer.setAppBackgrounded(true);
+		tick(1000);
+		peer.setAppBackgrounded(false);
+	}
+	assert.equal(sent[0], 30001);
+	assert.deepEqual(errors, ['Pong timeout']);
+	assert.equal(peer.getState(), 'disconnected');
+});
+
+test('a short return sends a ping whose interval fired before the active event', t => {
+	const { peer, tick, sent } = livePeer(t);
+	tick(29500);
+	peer.setAppBackgrounded(true);
+	tick(1000);
+	assert.equal(sent.length, 0);
+	peer.setAppBackgrounded(false);
+	assert.equal(sent.length, 1);
+});
+
+test('one-second app switches consume a single grace period for an overdue ping', t => {
+	const { peer, tick, errors } = livePeer(t);
+	tick(30000);
+	tick(59000);
+	peer.setAppBackgrounded(true);
+	tick(1000);
+	peer.setAppBackgrounded(false);
+	for (let visit = 0; visit < 4; visit++) {
+		tick(1000);
+		peer.setAppBackgrounded(true);
+		tick(1000);
+		peer.setAppBackgrounded(false);
+	}
+	tick(999);
+	assert.equal(peer.getState(), 'ready');
+	tick(1);
+	assert.deepEqual(errors, ['Pong timeout']);
+});
+
+test('a queued pong in the remaining grace period keeps the peer connected', t => {
+	const { peer, tick, pong, errors } = livePeer(t);
+	peer.setAppBackgrounded(true);
+	tick(65000);
+	peer.setAppBackgrounded(false);
+	tick(3000);
+	peer.setAppBackgrounded(true);
+	tick(1000);
+	peer.setAppBackgrounded(false);
+	tick(1900);
+	pong();
+	tick(1000);
+	assert.deepEqual(errors, []);
+	assert.equal(peer.getState(), 'ready');
+});

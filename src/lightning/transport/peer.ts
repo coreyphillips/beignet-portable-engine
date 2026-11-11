@@ -155,6 +155,9 @@ export class Peer extends EventEmitter {
 	private pingTimer: ReturnType<typeof setInterval> | null = null;
 	private pongTimer: ReturnType<typeof setTimeout> | null = null;
 	private pongDueAt: number | null = null;
+	private pingDueWhileAway = false;
+	// One foreground budget for this unanswered probe, shared across interruptions.
+	private resumePongRemainingMs: number | null = null;
 	private backgroundedAt: number | null = null;
 	private backgroundPongAt: number | null = null;
 	private pingIntervalMs: number;
@@ -1014,43 +1017,51 @@ export class Peer extends EventEmitter {
 		if (backgrounded) {
 			this.backgroundedAt = now;
 			this.backgroundPongAt = null;
-			// Keep the outstanding deadline as data. An overdue native timer can
-			// otherwise run before both the active notification and a buffered pong.
-			this.clearPingTimers();
+			// Defuse the overdue reply callback before the host pauses its timers.
+			// The ordinary ping interval keeps its cadence across short app switches.
+			if (this.resumePongRemainingMs !== null && this.pongDueAt !== null) {
+				this.resumePongRemainingMs = Math.min(
+					this.resumePongRemainingMs, Math.max(0, this.pongDueAt - now)
+				);
+			}
+			this.clearPongTimer();
 			return;
 		}
-		const awayMs = now - this.backgroundedAt!;
+		const longReturn = now - this.backgroundedAt! >= LONG_BACKGROUND_MS;
 		this.backgroundedAt = null;
 		if (this.state !== 'ready') return;
-		this.startPingTimer();
-		const dueAt = this.pongDueAt;
-		this.pongDueAt = null;
+		const pingDue = this.pingDueWhileAway;
+		this.pingDueWhileAway = false;
 		const grace = Math.min(RESUME_PONG_TIMEOUT_MS, this.pongTimeoutMs);
-		if (awayMs >= LONG_BACKGROUND_MS) {
+		if (this.resumePongRemainingMs !== null) {
+			// A second trip through the background must not replenish this probe.
+			this.armPongTimer(this.resumePongRemainingMs);
+		} else if (longReturn) {
 			// A pong just processed on unfreeze already proved this connection.
-			if (this.backgroundPongAt === null || now - this.backgroundPongAt >= grace) {
-				this.sendPing(grace);
-			}
-		} else if (dueAt !== null) {
-			// A brief interruption keeps the original budget, with enough time
-			// to process a queued answer when that deadline was already near.
-			this.sendPing(Math.min(this.pongTimeoutMs, Math.max(grace, dueAt - now)));
+			if (this.backgroundPongAt !== null && now - this.backgroundPongAt < grace) return;
+			this.resumePongRemainingMs = grace;
+			this.armPongTimer(grace);
+			this.sendPing();
+			return;
+		} else if (this.pongDueAt !== null) {
+			const remaining = Math.min(this.pongTimeoutMs, this.pongDueAt - now);
+			if (remaining < grace) this.resumePongRemainingMs = grace;
+			this.armPongTimer(Math.max(grace, remaining));
 		}
+		if (longReturn || pingDue) this.sendPing();
 	}
 
 	private startPingTimer(): void {
-		if (this.backgroundedAt !== null) return;
 		this.pingTimer = setInterval(() => {
-			this.sendPing();
+			// On Android a due interval can run on either side of the active
+			// notification. Deliver one missed ping when the host is ready.
+			if (this.backgroundedAt !== null) this.pingDueWhileAway = true;
+			else this.sendPing();
 		}, this.pingIntervalMs);
 		this.pingTimer.unref?.();
 	}
 
-	private clearPingTimers(): void {
-		if (this.pingTimer !== null) {
-			clearInterval(this.pingTimer);
-			this.pingTimer = null;
-		}
+	private clearPongTimer(): void {
 		if (this.pongTimer !== null) {
 			clearTimeout(this.pongTimer);
 			this.pongTimer = null;
@@ -1058,26 +1069,34 @@ export class Peer extends EventEmitter {
 	}
 
 	private stopPingTimer(): void {
-		this.clearPingTimers();
+		if (this.pingTimer !== null) {
+			clearInterval(this.pingTimer);
+			this.pingTimer = null;
+		}
+		this.clearPongTimer();
 		this.pongDueAt = null;
+		this.resumePongRemainingMs = null;
 		this.backgroundPongAt = null;
+		this.pingDueWhileAway = false;
 	}
 
-	private sendPing(timeoutMs = this.pongTimeoutMs): void {
+	private armPongTimer(timeoutMs: number): void {
+		this.pongDueAt = Date.now() + timeoutMs;
+		const timer = setTimeout(() => {
+			if (this.pongTimer !== timer) return;
+			this.pongTimer = null;
+			this.pongDueAt = null;
+			this.emit('error', new Error('Pong timeout'));
+			this.disconnect();
+		}, timeoutMs);
+		this.pongTimer = timer;
+	}
+
+	private sendPing(): void {
 		if (this.state !== 'ready' || this.backgroundedAt !== null) return;
 		// Keep the deadline of the oldest unanswered ping. Arm before writing
 		// so a synchronous reply or socket close can clear it too.
-		if (this.pongTimer === null) {
-			this.pongDueAt = Date.now() + timeoutMs;
-			const timer = setTimeout(() => {
-				if (this.pongTimer !== timer) return;
-				this.pongTimer = null;
-				this.pongDueAt = null;
-				this.emit('error', new Error('Pong timeout'));
-				this.disconnect();
-			}, timeoutMs);
-			this.pongTimer = timer;
-		}
+		if (this.pongTimer === null) this.armPongTimer(this.pongTimeoutMs);
 		try {
 			this.sendMessage(MessageType.PING, encodePingMessage(1, 0));
 		} catch {
@@ -1103,10 +1122,8 @@ export class Peer extends EventEmitter {
 			this.backgroundPongAt = Date.now();
 		}
 		this.pongDueAt = null;
-		if (this.pongTimer !== null) {
-			clearTimeout(this.pongTimer);
-			this.pongTimer = null;
-		}
+		this.resumePongRemainingMs = null;
+		this.clearPongTimer();
 	}
 
 	// ─── Socket helpers ────────────────────────────────────────
