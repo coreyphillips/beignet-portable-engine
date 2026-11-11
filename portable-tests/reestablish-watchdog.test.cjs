@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const { reestablishWatchdog } = require('../portable/reestablish-watchdog.cjs');
 
 function fixture(t, states) {
-	t.mock.timers.enable({ apis: ['setTimeout'] });
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1 });
 	const channels = states.map(state => ({ peerPubkey: 'primary', state }));
 	const redials = [];
 	const pendingTimers = new Set();
@@ -89,5 +89,26 @@ test('only connections still awaiting a check on return are armed, and a close c
 	watchdog.close();
 	watchdog.setAppBackgrounded(false);
 	watchdog.connected('primary');
+	assert.equal(pendingTimers.size, 0);
+});
+
+test('short foreground visits spend the same grace period for an unanswered channel', t => {
+	const { redials, watchdog, pendingTimers } = fixture(t, ['AWAITING_REESTABLISH']);
+	watchdog.connected('primary');
+	t.mock.timers.tick(7000);
+	watchdog.setAppBackgrounded(true);
+	t.mock.timers.tick(65000);
+	for (let visit = 0; visit < 3; visit++) {
+		watchdog.setAppBackgrounded(false);
+		t.mock.timers.tick(2000);
+		watchdog.setAppBackgrounded(true);
+		assert.equal(pendingTimers.size, 0);
+		t.mock.timers.tick(1000);
+	}
+	watchdog.setAppBackgrounded(false);
+	t.mock.timers.tick(1999);
+	assert.deepEqual(redials, []);
+	t.mock.timers.tick(1);
+	assert.deepEqual(redials, ['primary']);
 	assert.equal(pendingTimers.size, 0);
 });
