@@ -541,6 +541,35 @@ export async function createPortableRuntime(options: any) {
 			setupRunning = undefined;
 		}
 	};
+	const reportPolicyError = (error: any) => options.onDiagnostic?.({
+		phase: 'primary-connect', message: error.message, stack: error.cause?.stack ?? error.stack
+	});
+	const configureFundingPrimary = (owner: BeignetNode, entry: any) => {
+		try {
+			owner.configureDirectFunding(rules.directFundingConfig(record.lfbw, parsedPrimary(entry)));
+		} catch (error) {
+			reportPolicyError(error);
+		}
+	};
+	const configurePrimaryTrust = (owner: BeignetNode, entry: any, pubkey: string) => {
+		if (entry.trusted !== false) owner.addTrustedPeer(pubkey);
+		else owner.removeTrustedPeer(pubkey);
+	};
+	const setupAfterRestore = async (owner: BeignetNode) => {
+		if (closed || stopPromise || durabilityFailed || node !== owner || recoveryHold()) return;
+		if (!setupRunning) return setup();
+		// Recovery rebuilt the node while a setup pass was still dialling.
+		// Install policy on the restored node now and leave those dials alone.
+		const entries = primaries();
+		if (entries.length) configureFundingPrimary(owner, entries[0]);
+		for (const entry of entries) {
+			try {
+				configurePrimaryTrust(owner, entry, parsedPrimary(entry).pubkey);
+			} catch (error) {
+				reportPolicyError(error);
+			}
+		}
+	};
 	const runSetup = async (onReady?: () => void) => {
 		if (!node || !record) return;
 		const owner = node;
@@ -566,19 +595,7 @@ export async function createPortableRuntime(options: any) {
 		// primary that is down at start used to leave the policy unset, every
 		// offer declined with "no liquidity peer", and every request minted
 		// with no way to reach this wallet, until the next restart.
-		if (!held) {
-			try {
-				node.configureDirectFunding(
-					rules.directFundingConfig(record.lfbw, parsedPrimary(entries[0]))
-				);
-			} catch (error: any) {
-				options.onDiagnostic?.({
-					phase: 'primary-connect',
-					message: error.message,
-					stack: error.cause?.stack ?? error.stack
-				});
-			}
-		}
+		if (!held) configureFundingPrimary(owner, entries[0]);
 		// Every primary is trusted (or not) and dialled, each on its own: one
 		// that is down marks only its own entry failed, and the list is ready
 		// as soon as any of them answers.
@@ -610,10 +627,7 @@ export async function createPortableRuntime(options: any) {
 		};
 		try {
 			const p = parsedPrimary(entry);
-			if (!held) {
-				if (entry.trusted !== false) owner.addTrustedPeer(p.pubkey);
-				else owner.removeTrustedPeer(p.pubkey);
-			}
+			if (!held) configurePrimaryTrust(owner, entry, p.pubkey);
 			try {
 				if (options.preparePrimaryDial) {
 					await waitWhileRunning(options.preparePrimaryDial(p.host));
@@ -817,16 +831,7 @@ export async function createPortableRuntime(options: any) {
 			}
 		}
 		if (after[0] && after[0].pubkey !== beforeRank1 && !recoveryHold()) {
-			try {
-				node.configureDirectFunding(
-					rules.directFundingConfig(record.lfbw, parsedPrimary(after[0]))
-				);
-			} catch (error: any) {
-				options.onDiagnostic?.({
-					phase: 'primary-connect',
-					message: error.message
-				});
-			}
+			configureFundingPrimary(node, after[0]);
 		}
 	};
 	const channelize = async (force = false) => {
@@ -939,14 +944,17 @@ export async function createPortableRuntime(options: any) {
 				// Native restore flags are durable before the swap finishes. They
 				// cover a crash between installing channels and our completion event.
 				if (importPending() && hasInstalledRecovery(node)) completeRecoveryImport();
+				const recoveryNode = node;
 				node.on('recovery:restored', () => {
 					try {
-						if (appBackgrounded) node?.getNode().getPeerManager()?.setAppBackgrounded(true);
+						if (closed || node !== recoveryNode) return;
 						completeRecoveryImport();
+						if (stopPromise) return;
+						if (appBackgrounded) recoveryNode.getNode().getPeerManager()?.setAppBackgrounded(true);
 						// The native wrapper rebuilt its node and policy in process.
 						const pending = setTimeout(() => {
 							pendingTimers.delete(pending);
-							if (!closed && !durabilityFailed) void setup().catch(() => {});
+							void setupAfterRestore(recoveryNode).catch(() => {});
 						}, 0);
 						pendingTimers.add(pending);
 					} catch {

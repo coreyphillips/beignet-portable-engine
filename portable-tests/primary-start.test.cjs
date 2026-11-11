@@ -43,7 +43,7 @@ function deferred() {
 async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.test'] } = {}) {
 	const rows = hosts.map((host, index) => {
 		const pubkey = ['02' + 'ab'.repeat(32), '03' + 'cd'.repeat(32)][index];
-		return { pubkey, uri: `${pubkey}@${host}:9735`, rank: index + 1, setup: 'ready' };
+		return { pubkey, uri: `${pubkey}@${host}:9735`, rank: index + 1, setup: 'ready', trusted: index === 0 };
 	});
 	const node = new EventEmitter();
 	const peers = new Set();
@@ -51,18 +51,21 @@ async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.tes
 	const attempts = rows.map(() => deferred());
 	const dialled = [];
 	const seen = [];
+	const fundingPolicies = [], trustChanges = [];
+	let restoring = recovery;
 	const policy = { primaries: rows, receiveTarget: rows[0].pubkey, fillThresholdSat: null };
 	Object.assign(node, {
 		getHealth: () => ({ electrumConnected: true }),
 		getInfo: () => ({ nodeId: rows[0].pubkey }),
 		getNode: () => ({ getPeerManager: () => undefined }),
-		getRecoverySurfaceStatus: () => recovery ? { state: 'restore-required' } : {},
+		getRecoverySurfaceStatus: () => restoring ? { state: 'restore-required' } : {},
 		waitForInitialSync: async () => {},
 		listPrimaries: () => policy,
 		listPeers: () => [...peers].map(pubkey => ({ pubkey, state: 'connected' })),
 		listChannels: () => channels,
-		configureDirectFunding: () => {},
-		addTrustedPeer: () => {},
+		configureDirectFunding: policy => fundingPolicies.push(policy),
+		addTrustedPeer: key => trustChanges.push([key, true]),
+		removeTrustedPeer: key => trustChanges.push([key, false]),
 		gracefulShutdown: async () => {},
 		destroy: async () => {},
 		connectPeer: async (pubkey, host) => {
@@ -88,7 +91,8 @@ async function fixture({ preparePrimaryDial, recovery, hosts = ['a.test', 'b.tes
 		socketFactory() { throw Error('Unexpected socket'); }
 	});
 	return {
-		attempts, dialled, seen, storage, channels,
+		attempts, dialled, seen, storage, channels, fundingPolicies, trustChanges,
+		finishRecovery() { restoring = false; node.emit('recovery:restored'); },
 		setAppBackgrounded: backgrounded => runtime.setAppBackgrounded(backgrounded),
 		start: () => runtime.request({ method: 'POST', path: '/api/wallets/test/start' }),
 		record: () => runtime.request({ path: '/api/wallets/test' }),
@@ -147,6 +151,35 @@ test('a recovering wallet waits for both setup results', async () => {
 		assert.equal(returned, false);
 		f.attempts[1].resolve();
 		await started;
+	} finally { await f.close(); }
+});
+
+test('finishing recovery installs the policy and trust while a secondary is still preparing', async t => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const tor = deferred();
+	const f = await fixture({
+		recovery: true, hosts: ['direct.test', 'peer.onion'],
+		preparePrimaryDial: async host => { if (host === 'peer.onion') await tor.promise; }
+	});
+	try {
+		const started = f.start();
+		await settle();
+		f.attempts[0].resolve();
+		await settle();
+		assert.deepEqual(f.fundingPolicies, []);
+		assert.deepEqual(f.trustChanges, []);
+		f.finishRecovery();
+		t.mock.timers.tick(0);
+		await settle();
+		assert.equal(f.fundingPolicies.length, 1);
+		assert.equal(f.fundingPolicies[0].lspHost, 'direct.test');
+		assert.deepEqual(f.trustChanges, [['02' + 'ab'.repeat(32), true], ['03' + 'cd'.repeat(32), false]]);
+		assert.deepEqual(f.dialled, ['direct.test']);
+		tor.resolve();
+		f.attempts[1].resolve();
+		assert.equal((await started).lfbw.setup, 'ready');
+		assert.deepEqual(f.dialled, ['direct.test', 'peer.onion']);
+		assert.equal(f.fundingPolicies.length, 1);
 	} finally { await f.close(); }
 });
 
