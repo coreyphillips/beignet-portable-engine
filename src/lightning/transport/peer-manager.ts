@@ -201,7 +201,7 @@ export function socks5SocketFactory(
 			destination: { host, port },
 			timeout: timeoutMs
 		});
-		return socket;
+		return Object.assign(socket, { viaTor: true });
 	};
 }
 
@@ -745,7 +745,7 @@ export class PeerManager extends EventEmitter {
 											this.socks5Proxy ?? { host: '127.0.0.1', port: 9050 },
 											timeoutMs ?? this.socks5TimeoutMs
 									  )(fallback.host, fallback.port);
-								return Object.assign(socket, { transportType: 'tcp' as const });
+								return Object.assign(socket, { transportType: 'tcp' as const, viaTor: true });
 							},
 							1500,
 							dialAbort.signal

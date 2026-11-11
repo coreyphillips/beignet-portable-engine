@@ -1033,20 +1033,22 @@ export class Peer extends EventEmitter {
 		const pingDue = this.pingDueWhileAway;
 		this.pingDueWhileAway = false;
 		const grace = Math.min(RESUME_PONG_TIMEOUT_MS, this.pongTimeoutMs);
+		// A live Tor circuit can stall longer than the direct-link probe.
+		const probeTimeout = this.socket?.viaTor ? this.pongTimeoutMs : grace;
 		if (this.resumePongRemainingMs !== null) {
 			// A second trip through the background must not replenish this probe.
 			this.armPongTimer(this.resumePongRemainingMs);
 		} else if (longReturn) {
 			// A pong just processed on unfreeze already proved this connection.
 			if (this.backgroundPongAt !== null && now - this.backgroundPongAt < grace) return;
-			this.resumePongRemainingMs = grace;
-			this.armPongTimer(grace);
+			this.resumePongRemainingMs = probeTimeout;
+			this.armPongTimer(probeTimeout);
 			this.sendPing();
 			return;
 		} else if (this.pongDueAt !== null) {
 			const remaining = Math.min(this.pongTimeoutMs, this.pongDueAt - now);
-			if (remaining < grace) this.resumePongRemainingMs = grace;
-			this.armPongTimer(Math.max(grace, remaining));
+			if (remaining < grace) this.resumePongRemainingMs = probeTimeout;
+			this.armPongTimer(this.resumePongRemainingMs ?? remaining);
 		}
 		if (longReturn || pingDue) this.sendPing();
 	}

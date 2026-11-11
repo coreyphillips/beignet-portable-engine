@@ -2,19 +2,27 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { buildSync } = require('esbuild');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 
 const compiled = buildSync({
-	entryPoints: [path.join(__dirname, '../src/lightning/transport/peer.ts')],
+	stdin: {
+		contents: [
+			"export { Peer } from './src/lightning/transport/peer';",
+			"export { Socket } from './portable/net';",
+			"export { configure, release } from './portable/state';"
+		].join('\n'),
+		resolveDir: path.join(__dirname, '..')
+	},
 	bundle: true, platform: 'node', format: 'cjs', write: false
 }).outputFiles[0].text;
 const fixture = { exports: {} };
 new Function('module', 'exports', 'require', compiled)(fixture, fixture.exports, require);
 
-function livePeer(t) {
+function livePeer(t, options = {}) {
 	t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: 1 });
 	const peer = new fixture.exports.Peer({
 		localPrivateKey: Buffer.alloc(32, 1), remotePublicKey: Buffer.alloc(33, 2),
-		host: 'localhost', port: 9735
+		host: 'localhost', port: 9735, ...options
 	});
 	const sent = [], errors = [];
 	peer.state = 'ready';
@@ -168,4 +176,50 @@ test('a queued pong in the remaining grace period keeps the peer connected', t =
 	tick(1000);
 	assert.deepEqual(errors, []);
 	assert.equal(peer.getState(), 'ready');
+});
+
+function connectPlatformSocket(t, peer, host, viaTor = false) {
+	const native = Object.assign(new EventEmitter(), { viaTor, destroy() {} });
+	fixture.exports.configure({ socketFactory: () => native });
+	t.after(() => fixture.exports.release());
+	peer.socket = new fixture.exports.Socket().connect(9735, host);
+}
+
+test('a platform onion stays ready when a live circuit returns its pong after 15 seconds', t => {
+	const { peer, tick, pong, sent, errors } = livePeer(t);
+	connectPlatformSocket(t, peer, 'a'.repeat(56) + '.onion');
+	peer.setAppBackgrounded(true);
+	tick(65000);
+	peer.setAppBackgrounded(false);
+	assert.equal(sent.length, 1);
+	tick(15000);
+	pong();
+	tick(20000);
+	assert.deepEqual(errors, []);
+	assert.equal(peer.getState(), 'ready');
+});
+
+test('a silent platform-proxied socket closes at its configured pong timeout', t => {
+	const { peer, tick, sent, errors } = livePeer(t, { pongTimeout: 12000 });
+	connectPlatformSocket(t, peer, 'peer.example', true);
+	peer.setAppBackgrounded(true);
+	tick(30000);
+	peer.setAppBackgrounded(false);
+	assert.equal(sent.length, 1);
+	tick(11999);
+	assert.equal(peer.getState(), 'ready');
+	tick(1);
+	assert.deepEqual(errors, ['Pong timeout']);
+	assert.equal(peer.getState(), 'disconnected');
+});
+
+test('a direct platform socket keeps the five-second probe', t => {
+	const { peer, tick, sent, errors } = livePeer(t);
+	connectPlatformSocket(t, peer, 'peer.example');
+	peer.setAppBackgrounded(true);
+	tick(30000);
+	peer.setAppBackgrounded(false);
+	assert.equal(sent.length, 1);
+	tick(5000);
+	assert.deepEqual(errors, ['Pong timeout']);
 });
