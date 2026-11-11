@@ -19,6 +19,8 @@ import type { EventEmitter } from 'events';
 import type { IIrohDiagnostics } from './iroh';
 
 export interface IDuplexTransport extends EventEmitter {
+	/** The selected stream uses Tor or a configured SOCKS proxy. */
+	readonly viaTor?: boolean;
 	readonly transportType?: 'tcp' | 'ws' | 'iroh';
 	getIrohDiagnostics?(): IIrohDiagnostics;
 	/**

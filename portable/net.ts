@@ -6,6 +6,7 @@ import { environment } from './state';
 export const handlesDestinationRouting = true;
 export class Socket extends EventEmitter {
 	inner: any;
+	viaTor = false;
 	destroyed = false;
 	connecting = false;
 	writable = true;
@@ -64,6 +65,8 @@ export class Socket extends EventEmitter {
 				port: opts.port,
 				tls: this.encrypted
 			});
+			this.viaTor = this.inner.viaTor === true ||
+				(typeof opts.host === 'string' && opts.host.trim().toLowerCase().endsWith('.onion'));
 			for (const event of [
 				'connect',
 				'secureConnect',

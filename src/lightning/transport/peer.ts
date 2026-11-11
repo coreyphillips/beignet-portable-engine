@@ -40,6 +40,8 @@ const DEFAULT_PING_INTERVAL_MS = 30_000;
 // causes spurious disconnects mid-payment. Dead TCP connections are still
 // detected promptly via socket error/close and the keepalive probes below.
 const DEFAULT_PONG_TIMEOUT_MS = 60_000;
+const LONG_BACKGROUND_MS = 30_000;
+const RESUME_PONG_TIMEOUT_MS = 5_000;
 const TCP_KEEPALIVE_DELAY_MS = 45_000;
 const ENCRYPTED_LENGTH_SIZE = 18; // 2-byte length + 16-byte tag
 const MAX_READ_BUFFER = 2 * 1024 * 1024; // 2 MB
@@ -152,6 +154,12 @@ export class Peer extends EventEmitter {
 	// Ping/pong
 	private pingTimer: ReturnType<typeof setInterval> | null = null;
 	private pongTimer: ReturnType<typeof setTimeout> | null = null;
+	private pongDueAt: number | null = null;
+	private pingDueWhileAway = false;
+	// One foreground budget for this unanswered probe, shared across interruptions.
+	private resumePongRemainingMs: number | null = null;
+	private backgroundedAt: number | null = null;
+	private backgroundPongAt: number | null = null;
 	private pingIntervalMs: number;
 	private pongTimeoutMs: number;
 	/** Pong bytes the remote may still request (see PONG_BYTES_BURST). */
@@ -1002,46 +1010,99 @@ export class Peer extends EventEmitter {
 
 	// ─── Ping/Pong ─────────────────────────────────────────────
 
-	private startPingTimer(): void {
-		this.pingTimer = setInterval(() => {
-			this.sendPing();
-		}, this.pingIntervalMs);
-		if (this.pingTimer.unref) {
-			this.pingTimer.unref?.();
+	/** A mobile host can suspend its JS timers while a socket is still alive. */
+	setAppBackgrounded(backgrounded: boolean): void {
+		if (backgrounded === (this.backgroundedAt !== null)) return;
+		const now = Date.now();
+		if (backgrounded) {
+			this.backgroundedAt = now;
+			this.backgroundPongAt = null;
+			// Defuse the overdue reply callback before the host pauses its timers.
+			// The ordinary ping interval keeps its cadence across short app switches.
+			if (this.resumePongRemainingMs !== null && this.pongDueAt !== null) {
+				this.resumePongRemainingMs = Math.min(
+					this.resumePongRemainingMs, Math.max(0, this.pongDueAt - now)
+				);
+			}
+			this.clearPongTimer();
+			return;
 		}
+		const longReturn = now - this.backgroundedAt! >= LONG_BACKGROUND_MS;
+		this.backgroundedAt = null;
+		if (this.state !== 'ready') return;
+		const pingDue = this.pingDueWhileAway;
+		this.pingDueWhileAway = false;
+		const grace = Math.min(RESUME_PONG_TIMEOUT_MS, this.pongTimeoutMs);
+		// A live Tor circuit can stall longer than the direct-link probe.
+		const probeTimeout = this.socket?.viaTor ? this.pongTimeoutMs : grace;
+		if (this.resumePongRemainingMs !== null) {
+			// A second trip through the background must not replenish this probe.
+			this.armPongTimer(this.resumePongRemainingMs);
+		} else if (longReturn) {
+			// A pong just processed on unfreeze already proved this connection.
+			if (this.backgroundPongAt !== null && now - this.backgroundPongAt < grace) return;
+			this.resumePongRemainingMs = probeTimeout;
+			this.armPongTimer(probeTimeout);
+			this.sendPing();
+			return;
+		} else if (this.pongDueAt !== null) {
+			const remaining = Math.min(this.pongTimeoutMs, this.pongDueAt - now);
+			if (remaining < grace) this.resumePongRemainingMs = probeTimeout;
+			this.armPongTimer(this.resumePongRemainingMs ?? remaining);
+		}
+		if (longReturn || pingDue) this.sendPing();
 	}
 
-	private stopPingTimer(): void {
-		if (this.pingTimer) {
-			clearInterval(this.pingTimer);
-			this.pingTimer = null;
-		}
-		if (this.pongTimer) {
+	private startPingTimer(): void {
+		this.pingTimer = setInterval(() => {
+			// On Android a due interval can run on either side of the active
+			// notification. Deliver one missed ping when the host is ready.
+			if (this.backgroundedAt !== null) this.pingDueWhileAway = true;
+			else this.sendPing();
+		}, this.pingIntervalMs);
+		this.pingTimer.unref?.();
+	}
+
+	private clearPongTimer(): void {
+		if (this.pongTimer !== null) {
 			clearTimeout(this.pongTimer);
 			this.pongTimer = null;
 		}
 	}
 
+	private stopPingTimer(): void {
+		if (this.pingTimer !== null) {
+			clearInterval(this.pingTimer);
+			this.pingTimer = null;
+		}
+		this.clearPongTimer();
+		this.pongDueAt = null;
+		this.resumePongRemainingMs = null;
+		this.backgroundPongAt = null;
+		this.pingDueWhileAway = false;
+	}
+
+	private armPongTimer(timeoutMs: number): void {
+		this.pongDueAt = Date.now() + timeoutMs;
+		const timer = setTimeout(() => {
+			if (this.pongTimer !== timer) return;
+			this.pongTimer = null;
+			this.pongDueAt = null;
+			this.emit('error', new Error('Pong timeout'));
+			this.disconnect();
+		}, timeoutMs);
+		this.pongTimer = timer;
+	}
+
 	private sendPing(): void {
-		if (this.state !== 'ready') return;
-
+		if (this.state !== 'ready' || this.backgroundedAt !== null) return;
+		// Keep the deadline of the oldest unanswered ping. Arm before writing
+		// so a synchronous reply or socket close can clear it too.
+		if (this.pongTimer === null) this.armPongTimer(this.pongTimeoutMs);
 		try {
-			const ping = encodePingMessage(1, 0);
-			this.sendMessage(MessageType.PING, ping);
-
-			// The deadline runs from the oldest ping still unanswered. Starting
-			// it again on every ping, with pings every 30s and a 60s deadline,
-			// meant it never ran out, and a connection that went silent without
-			// a socket error (a suspended phone, a dead Tor circuit) stayed
-			// listed as connected for good.
-			if (this.pongTimer) return;
-			this.pongTimer = setTimeout(() => {
-				this.pongTimer = null;
-				this.emit('error', new Error('Pong timeout'));
-				this.disconnect();
-			}, this.pongTimeoutMs);
+			this.sendMessage(MessageType.PING, encodePingMessage(1, 0));
 		} catch {
-			// Ignore send errors during ping
+			// A socket that never accepts a write must still time out.
 		}
 	}
 
@@ -1059,10 +1120,12 @@ export class Peer extends EventEmitter {
 	}
 
 	private handlePong(): void {
-		if (this.pongTimer) {
-			clearTimeout(this.pongTimer);
-			this.pongTimer = null;
+		if (this.backgroundedAt !== null && this.pongDueAt !== null) {
+			this.backgroundPongAt = Date.now();
 		}
+		this.pongDueAt = null;
+		this.resumePongRemainingMs = null;
+		this.clearPongTimer();
 	}
 
 	// ─── Socket helpers ────────────────────────────────────────

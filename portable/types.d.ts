@@ -60,6 +60,8 @@ export interface PortableRuntimeOptions {
 	databaseFactory(path: string): SQLiteCompatDatabase;
 	volume: DurableVolume;
 	socketFactory: SocketFactory;
+	/** Prepare a primary transport (for example, start Tor) before its connection deadline begins. */
+	preparePrimaryDial?(host: string): Promise<void>;
 	iroh?: {
 		factory: IrohEndpointFactory;
 		relays?: string[];
@@ -68,6 +70,8 @@ export interface PortableRuntimeOptions {
 	electrum?: TransportTarget;
 }
 export interface PortableRuntime {
+	/** Notify synchronously at background and foreground transitions so peer deadlines survive suspension. */
+	setAppBackgrounded(backgrounded: boolean): void;
 	request(input: {
 		method?: string;
 		path: string;
