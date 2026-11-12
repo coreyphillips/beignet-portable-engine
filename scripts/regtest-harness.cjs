@@ -103,9 +103,11 @@ async function createHarness({
 } = {}) {
 	if (JSON.parse(btc('getblockchaininfo')).chain !== 'regtest')
 		throw new Error('the bitcoin container is not on regtest');
-	const { BeignetNode } = require(path.join(
+	const sourceDir =
 		process.env.BEIGNET_SOURCE_DIR ||
-			'/Users/coreyphillips/Documents/synonym/beignet',
+		'/Users/coreyphillips/Documents/synonym/beignet';
+	const { BeignetNode } = require(path.join(
+		sourceDir,
 		'dist/cli/beignet-node.js'
 	));
 	const { EmbeddedWalletClient } = await import(
@@ -401,8 +403,17 @@ async function createHarness({
 		device,
 		close,
 		BeignetNode,
+		sourceDir,
 		temp
 	};
 }
 
-module.exports = { btc, wait, delay, miner, createHarness, makeVolume };
+module.exports = {
+	btc,
+	wait,
+	delay,
+	miner,
+	freePort,
+	createHarness,
+	makeVolume
+};

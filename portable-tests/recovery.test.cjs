@@ -134,9 +134,11 @@ async function fixture(
 		databaseFactory: () => {
 			throw Error('unexpected database');
 		},
-		socketFactory: () => {
-			throw Error('unexpected network');
-		}
+		socketFactory:
+			runtimeOptions.socketFactory ??
+			(() => {
+				throw Error('unexpected network');
+			})
 	});
 	return {
 		runtime,
@@ -503,6 +505,84 @@ test('an unsupported Iroh primary is refused before a wallet record or seed is s
 		assert.equal(f.control.options.length, 0);
 	} finally {
 		await f.runtime.close();
+	}
+});
+
+const PORCH_URL = `wss://relay.example/v1/p/${'k3vq' + 'a'.repeat(28)}`;
+const PORCH = `${PK}@${PORCH_URL}`;
+// The byte relay: every peer socket reaches its one fixed upstream node.
+const fixedUpstream = () =>
+	Object.assign(
+		() => {
+			throw Error('unexpected network');
+		},
+		{ fixedUpstream: true }
+	);
+
+test('a Porch primary is dialed by its URL alone, with no host and port beside it and no native endpoint', async () => {
+	const f = await fixture(memory(), [], {
+		iroh: {
+			factory: async () => {
+				throw Error('must stay unused');
+			}
+		}
+	});
+	try {
+		const created = await create(f, { lfbw: { primaryUri: PORCH.replace('wss://relay.example', 'WSS://Relay.Example:443') } });
+		assert.equal(f.control.options[0].iroh, false);
+		assert.deepEqual(f.connects, [[PK, undefined, undefined, { type: 'ws', url: PORCH_URL }]]);
+		assert.equal(created.record.lfbw.primaryUri, PORCH);
+		assert.equal(f.registry().record.lfbw.setup, 'ready');
+		assert.equal((await f.runtime.request({ path: '/api/config' })).porchPrimaryAvailable, true);
+	} finally {
+		await f.runtime.close();
+	}
+});
+
+test('behind a relay that reaches one fixed node a Porch link is refused: at creation, as the new primary and as an added one', async () => {
+	const f = await fixture(memory(), [], { socketFactory: fixedUpstream() });
+	try {
+		assert.equal((await f.runtime.request({ path: '/api/config' })).porchPrimaryAvailable, false);
+		await assert.rejects(create(f, { lfbw: { primaryUri: PORCH } }), { code: 'PORCH_UNSUPPORTED' });
+		assert.equal(f.volume.read('/wallet/registry.json'), null);
+		assert.equal(f.control.options.length, 0);
+		const id = (await create(f)).record.id;
+		const before = JSON.stringify(f.registry().record.lfbw);
+		await assert.rejects(
+			f.runtime.request({ method: 'PATCH', path: `/api/wallets/${id}`, body: { lfbw: { enabled: true, primaryUri: PORCH } } }),
+			{ code: 'PORCH_UNSUPPORTED' }
+		);
+		// The same node at a new address is not a second primary: the refusal is the link's own.
+		await assert.rejects(
+			f.runtime.request({ method: 'POST', path: `/wallets/${id}/api/primaries/add`, body: { pubkey: PK, uri: PORCH } }),
+			{ code: 'PORCH_UNSUPPORTED' }
+		);
+		assert.equal(JSON.stringify(f.registry().record.lfbw), before);
+		assert.equal(f.connects.length, 1, 'only the TCP primary was dialed');
+	} finally {
+		await f.runtime.close();
+	}
+});
+
+test('a Porch primary set up on a host that could dial it is not dialed through a relay that reaches one fixed node', async () => {
+	const volume = memory();
+	const native = await fixture(volume);
+	let id;
+	try {
+		id = (await create(native, { lfbw: { primaryUri: PORCH } })).record.id;
+		assert.equal(native.registry().record.lfbw.setup, 'ready');
+	} finally {
+		await native.runtime.close();
+	}
+	const relayed = await fixture(volume, [], { socketFactory: fixedUpstream() });
+	try {
+		await relayed.runtime.request({ method: 'POST', path: `/api/wallets/${id}/start` });
+		assert.deepEqual(relayed.connects, [], 'the upgrade request would have gone to the fixed node');
+		const lf = relayed.registry().record.lfbw;
+		assert.equal(lf.setup, 'failed');
+		assert.match(lf.setupError, /Porch link requires Native networking/);
+	} finally {
+		await relayed.runtime.close();
 	}
 });
 

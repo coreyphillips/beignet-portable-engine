@@ -46,6 +46,16 @@ function defaultWebSocketImpl(): WebSocketConstructor | undefined {
 	if (proc?.versions?.node) {
 		return NodeWebSocket;
 	}
+	// A portable host hands the engine every socket it opens (net and tls
+	// resolve to its adapter). The in-repo client dials through that adapter,
+	// so a WebSocket peer takes the same route as any other connection. The
+	// platform's own WebSocket would open a socket the host never sees.
+	if (
+		(nodeNet() as typeof net & { handlesDestinationRouting?: boolean })
+			.handlesDestinationRouting === true
+	) {
+		return NodeWebSocket;
+	}
 	return undefined;
 }
 
