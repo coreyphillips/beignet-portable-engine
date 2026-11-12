@@ -18,6 +18,7 @@ import { sendRoutes } from './send-routes.cjs';
 import { primariesRoutes } from './primaries-routes.cjs';
 import {
 	anyIroh,
+	anyPorch,
 	engineToEntries,
 	entryToEngine,
 	planPrimariesSync
@@ -416,10 +417,14 @@ export async function createPortableRuntime(options: any) {
 	const parsedPrimary = (entry: any) => {
 		const p = rules.parseNodeUri(entry.uri);
 		const fallback = parsePrimaryFallback(p, entry.fallbackUri);
+		// A Porch link is dialed by its URL alone: the engine takes the address
+		// from it and refuses a host and port beside it that differ. Its port
+		// is 0, so the relay is never signed in as the node's TCP address.
+		const byUrl = p.transport?.type === 'ws';
 		return {
 			...p,
-			connectHost: p.host,
-			connectPort: p.port,
+			connectHost: byUrl ? undefined : p.host,
+			connectPort: byUrl ? undefined : p.port,
 			...(fallback
 				? {
 						transport: {
@@ -459,7 +464,7 @@ export async function createPortableRuntime(options: any) {
 					node.disconnectPeer(p.pubkey);
 				} catch {}
 			}
-			await node.connectPeer(p.pubkey, p.host, p.port, p.transport);
+			await node.connectPeer(p.pubkey, p.connectHost, p.connectPort, p.transport);
 			options.onDiagnostic?.({
 				phase: 'primary-redial',
 				message: 'reconnected'
@@ -634,7 +639,14 @@ export async function createPortableRuntime(options: any) {
 					if (!currentEntry()) return;
 					if (!held && recoveryHold()) return;
 				}
-				await waitWhileRunning(owner.connectPeer(p.pubkey, p.host, p.port, p.transport));
+				// Set up while the host could dial it, then moved to a relay
+				// that reaches one fixed peer: the upgrade request would be
+				// sent to that peer.
+				if (p.transport?.type === 'ws' && options.socketFactory?.fixedUpstream === true)
+					failure('PORCH_UNSUPPORTED', PORCH_NEEDS_NATIVE);
+				await waitWhileRunning(
+					owner.connectPeer(p.pubkey, p.connectHost, p.connectPort, p.transport)
+				);
 			} catch (error) {
 				if (!currentEntry() || nodeUnavailable()) return;
 				if (
@@ -752,13 +764,16 @@ export async function createPortableRuntime(options: any) {
 	};
 	const SINGLE_PEER_RELAY =
 		'The relay reaches one primary node. Switch to Native networking to add another.';
+	const PORCH_NEEDS_NATIVE =
+		'A Porch link requires Native networking: the relay reaches one fixed node and cannot dial another relay.';
 	/**
 	 * The runtime's own checks on a policy write, before the engine is
 	 * touched: an added address must be one this transport can dial (the
-	 * engine admits peer URI forms the phone has no transport for), an Iroh
-	 * primary needs the host's Iroh, an onion fallback must name the same
-	 * node, and a relay that reaches one fixed upstream peer reaches one
-	 * primary (coreyphillips/beignet#1924).
+	 * engine admits peer URI forms the phone has no transport for: of the
+	 * WebSocket ones it takes a Porch link alone), an Iroh primary needs the
+	 * host's Iroh, a Porch link needs a host that opens its own sockets, an
+	 * onion fallback must name the same node, and a relay that reaches one
+	 * fixed upstream peer reaches one primary (coreyphillips/beignet#1924).
 	 */
 	const beforePrimariesWrite = (kind: string, body: any) => {
 		if (kind !== 'add') return;
@@ -777,6 +792,8 @@ export async function createPortableRuntime(options: any) {
 		}
 		if (parsed.transport?.type === 'iroh' && !options.iroh)
 			failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+		if (parsed.transport?.type === 'ws' && options.socketFactory?.fixedUpstream === true)
+			failure('PORCH_UNSUPPORTED', PORCH_NEEDS_NATIVE);
 		if (
 			options.socketFactory?.fixedUpstream === true &&
 			primaries().some((e) => e.pubkey !== parsed.pubkey)
@@ -1853,6 +1870,10 @@ export async function createPortableRuntime(options: any) {
 				// The runtime keeps the engine's ranked list, dials every primary
 				// and steers receives by it (coreyphillips/beignet#1924).
 				primariesAvailable: true,
+				// A primary may be a Porch link, pubkey@wss://relay/v1/p/<route>
+				// (coreyphillips/beignet#1980), on a host that opens its own
+				// sockets. A relay that reaches one fixed peer cannot dial one.
+				porchPrimaryAvailable: options.socketFactory?.fixedUpstream !== true,
 				engineVersion: ENGINE_VERSION,
 				embedded: true
 			};
@@ -1915,6 +1936,8 @@ export async function createPortableRuntime(options: any) {
 			);
 			if (anyIroh(lf.primaries) && !options.iroh)
 				failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+			if (anyPorch(lf.primaries) && options.socketFactory?.fixedUpstream === true)
+				failure('PORCH_UNSUPPORTED', PORCH_NEEDS_NATIVE);
 			if (options.socketFactory?.fixedUpstream === true && lf.primaries.length > 1)
 				failure('TRANSPORT_SINGLE_PEER', SINGLE_PEER_RELAY, 409);
 			record = {
@@ -2007,6 +2030,8 @@ export async function createPortableRuntime(options: any) {
 						  ];
 				if (anyIroh(entries) && !options.iroh)
 					failure('IROH_UNSUPPORTED', 'This host does not support Iroh.');
+				if (anyPorch(entries) && options.socketFactory?.fixedUpstream === true)
+					failure('PORCH_UNSUPPORTED', PORCH_NEEDS_NATIVE);
 				if (options.socketFactory?.fixedUpstream === true && entries.length > 1)
 					failure('TRANSPORT_SINGLE_PEER', SINGLE_PEER_RELAY, 409);
 				// The record is written first and marked unsynced, then the engine

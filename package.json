@@ -18,7 +18,8 @@
     "test:relay:integration": "npm run build && node --test scripts/relay-integration.test.cjs",
     "check:types": "tsc --noEmit --strict --skipLibCheck false --target es2020 --moduleResolution node portable/types.d.ts portable/sqljs.d.ts",
     "test:regtest:send-max": "npm run build && node scripts/regtest-send-max.cjs",
-    "test:regtest:primaries": "npm run build && node scripts/regtest-primaries.cjs"
+    "test:regtest:primaries": "npm run build && node scripts/regtest-primaries.cjs",
+    "test:regtest:porch": "npm run build && node scripts/regtest-porch-primary.cjs"
   },
   "repository": {
     "type": "git",

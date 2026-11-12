@@ -15,7 +15,7 @@ const { parsePrimaryUri } = require('./primary-uri.cjs');
 /**
  * The engine's add body for a stored entry: host and port for a TCP or onion
  * address (the engine reads those back as the relay address it signs into
- * direct-funding requests), the canonical URI for an Iroh one.
+ * direct-funding requests), the canonical URI for an Iroh one or a Porch link.
  */
 function entryToEngine(entry, rank) {
 	const parsed = parsePrimaryUri(entry.uri);
@@ -141,10 +141,22 @@ function anyIroh(entries) {
 	});
 }
 
+/** Whether any entry is a Porch link; an unreadable address counts as not. */
+function anyPorch(entries) {
+	return (entries || []).some((e) => {
+		try {
+			return parsePrimaryUri(e.uri).transport?.type === 'ws';
+		} catch {
+			return false;
+		}
+	});
+}
+
 module.exports = {
 	entryToEngine,
 	engineToEntry,
 	engineToEntries,
 	planPrimariesSync,
-	anyIroh
+	anyIroh,
+	anyPorch
 };

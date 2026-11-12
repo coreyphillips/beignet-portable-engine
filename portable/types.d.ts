@@ -211,12 +211,15 @@ export interface ParsedPrimary {
 	host: string;
 	port: number;
 	uri: string;
-	transport?: {
-		type: 'iroh';
-		endpointId: string;
-		relayUrl?: string;
-		fallbackOnion?: { host: string; port: number };
-	};
+	transport?:
+		| {
+				type: 'iroh';
+				endpointId: string;
+				relayUrl?: string;
+				fallbackOnion?: { host: string; port: number };
+		  }
+		/** A Porch link: the relay's WebSocket URL with the node's route id. `host` is the relay's and `port` is 0. */
+		| { type: 'ws'; url: string };
 }
 export declare function parsePrimaryUri(input: string): ParsedPrimary;
 export declare function parsePrimaryFallback(
