@@ -257,3 +257,32 @@ test('funds move toward the primary a receive would go to, which need not be ran
 	assert.equal((await runChannelize({ node: legacy, record, primary, rules })).last.action, 'splice-in');
 });
 
+test('a channel open with a Porch primary dials it by its URL alone', async () => {
+	// The engine takes the address from the URL and refuses a host and port
+	// beside it that differ, so the open hands it neither.
+	const url = `wss://relay.example/v1/p/${'a'.repeat(32)}`;
+	const porch = () => ({
+		pubkey: PRIMARY,
+		connectHost: undefined,
+		connectPort: undefined,
+		transport: { type: 'ws', url }
+	});
+	const node = fakeNode();
+	node.connectPeer = async (...args) => void node.calls.push(['connectPeer', ...args]);
+	node.openChannel = async (...args) => void node.calls.push(['openChannel', ...args]);
+	const { last } = await runChannelize({ node, record, primary: porch, rules, now: 5 });
+	assert.equal(last.action, 'open');
+	assert.deepEqual(node.calls.find((c) => c[0] === 'connectPeer'), [
+		'connectPeer',
+		PRIMARY,
+		undefined,
+		undefined,
+		{ type: 'ws', url }
+	]);
+	const open = node.calls.find((c) => c[0] === 'openChannel');
+	assert.equal(open[1], PRIMARY);
+	assert.ok(open[2] > 0);
+	assert.equal(node.calls.some((c) => c[0] === 'connectAndOpenChannel'), false);
+	const dial = node.calls.findIndex((c) => c[0] === 'connectPeer');
+	assert.ok(dial < node.calls.findIndex((c) => c[0] === 'openChannel'), 'connected before the open');
+});
