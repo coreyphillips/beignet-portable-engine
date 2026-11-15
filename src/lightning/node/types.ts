@@ -24,7 +24,10 @@ import type { ILogger } from '../../logger';
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import type { SignerFactory } from '../keys/signer';
 import type { WebSocketConstructor } from '../transport/websocket';
-import type { Socks5ProxyScope } from '../transport/peer-manager';
+import type {
+	LearnedAddressDials,
+	Socks5ProxyScope
+} from '../transport/peer-manager';
 import type { GuardianStartupGate } from '../recovery/startup-gate';
 import type { DurabilityBarrier } from '../recovery/durability-barrier';
 import type { IGuardianHostConfig } from '../recovery/guardian-host';
@@ -39,6 +42,7 @@ import type { IFforSettlePolicy } from '../ffor/types';
 import type { IFforWitnessConfig } from '../ffor/witness-service';
 import type { IFforIssuerConfig } from '../ffor/issuer-service';
 import type { IIrohConfig } from '../transport/iroh';
+import type { IPorchConfig } from '../transport/porch-host';
 import type { IPayAllBudget, PaymentStatus } from './payment-types';
 
 export type { IInvoiceInfo };
@@ -629,7 +633,11 @@ export interface INodeConfig {
 	forwardingPolicyGraceMs?: number;
 	/** MPP partial payment timeout in ms (default 60000) */
 	mppTimeoutMs?: number;
-	/** Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) */
+	/**
+	 * Human-readable node alias (max 32 bytes UTF-8, per BOLT 7). The node
+	 * refuses to start if it holds a character BOLT 1 forbids: control,
+	 * format (zero-width, bidi), private-use, unassigned, U+2028 or U+2029.
+	 */
 	alias?: string;
 	/** Addresses to advertise in our node_announcement (BOLT 7 descriptors,
 	 *  e.g. from parseAnnouncedAddress). Only meaningful once the node has at
@@ -653,15 +661,42 @@ export interface INodeConfig {
 	 */
 	socks5ProxyScope?: Socks5ProxyScope;
 	/**
+	 * How addresses the operator did not choose are dialed (default 'any'):
+	 * a channel peer's announced reconnect addresses, a node id resolved
+	 * through the gossip graph or DNS seeds, a direct-funding lane a
+	 * counterparty named. 'proxy-only' sends those dials through socks5Proxy
+	 * whatever socks5ProxyScope says, and refuses them when no proxy carries
+	 * them, so nobody can learn this node's address by naming one of their
+	 * own. Addresses passed to connectPeer are not affected. Always
+	 * 'proxy-only' when iroh.relayOnly is set.
+	 */
+	learnedAddressDials?: LearnedAddressDials;
+	/**
 	 * WebSocket constructor for outbound WS peer connections. Defaults to the
 	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the
 	 * built-in WebSocket's lowercased headers) and to globalThis.WebSocket in
 	 * browsers. Only consulted when a peer is dialed with transport
-	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
+	 * {type: 'ws'} and the dial is a direct one; mirrors how electrumOptions
+	 * injects net/tls. A dial that the SOCKS5 proxy carries is made by the
+	 * in-repo client over the proxy's socket, and fails where that client
+	 * cannot run.
 	 */
 	webSocketImpl?: WebSocketConstructor;
-	/** Opt-in Iroh endpoint, supplied by Node or a native mobile bridge. */
+	/**
+	 * Opt-in Iroh endpoint, supplied by Node or a native mobile bridge.
+	 * `relayOnly: true` keeps every Iroh connection on the relay so a peer
+	 * never learns this node's IP address (the relay operator still does);
+	 * it needs a factory whose endpoint reports IIrohEndpoint.relayOnly, and
+	 * it switches learnedAddressDials to 'proxy-only'.
+	 */
 	iroh?: import('../transport/iroh').IIrohConfig;
+	/**
+	 * Opt-in Porch relays (docs/PORCH-PROTOCOL.md): the node dials out to
+	 * each and waits there, so it can be reached by a `wss://` link that does
+	 * not say where it runs. Started with listenPorch(). Setting it switches
+	 * learnedAddressDials to 'proxy-only'.
+	 */
+	porch?: IPorchConfig;
 	/**
 	 * Watchtowers to ship encrypted justice data to at every revocation, as
 	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined
@@ -802,7 +837,7 @@ type SeedDerivedNodeConfigKey =
  */
 export type LightningNodeSeedOptions = Omit<
 	INodeConfig,
-	SeedDerivedNodeConfigKey | 'iroh'
+	SeedDerivedNodeConfigKey | 'iroh' | 'porch'
 > & {
 	/** BIP39 passphrase. */
 	passphrase?: string;
@@ -816,6 +851,13 @@ export type LightningNodeSeedOptions = Omit<
 	coinType?: number;
 	/** Opt-in Iroh endpoint. Its secret key is derived from the seed. */
 	iroh?: Omit<IIrohConfig, 'secretKey'>;
+	/**
+	 * Opt-in Porch relays. The host key is derived from the seed, and so is
+	 * the one link served when `tags` is left out.
+	 */
+	porch?: Omit<IPorchConfig, 'hostSecret' | 'tags'> & {
+		tags?: IPorchConfig['tags'];
+	};
 };
 
 // ─── Direct funding ───
@@ -963,10 +1005,13 @@ export interface IPaymentRetryContext {
 	 * accumulated channel exclusions.
 	 */
 	bolt12Invoice?: IBolt12Invoice;
-	/** Index into bolt12Invoice.paths used by the current attempt. */
+	/**
+	 * Index into the invoice's blinded paths used by the current attempt:
+	 * bolt12Invoice.paths, or the BOLT 11 invoice's blindedPaths.
+	 */
 	bolt12PathIndex?: number;
 	/**
-	 * Indices of bolt12Invoice.paths whose BLINDED segment failed. Channel
+	 * Indices of those blinded paths whose BLINDED segment failed. Channel
 	 * exclusion cannot route around a blinded hop (its SCID is opaque), so
 	 * route selection skips these paths entirely and a retry rotates to the
 	 * invoice's other paths (BOLT 4: on a failure from a blinded hop the
@@ -1042,6 +1087,16 @@ export interface ICreateInvoiceOptions {
 	descriptionHash?: Buffer;
 	expiry?: number;
 	minFinalCltvExpiry?: number;
+	/**
+	 * Opaque bytes written as the invoice's BOLT 11 `m` field, with feature
+	 * bit 49 (option_payment_metadata). A payer returns them as
+	 * payment_metadata in every HTLC's final onion payload, and an HTLC for
+	 * this invoice without the same bytes fails with
+	 * incorrect_or_unknown_payment_details. At most 639 bytes, the largest
+	 * field BOLT 11 can carry; long metadata shortens the routes a payer can
+	 * use, since it shares the 1300-byte onion with every hop.
+	 */
+	paymentMetadata?: Buffer;
 	/**
 	 * Emit receiver route-blinding blinded paths instead of cleartext routing
 	 * hints (BOLT 4 / BOLT 11). Each usable channel becomes a 2-hop blinded path

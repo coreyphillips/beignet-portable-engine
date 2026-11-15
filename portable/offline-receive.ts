@@ -741,9 +741,15 @@ export class OfflineReceive {
 				// Recover an invoice saved by the engine immediately before a crash in
 				// our metadata write. No new invoice or replacement hash is created.
 				if (!job.expiresAt && epoch.slots[0]?.bolt11) {
-					const d = this.node.decodeInvoice(epoch.slots[0].bolt11);
-					job.expiresAt = (Number(d.timestamp) + Number(d.expiry)) * 1000;
-					this.persist();
+					// An invoice an engine before 0.41.0 issued can carry a
+					// description BOLT 1's reader now refuses (beignet #2074).
+					// Leave its expiry unknown, as it was, rather than stop this
+					// pass for every other request.
+					try {
+						const d = this.node.decodeInvoice(epoch.slots[0].bolt11);
+						job.expiresAt = (Number(d.timestamp) + Number(d.expiry)) * 1000;
+						this.persist();
+					} catch {}
 				}
 				try {
 					if (epoch.concurrentVersion) this.node.fforSync(job.channelId);

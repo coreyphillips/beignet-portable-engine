@@ -161,6 +161,9 @@ export interface ISerializedHtlcEntry {
 	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
 	 * survives restart and can still peel its onion with the blinded key. */
 	blindingPoint?: string;
+	/** The preimage the peer's fulfil revealed (hex; see
+	 * IHtlcEntry.paymentPreimage). Absent on rows written before it existed. */
+	paymentPreimage?: string;
 	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
 	addRemoteCommitted?: boolean;
 	removalRemoteCommitted?: boolean;
@@ -239,6 +242,9 @@ export function serializeHtlcEntry(
 		...(e.blindingPoint
 			? { blindingPoint: e.blindingPoint.toString('hex') }
 			: {}),
+		...(e.paymentPreimage
+			? { paymentPreimage: e.paymentPreimage.toString('hex') }
+			: {}),
 		...(e.addRemoteCommitted !== undefined
 			? { addRemoteCommitted: e.addRemoteCommitted }
 			: {}),
@@ -302,6 +308,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			...(s.fforMismatch === true ? { fforMismatch: true } : {}),
 			...(s.blindingPoint
 				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
+				: {}),
+			...(s.paymentPreimage
+				? { paymentPreimage: Buffer.from(s.paymentPreimage, 'hex') }
 				: {}),
 			...(s.addRemoteCommitted !== undefined
 				? { addRemoteCommitted: s.addRemoteCommitted }
@@ -2107,6 +2116,7 @@ export interface ISerializedInvoiceInfo {
 	cancelledAt?: number;
 	jitFee?: { flatFeeSat: number; feePpm: number };
 	minFinalCltvExpiry?: number;
+	paymentMetadata?: string;
 }
 
 export function serializeInvoiceInfo(
@@ -2126,7 +2136,8 @@ export function serializeInvoiceInfo(
 		bolt12: invoice.bolt12,
 		cancelledAt: invoice.cancelledAt,
 		jitFee: invoice.jitFee,
-		minFinalCltvExpiry: invoice.minFinalCltvExpiry
+		minFinalCltvExpiry: invoice.minFinalCltvExpiry,
+		paymentMetadata: invoice.paymentMetadata
 	};
 }
 
@@ -2148,6 +2159,7 @@ export function deserializeInvoiceInfo(
 		jitFee: s.jitFee,
 		// A row written before #770 has none: the final hop then enforces
 		// the node default, which is what it advertised.
-		minFinalCltvExpiry: s.minFinalCltvExpiry
+		minFinalCltvExpiry: s.minFinalCltvExpiry,
+		paymentMetadata: s.paymentMetadata
 	};
 }

@@ -537,6 +537,10 @@ export interface IChannelManagerConfig {
  */
 const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
 
+// BOLT 7: a channel_announcement is not sent before its funding has this
+// many confirmations.
+const ANNOUNCEMENT_MIN_CONFIRMATIONS = 6;
+
 /** BOLT 2: "MUST disconnect after 60 seconds of quiescence if the HTLCs are pending". */
 const DEFAULT_QUIESCENCE_TIMEOUT_MS = 60_000;
 
@@ -799,6 +803,17 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	private monitors: Map<string, ChainMonitor> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
 	private _currentBlockHeight = 0;
+	// Channels whose channel_announcement is signed by both sides but whose
+	// SCID is not yet 6 blocks deep (BOLT 7). Rebuilt and released by the block
+	// that takes it there.
+	private readonly _announcementsHeldForDepth = new Set<string>();
+	// announcement_signatures that arrived before this side sent channel_ready,
+	// by channel id hex. Handled once the channel is NORMAL (BOLT 7 asks to
+	// defer it, not drop it).
+	private readonly _earlyAnnouncementSigs = new Map<
+		string,
+		{ peerPubkey: string; payload: Buffer }
+	>();
 	// Anchor force-close commitment CPFPs awaiting confirmation, keyed by channelId
 	// hex. Retained so a stuck commitment package can be re-CPFP'd at a higher feerate
 	// each block (reCpfpStuckCommitments) until the commitment reaches irrevocable depth.
@@ -2670,6 +2685,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 	 * re-entrant handler throwing out of the action loop.
 	 */
 	private sendReestablish(peerPubkey: string, channel: Channel): void {
+		channel.setSpliceNegotiated(this.peerSupportsSplicing(peerPubkey));
 		const actions = channel.createReestablish();
 		const missing = channel.takeReestablishSecretMissingNotice();
 		if (missing) {
@@ -3548,6 +3564,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
 		}
+		this._releaseAnnouncementsAtDepth();
 
 		// Invariant keeper for settles deferred during quiescence (issue 430):
 		// terminal quiescence exits and reestablish gaps have no event to drain
@@ -4889,7 +4906,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 		const detail = err instanceof Error ? err.message : String(err);
 		const reason = `Undecodable ${name}: ${detail}`;
 		const actions: ChannelAction[] = [
-			{ type: ChannelActionType.ERROR, message: reason }
+			{ type: ChannelActionType.ERROR, message: reason },
+			{ type: ChannelActionType.DISCONNECT_PEER, reason }
 		];
 		if (canScopeWireError(channelId)) {
 			actions.unshift({
@@ -4902,7 +4920,32 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			});
 		}
 		this.processActions(peerPubkey, channel, actions);
-		this.peerManager?.disconnectPeer(peerPubkey);
+	}
+
+	/** How long the warning ahead of a DISCONNECT_PEER may take to leave. */
+	private static readonly VIOLATION_WARNING_FLUSH_MS = 2_000;
+
+	/**
+	 * The DISCONNECT_PEER action: drop the connection after a warning, so the
+	 * channel_reestablish on the next one restarts what the violation broke.
+	 * A peer the PeerManager does not hold gets its messages through
+	 * 'message:outbound' (see sendMessage), so the host that carries them is
+	 * asked instead.
+	 */
+	private disconnectPeerForViolation(peerPubkey: string, reason: string): void {
+		if (this.peerManager?.getPeer(peerPubkey)) {
+			try {
+				this.peerManager.disconnectPeer(
+					peerPubkey,
+					ChannelManager.VIOLATION_WARNING_FLUSH_MS
+				);
+			} catch {
+				// Already gone, or the teardown raced: the warning and the local
+				// error have run, and nothing after this action depends on it.
+			}
+			return;
+		}
+		this.emit('peer:disconnect-needed', peerPubkey, reason);
 	}
 
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
@@ -9093,8 +9136,20 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			return;
 		}
 		const channel = this.findChannelByChannelId(msg.channelId);
-		if (!channel) {
+		const channelIdHex = msg.channelId.toString('hex');
+		// Only the channel's own peer may sign for it: we answer with our
+		// signatures, and a stranger's would mark the exchange as received.
+		if (!channel || this.channelPeers.get(channelIdHex) !== peerPubkey) {
 			this.emit('error', null, 'Unknown channel_id in announcement_signatures');
+			return;
+		}
+		const st = channel.getState();
+		if (
+			st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+			st === ChannelState.AWAITING_CHANNEL_READY
+		) {
+			// The peer counted its confirmations first. The latest one wins.
+			this._earlyAnnouncementSigs.set(channelIdHex, { peerPubkey, payload });
 			return;
 		}
 
@@ -9192,12 +9247,110 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 			Buffer.from(peerPubkey, 'hex')
 		);
 		if (ready?.type !== ChannelActionType.ANNOUNCEMENT_READY) return;
+		this._emitAnnouncementReady(channel, ready);
+	}
+
+	/**
+	 * Send our stored announcement_signatures again (BOLT 7: on reconnection,
+	 * to a peer we have not received them from). Returns whether a message
+	 * was produced.
+	 */
+	resendAnnouncementSignatures(channelId: Buffer): boolean {
+		const channel = this.findChannelByChannelId(channelId);
+		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
+		if (!channel || !peerPubkey) return false;
+		const localNodeId = this.config.nodePrivateKey
+			? getPublicKey(this.config.nodePrivateKey)
+			: this.config.localBasepoints.fundingPubkey;
+		const actions = channel.retransmitAnnouncementSignatures(
+			localNodeId,
+			Buffer.from(peerPubkey, 'hex')
+		);
+		if (actions.length === 0) return false;
+		this.processActions(peerPubkey, channel, actions);
+		return true;
+	}
+
+	/**
+	 * BOLT 7: no channel_announcement before the funding has 6 confirmations.
+	 * Since bolts#1215 a peer may sign earlier than that, so an announcement
+	 * both sides signed early is held here until its SCID is deep enough.
+	 */
+	private _emitAnnouncementReady(
+		channel: Channel,
+		ready: {
+			channelId: Buffer;
+			channelAnnouncement: Buffer;
+			channelUpdate: Buffer;
+		}
+	): void {
+		const idHex = ready.channelId.toString('hex');
+		const scid = channel.getShortChannelId();
+		if (!scid || !this._scidAtAnnouncementDepth(scid)) {
+			this._announcementsHeldForDepth.add(idHex);
+			return;
+		}
+		this._announcementsHeldForDepth.delete(idHex);
 		this.emit(
 			'announcement:ready',
 			ready.channelId,
 			ready.channelAnnouncement,
 			ready.channelUpdate
 		);
+	}
+
+	/** Whether the channel's signed announcement is waiting for depth. */
+	isAnnouncementHeld(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		if (this._announcementsHeldForDepth.has(idHex)) return true;
+		// A restored channel joins the set only when it is next rebuilt, so
+		// its depth is judged here too.
+		const scid = this.channels.get(idHex)?.getShortChannelId();
+		return !!scid && !this._scidAtAnnouncementDepth(scid);
+	}
+
+	private _scidAtAnnouncementDepth(scid: Buffer): boolean {
+		const block = (scid[0] << 16) | (scid[1] << 8) | scid[2];
+		return (
+			this._currentBlockHeight - block + 1 >= ANNOUNCEMENT_MIN_CONFIRMATIONS
+		);
+	}
+
+	/**
+	 * Rebuild each held announcement whose SCID has reached depth. Rebuilt
+	 * rather than replayed: a splice since may have replaced the SCID or reset
+	 * the signatures, and the channel_update gets a current timestamp.
+	 */
+	private _releaseAnnouncementsAtDepth(): void {
+		for (const idHex of [...this._announcementsHeldForDepth]) {
+			const channel = this.channels.get(idHex);
+			const scid = channel?.getShortChannelId();
+			if (!channel || !scid) {
+				this._announcementsHeldForDepth.delete(idHex);
+				continue;
+			}
+			// Kept while unusable: a splice that is later aborted would
+			// otherwise lose the only release this announcement gets.
+			if (!channel.isHtlcUsable(true) || !this._scidAtAnnouncementDepth(scid))
+				continue;
+			this._announcementsHeldForDepth.delete(idHex);
+			this.reannounceChannel(Buffer.from(idHex, 'hex'));
+		}
+	}
+
+	/**
+	 * Handle an announcement_signatures stashed before channel_ready, now that
+	 * the channel is NORMAL. Deferred out of the dispatch that made it ready.
+	 */
+	private _replayEarlyAnnouncementSignatures(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		const early = this._earlyAnnouncementSigs.get(idHex);
+		if (!early) return;
+		this._earlyAnnouncementSigs.delete(idHex);
+		setImmediate(() => {
+			if (!this.channels.has(idHex)) return;
+			this.handleAnnouncementSignaturesMsg(early.peerPubkey, early.payload);
+		});
 	}
 
 	/**
@@ -10140,6 +10293,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					break;
 				case ChannelActionType.CHANNEL_READY:
 					this.emit('channel:ready', action.channelId);
+					this._replayEarlyAnnouncementSignatures(action.channelId);
 					break;
 				case ChannelActionType.CHANNEL_CLOSED:
 					this.emit('channel:closed', action.channelId);
@@ -10192,7 +10346,8 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						'htlc:fulfilled',
 						channel.getChannelId()!,
 						action.htlcId,
-						action.paymentPreimage
+						action.paymentPreimage,
+						action.replay === true
 					);
 					break;
 				case ChannelActionType.HTLC_FAILED:
@@ -10339,12 +10494,7 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 					);
 					break;
 				case ChannelActionType.ANNOUNCEMENT_READY:
-					this.emit(
-						'announcement:ready',
-						action.channelId,
-						action.channelAnnouncement,
-						action.channelUpdate
-					);
+					this._emitAnnouncementReady(channel, action);
 					break;
 				case ChannelActionType.PERSIST_STATE:
 					// One commit per batch. Channel methods mutate state fully
@@ -10395,6 +10545,9 @@ export class ChannelManager extends TypedEmitter<ChannelManagerEvents> {
 						action.spliceTxid,
 						action.conflictTxid
 					);
+					break;
+				case ChannelActionType.DISCONNECT_PEER:
+					this.disconnectPeerForViolation(peerPubkey, action.reason);
 					break;
 			}
 			if (progress) progress.completedIndex = index;

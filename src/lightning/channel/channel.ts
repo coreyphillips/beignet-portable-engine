@@ -80,8 +80,14 @@ import {
 	closingOutputDustLimit,
 	minRelayFeeForWeight
 } from '../chain/closing';
-import type { IChannelReestablishMessage } from '../message/channel-reestablish';
-import { encodeChannelReestablishMessage } from '../message/channel-reestablish';
+import type {
+	IChannelReestablishMessage,
+	IMyCurrentFundingLocked
+} from '../message/channel-reestablish';
+import {
+	encodeChannelReestablishMessage,
+	RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+} from '../message/channel-reestablish';
 import { canScopeWireError, encodeErrorMessage } from '../message/error';
 import type {
 	ChannelAction,
@@ -1209,6 +1215,20 @@ export class Channel {
 	// tx_abort) by retransmitting ours. Without the latch two nodes that both
 	// retransmit would ping-pong reestablish forever.
 	private _reestablishRetransmitted = false;
+	// option_splice negotiated on the current connection: gates sending
+	// my_current_funding_locked (TLV 5) on channel_reestablish. Set by the
+	// manager before each reestablish; false for a channel driven directly.
+	private _spliceNegotiated = false;
+	// The txid our last channel_reestablish carried in
+	// my_current_funding_locked, or null when it carried none.
+	private _sentFundingLockedTxid: Buffer | null = null;
+	// A peer's my_current_funding_locked naming our in-flight splice while we
+	// still lack its tx_signatures. Applied when they arrive; cleared on
+	// disconnect, since the next reestablish carries the TLV again.
+	private _pendingRemoteSpliceLockTxid: Buffer | null = null;
+	// The peer's last reestablish asked for our announcement_signatures for
+	// the funding we are now on (my_current_funding_locked flag bit 0).
+	private _announcementSigsRequested = false;
 	// Splice-out only: where withdrawn funds are paid (wallet-owned script) and
 	// how much. Set by the node when it requests a splice-out.
 	private _spliceOutDestination: { script: Buffer; sats: bigint } | null = null;
@@ -2599,10 +2619,11 @@ export class Channel {
 			}
 			this._state.channelType = msg.channelType;
 		} else {
-			// If no channel type proposed, default to static_remotekey
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
+			// BOLT 2 (option_channel_type is assumed): fail the channel. A peer
+			// still on implicit negotiation may assume anchors from our shared
+			// features while we would build static_remotekey, which surfaces much
+			// later as a commitment signature mismatch.
+			return refuse('open_channel omitted channel_type');
 		}
 
 		// BOLT 2 couplings for the accept_channel WE build: our channel_reserve
@@ -4406,8 +4427,8 @@ export class Channel {
 			// reads this as a MUST-fail, but a legal crossing reaches it: a peer
 			// that crashed after completing the removal round and restored a
 			// lagging snapshot (the issue 295/297 window this codebase embraces)
-			// replays its WHOLE pending-update queue on reestablish, and our own
-			// handleReestablish does exactly that, unconditionally. The replayed
+			// replays its WHOLE pending-update queue on reestablish, as beignet's
+			// own handleReestablish did before #2089. The replayed
 			// fulfill/fail then lands on an entry handleRevokeAndAck already
 			// deleted. A replay that finds the entry takes the repeat branch
 			// below; this arm is the same family one persist further along, and
@@ -4440,10 +4461,13 @@ export class Channel {
 		// in a commit that precedes the node-level preimage and forward
 		// bookkeeping (the quorum pipeline persists deferred snapshots), and a
 		// process killed in that window restarts knowing the fulfill happened
-		// while holding no preimage at all. The peer's retransmission is then
-		// the only remaining source, so swallowing it here would strand the
-		// upstream leg of a forward forever (issue 295). Every listener on the
-		// resulting event is repeat-tolerant.
+		// without the node-level preimage (issue 295). The entry now carries
+		// the preimage itself (paymentPreimage, same row as FULFILLED) and
+		// handleReestablish re-emits HTLC_FULFILLED from it, because a
+		// conformant peer that holds our signature never retransmits the
+		// fulfill. Older beignet peers still do, and this branch keeps that
+		// replay doing the same job. Every listener on the resulting event is
+		// repeat-tolerant.
 		const ffor = this._state.ffor;
 		const redeemed =
 			!!ffor &&
@@ -4466,7 +4490,8 @@ export class Channel {
 				{
 					type: ChannelActionType.HTLC_FULFILLED,
 					htlcId: msg.id,
-					paymentPreimage: msg.paymentPreimage
+					paymentPreimage: msg.paymentPreimage,
+					replay: true
 				}
 			];
 		}
@@ -4478,6 +4503,9 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FULFILLED;
+		// In the same row as FULFILLED, so no persist of this state can lack it
+		// (issue 295; see IHtlcEntry.paymentPreimage).
+		entry.paymentPreimage = Buffer.from(msg.paymentPreimage);
 		// Two-phase: finalize the balance movement (and delete the entry) only
 		// once the peer has revoked for OUR commitment covering this removal.
 		entry.removalRemoteCommitted = false;
@@ -4899,9 +4927,10 @@ export class Channel {
 	 * forgotten across a disconnect, and a restarted peer restores a state
 	 * that may predate it), so handleReestablish retransmits the queue: the
 	 * entries our last commitment_signed covered ahead of that signature when
-	 * it is retransmitted, the entries queued after it behind it. Receivers
-	 * treat replays idempotently (duplicate add ids are ignored; a
-	 * fulfill/fail of an already fulfilled/failed HTLC is a no-op).
+	 * it is retransmitted, the entries queued after it behind it. When the
+	 * peer already holds that signature, the entries it covered are not
+	 * retransmitted: the peer holds them too, and LND rejects a duplicate as
+	 * "invalid update".
 	 */
 	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
 		this._state.pendingLocalUpdates.push({
@@ -5388,15 +5417,12 @@ export class Channel {
 			// operation, but with TWO active fundings every commitment update
 			// MUST arrive as a start_batch of one commitment_signed per funding.
 			// A lone commitment_signed here (no preceding start_batch) is invalid
-			// and would revoke on only one funding.
+			// and would revoke on only one funding. The splicing spec fails the
+			// channel for it.
 			if (this.isSplicePendingLock()) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'commitment_signed during a pending splice must be a start_batch'
-					}
-				];
+				return this._failChannelWithWireError(
+					'commitment_signed during a pending splice must be a start_batch'
+				);
 			}
 			// Mid-splice: the peer sends commitment_signed for the new commitment
 			// (spending the spliced funding output) after the interactive tx
@@ -9115,6 +9141,25 @@ export class Channel {
 		this._state.closingFeeMax = max < openerBalance ? max : openerBalance;
 	}
 
+	/**
+	 * Whether option_splice was negotiated on the current connection. Set by
+	 * the manager before it builds a channel_reestablish: the splice spec only
+	 * puts my_current_funding_locked on the wire when it was. Receiving the
+	 * TLV is not gated, since only a splice we negotiated can match it.
+	 */
+	setSpliceNegotiated(negotiated: boolean): void {
+		this._spliceNegotiated = negotiated;
+	}
+
+	/**
+	 * The peer's last channel_reestablish asked us to retransmit our
+	 * announcement_signatures for the current funding (my_current_funding_locked
+	 * retransmit_flags bit 0). Cleared on disconnect.
+	 */
+	isAnnouncementSignaturesRequested(): boolean {
+		return this._announcementSigsRequested;
+	}
+
 	// ─────────────── option_simple_close ───────────────
 
 	/**
@@ -9353,9 +9398,17 @@ export class Channel {
 			closeeScriptPubkey: Buffer
 		) => Buffer
 	): ChannelAction[] {
+		// A closing_complete that does not fit the channel's state (or arrives
+		// while something is still unresolved) is refused locally. One refused
+		// for its content, by the spec or by our own fee, locktime and payout
+		// checks, would otherwise leave the peer waiting for a closing_sig that
+		// never comes: it gets a warning and a disconnect, and the reconnect
+		// restarts the close from shutdown.
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
+		const refuse = (message: string): ChannelAction[] =>
+			this._warnAndDisconnect(message);
 
 		// Concurrent-close race: both sides may send closing_complete. If we
 		// already reached CLOSED through one direction, still co-sign the peer's
@@ -9393,7 +9446,7 @@ export class Channel {
 
 		// The closer pays the fee from its own (remote, from our view) balance.
 		if (msg.feeSatoshis > this._state.remoteBalanceMsat / 1000n) {
-			return err('closing_complete: fee exceeds closer balance');
+			return refuse('closing_complete: fee exceeds closer balance');
 		}
 		// And never less than the tx needs to relay. Co-signing is closing:
 		// the closee cannot bump (only the closer RBFs, sendClosingComplete),
@@ -9414,7 +9467,7 @@ export class Channel {
 			});
 			const floor = minRelayFeeForWeight(weight);
 			if (feePaid < floor) {
-				return err(
+				return refuse(
 					`closing_complete: fee ${msg.feeSatoshis} sat pays ${feePaid} sat on the closing tx, below the ${floor} sat relay floor`
 				);
 			}
@@ -9427,13 +9480,13 @@ export class Channel {
 		// anti-fee-sniping), and refuse any nonzero value while we have no tip
 		// to judge against.
 		if (msg.locktime >= 500_000_000) {
-			return err(
+			return refuse(
 				`closing_complete: locktime ${msg.locktime} is not a block height`
 			);
 		}
 		if (msg.locktime > 0) {
 			if (this._currentBlockHeight <= 0) {
-				return err(
+				return refuse(
 					`closing_complete: no chain tip to validate locktime ${msg.locktime} against`
 				);
 			}
@@ -9441,7 +9494,7 @@ export class Channel {
 				msg.locktime >
 				this._currentBlockHeight + SIMPLE_CLOSE_LOCKTIME_FUTURE_TOLERANCE
 			) {
-				return err(
+				return refuse(
 					`closing_complete: locktime ${msg.locktime} is beyond our chain tip ${this._currentBlockHeight}`
 				);
 			}
@@ -9451,12 +9504,12 @@ export class Channel {
 			!this._state.localShutdownScript ||
 			!msg.closeeScriptPubkey.equals(this._state.localShutdownScript)
 		) {
-			return err('closing_complete: closee script does not match ours');
+			return refuse('closing_complete: closee script does not match ours');
 		}
 		// Their script may differ from their shutdown (simple close allows script
 		// updates), but must still be a standard form (OP_RETURN allowed here).
 		if (!isValidShutdownScript(msg.closerScriptPubkey, true, true)) {
-			return err('closing_complete: invalid closer script');
+			return refuse('closing_complete: invalid closer script');
 		}
 		this._state.remoteShutdownScript = msg.closerScriptPubkey;
 		if (!alreadyClosed) {
@@ -9469,12 +9522,14 @@ export class Channel {
 		const ourValue = this._state.localBalanceMsat / 1000n;
 		const ourDust = isDustOutput(msg.closeeScriptPubkey, ourValue);
 		if (this._state.externalClose && ourDust)
-			return err('Cannot close cooperatively: external payout would be dust');
+			return refuse(
+				'Cannot close cooperatively: external payout would be dust'
+			);
 		let variant: ClosingSigVariant;
 		let theirSig: Buffer;
 		if (ourDust) {
 			if (!msg.closerOutputOnlySig) {
-				return err(
+				return refuse(
 					'closing_complete: our output is dust but no closer_output_only sig'
 				);
 			}
@@ -9489,7 +9544,7 @@ export class Channel {
 		} else {
 			// Only closer_output_only offered but our output is not dust — signing
 			// it would burn our balance to their close. Refuse.
-			return err(
+			return refuse(
 				'closing_complete: peer offered only closer_output_only for our non-dust output'
 			);
 		}
@@ -9504,7 +9559,7 @@ export class Channel {
 				theirSig
 			)
 		) {
-			return err('closing_complete: peer signature failed to verify');
+			return refuse('closing_complete: peer signature failed to verify');
 		}
 
 		const ourSig = signFn(
@@ -9558,9 +9613,13 @@ export class Channel {
 			signature: Buffer
 		) => boolean
 	): ChannelAction[] {
+		// State refusals stay local; a closing_sig refused for its content gets
+		// a warning and a disconnect, as in handleClosingComplete.
 		const err = (message: string): ChannelAction[] => [
 			{ type: ChannelActionType.ERROR, message }
 		];
+		const refuse = (message: string): ChannelAction[] =>
+			this._warnAndDisconnect(message);
 
 		// Concurrent-close race: our closing_complete may be answered after we
 		// already reached CLOSED as the closee of the peer's round. Accept it —
@@ -9595,7 +9654,7 @@ export class Channel {
 		}
 		const last = this._state.lastLocalClosingComplete;
 		if (!last || !this._state.awaitingClosingSig) {
-			return err('closing_sig without a pending closing_complete');
+			return refuse('closing_sig without a pending closing_complete');
 		}
 		if (
 			msg.feeSatoshis !== last.feeSatoshis ||
@@ -9603,7 +9662,7 @@ export class Channel {
 			!msg.closerScriptPubkey.equals(last.closerScript) ||
 			!msg.closeeScriptPubkey.equals(last.closeeScript)
 		) {
-			return err('closing_sig does not echo our closing_complete');
+			return refuse('closing_sig does not echo our closing_complete');
 		}
 
 		const sigs: Array<{ variant: ClosingSigVariant; sig: Buffer }> = [];
@@ -9626,13 +9685,13 @@ export class Channel {
 			});
 		}
 		if (sigs.length !== 1) {
-			return err(
+			return refuse(
 				`closing_sig must carry exactly one signature, got ${sigs.length}`
 			);
 		}
 		const { variant, sig } = sigs[0];
 		if (!last.sentVariants.includes(variant)) {
-			return err('closing_sig signature variant was not offered by us');
+			return refuse('closing_sig signature variant was not offered by us');
 		}
 
 		if (
@@ -9645,7 +9704,7 @@ export class Channel {
 				sig
 			)
 		) {
-			return err('closing_sig: peer signature failed to verify');
+			return refuse('closing_sig: peer signature failed to verify');
 		}
 
 		this._state.awaitingClosingSig = false;
@@ -10023,6 +10082,9 @@ export class Channel {
 		this._txAbortSent = false;
 		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
+		this._pendingRemoteSpliceLockTxid = null;
+		this._announcementSigsRequested = false;
+		this._announcements.handleDisconnect();
 		// Any coins selected for a raise the peer never acked go back to the
 		// wallet: the request dies here, so nothing will ever spend them.
 		this._releasePendingRbfTopUp();
@@ -10167,7 +10229,7 @@ export class Channel {
 	 *
 	 * The crossing clause also covers the crash-replay family (issue 409): a
 	 * peer restored from a legally lagging snapshot replays its whole pending
-	 * update queue on reestablish (handleReestablish does the same), so the
+	 * update queue on reestablish (beignet did the same before #2089), so the
 	 * "HTLC not found" arms and the pending-HTLC closing_signed arm can fire
 	 * against a conformant peer and stay bare, each argued at its guard. So
 	 * does the taproot closing_signed nonce-exchange arm, whose predicate
@@ -10359,6 +10421,37 @@ export class Channel {
 		);
 	}
 
+	/**
+	 * BOLT 1 `warning` and a disconnect: the lighter of the two answers BOLT 2
+	 * allows for a protocol violation ("send a `warning` and close the
+	 * connection, or send an `error` and fail the channel"). For a fault the
+	 * next channel_reestablish recovers from, where failing the channel would
+	 * broadcast a commitment over a disagreement a reconnect settles. Nothing
+	 * about the channel changes here, so there is nothing to persist.
+	 */
+	private _warnAndDisconnect(message: string): ChannelAction[] {
+		return [
+			...this._wireWarning(message),
+			{ type: ChannelActionType.ERROR, message },
+			{ type: ChannelActionType.DISCONNECT_PEER, reason: message }
+		];
+	}
+
+	/**
+	 * A BOLT 1 `warning` scoped to this channel. Same scope rule as
+	 * wireErrorFor: an id that cannot carry one sends nothing.
+	 */
+	private _wireWarning(message: string): ChannelAction[] {
+		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
+		if (!canScopeWireError(channelId)) return [];
+		return [
+			sendMsg(
+				MessageType.WARNING,
+				encodeErrorMessage({ channelId, data: Buffer.from(message, 'ascii') })
+			)
+		];
+	}
+
 	private _failChannelWithWireError(
 		message: string,
 		cleanup?: IErrorAction['cleanup'],
@@ -10495,6 +10588,19 @@ export class Channel {
 			}
 		}
 
+		const lockedTxid = this._spliceNegotiated
+			? this._myCurrentFundingLockedTxid()
+			: null;
+		this._sentFundingLockedTxid = lockedTxid;
+		if (lockedTxid) {
+			msg.myCurrentFundingLocked = {
+				txid: lockedTxid,
+				retransmitFlags: this._wantsAnnouncementSignatures(lockedTxid)
+					? RETRANSMIT_ANNOUNCEMENT_SIGNATURES
+					: 0
+			};
+		}
+
 		const actions: ChannelAction[] = [];
 
 		// We dropped an unresumable splice; the peer may still hold it in-flight.
@@ -10604,6 +10710,55 @@ export class Channel {
 	}
 
 	/**
+	 * my_current_funding_locked for our channel_reestablish, by the splice
+	 * spec's three rules in order: a splice that reached its lock depth while
+	 * we were disconnected, else the last splice we sent splice_locked for,
+	 * else the funding we sent channel_ready for. Null before channel_ready.
+	 *
+	 * A completed splice is the channel's funding from then on, so the last
+	 * two rules both name fundingTxid once nothing is in flight.
+	 */
+	private _myCurrentFundingLockedTxid(): Buffer | null {
+		const spliceTxid = this._lockableSpliceTxid();
+		if (spliceTxid) return spliceTxid;
+		if (!this._state.localChannelReady || !this._state.fundingTxid) return null;
+		return Buffer.from(this._state.fundingTxid);
+	}
+
+	/**
+	 * The in-flight splice's txid when we have locked it, or may lock it now
+	 * because it confirmed while splice_locked could not be sent. Null
+	 * otherwise. handleReestablish records the second case as our lock, so the
+	 * value sent in my_current_funding_locked and our state agree.
+	 */
+	private _lockableSpliceTxid(): Buffer | null {
+		const inflight = this._state.spliceInFlight;
+		const session = this._spliceSession;
+		const txid = inflight?.spliceTxid ?? session?.getSpliceTxid() ?? null;
+		if (!txid) return null;
+		if (inflight?.localSpliceLocked || session?.hasSentSpliceLocked()) {
+			return Buffer.from(txid);
+		}
+		if (inflight?.confirmed && inflight.receivedTxSignatures) {
+			return Buffer.from(txid);
+		}
+		return null;
+	}
+
+	/**
+	 * retransmit_flags bit 0 for my_current_funding_locked: set on a public
+	 * channel when we hold no announcement_signatures from the peer for that
+	 * funding. A splice that is not yet adopted has none by definition: the
+	 * announcement state is reset when it completes.
+	 */
+	private _wantsAnnouncementSignatures(lockedTxid: Buffer): boolean {
+		if (!this._state.announceChannel) return false;
+		const current = this._state.fundingTxid;
+		if (!current || !lockedTxid.equals(current)) return true;
+		return !this._state.announcementSigsReceived;
+	}
+
+	/**
 	 * The txid of an in-flight v2 open whose signature exchange is incomplete
 	 * (the condition for setting next_funding_txid on channel_reestablish), or
 	 * null. Unlike the splice regime above (announce until locked), BOLT 2
@@ -10710,28 +10865,72 @@ export class Channel {
 			}
 		}
 
-		// ── splice_locked retransmission (analogous to channel_ready) ──
+		// ── Lock recovery ──
+		// A peer that sends my_current_funding_locked reads ours too (splice
+		// spec). When our reestablish named this splice, our lock already
+		// reached the peer, and a splice_locked on top is a duplicate some
+		// peers fail the channel for. Any other peer still gets the message.
+		const lockReachedPeer =
+			msg.myCurrentFundingLocked !== undefined &&
+			!!ourSpliceTxid &&
+			!!this._sentFundingLockedTxid?.equals(ourSpliceTxid);
 		if (this._state.state === ChannelState.SPLICING && this._state.channelId) {
 			if (
 				(inflight?.localSpliceLocked || session?.hasSentSpliceLocked()) &&
 				ourSpliceTxid
 			) {
-				actions.push(
-					sendMsg(
-						MessageType.SPLICE_LOCKED,
-						encodeSpliceLockedMessage({
-							channelId: this._state.channelId,
-							fundingTxid: ourSpliceTxid
-						})
-					)
-				);
+				if (!lockReachedPeer) {
+					actions.push(
+						sendMsg(
+							MessageType.SPLICE_LOCKED,
+							encodeSpliceLockedMessage({
+								channelId: this._state.channelId,
+								fundingTxid: ourSpliceTxid
+							})
+						)
+					);
+				}
 			} else if (inflight?.confirmed && inflight.receivedTxSignatures) {
 				// The splice tx confirmed while we were disconnected: lock it now.
-				actions.push(...this.sendSpliceLocked());
+				actions.push(...this._lockSplice(!lockReachedPeer));
 			}
+		}
+		if (msg.myCurrentFundingLocked) {
+			actions.push(
+				...this._applyRemoteFundingLocked(msg.myCurrentFundingLocked)
+			);
 		}
 
 		return actions;
+	}
+
+	/**
+	 * The peer's my_current_funding_locked, processed as a splice_locked for
+	 * that txid (splice spec). Only our in-flight splice's txid can lock
+	 * anything: the current funding txid means nothing new, and any other txid
+	 * names a transaction this channel cannot adopt, so it is ignored.
+	 */
+	private _applyRemoteFundingLocked(
+		locked: IMyCurrentFundingLocked
+	): ChannelAction[] {
+		const session = this._spliceSession;
+		if (this._state.state !== ChannelState.SPLICING || !session) return [];
+		const spliceTxid =
+			this._state.spliceInFlight?.spliceTxid ?? session.getSpliceTxid();
+		if (!spliceTxid || !locked.txid.equals(spliceTxid)) return [];
+		if (session.hasReceivedSpliceLocked()) return [];
+		if (session.getState() === SpliceState.AWAITING_TX_SIGNATURES) {
+			// The peer locked before we hold its tx_signatures (they are being
+			// retransmitted over this connection). _spliceCompletionTail applies
+			// it once they arrive.
+			this._pendingRemoteSpliceLockTxid = Buffer.from(locked.txid);
+			return [];
+		}
+		if (session.getState() !== SpliceState.AWAITING_SPLICE_LOCKED) return [];
+		return this.handleSpliceLocked({
+			channelId: this._state.channelId!,
+			fundingTxid: Buffer.from(locked.txid)
+		});
 	}
 
 	/**
@@ -11019,10 +11218,11 @@ export class Channel {
 			localSpliceLocked: inflight.localSpliceLocked,
 			remoteSpliceLocked: inflight.remoteSpliceLocked
 		});
-		// An in-flight splice only exists once the mid-splice commitment round
-		// completed (or our sigs left), so both commitment flags are true.
+		// The record is written as OUR splice commitment_signed leaves, which
+		// can be before the peer's arrives: only a recorded signature says we
+		// hold one. Reestablish asks for it by the same test.
 		this._spliceSentCommitment = true;
-		this._spliceReceivedCommitment = true;
+		this._spliceReceivedCommitment = inflight.remoteCommitmentSig !== null;
 		this._spliceSentTxSigs = inflight.sentTxSignatures;
 		this._spliceRemoteCommitmentSig = inflight.remoteCommitmentSig;
 		this._spliceRemoteHtlcSigs = inflight.remoteHtlcSignatures ?? null;
@@ -11810,13 +12010,19 @@ export class Channel {
 		}
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
-		// Every queued update the peer has not acknowledged with a
-		// revoke_and_ack may have been lost with the connection (the peer
-		// forgets uncommitted updates; a restarted peer restores a state that
-		// may predate them). Replay them verbatim, in the order they were
-		// sent. Peers that did keep them treat the replays idempotently
-		// (duplicate add ids ignored; fulfill/fail of an already
-		// fulfilled/failed HTLC is a no-op).
+		// A queued update the peer has not acknowledged with a revoke_and_ack
+		// may have been lost with the connection (the peer forgets uncommitted
+		// updates; a restarted peer restores a state that may predate them).
+		// Replay those verbatim, in the order they were sent.
+		//
+		// Except the ones our last commitment_signed covered, when the peer's
+		// next_commitment_number says it holds that signature: it then holds
+		// every update the signature covered, and only its revoke_and_ack was
+		// lost (it retransmits that itself). A replay of a covered update
+		// reaches the peer as a duplicate. Beignet's receiver ignores one, but
+		// LND does not: a second add with a used id, or a fulfil or fail of an
+		// HTLC it has already removed, fails its link with "invalid update",
+		// sent as a wire error, and we force-close on that error.
 		//
 		// A retransmitted commitment_signed must follow exactly the updates it
 		// covers (issue #1300). The queue's first pendingLocalUpdatesSignedCount
@@ -11830,7 +12036,8 @@ export class Channel {
 		// it), which is where they sat on the original connection. They stay
 		// queued and needsCommitment stays set, so our NEXT signature covers
 		// them once the peer's revoke_and_ack for this one arrives. With no
-		// signature to retransmit the whole queue goes out here, as before.
+		// signature to retransmit, every update the peer does not already hold
+		// goes out here.
 		const peerMissedCommitment =
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n;
@@ -11848,15 +12055,24 @@ export class Channel {
 					: queue.length;
 			for (let i = 0; i < queue.length; i++) {
 				const update = queue[i];
-				// A fee already covered by the commitment the peer holds must not
-				// start another fee round on replay. The lost revoke_and_ack will
-				// acknowledge it; unsigned updates and a missing commitment still
-				// need their original replay.
+				// Covered by the commitment the peer holds: the peer has it, and
+				// its lost revoke_and_ack will acknowledge it. Whatever the
+				// type: a replayed add, fulfil or fail is a duplicate LND
+				// rejects, and a replayed fee starts another fee round. The entry
+				// stays queued until that revoke_and_ack trims it. Updates sent
+				// after the signature, and every update when the peer missed the
+				// signature, still need their original replay.
+				//
+				// A covered fulfil used to go out anyway, so a beignet forwarder
+				// killed before persisting the preimage could learn it again
+				// (issue 295). The forwarder now keeps the preimage on the
+				// FULFILLED entry itself and re-emits it on reestablish, so it no
+				// longer depends on this peer, which matters because LND, CLN
+				// and Eclair never send that replay.
 				if (
 					peerHasCommitment &&
 					Number.isInteger(signedCount) &&
-					i < signedCount &&
-					update.type === MessageType.UPDATE_FEE
+					i < signedCount
 				) {
 					continue;
 				}
@@ -11892,6 +12108,7 @@ export class Channel {
 			} else if (
 				this._signer &&
 				this._state.channelId &&
+				this._state.fundingTxid &&
 				this._state.spliceInFlight &&
 				this._state.lastSentCommitmentSigned &&
 				!isTaprootChannel(this._state.channelType)
@@ -11923,7 +12140,8 @@ export class Channel {
 						const currentBytes = encodeCommitmentSignedMessage({
 							channelId: this._state.channelId,
 							signature: this._state.lastSentCommitmentSigned,
-							htlcSignatures: this._state.lastSentHtlcSignatures ?? []
+							htlcSignatures: this._state.lastSentHtlcSignatures ?? [],
+							fundingTxid: Buffer.from(this._state.fundingTxid)
 						});
 						const spliceBytes = encodeCommitmentSignedMessage({
 							channelId: this._state.channelId,
@@ -12052,6 +12270,16 @@ export class Channel {
 			actions.push(...this._handleReestablishSplice(msg));
 		}
 
+		// Read after the splice handler, which may have adopted the splice the
+		// TLV names: the request is for that funding's announcement.
+		const lockedTlv = msg.myCurrentFundingLocked;
+		const fundingTxid = this._state.fundingTxid;
+		this._announcementSigsRequested =
+			lockedTlv !== undefined &&
+			(lockedTlv.retransmitFlags & RETRANSMIT_ANNOUNCEMENT_SIGNATURES) !== 0 &&
+			!!fundingTxid &&
+			lockedTlv.txid.equals(fundingTxid);
+
 		// ── FFOR section 7.5.5 retransmission rules ──
 		// A reestablish decides the hold afresh, from a clean set. A peer may
 		// send a second channel_reestablish on a connection we are already
@@ -12168,6 +12396,35 @@ export class Channel {
 			actions.push(
 				...this.fundingConfirmed(this._state.fundingTxid ?? undefined)
 			);
+		}
+
+		// ── Re-emit fulfils the peer has already revealed (issue 295) ──
+		// An offered HTLC the peer fulfilled keeps the preimage on its entry,
+		// in the same row as FULFILLED. A node killed after that row landed
+		// but before the node-level preimage and forward bookkeeping did
+		// restarts with the HTLC fulfilled and nothing to settle the upstream
+		// leg with, and a peer that holds our signature never retransmits the
+		// fulfil (BOLT 2; beignet stopped doing so in #2089, LND, CLN and
+		// Eclair never did). So re-emit it here, where that replay used to
+		// land. Every HTLC_FULFILLED listener is repeat-tolerant, the same
+		// property the replay relied on, and the node announces a replay to
+		// the application only when it still had something to settle (see
+		// IHtlcFulfilledAction.replay). An unsigned peer fulfil was already
+		// rolled back to COMMITTED by markForReestablish and is not re-emitted:
+		// the peer retransmits that one itself.
+		for (const [key, entry] of this._state.htlcs) {
+			if (
+				key.startsWith('offered-') &&
+				entry.state === HtlcState.FULFILLED &&
+				entry.paymentPreimage
+			) {
+				actions.push({
+					type: ChannelActionType.HTLC_FULFILLED,
+					htlcId: entry.id,
+					paymentPreimage: entry.paymentPreimage,
+					replay: true
+				});
+			}
 		}
 
 		this._lastReestablishOutcome = actions.some(
@@ -14356,6 +14613,10 @@ export class Channel {
 
 		const result = this._spliceSession.handleSpliceLocked(msg);
 		if (!result.ok) {
+			// A txid that matches no pending splice. The spec allows a warning
+			// and a disconnect, and nothing is lost by reconnecting: the
+			// reestablish exchange settles which funding is locked.
+			if (result.txidMismatch) return this._warnAndDisconnect(result.error!);
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
 		}
 
@@ -14376,6 +14637,15 @@ export class Channel {
 	 * Send splice_locked after the splice tx is confirmed.
 	 */
 	sendSpliceLocked(): ChannelAction[] {
+		return this._lockSplice(true);
+	}
+
+	/**
+	 * Record our splice lock and, when `send`, put splice_locked on the wire.
+	 * Without it the lock reached the peer some other way: the
+	 * my_current_funding_locked TLV of our channel_reestablish.
+	 */
+	private _lockSplice(send: boolean): ChannelAction[] {
 		if (this._state.state !== ChannelState.SPLICING) {
 			return [
 				{
@@ -14423,9 +14693,11 @@ export class Channel {
 			this.completeSplice();
 		}
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
-		actions.push(
-			sendMsg(MessageType.SPLICE_LOCKED, encodeSpliceLockedMessage(lockedMsg))
-		);
+		if (send) {
+			actions.push(
+				sendMsg(MessageType.SPLICE_LOCKED, encodeSpliceLockedMessage(lockedMsg))
+			);
+		}
 		if (spliceComplete) {
 			actions.push({ type: ChannelActionType.SPLICE_COMPLETE });
 		}
@@ -15507,6 +15779,9 @@ export class Channel {
 			this._state.spliceFundingTxid !== null &&
 			this._state.fundingTxid !== null &&
 			this._state.spliceFundingTxid.equals(this._state.fundingTxid);
+		// Refused locally and nothing collected: the members that follow are
+		// judged one by one, which is what the spec asks of a start_batch the
+		// receiver ignores.
 		if (!this.isSplicePendingLock() && !postSpliceNormal) {
 			return [
 				{
@@ -15515,6 +15790,9 @@ export class Channel {
 				}
 			];
 		}
+		// The spec ignores a start_batch for another message type and processes
+		// what follows sequentially. A lone commitment_signed during the pending
+		// splice then fails the channel in handleCommitmentSigned.
 		if (msg.messageType !== undefined && msg.messageType !== 132) {
 			return [
 				{
@@ -15523,17 +15801,24 @@ export class Channel {
 				}
 			];
 		}
-		// Exactly one current funding + one pending splice (no splice RBF yet):
-		// the batch MUST carry one commitment_signed per active funding. A
-		// smaller batch would revoke on only one funding (see the fund-safety
-		// note in _handleCommitmentSignedBatch).
-		if (msg.batchSize !== 2) {
+		// A batch_size of 0 or 1 is ignored with a warning (spec); the lone
+		// commitment_signed after it meets the same arm as above.
+		if (msg.batchSize <= 1) {
+			const message = `Ignoring start_batch of size ${msg.batchSize}`;
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `Unsupported start_batch size ${msg.batchSize} (expected 2)`
-				}
+				...this._wireWarning(message),
+				{ type: ChannelActionType.ERROR, message }
 			];
+		}
+		// Exactly one current funding + one pending splice (no splice RBF yet):
+		// the batch MUST carry one commitment_signed per active funding. Any
+		// other size means the peer is signing a different set of fundings, and
+		// the two sides would revoke on different commitments (see the
+		// fund-safety note in _handleCommitmentSignedBatch).
+		if (msg.batchSize !== 2) {
+			return this._failChannelWithWireError(
+				`Unsupported start_batch size ${msg.batchSize} (expected 2)`
+			);
 		}
 		this._pendingBatch = { size: msg.batchSize, msgs: [] };
 		return [];
@@ -15552,6 +15837,15 @@ export class Channel {
 	private _handleCommitmentSignedBatch(
 		msgs: ICommitmentSignedMessage[]
 	): ChannelAction[] {
+		// Every batch member must name the funding it spends, the current one
+		// included, and the splicing spec fails the channel when one does not.
+		// Guessing that an untagged member is the current funding would hide a
+		// sender that other implementations refuse.
+		if (msgs.some((m) => !m.fundingTxid)) {
+			return this._failChannelWithWireError(
+				'Commitment batch member without funding_txid'
+			);
+		}
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) {
 			// The batch raced our splice_locked: the peer built it before
@@ -15565,13 +15859,9 @@ export class Channel {
 					m.fundingTxid.equals(this._state.fundingTxid)
 			);
 			if (!current) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Commitment batch without a pending splice or a current-funding commitment'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Commitment batch without a pending splice or a current-funding commitment'
+				);
 			}
 			return this.handleCommitmentSigned(current);
 		}
@@ -15581,36 +15871,27 @@ export class Channel {
 		for (const m of msgs) {
 			if (m.fundingTxid && m.fundingTxid.equals(inflight.spliceTxid)) {
 				if (spliceMsg) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Commitment batch has two splice-funding commitments'
-						}
-					];
+					return this._failChannelWithWireError(
+						'Commitment batch has two splice-funding commitments'
+					);
 				}
 				spliceMsg = m;
 			} else if (
-				!m.fundingTxid ||
-				(this._state.fundingTxid &&
-					m.fundingTxid.equals(this._state.fundingTxid))
+				this._state.fundingTxid &&
+				m.fundingTxid?.equals(this._state.fundingTxid)
 			) {
 				if (currentMsg) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Commitment batch has two current-funding commitments'
-						}
-					];
+					return this._failChannelWithWireError(
+						'Commitment batch has two current-funding commitments'
+					);
 				}
 				currentMsg = m;
 			} else {
-				const peerTxid = Buffer.from(m.fundingTxid).reverse().toString('hex');
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Commitment batch funding_txid unknown: ${peerTxid}`
-					}
-				];
+				// Every member carries a funding_txid: refused above otherwise.
+				const peerTxid = Buffer.from(m.fundingTxid!).reverse().toString('hex');
+				return this._failChannelWithWireError(
+					`Commitment batch funding_txid unknown: ${peerTxid}`
+				);
 			}
 		}
 		// Fund-safety (both required): the revoke_and_ack the standard path emits
@@ -15621,20 +15902,14 @@ export class Channel {
 		// the splice-funding commitment while leaving us with only a stale
 		// signature for it, and hence no unilateral exit on the spliced channel.
 		if (!currentMsg) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch missing the current-funding commitment'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Commitment batch missing the current-funding commitment'
+			);
 		}
 		if (!spliceMsg) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch missing the splice-funding commitment'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Commitment batch missing the splice-funding commitment'
+			);
 		}
 
 		// Verify the SPLICE-funding commitment first, at the post-round height
@@ -15684,12 +15959,9 @@ export class Channel {
 				nextNum
 			)
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid batched splice commitment signature'
-				}
-			];
+			return this._failChannelWithWireError(
+				'Invalid batched splice commitment signature'
+			);
 		}
 		// Committed HTLCs may ride through a splice (S-2.M8): the spliced
 		// commitment then carries HTLC outputs, and the peer's second-level
@@ -15713,12 +15985,9 @@ export class Channel {
 						nextNum
 				  );
 			if (!htlcSigsValid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid HTLC signature in a pending-lock batch'
-					}
-				];
+				return this._failChannelWithWireError(
+					'Invalid HTLC signature in a pending-lock batch'
+				);
 			}
 		}
 		// The rate the spliced commitment was verified at (before the standard
@@ -15730,13 +15999,17 @@ export class Channel {
 		// verifies at the same post-round height, adopts any staged feerate,
 		// advances the commitment number and emits the single revoke_and_ack
 		// for the whole batch). The state briefly reads NORMAL so the standard
-		// branch accepts it; SPLICING is restored either way.
+		// branch accepts it. Only that NORMAL is undone: a state the standard
+		// path moved to (ERRORED on a bad signature) must survive, or the
+		// manager persists a live channel and never emits channel:errored.
 		let actions: ChannelAction[];
 		this._state.state = ChannelState.NORMAL;
 		try {
 			actions = this.handleCommitmentSigned(currentMsg);
 		} finally {
-			this._state.state = ChannelState.SPLICING;
+			if (this._state.state === ChannelState.NORMAL) {
+				this._state.state = ChannelState.SPLICING;
+			}
 		}
 
 		const failed = actions.some((a) => a.type === ChannelActionType.ERROR);
@@ -15764,22 +16037,21 @@ export class Channel {
 		msg: ICommitmentSignedMessage
 	): ChannelAction[] {
 		const actions: ChannelAction[] = [];
-		// Make sure our own commitment_signed has gone out (the peer may send first).
+		// Make sure our own commitment_signed has gone out (the peer may send
+		// first). This can mark our commitment sent and queue its persist and
+		// send, so every return below carries these actions.
 		actions.push(...this._maybeSendSpliceCommitment());
 
 		const spliced = this._splicedState();
 		if (!spliced) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Unexpected splice commitment_signed: tx not built'
-				}
-			];
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: 'Unexpected splice commitment_signed: tx not built'
+			});
+			return actions;
 		}
 
-		// Route by funding_txid (internal byte order). If the peer specified a
-		// funding_txid that is neither our spliced tx nor the current funding tx,
-		// ignore it (BOLT: ignore commitment_signed whose funding_txid is unknown).
+		// Route by funding_txid (internal byte order).
 		const spliceTxid = this._spliceTx
 			? Buffer.from(this._spliceTx.tx.getHash())
 			: null;
@@ -15792,17 +16064,19 @@ export class Channel {
 				// splice). Accept silently; it is not the spliced commitment.
 				return actions;
 			}
-			// Peer's commitment is for a splice tx we did not build — the two sides
-			// constructed different splice transactions. Surface both txids (display
-			// order) so the divergence is visible.
+			// Stray commitments from an aborted splice were filtered out in
+			// handleCommitmentSigned, so this one is for a splice tx we did not
+			// build: the two sides negotiated different transactions and this
+			// splice can never complete. Fail the channel, as for an unknown
+			// batch member. Both txids (display order) show the divergence.
 			const peerTxid = Buffer.from(msg.fundingTxid).reverse().toString('hex');
 			const ourTxid = Buffer.from(spliceTxid).reverse().toString('hex');
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `splice commitment_signed funding_txid mismatch: peer=${peerTxid} ours=${ourTxid}`
-				}
-			];
+			actions.push(
+				...this._failChannelWithWireError(
+					`splice commitment_signed funding_txid mismatch: peer=${peerTxid} ours=${ourTxid}`
+				)
+			);
+			return actions;
 		}
 
 		// Cannot verify -> must not cache: the signature stored below is the
@@ -15810,13 +16084,12 @@ export class Channel {
 		// flag it sets gates the rest of the splice round. A plain ERROR, not
 		// a wire error: the missing pieces are a LOCAL invariant failure.
 		if (!this._signer || !this._state.remoteBasepoints) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cannot verify splice commitment signature: no signer or remote basepoints'
-				}
-			];
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message:
+					'Cannot verify splice commitment signature: no signer or remote basepoints'
+			});
+			return actions;
 		}
 		const ourPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
@@ -15830,12 +16103,11 @@ export class Channel {
 			this._state.localCommitmentNumber
 		);
 		if (!valid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid splice commitment signature'
-				}
-			];
+			// BOLT 2: an invalid commitment signature fails the channel.
+			actions.push(
+				...this._failChannelWithWireError('Invalid splice commitment signature')
+			);
+			return actions;
 		}
 		// Committed HTLCs riding through the splice (S-2.M8) put HTLC
 		// outputs on the spliced commitment; verify the peer's second-level
@@ -15856,12 +16128,12 @@ export class Channel {
 					this._state.localCommitmentNumber
 			  );
 		if (!htlcSigsValid) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid splice commitment HTLC signature'
-				}
-			];
+			actions.push(
+				...this._failChannelWithWireError(
+					'Invalid splice commitment HTLC signature'
+				)
+			);
+			return actions;
 		}
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
@@ -16183,6 +16455,18 @@ export class Channel {
 			this._state.spliceInFlight?.confirmed
 		) {
 			actions.push(...this.sendSpliceLocked());
+		}
+		// The peer's lock arrived in its channel_reestablish ahead of these
+		// signatures; it will not send splice_locked again.
+		const pendingLock = this._pendingRemoteSpliceLockTxid;
+		this._pendingRemoteSpliceLockTxid = null;
+		if (pendingLock?.equals(spliceTxid)) {
+			actions.push(
+				...this._applyRemoteFundingLocked({
+					txid: pendingLock,
+					retransmitFlags: 0
+				})
+			);
 		}
 		return actions;
 	}
@@ -16783,6 +17067,21 @@ export class Channel {
 			remoteNodeId,
 			localNodeSig,
 			localBitcoinSig
+		);
+	}
+
+	/**
+	 * Our stored announcement_signatures, for a peer that has not sent its own
+	 * (BOLT 7 retransmission on reconnect). Empty when there is nothing signed
+	 * to send.
+	 */
+	retransmitAnnouncementSignatures(
+		localNodeId: Buffer,
+		remoteNodeId: Buffer
+	): ChannelAction[] {
+		return this._announcements.retransmitAnnouncementSignatures(
+			localNodeId,
+			remoteNodeId
 		);
 	}
 
@@ -20702,6 +21001,19 @@ export class Channel {
 			// are already fully signed: benign no-op.
 			if (this._state.spliceInFlight?.receivedTxSignatures) {
 				return [];
+			}
+
+			// The peer's signature completes the shared input, so applying it
+			// publishes the splice. Without the peer's verified splice
+			// commitment_signed we hold no signed commitment on the new funding
+			// output, and so no unilateral exit once the splice confirms. An
+			// honest peer sends that commitment first on the same stream. The
+			// reestablish after this disconnect asks for both again, in order
+			// (retransmit_flags bit 0).
+			if (!this._spliceSentCommitment || !this._spliceReceivedCommitment) {
+				return this._warnAndDisconnect(
+					'tx_signatures before the splice commitment_signed exchange'
+				);
 			}
 
 			// The peer's 2-of-2 funding signature arrives in the

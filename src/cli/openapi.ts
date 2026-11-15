@@ -1635,6 +1635,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/offer/create': {
 				post: {
 					summary: 'Create a BOLT 12 offer',
+					description:
+						'amountSats, when given, must be a positive integer. Omit it for an offer that takes any amount; 0 is refused with INVALID_PARAMS, since BOLT 12 readers will not answer an offer whose amount is zero.',
 					tags: ['Offers'],
 					requestBody: bodyContent({
 						description: 'string',
@@ -5172,6 +5174,64 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/porch/links': {
+				get: {
+					summary:
+						'List the Porch links this node serves and how it stands with each relay',
+					description:
+						'A Porch link is an ordinary peer URI, pubkey@wss://relay/v1/p/<route>, that reaches the node through a relay it dialed out to. It does not say where the node runs, and whoever dials it learns only the relay. Every node has one link from its seed; POST /porch/links/create makes more, so each can be handed to one person and revoked alone. With no Porch relay configured this answers enabled: false.',
+					tags: ['Porch'],
+					responses: {
+						'200': {
+							description: 'Links and relay status',
+							content: jsonContent({
+								$ref: '#/components/schemas/PorchLinksInfo'
+							})
+						}
+					}
+				}
+			},
+			'/porch/links/create': {
+				post: {
+					summary:
+						'Make a Porch link of its own, to hand to one person or device',
+					description:
+						'The link has a random id and works as soon as the relays have the node registered with it, which is asked of them at once. The label is for the operator: at most 64 characters, no control characters. A node serves at most 256 links. 400 INVALID_PARAMS when Porch is not configured.',
+					tags: ['Porch'],
+					requestBody: bodyContent({ label: 'string?' }),
+					responses: {
+						'200': {
+							description: 'The new link',
+							content: jsonContent({
+								$ref: '#/components/schemas/PorchLinkInfo'
+							})
+						}
+					}
+				}
+			},
+			'/porch/links/revoke': {
+				post: {
+					summary: 'Revoke a Porch link, for whoever holds it',
+					description:
+						"The link stops resolving at the relays, and every peer connected through it is disconnected, channel peers included: their channels stay open and they need another link to reconnect. Revoking is permanent and is written before it takes effect. The seed's link can be revoked too and stays revoked on this database; a restore from the seed alone, with no database, serves it again.",
+					tags: ['Porch'],
+					requestBody: bodyContent({ id: 'string' }),
+					responses: {
+						'200': {
+							description: 'Link revoked',
+							content: jsonContent({
+								type: 'object',
+								required: ['revoked', 'id'],
+								properties: {
+									revoked: { type: 'boolean', enum: [true] },
+									id: { type: 'string' }
+								}
+							})
+						},
+						'404': { description: 'No such link' }
+					}
+				}
+			},
 			'/queue/add': {
 				post: {
 					summary:
@@ -5450,7 +5510,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						listening: {
 							type: 'boolean',
 							description:
-								'True while an inbound listener (TCP, WebSocket or Iroh) is bound'
+								'True while an inbound listener is up: TCP, WebSocket or Iroh bound, or the node waiting at its Porch relays'
 						},
 						listenPort: {
 							type: 'integer',
@@ -5465,6 +5525,37 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'The WebSocket listener port, present only while it is bound'
 						},
+						porchAvailable: {
+							type: 'boolean',
+							description:
+								'Engine can wait at Porch relays (porchRelays, BEIGNET_PORCH_RELAYS)'
+						},
+						porch: {
+							type: 'object',
+							description:
+								'Present when Porch relays are configured: the node dials out to each relay and waits there, so it can be reached by a wss:// peer link that does not say where it runs',
+							properties: {
+								uris: {
+									type: 'array',
+									items: { type: 'string' },
+									description:
+										"The peer URIs of the seed's link (pubkey@wss://relay/v1/p/<route>), one per relay, while the node waits at its relays. Empty once that link is revoked; GET /porch/links has every link"
+								},
+								links: {
+									type: 'integer',
+									description:
+										"Links served: the seed's, unless revoked, and those made since"
+								},
+								relays: {
+									type: 'array',
+									items: { $ref: '#/components/schemas/PorchRelayInfo' }
+								}
+							},
+							required: ['uris', 'links', 'relays']
+						},
+						porchListenError: {
+							$ref: '#/components/schemas/ListenerProblem'
+						},
 						irohAvailable: {
 							type: 'boolean',
 							description: 'Engine supports the optional Iroh transport'
@@ -5474,6 +5565,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Iroh connection string, present while listening'
 						},
 						irohListenError: { $ref: '#/components/schemas/ListenerProblem' },
+						irohRelayOnly: {
+							type: 'boolean',
+							description:
+								'True when Iroh is configured relay-only (irohRelayOnly): no direct path is offered or taken, so a peer does not learn this node IP address; the relay operator still sees it'
+						},
+						irohRelayOnlyMode: {
+							type: 'string',
+							enum: ['native', 'loopback-pin'],
+							description:
+								'How the bound relay-only endpoint keeps to the relay, present while one is bound. native: the endpoint has no IP transport. loopback-pin: its sockets are bound to loopback, and it shuts down (irohListenError with errno IROH_RELAY_ONLY_VIOLATED, node:error IROH_RELAY_ONLY_VIOLATED) if the router ever grants it a port mapping'
+						},
 						websocketListenError: {
 							$ref: '#/components/schemas/ListenerProblem'
 						}
@@ -5654,6 +5756,19 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								path: { type: 'string', enum: ['direct', 'relay', 'unknown'] },
 								rttMs: { type: 'number' }
 							}
+						},
+						porch: {
+							type: 'object',
+							description:
+								'Set for a peer that came in through a Porch link. Its host reads porch:<relay>: the node never learns where such a peer is',
+							properties: {
+								relay: { type: 'string', description: "The relay's name" },
+								link: {
+									type: 'string',
+									description: 'The id of the link it used (GET /porch/links)'
+								}
+							},
+							required: ['relay', 'link']
 						},
 						pubkey: { type: 'string' },
 						host: { type: 'string' },
@@ -7137,6 +7252,106 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						}
 					},
 					required: ['type', 'priority', 'reason']
+				},
+				PorchRelayInfo: {
+					type: 'object',
+					description: 'One Porch relay, as the node stands with it',
+					properties: {
+						relay: {
+							type: 'string',
+							description: 'ws(s)://name, as configured'
+						},
+						state: {
+							type: 'string',
+							enum: [
+								'stopped',
+								'no-links',
+								'connecting',
+								'ready',
+								'refused',
+								'unreachable'
+							],
+							description:
+								'ready: registered, so links through this relay work. connecting: on its way. unreachable: the last attempts failed and the node is retrying with backoff. refused: the relay turned the node down (a wrong token, too many links); retried every five minutes. no-links: every link is revoked, so the node stays away from the relay. stopped: not waiting (held, fenced or shut down)'
+						},
+						idle: {
+							type: 'integer',
+							description:
+								'Connections waiting for a visitor; each takes one and is replaced'
+						},
+						circuits: {
+							type: 'integer',
+							description: 'Visitors connected through this relay now'
+						},
+						lastError: {
+							type: 'string',
+							description:
+								'Why the last attempt failed, while the relay is not ready'
+						},
+						proxied: {
+							type: 'boolean',
+							description:
+								"True when the node reaches this relay through a SOCKS5 proxy (porchProxy, porchVia tor, or torProxy), so the relay does not see the node's address. False: the relay's operator does, and nobody else"
+						}
+					},
+					required: ['relay', 'state', 'idle', 'circuits', 'proxied']
+				},
+				PorchLinkInfo: {
+					type: 'object',
+					description:
+						'One link the node can be reached by through its Porch relays',
+					properties: {
+						id: {
+							type: 'string',
+							description: "The link's id (32 hex characters), to revoke it by"
+						},
+						default: {
+							type: 'boolean',
+							enum: [true],
+							description: 'Present on the link every node has from its seed'
+						},
+						label: { type: 'string' },
+						createdAt: {
+							type: 'integer',
+							description: "Creation time (ms). The seed's link has none"
+						},
+						uris: {
+							type: 'array',
+							items: { type: 'string' },
+							description:
+								'pubkey@wss://relay/v1/p/<route>, one per relay in the configured order. Any of them reaches the node'
+						}
+					},
+					required: ['id', 'uris']
+				},
+				PorchLinksInfo: {
+					type: 'object',
+					properties: {
+						enabled: {
+							type: 'boolean',
+							description:
+								'False when no Porch relay is configured; the lists are then empty'
+						},
+						listening: {
+							type: 'boolean',
+							description:
+								'True while the node waits at its relays. False while a recovery mode holds the listener, on a fenced node, and when Porch is off; porchListenError on GET /info says which'
+						},
+						links: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/PorchLinkInfo' }
+						},
+						relays: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/PorchRelayInfo' }
+						},
+						problem: {
+							type: 'string',
+							description:
+								"Present when the stored links could not be read. None is served until one is made, and the seed's link stays revoked"
+						}
+					},
+					required: ['enabled', 'listening', 'links', 'relays']
 				},
 				WebhookRegistration: {
 					type: 'object',

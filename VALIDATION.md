@@ -1,3 +1,24 @@
+# Portable engine validation, 2026-11-15 addendum for 0.41.0
+
+The fork tracks Beignet **0.41.0** at `fbdd109ec47f7e479cc6cae9cdf9c69c1d132465`, npm's `gitHead` for the release. That is the version bump #2091, whose `src/` is the same as the merge of #2090, `c70bffb0`. This addendum supersedes the baseline statement of the 0.38.4 addendum below. Six hunks were merged by hand and one hunk is new (`decode.ts`, for saved receive requests); see `PATCHES.md`.
+
+All on Node 24.22.1:
+- `npm test`: 315 of 315 pass, the new saved-request case among them. With the `decode.ts` hunk switched off that case fails.
+- `npm run check:types` passes, and `npm audit` reports no advisory.
+- A full `tsc --noEmit -p .` reports 22 errors: the 0.38.4 tree's 21 and one more in `iroh-node.ts`, which the fork does not bundle.
+- The built bundle reports `0.41.0-portable` and is 7,666,709 bytes. The build prints no esbuild warnings.
+- NPM_INTEGRITY_LINE
+- Upstream's offline suites ran in an upstream `fbdd109e` tree with this fork's `src/` in place of its own, after `npm run build`:
+  - `test:cli` passes, 2,712 tests, as pristine 0.41.0 does.
+  - `test:lightning` runs 10,593 passing and 28 failing: the 19 known failures listed in `PATCHES.md`, #2090's new forward test on the same fixture as the 13 known forwarding tests, and the eight #2055 upgrade tests that expect upstream's step-by-step migration commits where the fork rolls a failed upgrade back whole.
+- The live regtest scripts ran against the Docker `bitcoin`, `electrum` and `cln` containers, with a 0.41.0 primary (the tarball packed from the publish clone of `fbdd109e`, installed with `npm install --omit=dev`), wallet-core `190854c` and a stand-in byte relay:
+  - `test:regtest:porch`: all pass. A 0.41.0 node waits at its own Porch relay; the device connects by the link through the adapter (the `ws` branch guard), pays both ways, reconnects by itself after a relay restart and after its own restart, and holds a Porch primary beside a TCP one.
+  - `test:regtest`: 13 checks pass, the stranger's direct funding as an unpaired splice among them.
+  - `test:regtest:send-max`: 73 checks pass, the `cln` case included.
+  - `test:regtest:channelize`: 19 checks pass.
+
+Not run: the FFOR live suites (`regtest-ffor.cjs` and its worker and native variants), a phone or emulator build of the bundle (Chicory's release round covers that), and Tor-mode routing.
+
 # Portable engine validation, 2026-11-10 addendum for 0.38.4
 
 The fork tracks Beignet **0.38.4** at `5970f941a067b252e19214db47971260c93dcd95`, npm's `gitHead` for the release. That is the version bump #1979, whose `src/` is the same as the merge of #1977, `b346727f`. This addendum supersedes the baseline statement of the 0.38.1 addendum below. The patch reapplies with every hunk at its recorded line and no hand merge (see `PATCHES.md`).

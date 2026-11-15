@@ -36,7 +36,8 @@ export enum ChannelActionType {
 	SPLICE_CONFLICT_REQUEST_READY = 'SPLICE_CONFLICT_REQUEST_READY',
 	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED',
 	SPLICE_TX_SIGNATURES_NEEDED = 'SPLICE_TX_SIGNATURES_NEEDED',
-	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED'
+	SPLICE_TX_NEGOTIATED = 'SPLICE_TX_NEGOTIATED',
+	DISCONNECT_PEER = 'DISCONNECT_PEER'
 }
 
 export interface ISendMessageAction {
@@ -231,6 +232,13 @@ export interface IHtlcFulfilledAction {
 	type: ChannelActionType.HTLC_FULFILLED;
 	htlcId: bigint;
 	paymentPreimage: Buffer;
+	/**
+	 * Set when the fulfil was already processed once: re-emitted from the
+	 * stored entry on reestablish, or a peer's retransmission of a fulfil the
+	 * entry already holds. The node uses it to settle anything still owed
+	 * without announcing the HTLC to the application a second time.
+	 */
+	replay?: true;
 }
 
 export interface IHtlcFailedAction {
@@ -403,6 +411,18 @@ export interface ISpliceTxNegotiatedAction {
 	/** Negotiated txid in tx.getHash() internal byte order. */
 	spliceTxid: Buffer;
 	newFundingOutputIndex: number;
+}
+
+/**
+ * Close the connection to this channel's peer, leaving the channel's own state
+ * to the reconnect. The answer to a protocol violation the next
+ * channel_reestablish can recover from, sent after a BOLT 1 `warning` that
+ * says why. Runs in batch order, so the warning ahead of it is on the wire
+ * first.
+ */
+export interface IDisconnectPeerAction {
+	type: ChannelActionType.DISCONNECT_PEER;
+	reason: string;
 }
 
 /**
@@ -654,4 +674,5 @@ export type ChannelAction =
 	| ISpliceConflictRequestReadyAction
 	| ITxSignaturesNeededAction
 	| ISpliceTxSignaturesNeededAction
-	| ISpliceTxNegotiatedAction;
+	| ISpliceTxNegotiatedAction
+	| IDisconnectPeerAction;

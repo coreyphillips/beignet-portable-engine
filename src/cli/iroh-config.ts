@@ -7,6 +7,18 @@ export interface IrohDaemonConfig {
 	irohRelays?: string[];
 	/** Public endpoint discovery and publication (default true when enabled). */
 	irohDiscovery?: boolean;
+	/**
+	 * Keep every Iroh connection on the relay (default false). No direct path
+	 * is offered or taken, so someone who holds the node's Iroh link cannot
+	 * learn its IP address; the relay operator still sees it. Slower than a
+	 * direct path. Needs a relay, and learned addresses are then dialed
+	 * through the SOCKS5 proxy or not at all. The node dials out over Iroh
+	 * only with irohDiscovery off, and only to a peer on one of its own
+	 * relays: any other relay would see its address. With an Iroh binding that
+	 * cannot remove its IP transport, the node stops serving Iroh on a
+	 * network whose router grants port mappings (see the Iroh section).
+	 */
+	irohRelayOnly?: boolean;
 }
 
 export function irohBooleanEnv(name: string): boolean | undefined {
@@ -24,7 +36,7 @@ export function irohRelaysEnv(): string[] | undefined {
 }
 
 export function validateIrohConfig(config: IrohDaemonConfig): void {
-	for (const name of ['iroh', 'irohDiscovery'] as const) {
+	for (const name of ['iroh', 'irohDiscovery', 'irohRelayOnly'] as const) {
 		if (config[name] !== undefined && typeof config[name] !== 'boolean')
 			throw new Error(`${name} must be a boolean`);
 	}
@@ -36,4 +48,8 @@ export function validateIrohConfig(config: IrohDaemonConfig): void {
 			throw new Error('irohRelays must be an array of relay URLs');
 		config.irohRelays.forEach(validateIrohRelayUrl);
 	}
+	if (config.iroh && config.irohRelayOnly && config.irohRelays?.length === 0)
+		throw new Error(
+			'irohRelayOnly needs a relay, and an empty irohRelays disables them'
+		);
 }
