@@ -7,7 +7,7 @@ All on Node 24.22.1:
 - `npm run check:types` passes, and `npm audit` reports no advisory.
 - A full `tsc --noEmit -p .` reports 22 errors: the 0.38.4 tree's 21 and one more in `iroh-node.ts`, which the fork does not bundle.
 - The built bundle reports `0.41.0-portable` and is 7,666,709 bytes. The build prints no esbuild warnings.
-- NPM_INTEGRITY_LINE
+- The published `beignet@0.41.0` tarball matches npm's integrity hash (`sha512-Kioby+0i...pKwYbQ==`) and is byte-identical to `npm pack` of a fresh clone of `fbdd109e` after `npm ci && npm run build`, the tarball the live suites below ran.
 - Upstream's offline suites ran in an upstream `fbdd109e` tree with this fork's `src/` in place of its own, after `npm run build`:
   - `test:cli` passes, 2,712 tests, as pristine 0.41.0 does.
   - `test:lightning` runs 10,593 passing and 28 failing: the 19 known failures listed in `PATCHES.md`, #2090's new forward test on the same fixture as the 13 known forwarding tests, and the eight #2055 upgrade tests that expect upstream's step-by-step migration commits where the fork rolls a failed upgrade back whole.
