@@ -12,6 +12,12 @@ import {
 	normalizeIrohEndpointId,
 	validateIrohRelayUrl
 } from '../transport/iroh';
+import type { IrohRelayOnlyMode } from '../transport/iroh';
+import {
+	derivePorchDefaultTag,
+	derivePorchHostSecret
+} from '../transport/porch';
+import type { IPorchHostStatus, IPorchLink } from '../transport/porch-host';
 import type { IFforVoucherArchive } from '../ffor/voucher-archive';
 import {
 	archiveFforVouchers,
@@ -65,12 +71,15 @@ import {
 import type {
 	IBlindedHopData,
 	IBlindedPath,
-	IBlindedPaymentPath
+	IBlindedPaymentPath,
+	IChannelEnds
 } from '../onion/blinded-path';
 import {
 	constructBlindedPath,
 	processBlindedHop,
-	deriveBlindedPrivkey
+	deriveBlindedPrivkey,
+	payInfoRequiresUnknownFeature,
+	resolveIntroductionNode
 } from '../onion/blinded-path';
 import type { IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelManager, txInputOutpoints } from '../channel/channel-manager';
@@ -167,6 +176,7 @@ import {
 	nodeAddressToHostPort,
 	announcedDialableAddresses
 } from '../gossip/messages';
+import { assertBolt1String } from '../message/field-rules';
 import {
 	decodeReplyChannelRangeMessage,
 	decodeReplyShortChannelIdsEndMessage,
@@ -186,7 +196,8 @@ import {
 import {
 	constructOnionPacket,
 	encodeOnionPacket,
-	decodeOnionPacket
+	decodeOnionPacket,
+	onionPayloadBytes
 } from '../onion/construct';
 import {
 	processOnionPacket,
@@ -221,7 +232,8 @@ import {
 	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
-	EXPIRY_TOO_FAR
+	EXPIRY_TOO_FAR,
+	ROUTING_INFO_LENGTH
 } from '../onion/types';
 import { checkDelegatedAmounts } from '../ffor/amounts';
 import type { IFforEpochRecord } from '../ffor/types';
@@ -233,6 +245,7 @@ import {
 } from '../ffor/types';
 import { encode as encodeInvoice } from '../invoice/encode';
 import { decode as decodeInvoice } from '../invoice/decode';
+import { assertPayableInvoice } from './invoice-payability';
 import type { IRoutingHintHop } from '../invoice/types';
 import {
 	Network,
@@ -782,16 +795,10 @@ const FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE = 10;
 const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
 
 /**
- * Invoice feature bits this payer implements (BOLT 11 `9` field). An unknown
- * even (compulsory) bit outside this set MUST fail the payment. Listed by the
- * even bit; the odd variant is unknown-odd and always safe to ignore.
+ * The largest BOLT 11 `m` field: a tagged field holds at most 1023 5-bit
+ * words, and 639 bytes is the most that fits.
  */
-const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
-	Feature.TLV_ONION,
-	Feature.PAYMENT_SECRET,
-	Feature.BASIC_MPP,
-	Feature.ROUTE_BLINDING
-]);
+const MAX_INVOICE_METADATA_BYTES = 639;
 
 /** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
 const FUNDING_FORGET_BLOCKS = 2016;
@@ -1743,6 +1750,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const leaveLifecycleToCreate = constructingForCreate;
 		constructingForCreate = false;
 		const config = resolveNodeConfig(nodeConfig);
+		// Peers ignore a node_announcement whose alias breaks the BOLT 1 string
+		// rule, so the node would silently vanish from their graphs.
+		if (config.alias !== undefined) {
+			assertBolt1String(config.alias, 'Node alias');
+		}
 
 		this.nodePrivkey = config.nodePrivateKey;
 		this.ownNodeIdBytes = getPublicKey(config.nodePrivateKey);
@@ -2280,6 +2292,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.emitOutbound(toPeer, type, payload);
 			}
 		);
+		this.onionMessageManager.setChannelLookup((scid) =>
+			this.channelEndsForScid(scid)
+		);
 		this.wireOnionMessageEvents();
 
 		this.offerManager = new OfferManager(config.nodePrivateKey, {
@@ -2588,8 +2603,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					this.channelManager.getChannelsByPeer(pubkey).length > 0,
 				socks5Proxy: config.socks5Proxy,
 				socks5ProxyScope: this.socks5ProxyScope,
+				learnedAddressDials: config.learnedAddressDials,
 				webSocketImpl: config.webSocketImpl,
-				iroh: config.iroh
+				iroh: config.iroh,
+				porch: config.porch
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			// The socket boundary answers to the startup quarantine gate
@@ -5113,6 +5130,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// event where the restore repair above is not.
 		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
 			this.sendPrivateChannelPolicy(channelId);
+			this.triggerPendingAnnouncementSigning(channelId);
 			this.settleForwardsOwedUpstream(channelId);
 			this.fulfillSettledReceivedHtlcs(channelId);
 			// A conflict verdict the peer has not yet agreed is re-asked on
@@ -5151,9 +5169,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// and waitForReady() spuriously times out. Idempotent via _readyEmitted.
 			this.emitReady();
 
-			// After reestablish, check if we still need to send announcement_signatures.
-			// This handles the case where LND sent its sigs before, but beignet never
-			// sent back (e.g. ChainWatcher didn't fire announcement:depth).
+			// The depth trigger may have fired before the channel was NORMAL, or
+			// the peer's announcement_signatures may already be in.
 			this.triggerPendingAnnouncementSigning(channelId);
 		});
 
@@ -5687,6 +5704,22 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		);
 
+		// A peer protocol violation answered with a warning (simple close, a
+		// splice_locked for no pending splice). Only emitted when no
+		// PeerManager holds the peer; otherwise the manager already dropped it.
+		this.channelManager.on(
+			'peer:disconnect-needed',
+			(peerPubkey: string, reason: string) => {
+				this.emitStructuredLog('channel', 'peer_disconnect_needed', {
+					peerPubkey,
+					reason
+				});
+				setImmediate(() => {
+					this.requestPeerDisconnect(peerPubkey);
+				});
+			}
+		);
+
 		// Recovery 5.7 (issue #462): a peer is waiting on a channel this node
 		// has no record of, and the reply is parked rather than sent. This is
 		// the operator's cue that a Recovery Capsule has to be applied before
@@ -5897,9 +5930,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		this.channelManager.on(
 			'htlc:fulfilled',
-			(channelId: Buffer, htlcId: bigint, preimage: Buffer) => {
-				this.handleHtlcFulfilled(channelId, htlcId, preimage);
-				this.emit('htlc:fulfilled', { channelId, htlcId });
+			(
+				channelId: Buffer,
+				htlcId: bigint,
+				preimage: Buffer,
+				replay: boolean
+			) => {
+				if (this.handleHtlcFulfilled(channelId, htlcId, preimage, replay)) {
+					this.emit('htlc:fulfilled', { channelId, htlcId });
+				}
 			}
 		);
 
@@ -6391,8 +6430,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * have come from the peer, e.g. a post-splice re-announcement). Before
 	 * signing, verify the SCID actually points at this channel's CURRENT
 	 * funding transaction via a merkle-position lookup — signing a stale or
-	 * bogus SCID produces an announcement the network rejects and burns our
-	 * one announcement_signatures send for the session.
+	 * bogus SCID produces an announcement the network rejects.
 	 */
 	private async signAnnouncementForScid(
 		channelId: Buffer,
@@ -6461,16 +6499,15 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
-	 * Check if a channel needs announcement_signatures sent and trigger signing.
-	 * Called after channel reaches NORMAL (including after reestablishment).
+	 * Owe the peer our announcement_signatures? Called when a channel reaches
+	 * NORMAL: first channel_ready, and every reestablish after it.
 	 */
 	private triggerPendingAnnouncementSigning(channelId: Buffer): void {
-		const channel = this.channelManager
-			.listChannels()
-			.find((ch) => ch.getChannelId()?.equals(channelId));
+		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 
 		const state = channel.getFullState();
+		if (state.state !== ChannelState.NORMAL) return;
 		if (
 			state.announcementSigsReceived &&
 			!state.announcementSigsSent &&
@@ -6480,6 +6517,34 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// verified against the funding tx's actual position before signing
 			// (it can be stale, e.g. from a pre-splice funding generation).
 			void this.signAnnouncementForScid(channelId, state.shortChannelId);
+			return;
+		}
+		// BOLT 7: on reconnection, a node that has not received the peer's
+		// announcement_signatures sends its own again. The splice spec adds the
+		// peer asking for ours in its channel_reestablish, which covers ours
+		// being lost after theirs arrived.
+		if (
+			state.announceChannel &&
+			state.announcementSigsSent &&
+			(!state.announcementSigsReceived ||
+				channel.isAnnouncementSignaturesRequested())
+		) {
+			this.channelManager.resendAnnouncementSignatures(channelId);
+			return;
+		}
+		// Nothing signed yet, or a private channel with no real SCID: the
+		// one-shot depth trigger may have fired while the channel was not NORMAL
+		// (peer offline at the sixth confirmation). Re-arm it; it fires now if
+		// the funding is deep enough, else at the block that makes it so.
+		const unsigned =
+			state.announceChannel &&
+			!state.announcementSigsSent &&
+			!state.announcementSigsReceived;
+		if ((unsigned || !state.shortChannelId) && state.fundingTxid) {
+			this.chainWatcher?.rearmAnnouncementTracking(
+				channelId,
+				Buffer.from(state.fundingTxid).reverse().toString('hex')
+			);
 		}
 	}
 
@@ -7513,6 +7578,16 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
 		});
+		this.peerManager.on('iroh:relay-only-violated', (err: Error) => {
+			this.emit('node:error', {
+				code: 'IROH_RELAY_ONLY_VIOLATED',
+				message: err.message,
+				timestamp: Date.now()
+			});
+		});
+		this.peerManager.on('porch:status', (status: IPorchHostStatus) => {
+			this.emit('porch:status', status);
+		});
 	}
 
 	/**
@@ -7699,9 +7774,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 
 		// Count how many peers we need to reconnect
-		const peersToConnect = peerAddresses.filter((p) =>
-			channelPeers.has(p.pubkey)
-		);
+		const peersToConnect: Array<{
+			pubkey: string;
+			host: string;
+			port: number;
+			transport?: IPeerTransportOptions;
+			learned?: boolean;
+		}> = peerAddresses.filter((p) => channelPeers.has(p.pubkey));
 
 		// Seed gossip-announced reconnect fallbacks for every channel peer, and
 		// dial peers that have no stored address at all (they only ever
@@ -7744,15 +7823,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				addresses: newest.addresses
 			});
 			this.peerManager.setAnnouncedAddresses(pubkey, newest.addresses);
-			if (
-				newest.addresses.length > 0 &&
-				!peersToConnect.some((p) => p.pubkey === pubkey)
-			) {
-				peersToConnect.push({
-					pubkey,
-					host: newest.addresses[0].host,
-					port: newest.addresses[0].port
-				});
+			// The peer chose these, so they are dialed as learned addresses,
+			// and one the node would refuse is not worth a start-up dial.
+			const announced = this.firstDialableLearnedAddress(newest.addresses);
+			if (announced && !peersToConnect.some((p) => p.pubkey === pubkey)) {
+				peersToConnect.push({ pubkey, ...announced, learned: true });
 			}
 		}
 		// A sliced restore of the stored map has not brought the graph's
@@ -7776,12 +7851,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		let delay = 0;
 		const STAGGER_MS = 500;
 
-		for (const { pubkey, host, port, transport } of peersToConnect) {
+		for (const { pubkey, host, port, transport, learned } of peersToConnect) {
 			const pm = this.peerManager;
 			const timer = setTimeout(() => {
 				this._reconnectTimers.delete(timer);
 				if (this._destroyed) return;
-				pm.connectPeer(pubkey, host, port, transport)
+				// A stored address is dialed exactly as before; only one the
+				// peer announced carries the mark.
+				(learned
+					? pm.connectPeer(pubkey, host, port, transport, { learned: true })
+					: pm.connectPeer(pubkey, host, port, transport)
+				)
 					.catch((err) => {
 						this.emit('node:error', {
 							code: 'AUTO_RECONNECT_FAILED',
@@ -7802,6 +7882,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			this._reconnectTimers.add(timer);
 			delay += STAGGER_MS;
 		}
+	}
+
+	/**
+	 * The first of a peer's announced addresses the peer manager would dial
+	 * as a learned address (every one under learnedAddressDials 'any').
+	 */
+	private firstDialableLearnedAddress(
+		addresses: Array<{ host: string; port: number }>
+	): { host: string; port: number } | undefined {
+		const pm = this.peerManager;
+		if (!pm) return undefined;
+		return addresses.find((addr) => pm.canDialLearnedAddress(addr.host));
 	}
 
 	/**
@@ -7829,19 +7921,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				addresses
 			});
 			pm.setAnnouncedAddresses(pubkey, addresses);
-			if (dialing.has(pubkey) || addresses.length === 0) continue;
+			const announced = this.firstDialableLearnedAddress(addresses);
+			if (dialing.has(pubkey) || !announced) continue;
 			if (pm.getPeer(pubkey)) continue;
-			pm.connectPeer(pubkey, addresses[0].host, addresses[0].port).catch(
-				(err) => {
-					this.emit('node:error', {
-						code: 'AUTO_RECONNECT_FAILED',
-						message: `Failed to reconnect ${pubkey.slice(0, 8)}...: ${
-							(err as Error).message
-						}`,
-						timestamp: Date.now()
-					});
-				}
-			);
+			pm.connectPeer(pubkey, announced.host, announced.port, undefined, {
+				learned: true
+			}).catch((err) => {
+				this.emit('node:error', {
+					code: 'AUTO_RECONNECT_FAILED',
+					message: `Failed to reconnect ${pubkey.slice(0, 8)}...: ${
+						(err as Error).message
+					}`,
+					timestamp: Date.now()
+				});
+			});
 		}
 	}
 
@@ -9821,6 +9914,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			const dialable = nodeAddressToHostPort(addr);
 			if (dialable) candidates.push(dialable);
 		}
+		// Whoever announced or seeded these chose them, not the operator.
+		const learnedOptions: IPeerDialOptions = { ...options, learned: true };
 		for (const { host, port } of candidates) {
 			assertNotCancelled();
 			try {
@@ -9829,7 +9924,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					host,
 					port,
 					undefined,
-					options
+					learnedOptions
 				);
 				return;
 			} catch (err) {
@@ -9879,7 +9974,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						peer.host,
 						peer.port,
 						undefined,
-						options
+						learnedOptions
 					);
 					return;
 				} catch (err) {
@@ -10021,6 +10116,58 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 	getIrohConnectionString(): string | undefined {
 		return this.peerManager?.getIrohConnectionString();
+	}
+
+	/**
+	 * How the Iroh endpoint keeps its traffic on the relay, when
+	 * `iroh.relayOnly` is set: `mode` while an endpoint is bound, `failure`
+	 * once one had to shut down (nothing rebinds after that). Undefined when
+	 * relay-only was not asked for.
+	 */
+	getIrohRelayOnlyStatus():
+		| { mode?: IrohRelayOnlyMode; failure?: string }
+		| undefined {
+		const pm = this.peerManager;
+		if (!pm?.isIrohRelayOnly()) return undefined;
+		const mode = pm.getIrohRelayOnlyMode();
+		const failure = pm.getIrohRelayOnlyFailure()?.message;
+		return {
+			...(mode ? { mode } : {}),
+			...(failure ? { failure } : {})
+		};
+	}
+
+	/**
+	 * Start waiting at the configured Porch relays, alongside any other
+	 * listener. It returns at once: whether a relay is reachable is status
+	 * (getPorchStatus, 'porch:status'), not an error.
+	 */
+	listenPorch(): void {
+		if (!this.peerManager) throw new Error('Networking is not enabled');
+		this.assertPeerContactPermitted('listenPorch');
+		this.peerManager.listenPorch();
+	}
+
+	/** One entry per configured Porch relay. Empty when Porch is not configured. */
+	getPorchStatus(): IPorchHostStatus[] {
+		return this.peerManager?.getPorchStatus() ?? [];
+	}
+
+	/**
+	 * The peer URIs this node can be reached by through Porch, one per link
+	 * and relay. A URI works while its relay's status is 'ready'.
+	 */
+	getPorchLinks(): IPorchLink[] {
+		return this.peerManager?.getPorchLinks() ?? [];
+	}
+
+	/**
+	 * Replace the Porch links served (16-byte tags). A link left out stops
+	 * resolving, and the connections that came in through it are closed.
+	 */
+	setPorchTags(tags: readonly Uint8Array[]): void {
+		if (!this.peerManager) throw new Error('Networking is not enabled');
+		this.peerManager.setPorchTags(tags);
 	}
 
 	/** Start the opt-in WebSocket listener alongside TCP. */
@@ -11420,7 +11567,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		for (const peer of peers.slice(0, maxPeers)) {
 			try {
 				const pubkeyHex = peer.pubkey.toString('hex');
-				await this.peerManager.connectPeer(pubkeyHex, peer.host, peer.port);
+				await this.peerManager.connectPeer(
+					pubkeyHex,
+					peer.host,
+					peer.port,
+					undefined,
+					{ learned: true }
+				);
 				connected.push(pubkeyHex);
 			} catch {
 				// Skip failed connections
@@ -16876,7 +17029,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * announceChannel alone is an INTENT flag: it stays true on pending and
 	 * closed channels, and a preferTaproot opener keeps it true while the
 	 * wire flag is private, so gating on it suppressed valid private paths
-	 * (issue #544 review).
+	 * (issue #544 review). A pair signed before 6 confirmations is held by
+	 * the ChannelManager and is not in anyone's graph yet.
 	 */
 	private hasPublishedPublicChannel(): boolean {
 		return this.channelManager.listChannels().some((channel) => {
@@ -16885,6 +17039,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				st.announceChannel === true &&
 				st.announcementSigsSent &&
 				st.announcementSigsReceived &&
+				!(
+					st.channelId && this.channelManager.isAnnouncementHeld(st.channelId)
+				) &&
 				channel.acceptsNewHtlcs(true)
 			);
 		});
@@ -17763,6 +17920,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		) {
 			throw new Error('Must specify either description or descriptionHash');
 		}
+		if (options.description !== undefined) {
+			assertBolt1String(options.description, 'Invoice description');
+		}
 
 		// A JIT allowance is an authorization to be paid LESS than the onion
 		// says, so a malformed quote must not reach the invoice record: it is
@@ -17780,6 +17940,19 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					);
 				}
 			}
+		}
+
+		// Checked before any state is written: encodeInvoice would throw on an
+		// oversized field only after the preimage and secret were registered.
+		const paymentMetadata = options.paymentMetadata;
+		if (
+			paymentMetadata !== undefined &&
+			(paymentMetadata.length === 0 ||
+				paymentMetadata.length > MAX_INVOICE_METADATA_BYTES)
+		) {
+			throw new Error(
+				`paymentMetadata must be 1 to ${MAX_INVOICE_METADATA_BYTES} bytes`
+			);
 		}
 
 		// Hold invoice with an externally-held preimage: the caller supplies only
@@ -17867,6 +18040,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if (useBlinded) {
 			invoiceFeatures.setOptional(Feature.ROUTE_BLINDING); // bit 25
 		}
+		if (paymentMetadata) {
+			invoiceFeatures.setOptional(Feature.PAYMENT_METADATA); // bit 49
+		}
 
 		const invoiceStr = encodeInvoice({
 			network: this.network,
@@ -17889,7 +18065,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					? routingHints
 					: undefined,
 			blindedPaths: useBlinded ? blindedPaths : undefined,
-			featureBits: invoiceFeatures
+			featureBits: invoiceFeatures,
+			metadata: paymentMetadata
 		});
 
 		const payment: IPaymentInfo = {
@@ -17925,6 +18102,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// back to the default and admit an HTLC the invoice promised to refuse.
 		if (options.minFinalCltvExpiry !== undefined) {
 			record.minFinalCltvExpiry = options.minFinalCltvExpiry;
+		}
+		// The final hop checks every HTLC's payment_metadata against this, so
+		// it has to survive a restart like the c tag above.
+		if (paymentMetadata) {
+			record.paymentMetadata = paymentMetadata.toString('hex');
 		}
 
 		this.persistInvoiceRecords(paymentHash, record, preimage, paymentSecret);
@@ -18027,14 +18209,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				'Pay-all requires an amountless BOLT 11 invoice with a payment secret on this network and an unblinded route'
 			);
 		}
-		for (const bit of invoice.featureBits?.listSetBits() ?? []) {
-			if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
-				throw new LightningPaymentError(
-					LightningErrorCode.INVALID_INVOICE,
-					`Invoice requires unknown feature bit ${bit}`
-				);
-			}
-		}
+		assertPayableInvoice(invoice);
 		if (
 			Math.floor(Date.now() / 1000) >
 			invoice.timestamp + (invoice.expiry ?? DEFAULT_EXPIRY)
@@ -18212,7 +18387,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			invoice.paymentSecret!,
 			found.route.hops[found.route.hops.length - 1].amountToForwardMsat,
 			context,
-			metadata
+			metadata,
+			invoice.metadata
 		);
 	}
 
@@ -18342,26 +18518,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return payment;
 		}
 
-		// BOLT 11 payer MUSTs: fail the payment when the invoice requires a
-		// feature we do not understand (unknown even bit in the `9` field), and
-		// never pay a secretless invoice (payment_secret is compulsory; without
-		// it any forwarding node can probe or steal an amount-adjusted payment).
-		if (invoice.featureBits) {
-			for (const bit of invoice.featureBits.listSetBits()) {
-				if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
-					throw new LightningPaymentError(
-						LightningErrorCode.INVALID_INVOICE,
-						`Invoice requires unknown feature bit ${bit}`
-					);
-				}
-			}
-		}
-		if (!invoice.paymentSecret) {
-			throw new LightningPaymentError(
-				LightningErrorCode.INVALID_INVOICE,
-				'Invoice has no payment secret (s field); refusing to pay'
-			);
-		}
+		// BOLT 11 payer MUSTs on top of decode(): no unknown even feature bit,
+		// and never a secretless invoice.
+		assertPayableInvoice(invoice);
 
 		const finalCltvExpiry = this.paddedFinalCltvExpiry(
 			invoice.minFinalCltvExpiry
@@ -18373,44 +18532,85 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 
 		// Route blinding: if the invoice advertises blinded paths, route through
 		// one (the sender learns only the introduction node, never the payee).
+		// Each path is tried in turn, as payBolt12Invoice does: a path with no
+		// route, an unusable self-introduction, a fee over the cap or a
+		// payinfo requiring an unknown feature is skipped, and a retry skips
+		// the paths whose blinded segment already failed.
 		if (invoice.blindedPaths && invoice.blindedPaths.length > 0) {
-			const blinded = invoice.blindedPaths[0];
-			const blindedRoute = findRouteToBlindedPath(
-				this.graph,
-				sourceNodeId,
-				blinded.path,
-				blinded.payInfo,
-				paymentAmountMsat,
-				finalCltvExpiry,
-				undefined,
-				excludedChannels,
-				this.missionControl,
-				this.getLocalChannelEdges(),
-				cltvBudget,
-				overrides
-			);
+			const excludedPaths =
+				this.paymentRetryContexts.get(dedupHashHex)?.bolt12ExcludedPathIndices;
+			let blindedRoute: IRoute | null = null;
+			let pathIndex = 0;
+			let overCap = false;
+			let selfIntroError: LightningPaymentError | undefined;
+			for (let i = 0; i < invoice.blindedPaths.length; i++) {
+				if (excludedPaths?.has(i)) continue;
+				const blinded = invoice.blindedPaths[i];
+				if (payInfoRequiresUnknownFeature(blinded.payInfo)) continue;
+				const path = resolveIntroductionNode(blinded.path, (scid) =>
+					this.channelEndsForScid(scid)
+				);
+				if (!path) continue;
+				const candidate = findRouteToBlindedPath(
+					this.graph,
+					sourceNodeId,
+					path,
+					blinded.payInfo,
+					paymentAmountMsat,
+					finalCltvExpiry,
+					undefined,
+					excludedChannels,
+					this.missionControl,
+					this.getLocalChannelEdges(),
+					cltvBudget,
+					overrides
+				);
+				if (!candidate) continue;
+				// The fee cap judges the fee actually PAID: a self-introduction
+				// send removes our own introduction fee on the wire, so a
+				// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
+				// review). prepareSelfIntroSend also validates the path, so an
+				// unusable self-intro path moves on to the next one. A grafted
+				// route is judged on what leaves us beyond what the recipient
+				// receives: that includes the payee-written blinded fee, which
+				// the route's reported fee used to leave out (issue #1001).
+				let selfIntroForCap: { wireRoute: { totalFeeMsat: bigint } } | null;
+				try {
+					selfIntroForCap = this.prepareSelfIntroSend(candidate);
+				} catch (err) {
+					if (
+						err instanceof LightningPaymentError &&
+						(err.code === LightningErrorCode.NO_ROUTE ||
+							err.code === LightningErrorCode.NO_CHANNEL_TO_HOP)
+					) {
+						selfIntroError = err;
+						continue;
+					}
+					throw err;
+				}
+				const effectiveFeeMsat =
+					selfIntroForCap?.wireRoute.totalFeeMsat ??
+					candidate.totalAmountMsat - paymentAmountMsat;
+				if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
+					overCap = true;
+					continue;
+				}
+				blindedRoute = candidate;
+				pathIndex = i;
+				break;
+			}
 			if (!blindedRoute) {
+				if (overCap) {
+					throw new LightningPaymentError(
+						LightningErrorCode.FEE_EXCEEDS_MAX,
+						'Route fee exceeds maximum'
+					);
+				}
+				// An unusable self-introduction path fails by its own reason.
+				if (selfIntroError) throw selfIntroError;
 				throw new LightningPaymentError(
 					LightningErrorCode.NO_ROUTE,
 					'No route to blinded path introduction node'
-				);
-			}
-			// The fee cap judges the fee actually PAID: a self-introduction
-			// send removes our own introduction fee on the wire, so a
-			// genuinely zero-fee payment must pass maxFeeMsat 0 (issue #550
-			// review). prepareSelfIntroSend also validates the path, so an
-			// unusable self-intro path fails here by name. A grafted route is
-			// judged on what leaves us beyond what the recipient receives:
-			// that includes the payee-written blinded fee, which the route's
-			// reported fee used to leave out (issue #1001).
-			const selfIntroForCap = this.prepareSelfIntroSend(blindedRoute);
-			const effectiveFeeMsat =
-				selfIntroForCap?.wireRoute.totalFeeMsat ??
-				blindedRoute.totalAmountMsat - paymentAmountMsat;
-			if (maxFeeMsat !== undefined && effectiveFeeMsat > maxFeeMsat) {
-				throw new LightningPaymentError(
-					LightningErrorCode.FEE_EXCEEDS_MAX,
-					'Route fee exceeds maximum'
 				);
 			}
 			return this.dispatchInvoiceRoute(
@@ -18428,9 +18628,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					amountMsat,
 					maxCltvExpiryHeight: cltvCeiling,
 					policyOverrides: overrides,
-					metadata: metadata && { ...metadata }
+					metadata: metadata && { ...metadata },
+					bolt12PathIndex: pathIndex
 				},
-				metadata
+				metadata,
+				invoice.metadata
 			);
 		}
 
@@ -18506,6 +18708,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					{
 						paymentHash: invoice.paymentHash,
 						paymentSecret: invoice.paymentSecret,
+						paymentMetadata: invoice.metadata,
 						amountMsat: paymentAmountMsat
 					},
 					multiRoute,
@@ -18548,7 +18751,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				policyOverrides: overrides,
 				metadata: metadata && { ...metadata }
 			},
-			metadata
+			metadata,
+			invoice.metadata
 		);
 	}
 
@@ -18569,11 +18773,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentSecret: Buffer,
 		paymentAmountMsat: bigint,
 		context: IPaymentRetryContext,
-		metadata?: Record<string, string>
+		metadata?: Record<string, string>,
+		paymentMetadata?: Buffer
 	): IPaymentInfo {
 		const hashHex = paymentHash.toString('hex');
-		if (!this.paymentRetryContexts.has(hashHex)) {
+		const registered = this.paymentRetryContexts.get(hashHex);
+		if (!registered) {
 			this.paymentRetryContexts.set(hashHex, context);
+		} else {
+			// A retry keeps its context; only the blinded path it now uses
+			// is this attempt's own.
+			registered.bolt12PathIndex = context.bolt12PathIndex;
 		}
 		// By identity: a payment:failed listener may already have started a
 		// new send of the hash, and the context there now is that send's.
@@ -18590,7 +18800,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				paymentSecret,
 				paymentAmountMsat,
 				metadata,
-				context.payAll
+				context.payAll,
+				paymentMetadata
 			);
 			if (payment.status === PaymentStatus.FAILED) release();
 			return payment;
@@ -18603,6 +18814,26 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 			throw err;
 		}
+	}
+
+	/**
+	 * Refuse a route whose hop payloads do not fit the 1300-byte payment
+	 * onion. Only a large payment_metadata gets there in practice, and the
+	 * route is fixed by then, so the refusal is NO_ROUTE.
+	 */
+	private assertOnionFits(
+		payloads: IHopPayload[],
+		paymentMetadata?: Buffer
+	): void {
+		const used = onionPayloadBytes(payloads);
+		if (used <= ROUTING_INFO_LENGTH) return;
+		throw new LightningPaymentError(
+			LightningErrorCode.NO_ROUTE,
+			`The route's onion payloads take ${used} bytes, more than the ${ROUTING_INFO_LENGTH} a payment onion holds` +
+				(paymentMetadata
+					? ` (the invoice's payment_metadata is ${paymentMetadata.length} bytes)`
+					: '')
+		);
 	}
 
 	/**
@@ -18625,6 +18856,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 	}
 
+	/**
+	 * Send along an explicit route. `paymentMetadata` is the invoice's BOLT 11
+	 * `m` field, written as payment_metadata (TLV 16) beside the payment
+	 * secret in the final payload. A route whose payloads do not fit the onion
+	 * is refused with NO_ROUTE before any record or HTLC exists.
+	 */
 	sendPaymentToRoute(
 		route: {
 			hops: Array<{
@@ -18641,7 +18878,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		paymentSecret?: Buffer,
 		totalMsat?: bigint,
 		metadata?: Record<string, string>,
-		payAll?: IPayAllBudget
+		payAll?: IPayAllBudget,
+		paymentMetadata?: Buffer
 	): IPaymentInfo {
 		if (route.hops.length === 0) {
 			throw new Error('Route must have at least one hop');
@@ -18734,6 +18972,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				if (isFinal && paymentSecret) {
 					payload.paymentSecret = paymentSecret;
 					payload.totalMsat = totalMsat ?? hop.amountToForwardMsat;
+					if (paymentMetadata) payload.paymentMetadata = paymentMetadata;
 				}
 				// Route blinding (BOLT 4): the introduction node and each blinded
 				// hop read their own encrypted_recipient_data (TLV 10) to learn the
@@ -18762,6 +19001,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				}
 				return { pubkey: hop.pubkey, payload };
 			}
+		);
+		this.assertOnionFits(
+			onionHops.map((h) => h.payload),
+			paymentMetadata
 		);
 
 		// Generate session key and compute shared secrets for failure decryption
@@ -19130,8 +19373,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		route: IPaymentInfo['route'],
 		heightSkew: boolean
 	): boolean {
-		if (!ctx?.bolt12Invoice || heightSkew) return false;
+		if (!ctx || heightSkew) return false;
 		if (ctx.bolt12PathIndex === undefined) return false;
+		const pathCount = this.blindedPathCount(ctx);
+		if (pathCount === 0) return false;
 		const hops = route?.hops as IRouteHop[] | undefined;
 		if (!hops || payment.failureSourceIndex === undefined) return false;
 		const introIndex = hops.findIndex(
@@ -19150,10 +19395,18 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			ctx.bolt12ExcludedPathIndices = new Set();
 		}
 		ctx.bolt12ExcludedPathIndices.add(ctx.bolt12PathIndex);
-		return (
-			ctx.bolt12ExcludedPathIndices.size <
-			(ctx.bolt12Invoice.paths?.length ?? 0)
-		);
+		return ctx.bolt12ExcludedPathIndices.size < pathCount;
+	}
+
+	/** How many blinded paths the payment's invoice offers (BOLT 12 or 11). */
+	private blindedPathCount(ctx: IPaymentRetryContext): number {
+		if (ctx.bolt12Invoice) return ctx.bolt12Invoice.paths?.length ?? 0;
+		if (!ctx.invoiceStr) return 0;
+		try {
+			return decodeInvoice(ctx.invoiceStr).blindedPaths?.length ?? 0;
+		} catch {
+			return 0;
+		}
 	}
 
 	/**
@@ -19573,6 +19826,45 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	}
 
 	/**
+	 * One MPP part's onion payloads. The final payload carries the payment
+	 * secret, the payment's FULL total (not the part's amount) and the
+	 * invoice's payment_metadata.
+	 */
+	private mppPartOnionHops(
+		hops: Array<{
+			pubkey: Buffer;
+			shortChannelId: Buffer;
+			amountToForwardMsat: bigint;
+			outgoingCltvValue: number;
+		}>,
+		baseHeight: number,
+		invoice: { paymentSecret?: Buffer; paymentMetadata?: Buffer },
+		totalMsat: bigint
+	): { pubkey: Buffer; payload: IHopPayload }[] {
+		return hops.map((hop, idx) => {
+			const isFinal = idx === hops.length - 1;
+			const payload: IHopPayload = isFinal
+				? {
+						amountToForwardMsat: hop.amountToForwardMsat,
+						outgoingCltvValue: hop.outgoingCltvValue + baseHeight
+				  }
+				: {
+						amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
+						outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
+						shortChannelId: hops[idx + 1].shortChannelId
+				  };
+			if (isFinal && invoice.paymentSecret) {
+				payload.paymentSecret = invoice.paymentSecret;
+				payload.totalMsat = totalMsat;
+				if (invoice.paymentMetadata) {
+					payload.paymentMetadata = invoice.paymentMetadata;
+				}
+			}
+			return { pubkey: hop.pubkey, payload };
+		});
+	}
+
+	/**
 	 * Send a payment using multi-path routing (MPP).
 	 * Splits payment across multiple routes, each carrying a portion.
 	 */
@@ -19581,6 +19873,8 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		invoice: {
 			paymentHash: Buffer;
 			paymentSecret?: Buffer;
+			/** The invoice's `m` field, sent with every part. */
+			paymentMetadata?: Buffer;
 			// The amount being paid, not the invoice field: a zero-amount
 			// invoice has none, and this becomes the record's amount and every
 			// part's total_msat.
@@ -19612,6 +19906,20 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
 		const totalMsat = invoice.amountMsat;
+		// A part refused after an earlier one left would strand that part at
+		// the payee until its MPP timeout, so every part is sized first.
+		for (const part of multiRoute.parts) {
+			if (part.hops.length === 0) continue;
+			this.assertOnionFits(
+				this.mppPartOnionHops(
+					part.hops,
+					this.cltvBaseHeight(paymentHash),
+					invoice,
+					totalMsat
+				).map((h) => h.payload),
+				invoice.paymentMetadata
+			);
+		}
 
 		// Create a single payment record, journaled BEFORE any part leaves,
 		// as the single-path send does: a restart mid-flight must find the
@@ -19702,26 +20010,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			// height-skew failure has to beat to count as new information.
 			payment.cltvBaseHeight = baseHeight;
 
-			// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
-			const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
-				(hop, idx) => {
-					const isFinal = idx === hops.length - 1;
-					const payload: IHopPayload = isFinal
-						? {
-								amountToForwardMsat: hop.amountToForwardMsat,
-								outgoingCltvValue: hop.outgoingCltvValue + baseHeight
-						  }
-						: {
-								amountToForwardMsat: hops[idx + 1].amountToForwardMsat,
-								outgoingCltvValue: hops[idx + 1].outgoingCltvValue + baseHeight,
-								shortChannelId: hops[idx + 1].shortChannelId
-						  };
-					if (isFinal && invoice.paymentSecret) {
-						payload.paymentSecret = invoice.paymentSecret;
-						payload.totalMsat = totalMsat; // Full amount, not part amount
-					}
-					return { pubkey: hop.pubkey, payload };
-				}
+			const onionHops = this.mppPartOnionHops(
+				hops,
+				baseHeight,
+				invoice,
+				totalMsat
 			);
 
 			const sessionKey = randomBytes(32);
@@ -20035,6 +20328,23 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			],
 			RecoveryCriticality.SafetyCritical
 		);
+
+		// BOLT 4: an HTLC that arrived with a path_key in update_add_htlc MUST
+		// be refused when its payload also carries current_path_key. Only one
+		// of the two can be the hop's real blinding source.
+		if (htlcEntry.blindingPoint && processed.hopPayload.blindingPoint) {
+			this.emitStructuredLog('htlc', 'blinded_double_path_key', {
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString()
+			});
+			this.failBlindedIncomingHtlc(
+				channelId,
+				htlcId,
+				'mid',
+				processed.sharedSecret
+			);
+			return;
+		}
 
 		// Policy fail-backs (issue 410): BOLT 2's dust-exposure section says an
 		// HTLC over the ceiling SHOULD be failed once committed and its preimage
@@ -21121,6 +21431,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		description = 'FFOR voucher',
 		expirySecs?: number
 	): ICreateInvoiceResult {
+		assertBolt1String(description, 'Invoice description');
 		if (expirySecs !== undefined && (!Number.isSafeInteger(expirySecs) || expirySecs < 60 || expirySecs > 86400)) throw new Error('expirySecs must be between 60 and 86400');
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		const channel = this.channelManager.getChannel(channelId);
@@ -22186,6 +22497,31 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
 			}
+		}
+
+		// An invoice issued with an `m` field is paid only by HTLCs that
+		// return the same bytes as payment_metadata (BOLT 4 makes the payer
+		// include it in every HTLC). Without such an invoice the record is
+		// ignored.
+		const expectedMetadata = this.invoices.get(hashHex)?.paymentMetadata;
+		if (
+			expectedMetadata !== undefined &&
+			hopPayload?.paymentMetadata?.toString('hex') !== expectedMetadata
+		) {
+			this.emitStructuredLog('htlc', 'payment_metadata_mismatch', {
+				paymentHash: hashHex,
+				present: hopPayload?.paymentMetadata !== undefined
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
 		}
 
 		// BOLT 12: an invoice we issued binds its payment to the path_id we
@@ -25045,6 +25381,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// hop's own payment_relay (not the cleartext onion), so per-hop fees
 		// distribute correctly across >2 blinded hops.
 		let outgoingScid = hopPayload.shortChannelId;
+		// A blinded hop may name its next node instead of a channel (BOLT 4
+		// next_node_id); any of our usable channels to that peer will do.
+		let outgoingNodeId: Buffer | undefined;
 		let nextBlindingPoint: Buffer | undefined;
 		let holdForLsp = false;
 		let holdRegistrationId: Buffer | undefined;
@@ -25063,6 +25402,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 				hopPayload.omitForwardAmounts !== true ||
 				hopPayload.shortChannelId !== undefined ||
 				hopPayload.paymentSecret !== undefined ||
+				hopPayload.paymentMetadata !== undefined ||
 				hopPayload.totalAmountMsat !== undefined;
 			try {
 				const { hopData, nextBlindingKey } = processBlindedHop(
@@ -25071,6 +25411,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 					hopPayload.encryptedRecipientData
 				);
 				outgoingScid = hopData.shortChannelId;
+				outgoingNodeId = hopData.nextNodeId;
 				nextBlindingPoint = nextBlindingKey;
 				holdForLsp = !!hopData.holdHtlc;
 				holdRegistrationId = hopData.holdRegistrationId;
@@ -25188,6 +25529,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			inHtlcId: Number(inHtlcId),
 			amountInMsat: Number(incomingAmountMsat),
 			outgoingScid: outgoingScid?.toString('hex'),
+			...(outgoingNodeId && {
+				outgoingNodeId: outgoingNodeId.toString('hex')
+			}),
 			blinded: isBlindedForward
 		});
 
@@ -25217,6 +25561,17 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			return;
 		}
 
+		let peerChannelId: Buffer | undefined;
+		if (!outgoingScid && isBlindedForward && outgoingNodeId) {
+			const toPeer = this.findChannelForPeer(
+				outgoingNodeId.toString('hex'),
+				forwardAmount
+			);
+			const st = toPeer?.getFullState();
+			peerChannelId = toPeer?.getChannelId() ?? undefined;
+			outgoingScid =
+				st?.shortChannelId ?? st?.scidAlias ?? st?.remoteScidAlias ?? undefined;
+		}
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
@@ -25226,7 +25581,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// the policy checks: the fee/CLTV we enforce is the OUTGOING channel's
 		// effective policy (per-channel override or node defaults).
 		const scidHex = outgoingScid.toString('hex');
-		const outChannelId = this.scidToChannelId.get(scidHex);
+		const outChannelId = peerChannelId ?? this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
 			// JIT receive (LSP role): an unknown SCID may be an intercept SCID we
 			// minted for a wallet peer, so hold the HTLC and fund a channel to it
@@ -26080,13 +26435,49 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 	}
 
+	/**
+	 * Settle an HTLC this node offered that the peer fulfilled. Returns false
+	 * when it was a replay with nothing left to do, in which case the
+	 * application-facing events (`htlc:fulfilled`, `payment:htlc-resolved`,
+	 * `payment:preimage`) are not raised again.
+	 */
 	private handleHtlcFulfilled(
 		channelId: Buffer,
 		htlcId: bigint,
-		preimage: Buffer
-	): void {
-		// Persist preimage immediately (proof of payment) before any message sends
+		preimage: Buffer,
+		replay = false
+	): boolean {
 		const preimageHash = sha256(preimage);
+		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
+
+		// A replay is a fulfil this node already processed once: the channel
+		// re-emits every FULFILLED entry it still holds on reestablish (issue
+		// 295), and an older beignet peer retransmits the fulfil itself. The
+		// replay exists for a node killed before the node-level work below
+		// reached disk. When that work is already durable (the preimage is
+		// stored, no forward linkage is left to settle and no outgoing record
+		// is still waiting for this preimage), there is nothing to redo, and
+		// raising the events again would make an application that counts
+		// fulfils count this one twice (#2090).
+		if (replay) {
+			const hashHex = preimageHash.toString('hex');
+			const owed = this.payments.get(hashHex);
+			if (
+				this.preimages.has(hashHex) &&
+				!this.forwardedHtlcs.has(outKey) &&
+				!(
+					owed &&
+					owed.direction === PaymentDirection.OUTGOING &&
+					(owed.status === PaymentStatus.PENDING ||
+						owed.status === PaymentStatus.FAILED)
+				)
+			) {
+				this.retriesAwaitingRemoval.delete(outKey);
+				return false;
+			}
+		}
+
+		// Persist preimage immediately (proof of payment) before any message sends
 		this.preimages.set(preimageHash.toString('hex'), preimage);
 		this.commitMutations(
 			'savePreimage',
@@ -26101,7 +26492,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		);
 
 		// Check if this is a forwarded HTLC — propagate fulfillment upstream
-		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		// A failure parked on this HTLC until its removal round completed
 		// (issue #989) is void: the peer fulfilled it after all (a disconnect
 		// before our revocation rolled the fail back, and the peer
@@ -26122,11 +26512,11 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			);
 			if (intercept === 'held') {
 				this.persistChannel(channelId);
-				return;
+				return true;
 			}
 			this.settleForwardUpstream(outKey, forward, preimage, preimageHash);
 			this.persistChannel(channelId);
-			return;
+			return true;
 		}
 
 		// Hash preimage to find the payment
@@ -26193,6 +26583,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		}
 		this.emitHtlcResolved(paymentHash, channelId, htlcId, 'fulfilled');
 		this.emitPaymentPreimage(paymentHash, preimage, 'htlc');
+		return true;
 	}
 
 	/** 'payment:htlc-resolved' for one offered HTLC of an outgoing payment. */
@@ -27423,10 +27814,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 	 * eventually leaving no route at all.
 	 *
 	 * Channel-scoped failures are those carrying the UPDATE flag (0x1000), which by
-	 * definition describe the outgoing channel, plus the two BOLT 4 failures that
+	 * definition describe the outgoing channel, plus the three BOLT 4 failures that
 	 * also describe the outgoing channel but carry no channel_update and therefore
-	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
-	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
+	 * no UPDATE flag: permanent_channel_failure, required_channel_feature_missing
+	 * and unknown_next_peer.
 	 */
 	private getCulpableHopScid(
 		payment: IPaymentInfo,
@@ -27453,7 +27844,9 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		if ((code & 0x2000) !== 0) return false;
 		if ((code & 0x1000) !== 0) return true;
 		return (
-			code === UNKNOWN_NEXT_PEER || code === REQUIRED_CHANNEL_FEATURE_MISSING
+			code === PERMANENT_CHANNEL_FAILURE ||
+			code === REQUIRED_CHANNEL_FEATURE_MISSING ||
+			code === UNKNOWN_NEXT_PEER
 		);
 	}
 
@@ -29094,9 +29487,12 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 						if (peer === this.getNodeId()) {
 							throw new Error('refusing to dial this node itself');
 						}
+						// A lane's address comes from a descriptor the
+						// counterparty wrote.
 						await this.connectPeer(peer, host, port, undefined, {
 							...options,
-							...(timeoutMs !== undefined ? { timeoutMs } : {})
+							...(timeoutMs !== undefined ? { timeoutMs } : {}),
+							learned: true
 						});
 					},
 					onPeerConnect: (cb): (() => void) => {
@@ -29522,7 +29918,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			isPeerConnected: (peerHex: string) =>
 				this.listPeers().some((p) => p.pubkey === peerHex),
 			connectPeer: (peerHex: string, host: string, port: number) =>
-				this.connectPeer(peerHex, host, port)
+				this.connectPeer(peerHex, host, port, undefined, { learned: true })
 		};
 		const estimateFee = (targetBlocks: number): Promise<number | null> =>
 			this.estimateClampedFeeSatPerVbyte(targetBlocks);
@@ -31210,6 +31606,7 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			seed: givenSeed,
 			coinType: givenCoinType,
 			iroh,
+			porch,
 			channelKeyDeriver: givenChannelKeyDeriver,
 			...config
 		} = options ?? {};
@@ -31269,6 +31666,13 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			iroh: iroh
 				? { ...iroh, secretKey: deriveIrohSecretKey(seed) }
 				: undefined,
+			porch: porch
+				? {
+						...porch,
+						hostSecret: derivePorchHostSecret(seed),
+						tags: porch.tags ?? [derivePorchDefaultTag(seed)]
+				  }
+				: undefined,
 			channelKeyDeriver
 		});
 	}
@@ -31320,6 +31724,10 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		// recipient and the settlement-peer roles are implemented.
 		flags.setOptional(Feature.OPTION_FF_RECEIVE);
 		flags.setOptional(Feature.OPTION_FF_CONCURRENT);
+		// Route blinding (BOLT 4): we relay blinded payments and onion
+		// messages as an introduction or intermediate node. LND, CLN, Eclair
+		// and LDK only pick blinded hops among nodes that set this bit.
+		flags.setOptional(Feature.ROUTE_BLINDING);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.
@@ -31332,8 +31740,6 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 		//  - OPTION_WILL_FUND (112): liquidity ads negotiate via open_channel2
 		//    TLVs when liquidity rates are configured; init-bit advertising is a
 		//    separate decision.
-		//  - ROUTE_BLINDING (24): advertised per-invoice (see invoiceFeatures),
-		//    not in the init set.
 		//  - OPTION_TAPROOT (180/181): negotiated via channel_type when
 		//    preferTaproot is set; staging bits are not init-advertised. A
 		//    caller that adds them loses SIMPLE_CLOSE: the constructor clears
@@ -31898,17 +32304,25 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			let overCap = false;
 			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
 				if (excludedPaths?.has(i)) continue;
-				const payInfo = invoice.blindedPayInfo?.[i] ?? {
+				// BOLT 12: never pay over a path whose payinfo sets an unknown
+				// even feature bit.
+				const advertised = invoice.blindedPayInfo?.[i];
+				if (advertised && payInfoRequiresUnknownFeature(advertised)) continue;
+				const payInfo = advertised ?? {
 					feeBaseMsat: 0,
 					feeProportionalMillionths: 0,
 					cltvExpiryDelta: 0,
 					htlcMinimumMsat: 0n,
 					htlcMaximumMsat: amountMsat
 				};
+				const path = resolveIntroductionNode(invoice.paths[i], (scid) =>
+					this.channelEndsForScid(scid)
+				);
+				if (!path) continue;
 				blindedRoute = findRouteToBlindedPath(
 					this.graph,
 					sourceNodeId,
-					invoice.paths[i],
+					path,
 					payInfo,
 					amountMsat,
 					finalCltvExpiry,
@@ -34009,6 +34423,49 @@ export class LightningNode extends TypedEmitter<LightningNodeEvents> {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * The two ends of a channel by SCID: one of ours (real SCID or either
+	 * alias, in any state, since an onion message relay needs only the peer)
+	 * or one from the gossip graph. Feeds onion message next hops named by
+	 * channel and `sciddir` introduction points.
+	 */
+	private channelEndsForScid(scid: Buffer): IChannelEnds | undefined {
+		if (scid.length !== 8) return undefined;
+		const peer = this.peerOnChannelScid(scid);
+		if (peer) {
+			const own = this.ownNodeId();
+			return Buffer.compare(own, peer) < 0
+				? { nodeId1: own, nodeId2: peer }
+				: { nodeId1: peer, nodeId2: own };
+		}
+		const graphChannel = this.graph?.getChannel(scid);
+		return graphChannel
+			? { nodeId1: graphChannel.nodeId1, nodeId2: graphChannel.nodeId2 }
+			: undefined;
+	}
+
+	/** The peer at the other end of our channel with this SCID. */
+	private peerOnChannelScid(scid: Buffer): Buffer | undefined {
+		let channelId = this.scidToChannelId.get(scid.toString('hex'));
+		if (!channelId) {
+			for (const channel of this.channelManager.listChannels()) {
+				const st = channel.getFullState();
+				if (
+					(st.shortChannelId && st.shortChannelId.equals(scid)) ||
+					(st.scidAlias && st.scidAlias.equals(scid)) ||
+					(st.remoteScidAlias && st.remoteScidAlias.equals(scid))
+				) {
+					channelId = channel.getChannelId() ?? undefined;
+					break;
+				}
+			}
+		}
+		const peer = channelId
+			? this.channelManager.getPeerForChannel(channelId)
+			: undefined;
+		return peer ? Buffer.from(peer, 'hex') : undefined;
 	}
 
 	private findLocalChannelByScid(

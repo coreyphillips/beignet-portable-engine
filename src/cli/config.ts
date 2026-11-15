@@ -5,6 +5,12 @@
 
 import { irohBooleanEnv, irohRelaysEnv } from './iroh-config';
 import {
+	porchProxyEnv,
+	porchRelaysEnv,
+	porchStandbysEnv,
+	porchViaEnv
+} from './porch-config';
+import {
 	electrumTlsFingerprintsEnv,
 	electrumTlsVerifyEnv
 } from './electrum-tls-config';
@@ -466,12 +472,23 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			irohBooleanEnv('BEIGNET_IROH_DISCOVERY') ??
 			file.irohDiscovery,
 		irohRelays: cliFlags.irohRelays ?? irohRelaysEnv() ?? file.irohRelays,
+		irohRelayOnly:
+			cliFlags.irohRelayOnly ??
+			irohBooleanEnv('BEIGNET_IROH_RELAY_ONLY') ??
+			file.irohRelayOnly,
 		websocketPort:
 			cliFlags.websocketPort ||
 			(process.env.BEIGNET_WEBSOCKET_PORT
 				? parseInt(process.env.BEIGNET_WEBSOCKET_PORT, 10)
 				: undefined) ||
 			file.websocketPort,
+		porchRelays: cliFlags.porchRelays ?? porchRelaysEnv() ?? file.porchRelays,
+		porchVia: cliFlags.porchVia ?? porchViaEnv() ?? file.porchVia,
+		porchProxy: cliFlags.porchProxy ?? porchProxyEnv() ?? file.porchProxy,
+		porchStandbys:
+			cliFlags.porchStandbys ?? porchStandbysEnv() ?? file.porchStandbys,
+		porchToken:
+			cliFlags.porchToken || process.env.BEIGNET_PORCH_TOKEN || file.porchToken,
 		maxInboundPeers:
 			integerEnv(process.env.BEIGNET_MAX_INBOUND_PEERS) ?? file.maxInboundPeers,
 		daemonHost:

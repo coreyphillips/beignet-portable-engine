@@ -12,6 +12,7 @@ import type { IOnionMessagePayload } from '../onion-message/types';
 import type { GuardianState } from '../recovery/guardian-wire';
 import type { ISwapEvent } from '../swaps/engine-common';
 import type { IPeerDisconnectInfo } from '../transport/peer-manager';
+import type { IPorchHostStatus } from '../transport/porch-host';
 import type {
 	IGraphRestoreStats,
 	IHoldCancelledEvent,
@@ -53,6 +54,7 @@ export type NodeErrorCode =
 	| 'HTLC_CLAIM_FORCE_CLOSE'
 	| 'HTLC_DEADLINE_HELD'
 	| 'HTLC_EXPIRY_FORCE_CLOSE'
+	| 'IROH_RELAY_ONLY_VIOLATED'
 	| 'LISTEN_FAILED'
 	| 'MESSAGE_TOO_LARGE'
 	| 'NO_ROUTING_HINTS'
@@ -103,9 +105,9 @@ export interface LightningNodeEvents
 	'payment:sent': (payment: IPaymentInfo) => void;
 	/** Outgoing payment failed. */
 	'payment:failed': (payment: IPaymentInfo) => void;
-	/** One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). */
+	/** One offered HTLC of an outgoing payment reached a terminal state (fulfilled, irrevocably failed, or resolved on chain). A fulfilled HTLC is reported once, as `htlc:fulfilled` is. */
 	'payment:htlc-resolved': (event: IPaymentHtlcResolvedEvent) => void;
-	/** An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. */
+	/** An outgoing payment's preimage became known, from update_fulfill_htlc or an on-chain claim, whatever the record's status was. From update_fulfill_htlc it is raised once per HTLC, as `htlc:fulfilled` is. */
 	'payment:preimage': (event: IPaymentPreimageEvent) => void;
 	/** Preimage recorded (forwarding and settlement chokepoint). */
 	'preimage:learned': (paymentHash: Buffer, preimage: Buffer) => void;
@@ -251,7 +253,7 @@ export interface LightningNodeEvents
 		reason: string;
 		channelErrorCode?: ChannelErrorCode;
 	}) => void;
-	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
+	/** The peer fulfilled an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. Raised once per HTLC: a reconnect or restart raises it again only when this node had not yet stored what the fulfil settled (the preimage, the forward or the payment record). */
 	'htlc:fulfilled': (data: { channelId: Buffer; htlcId: bigint }) => void;
 	/** The peer failed an HTLC this node offered: a part of its own payment or the outgoing leg of a forward. */
 	'htlc:failed': (data: { channelId: Buffer; htlcId: bigint }) => void;
@@ -284,6 +286,8 @@ export interface LightningNodeEvents
 	'peer:disconnect-requested': (pubkey: string) => void;
 	/** Peer error (networking mode). */
 	'peer:error': (pubkey: string, error: Error) => void;
+	/** A Porch relay's standbys changed: the relay became reachable, was lost or refused the node, or a visitor connected or left. Carries that relay's whole status; `state: 'ready'` means links through it work. */
+	'porch:status': (status: IPorchHostStatus) => void;
 	/** A peer sent a BOLT 1 warning, which leaves the connection and its channels as they were, so it is not a `node:error`. `channelId` is null for a connection-level warning (the all-zero id); `text` is the peer's text as printable ASCII. */
 	'peer:warning': (warning: {
 		pubkey: string;

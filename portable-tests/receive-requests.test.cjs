@@ -42,6 +42,33 @@ test('saved requests skip signer recovery while new registrations still require 
  f.disk=JSON.stringify(saved);
  assert.throws(()=>f.open().list(),{code:'RECEIVE_REQUESTS_UNAVAILABLE'});
 });
+test('a saved request whose description an engine before 0.41.0 wrote still loads (beignet #2074)',async()=>{
+ const f=fixture(),row=request(73);
+ await f.open().register(row,checks(row));
+ // Rewrite the saved invoice's d field to what an older engine accepted and
+ // 0.41.0's BOLT 1 reader refuses: a line break and a joined emoji. Stored
+ // reads skip signer recovery, so the stale signature does not matter here.
+ const {bech32}=require('bech32');
+ const {prefix,words}=bech32.decode(row.bolt11,20000);
+ const sigStart=words.length-104,out=words.slice(0,7);
+ for(let i=7;i<sigStart;){
+  const type=words[i],len=words[i+1]*32+words[i+2];
+  if(type===13){const text=bech32.toWords(Buffer.from('Rent\nfor May \u{1F468}\u{200D}\u{1F373}','utf8'));out.push(13,text.length>>5,text.length&31,...text);}
+  else out.push(...words.slice(i,i+3+len));
+  i+=3+len;
+ }
+ out.push(...words.slice(sigStart));
+ const loose=bech32.encode(prefix,out,20000);
+ const saved=JSON.parse(f.disk);
+ saved.requests[0]={...saved.requests[0],bolt11:loose,uri:saved.requests[0].uri.replace(row.bolt11,loose)};
+ f.disk=JSON.stringify(saved);
+ const listed=f.open().list();
+ assert.equal(listed.length,1);
+ assert.equal(listed[0].bolt11,loose);
+ // The engine's own reader still refuses that invoice from anywhere else.
+ const {decode}=require('../dist/portable.cjs');
+ if(typeof decode==='function') assert.throws(()=>decode(loose),/BOLT 1/);
+});
 test('original unified request survives a new store without seed fields and replay returns canonical ID after invoice pruning',async()=>{
  const f=fixture(),row=request(),store=f.open();
  const saved=await store.register({...row,preimage:'SECRET',mnemonic:'SECRET'},checks(row));

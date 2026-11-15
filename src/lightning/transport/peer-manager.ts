@@ -8,8 +8,14 @@
  * - Reconnection with exponential backoff
  */
 
-import type { IIrohConfig, IIrohEndpoint, IIrohDiagnostics } from './iroh';
+import type {
+	IIrohConfig,
+	IIrohEndpoint,
+	IIrohDiagnostics,
+	IrohRelayOnlyMode
+} from './iroh';
 import {
+	IrohRelayOnlyError,
 	formatIrohAddress,
 	connectIrohWithFallback,
 	normalizeIrohEndpointId
@@ -27,9 +33,29 @@ import type {
 	IPeerTransportOptions
 } from './duplex-transport';
 import type { WebSocketConstructor } from './websocket';
-import { connectWebSocket, buildWebSocketUrl } from './websocket';
+import {
+	connectWebSocket,
+	buildWebSocketUrl,
+	parseWebSocketUrl
+} from './websocket';
 import { WebSocketServer } from './websocket-server';
-import { NodeWebSocket } from './websocket-node-client';
+import { NodeWebSocket, nodeWebSocketVia } from './websocket-node-client';
+import type { IPorchRelayAddress } from './porch';
+import {
+	PORCH_MAX_TAGS,
+	PORCH_TAG_BYTES,
+	parsePorchRelayUrl,
+	porchLink,
+	porchRouteId
+} from './porch';
+import type {
+	IPorchCircuitInfo,
+	IPorchConfig,
+	IPorchHostStatus,
+	IPorchLink,
+	PorchVia
+} from './porch-host';
+import { PORCH_MAX_MESSAGE_BYTES, PorchHost } from './porch-host';
 import { normalizeHexPubkey } from '../validation';
 import { CodedError } from '../../utils/errors';
 
@@ -41,9 +67,7 @@ import { CodedError } from '../../utils/errors';
  * resolves globalThis.WebSocket.
  */
 function defaultWebSocketImpl(): WebSocketConstructor | undefined {
-	const proc = (globalThis as { process?: { versions?: { node?: string } } })
-		.process;
-	if (proc?.versions?.node) {
+	if (isNodeRuntime()) {
 		return NodeWebSocket;
 	}
 	// A portable host hands the engine every socket it opens (net and tls
@@ -57,6 +81,13 @@ function defaultWebSocketImpl(): WebSocketConstructor | undefined {
 		return NodeWebSocket;
 	}
 	return undefined;
+}
+
+/** Whether this runtime opens its own sockets, as Node does. */
+function isNodeRuntime(): boolean {
+	const proc = (globalThis as { process?: { versions?: { node?: string } } })
+		.process;
+	return Boolean(proc?.versions?.node);
 }
 
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 300_000; // 5 minutes
@@ -124,13 +155,15 @@ export function isPrivateOrLoopbackHost(host: string): boolean {
  * loopback sources are not: a Tor onion service, a reverse proxy or a
  * container gateway hands every peer it carries to us from one such address.
  * IPv6 keys on the /64, since a single host is routinely given a whole /64.
+ * A source that is not an IP address at all (a transport that names where
+ * its connections come from, a relay for instance) is its own key, verbatim.
  */
 export function inboundAddressKey(address: string | undefined): string | null {
 	if (!address || isPrivateOrLoopbackHost(address)) return null;
 	const a = address.toLowerCase();
 	const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
 	if (mapped) return mapped[1];
-	if (!a.includes(':')) return a;
+	if (!a.includes(':') || !/^[0-9a-f:.]+(%.*)?$/.test(a)) return a;
 	const [head, tail] = a.split('::');
 	const front = head ? head.split(':') : [];
 	const back = tail ? tail.split(':') : [];
@@ -192,6 +225,66 @@ export function selectOutboundProxy(
 }
 
 /**
+ * The proxy a Porch standby dials its relay through, or undefined for a
+ * direct dial. A relay is a host the operator chose, so by default it is
+ * dialed as a peer at that host would be; `via` overrides that for the
+ * relays alone:
+ *
+ *   relay host         | via unset               | via 'tor'                | via 'direct'
+ *   .onion             | proxy, else Tor default | proxy, else Tor default  | refused
+ *   private / loopback | direct                  | refused                  | direct
+ *   public             | as selectOutboundProxy  | proxy, else Tor default  | direct
+ *
+ * The two refusals are configuration errors: Tor will not carry a
+ * connection to a private address, and an onion name resolves nowhere else.
+ * Under 'tor' there is no direct dial to fall back to.
+ *
+ * `own` is a proxy for the relays alone (IPorchConfig.proxy). With it every
+ * relay is dialed through `own`, whatever `proxy` and `scope` say: the 'tor'
+ * column with `own` in place of the proxy. It contradicts via 'direct', and
+ * the two together are refused.
+ */
+export function selectPorchProxy(
+	host: string,
+	via: PorchVia | undefined,
+	proxy: { host: string; port: number } | undefined,
+	scope: Socks5ProxyScope = 'all',
+	own?: { host: string; port: number }
+): { host: string; port: number } | undefined {
+	const onion = host.trim().toLowerCase().endsWith('.onion');
+	if (own) {
+		if (via === 'direct') {
+			throw new Error(
+				"Porch has a proxy of its own and via 'direct': the relays are dialed one way or the other, so set one"
+			);
+		}
+		if (!onion && isPrivateOrLoopbackHost(host)) {
+			throw new Error(
+				`Porch relay ${host} is a private address: it is not reached through a proxy, so a Porch proxy cannot be used`
+			);
+		}
+		return own;
+	}
+	if (via === 'direct') {
+		if (onion) {
+			throw new Error(
+				`Porch relay ${host} is an onion service: it cannot be dialed with via 'direct'`
+			);
+		}
+		return undefined;
+	}
+	if (via === 'tor') {
+		if (!onion && isPrivateOrLoopbackHost(host)) {
+			throw new Error(
+				`Porch relay ${host} is a private address: Tor cannot reach it, so via 'tor' cannot be used`
+			);
+		}
+		return proxy ?? DEFAULT_TOR_PROXY;
+	}
+	return selectOutboundProxy(host, proxy, scope);
+}
+
+/**
  * A socket factory that dials through a SOCKS5 proxy (Tor), shared by the
  * peer manager and by guardian sessions to onion hosts (recovery
  * guardian-bolt8.ts). Tor circuit establishment can hang for minutes;
@@ -215,6 +308,25 @@ export function socks5SocketFactory(
 	};
 }
 
+/**
+ * How an address somebody other than the operator chose is dialed: a
+ * peer's node_announcement, the gossip graph, DNS seeds, a payment
+ * descriptor. Whoever supplies such an address sees the source of the dial,
+ * so a node that keeps its own address private must not dial one directly.
+ *
+ * - `'any'`: dialed like any other address (the default).
+ * - `'proxy-only'`: dialed only over TCP through the SOCKS5 proxy, whatever
+ *   socks5ProxyScope says. Without a proxy, and for private or loopback
+ *   hosts (which never ride one), the dial is refused with
+ *   LearnedAddressRefusedError. A learned address that connects is not kept
+ *   as the peer's last-known-good address, so it never becomes a direct
+ *   reconnect target later.
+ *
+ * Addresses the operator supplied (IPeerDialOptions.learned unset) are not
+ * affected.
+ */
+export type LearnedAddressDials = 'any' | 'proxy-only';
+
 export interface IPeerManagerOptions {
 	/** Local node private key (32 bytes) */
 	localPrivateKey: Buffer;
@@ -226,10 +338,11 @@ export interface IPeerManagerOptions {
 	autoReconnect?: boolean;
 	/** Max reconnect delay in ms (default 5 min) */
 	maxReconnectDelay?: number;
-	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050).
-	 *  Which hosts use it is decided by socks5ProxyScope; private and
-	 *  loopback hosts never do. When not set, .onion addresses auto-route
-	 *  through 127.0.0.1:9050 and everything else is dialed directly. */
+	/** SOCKS5 proxy for outbound connections (e.g. Tor on 127.0.0.1:9050),
+	 *  TCP and WebSocket peers alike. Which hosts use it is decided by
+	 *  socks5ProxyScope; private and loopback hosts never do. When not set,
+	 *  .onion addresses auto-route through 127.0.0.1:9050 and everything
+	 *  else is dialed directly. */
 	socks5Proxy?: { host: string; port: number };
 	/** Which destinations ride socks5Proxy (default 'all'): 'all' proxies
 	 *  every public host, 'onion' proxies .onion hosts only and dials public
@@ -269,9 +382,21 @@ export interface IPeerManagerOptions {
 	 *  the in-repo RFC-cased Node client under Node (CLN's ws listener
 	 *  rejects the built-in WebSocket's lowercased headers) and to
 	 *  globalThis.WebSocket in browsers. Only consulted when a peer is
-	 *  dialed with transport {type: 'ws'}. */
+	 *  dialed with transport {type: 'ws'} and the dial is a direct one: a
+	 *  dial that socks5Proxy carries is made by the in-repo client over the
+	 *  proxy's socket, and fails where that client cannot run. */
 	webSocketImpl?: WebSocketConstructor;
 	iroh?: IIrohConfig;
+	/**
+	 * Porch relays to wait at (docs/PORCH-PROTOCOL.md), so the node can be
+	 * reached through a link that does not say where it runs. Setting it
+	 * switches learnedAddressDials to 'proxy-only': a node that hides its
+	 * address must not dial one a peer chose. Started with listenPorch().
+	 */
+	porch?: IPorchConfig;
+	/** How learned addresses are dialed (default 'any'); see
+	 *  LearnedAddressDials. */
+	learnedAddressDials?: LearnedAddressDials;
 }
 
 /**
@@ -295,6 +420,11 @@ export interface IPeerInfo {
 	/** Active transport when known ('tcp' when absent). */
 	transport?: 'tcp' | 'ws' | 'iroh';
 	iroh?: IIrohDiagnostics;
+	/**
+	 * Set when the peer came in through a Porch relay. Its `host` then names
+	 * the relay ('porch:<relay>'): the peer's own address is never known.
+	 */
+	porch?: IPorchCircuitInfo;
 }
 
 /** What peer:disconnect knows about the connection that ended. */
@@ -330,6 +460,13 @@ export interface IPeerDialOptions {
 	 * otherwise retry for good. A peer that was already a target stays one.
 	 */
 	reconnect?: boolean;
+	/**
+	 * true: somebody other than the operator chose this address (gossip, a
+	 * DNS seed, a descriptor a counterparty sent). Under learnedAddressDials
+	 * 'proxy-only' such a dial goes through the proxy or is refused; see
+	 * LearnedAddressDials.
+	 */
+	learned?: boolean;
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
@@ -351,7 +488,9 @@ export enum PeerErrorCode {
 	/** A lane peer carries only the message types its lane gate allows. */
 	LANE_REFUSED = 'LANE_REFUSED',
 	/** An explicit disconnectPeer() overtook the dial. */
-	DIAL_CANCELLED = 'DIAL_CANCELLED'
+	DIAL_CANCELLED = 'DIAL_CANCELLED',
+	/** A learned address may only be dialed through a proxy here. */
+	LEARNED_ADDRESS_REFUSED = 'LEARNED_ADDRESS_REFUSED'
 }
 
 /**
@@ -380,6 +519,22 @@ export class PeerDialCancelledError extends PeerError {
 			`Connection to peer ${pubkey} was cancelled while establishing`
 		);
 		this.name = 'PeerDialCancelledError';
+	}
+}
+
+/**
+ * A dial to a learned address that learnedAddressDials 'proxy-only' does
+ * not allow: no proxy carries it, so dialing would show this node's own
+ * address to whoever supplied the target. TYPED so a caller walking
+ * several candidates can tell a refusal from an unreachable host.
+ */
+export class LearnedAddressRefusedError extends PeerError {
+	constructor(pubkey: string, target: string) {
+		super(
+			PeerErrorCode.LEARNED_ADDRESS_REFUSED,
+			`Refusing to dial learned address ${target} for peer ${pubkey} without a proxy`
+		);
+		this.name = 'LearnedAddressRefusedError';
 	}
 }
 
@@ -447,6 +602,7 @@ export class PeerManager extends EventEmitter {
 	private wsServer: WebSocketServer | null = null;
 	private socks5Proxy?: { host: string; port: number };
 	private socks5ProxyScope: Socks5ProxyScope;
+	private learnedAddressDials: LearnedAddressDials;
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private isChannelPeer?: (pubkey: string) => boolean;
@@ -481,7 +637,19 @@ export class PeerManager extends EventEmitter {
 	private irohBinding?: Promise<IIrohEndpoint>;
 	private irohListening = false;
 	private irohListenEpoch = 0;
+	/**
+	 * Why relay-only Iroh is off for the rest of this manager's life. Once an
+	 * endpoint could not keep the promise, another bind would only ask the
+	 * router again, so nothing rebinds until the operator restarts.
+	 */
+	private irohRelayOnlyFailure?: IrohRelayOnlyError;
 	private webSocketImpl?: WebSocketConstructor;
+	/** One per configured Porch relay, in the order they were given. */
+	private porchHosts: PorchHost[] = [];
+	private porchRelays: IPorchRelayAddress[] = [];
+	private porchHostKey?: Buffer;
+	/** The links served now: sorted, distinct, 16 bytes each. */
+	private porchTags: Buffer[] = [];
 
 	constructor(options: IPeerManagerOptions) {
 		super();
@@ -494,6 +662,11 @@ export class PeerManager extends EventEmitter {
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
 		this.socks5ProxyScope = options.socks5ProxyScope ?? 'all';
+		// A node behind a Porch relay is hiding its address, and a dial to an
+		// address a peer chose would give it away (see LearnedAddressDials).
+		this.learnedAddressDials = options.porch
+			? 'proxy-only'
+			: options.learnedAddressDials ?? 'any';
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 		// NaN would silently disable the cap: `count >= NaN` is never true.
@@ -517,6 +690,7 @@ export class PeerManager extends EventEmitter {
 		this.maxLanePeers = options.maxLanePeers ?? 32;
 		this.webSocketImpl = options.webSocketImpl;
 		this.irohConfig = options.iroh;
+		if (options.porch) this.configurePorch(options.porch);
 	}
 
 	/**
@@ -549,7 +723,14 @@ export class PeerManager extends EventEmitter {
 			this.noReconnectPeers.add(pubkey);
 		}
 		try {
-			await this.dialPeer(pubkey, host, port, transport, options.timeoutMs);
+			await this.dialPeer(
+				pubkey,
+				host,
+				port,
+				transport,
+				options.timeoutMs,
+				options.learned === true
+			);
 		} catch (err) {
 			// An explicit disconnectPeer() during the dial (a peer:error
 			// observer's cleanup, an operator decision) already cancelled
@@ -596,11 +777,14 @@ export class PeerManager extends EventEmitter {
 		host: string,
 		port: number,
 		transport?: IPeerTransportOptions,
-		timeoutMs?: number
+		timeoutMs?: number,
+		learned = false
 	): Promise<void> {
+		// A restricted dial is a different dial from a plain one to the same
+		// address (it rides the proxy), so the two never share an attempt.
 		const key = `${pubkey}|${host}|${port}|${
 			transport ? JSON.stringify(transport) : ''
-		}`;
+		}${this.restrictsLearned(learned) ? '|learned' : ''}`;
 		const joined = this.inflightDials.get(key);
 		if (joined) {
 			if (timeoutMs === undefined) return joined;
@@ -617,10 +801,24 @@ export class PeerManager extends EventEmitter {
 				// The failed dial's own cleanup may not have run yet.
 				if (this.inflightDials.get(key) === joined)
 					this.inflightDials.delete(key);
-				return this.dialPeer(pubkey, host, port, transport, remainingMs);
+				return this.dialPeer(
+					pubkey,
+					host,
+					port,
+					transport,
+					remainingMs,
+					learned
+				);
 			});
 		}
-		const attempt = this.dialPeerOnce(pubkey, host, port, transport, timeoutMs);
+		const attempt = this.dialPeerOnce(
+			pubkey,
+			host,
+			port,
+			transport,
+			timeoutMs,
+			learned
+		);
 		this.inflightDials.set(key, attempt);
 		void attempt
 			.catch(() => undefined)
@@ -641,7 +839,8 @@ export class PeerManager extends EventEmitter {
 		host: string,
 		port: number,
 		transport?: IPeerTransportOptions,
-		timeoutMs?: number
+		timeoutMs?: number,
+		learned = false
 	): Promise<void> {
 		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		const dialAbort = new AbortController();
@@ -658,13 +857,30 @@ export class PeerManager extends EventEmitter {
 		// Keep stored address objects shaped exactly as before for TCP peers
 		// (no `transport` key unless a non-default transport was requested).
 		const addressEntry = transport ? { host, port, transport } : { host, port };
+		// A restricted dial never becomes the peer's last-known-good address:
+		// that slot is redialed under the configured proxy scope, which may be
+		// direct. The peer stays reachable through the announced set, which
+		// is held to the same rule on every round.
+		const restricted = this.restrictsLearned(learned);
 		if (this.peers.has(pubkey)) {
 			// Idempotent: the post-condition "connected to this peer" already holds.
 			// Throwing here forces every caller (reconnect loops, app code) to special-
 			// case an already-connected peer; instead refresh the cached address and
 			// return successfully.
-			this.peerAddresses.set(pubkey, addressEntry);
+			if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 			return;
+		}
+		// Checked before any socket, resolver or proxy is touched.
+		const learnedProxy = restricted
+			? this.learnedAddressProxy(host, transport)
+			: undefined;
+		if (restricted && !learnedProxy) {
+			throw new LearnedAddressRefusedError(
+				pubkey,
+				transport?.type === 'ws' && transport.url
+					? transport.url
+					: `${host}:${port}`
+			);
 		}
 
 		// Remember the last-known-good address: a failed dial to a NEW address
@@ -672,7 +888,7 @@ export class PeerManager extends EventEmitter {
 		// address (e.g. one typo'd manual connectPeer permanently breaks
 		// reconnection to a channel peer).
 		const previousAddress = this.peerAddresses.get(pubkey);
-		this.peerAddresses.set(pubkey, addressEntry);
+		if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 
 		let createSocket:
 			| ((h: string, p: number) => Promise<IDuplexTransport>)
@@ -762,11 +978,43 @@ export class PeerManager extends EventEmitter {
 						)
 				: primary;
 		} else if (transport?.type === 'ws') {
-			// WebSocket transport (does NOT route through the SOCKS5 proxy)
+			// Routed as a TCP dial is (selectOutboundProxy), by the host the
+			// WebSocket connects to. Through a proxy the dial is made by the
+			// in-repo client over the proxy's socket: the name goes to the
+			// proxy unresolved, TLS runs inside the tunnel, and there is no
+			// direct dial behind it. An injected webSocketImpl cannot be
+			// handed a socket, so it serves direct dials only.
+			//
+			// With no proxy configured an onion host falls back to Tor's
+			// default port, which helps only a runtime that opens its own
+			// sockets. A browser has nothing but its own WebSocket to reach
+			// an onion host with, and keeps it.
 			const url = transport.url ?? buildWebSocketUrl(host, port);
-			const webSocketImpl = this.webSocketImpl ?? defaultWebSocketImpl();
-			createSocket = (): Promise<IDuplexTransport> =>
-				connectWebSocket(url, { webSocketImpl });
+			createSocket = async (): Promise<IDuplexTransport> => {
+				// Portable transports already resolve the requested destination
+				// (for example, Tor runs at the fixed byte relay). A SOCKS
+				// handshake here would be sent to the relay or the peer rather
+				// than a SOCKS server, so such a host takes the in-repo client
+				// over its own adapter (defaultWebSocketImpl) and no proxy.
+				const platformRoutes =
+					(
+						nodeNet() as typeof net & {
+							handlesDestinationRouting?: boolean;
+						}
+					).handlesDestinationRouting === true;
+				const proxy =
+					!platformRoutes && (this.socks5Proxy || isNodeRuntime())
+						? selectOutboundProxy(
+								parseWebSocketUrl(url).host,
+								this.socks5Proxy,
+								this.socks5ProxyScope
+						  )
+						: undefined;
+				const webSocketImpl = proxy
+					? nodeWebSocketVia(this.buildSocks5Factory(proxy, timeoutMs))
+					: this.webSocketImpl ?? defaultWebSocketImpl();
+				return connectWebSocket(url, { webSocketImpl });
+			};
 		} else {
 			// Route selection for the outbound socket (selectOutboundProxy):
 			//   .onion           -> always via Tor (explicit proxy, else the default)
@@ -786,7 +1034,8 @@ export class PeerManager extends EventEmitter {
 				).handlesDestinationRouting === true;
 			const proxy = platformRoutes
 				? undefined
-				: selectOutboundProxy(host, this.socks5Proxy, this.socks5ProxyScope);
+				: learnedProxy ??
+				  selectOutboundProxy(host, this.socks5Proxy, this.socks5ProxyScope);
 			createSocket = proxy
 				? this.buildSocks5Factory(proxy, timeoutMs)
 				: undefined;
@@ -864,7 +1113,7 @@ export class PeerManager extends EventEmitter {
 		}
 		// The completed handshake proves this address dials the peer: later
 		// overlapping failures roll back to it, never past it.
-		burst.previous = addressEntry;
+		if (!restricted) burst.previous = addressEntry;
 		// Recheck AFTER the async establishment: a freeze, destroy or gate
 		// closure that landed mid-handshake must win over registration.
 		if (
@@ -939,7 +1188,7 @@ export class PeerManager extends EventEmitter {
 		// A newer overlapping dial may have stored its own attempt meanwhile;
 		// the registered connection's address is the one listPeers() reports
 		// and the peer:connect handlers persist, so re-assert it.
-		this.peerAddresses.set(pubkey, addressEntry);
+		if (!restricted) this.peerAddresses.set(pubkey, addressEntry);
 		// Reset the backoff only AFTER the connection proves stable, not
 		// immediately — otherwise a peer that drops right after connecting keeps
 		// reconnecting at the minimum delay. The disconnect handler clears this
@@ -1026,11 +1275,12 @@ export class PeerManager extends EventEmitter {
 	private removeRegisteredPeer(
 		pubkey: string,
 		peer: Peer,
-		reason?: string
+		reason?: string,
+		flushMs?: number
 	): void {
 		if (this.peers.get(pubkey) !== peer) return;
 		peer.removeAllListeners();
-		peer.disconnect();
+		peer.disconnect(flushMs);
 		this.peers.delete(pubkey);
 		this.clearStabilityTimer(pubkey);
 		const info = this.takeDisconnectInfo(
@@ -1121,9 +1371,10 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
-	 * Disconnect from a peer.
+	 * Disconnect from a peer. `flushMs` bounds how long writes already queued
+	 * to it may take to leave (see Peer.disconnect).
 	 */
-	disconnectPeer(pubkey: string): void {
+	disconnectPeer(pubkey: string, flushMs?: number): void {
 		pubkey = normalizeHexPubkey(pubkey);
 		const lanePeer = this.lanePeers.get(pubkey);
 		if (lanePeer) {
@@ -1161,7 +1412,7 @@ export class PeerManager extends EventEmitter {
 
 		const peer = this.peers.get(pubkey);
 		if (peer) {
-			this.removeRegisteredPeer(pubkey, peer, 'disconnect requested');
+			this.removeRegisteredPeer(pubkey, peer, 'disconnect requested', flushMs);
 		}
 	}
 
@@ -1518,6 +1769,8 @@ export class PeerManager extends EventEmitter {
 				info.transport = 'iroh';
 				info.iroh = diagnostics;
 			}
+			const porch = peer.getPorchCircuit();
+			if (porch) info.porch = porch;
 			result.push(info);
 		}
 		return result;
@@ -1567,25 +1820,65 @@ export class PeerManager extends EventEmitter {
 	 * Addresses a reconnect round dials, in order: the last-known-good outbound
 	 * address first, then gossip-announced fallbacks (deduplicated against it).
 	 */
-	private reconnectCandidates(
-		pubkey: string
-	): Array<{ host: string; port: number; transport?: IPeerTransportOptions }> {
+	private reconnectCandidates(pubkey: string): Array<{
+		host: string;
+		port: number;
+		transport?: IPeerTransportOptions;
+		learned?: boolean;
+	}> {
 		const candidates: Array<{
 			host: string;
 			port: number;
 			transport?: IPeerTransportOptions;
+			learned?: boolean;
 		}> = [];
 		const dialed = this.peerAddresses.get(pubkey);
 		if (dialed && (dialed.transport?.type !== 'iroh' || this.isIrohEnabled()))
 			candidates.push(dialed);
 		for (const addr of this.announcedAddresses.get(pubkey) ?? []) {
+			// One the proxy cannot carry would only ever be refused; leaving
+			// it out keeps a peer with nothing else from being retried for good.
+			if (!this.canDialLearnedAddress(addr.host)) continue;
 			if (
 				!candidates.some((c) => c.host === addr.host && c.port === addr.port)
 			) {
-				candidates.push(addr);
+				candidates.push({ ...addr, learned: true });
 			}
 		}
 		return candidates;
+	}
+
+	/**
+	 * Whether a dial to a learned address at `host` would be attempted: always
+	 * under learnedAddressDials 'any', and under 'proxy-only' when the proxy
+	 * carries it. For a caller choosing among several learned addresses.
+	 */
+	canDialLearnedAddress(host: string): boolean {
+		return (
+			this.learnedAddressDials === 'any' ||
+			this.learnedAddressProxy(host, undefined) !== undefined
+		);
+	}
+
+	private restrictsLearned(learned: boolean): boolean {
+		return learned && this.learnedAddressDials === 'proxy-only';
+	}
+
+	/**
+	 * The proxy a restricted learned dial rides, or undefined when it must be
+	 * refused. Scope 'all' whatever the configured scope is: under 'onion' a
+	 * public clearnet host is dialed directly, which is exactly what the
+	 * restriction exists to prevent. Only a TCP address qualifies: a learned
+	 * WebSocket or Iroh address is refused.
+	 */
+	private learnedAddressProxy(
+		host: string,
+		transport: IPeerTransportOptions | undefined
+	): { host: string; port: number } | undefined {
+		if (transport && transport.type !== 'tcp') return undefined;
+		// selectOutboundProxy falls back to Tor's default port for .onion with
+		// no proxy set; every other host needs a configured one.
+		return selectOutboundProxy(host, this.socks5Proxy, 'all');
 	}
 
 	/**
@@ -1729,15 +2022,38 @@ export class PeerManager extends EventEmitter {
 			return Promise.reject(
 				new Error('Iroh is not enabled; configure an Iroh endpoint factory')
 			);
+		if (this.irohRelayOnlyFailure)
+			return Promise.reject(this.irohRelayOnlyFailure);
 		if (this.irohEndpoint) return Promise.resolve(this.irohEndpoint);
 		if (!this.irohBinding) {
 			const { factory, ...config } = this.irohConfig;
+			const relayOnly = config.relayOnly === true;
 			this.irohBinding = factory({
 				...config,
+				...(relayOnly
+					? {
+							onRelayOnlyViolation: (error: IrohRelayOnlyError): void => {
+								this.irohRelayOnlyViolated(error);
+								config.onRelayOnlyViolation?.(error);
+							}
+					  }
+					: {}),
 				maxPendingInbound: this.maxPendingInbound,
 				handshakeTimeoutMs: this.inboundHandshakeTimeoutMs
 			})
 				.then(async (endpoint) => {
+					// A factory that ignored the option hands back an endpoint
+					// that offers its addresses to every peer.
+					if (relayOnly && !endpoint.relayOnly) {
+						await endpoint.close().catch(() => undefined);
+						throw new IrohRelayOnlyError(
+							'Iroh relay-only was asked for, and the endpoint factory did not provide it'
+						);
+					}
+					if (this.irohRelayOnlyFailure) {
+						await endpoint.close().catch(() => undefined);
+						throw this.irohRelayOnlyFailure;
+					}
 					if (this.connectionsDisabled()) {
 						await endpoint.close();
 						throw new Error('Iroh endpoint invalidated while binding');
@@ -1745,11 +2061,47 @@ export class PeerManager extends EventEmitter {
 					this.irohEndpoint = endpoint;
 					return endpoint;
 				})
+				.catch((err) => {
+					if (err instanceof IrohRelayOnlyError)
+						this.irohRelayOnlyFailure ??= err;
+					throw err;
+				})
 				.finally(() => {
 					this.irohBinding = undefined;
 				});
 		}
 		return this.irohBinding;
+	}
+
+	/**
+	 * A relay-only endpoint found a routable address in its own list and
+	 * closed itself, which drops every peer it carried. Stop offering the
+	 * link, keep the reason, and tell the node.
+	 */
+	private irohRelayOnlyViolated(error: IrohRelayOnlyError): void {
+		if (this.irohRelayOnlyFailure) return;
+		this.irohRelayOnlyFailure = error;
+		this.irohListening = false;
+		this.irohEndpoint = undefined;
+		this.emit('iroh:relay-only-violated', error);
+	}
+
+	/** Whether the Iroh endpoint was configured relay-only. */
+	isIrohRelayOnly(): boolean {
+		return this.irohConfig?.relayOnly === true;
+	}
+
+	/**
+	 * How the bound Iroh endpoint keeps to its relay: undefined when relay-only
+	 * was not asked for, or while no endpoint is bound.
+	 */
+	getIrohRelayOnlyMode(): IrohRelayOnlyMode | undefined {
+		return this.irohEndpoint?.relayOnly;
+	}
+
+	/** Why relay-only Iroh shut down, if it did. */
+	getIrohRelayOnlyFailure(): IrohRelayOnlyError | undefined {
+		return this.irohRelayOnlyFailure;
 	}
 
 	async listenIroh(): Promise<void> {
@@ -1776,10 +2128,163 @@ export class PeerManager extends EventEmitter {
 	getIrohConnectionString(): string | undefined {
 		if (!this.irohListening || !this.irohEndpoint) return undefined;
 		const address = this.irohEndpoint.address();
-		// Private discovery needs a relay hint before this URI is dialable.
-		if (this.irohConfig?.discovery === false && !address.relayUrl)
+		// Private discovery needs a relay hint before this URI is dialable,
+		// and a relay-only endpoint is reachable no other way.
+		if (
+			(this.irohConfig?.discovery === false || this.irohConfig?.relayOnly) &&
+			!address.relayUrl
+		)
 			return undefined;
 		return `${this.localPubkeyHex}@${formatIrohAddress(address)}`;
+	}
+
+	// ── Porch ────────────────────────────────────────────────────
+
+	/**
+	 * Check the Porch configuration and build one host per relay. Nothing is
+	 * dialed until listenPorch(), but a relay that could never be dialed as
+	 * configured fails here, when the node is built.
+	 */
+	private configurePorch(config: IPorchConfig): void {
+		if (config.relays.length === 0) {
+			throw new Error('Porch needs at least one relay');
+		}
+		const hostSecret = Buffer.from(config.hostSecret);
+		this.porchHostKey = getPublicKey(hostSecret);
+		this.porchTags = PeerManager.porchTagList(config.tags);
+		const seen = new Set<string>();
+		for (const entry of config.relays) {
+			const { url, token } =
+				typeof entry === 'string' ? { url: entry, token: undefined } : entry;
+			const relay = parsePorchRelayUrl(url);
+			if (seen.has(relay.authority)) {
+				throw new Error(`Porch relay ${relay.authority} is listed twice`);
+			}
+			seen.add(relay.authority);
+			const proxy = selectPorchProxy(
+				relay.host,
+				config.via,
+				this.socks5Proxy,
+				this.socks5ProxyScope,
+				config.proxy
+			);
+			// A host's message cap is fixed for the life of the connection, so
+			// it is the one a stranger gets.
+			const limits = { maxPayloadBytes: PORCH_MAX_MESSAGE_BYTES };
+			const host = new PorchHost({
+				relay,
+				hostSecret,
+				tags: (): readonly Uint8Array[] => this.porchTags,
+				...(token !== undefined ? { token } : {}),
+				...(config.standbys !== undefined ? { standbys: config.standbys } : {}),
+				...(config.timing ? { timing: config.timing } : {}),
+				// The one place a relay is dialed. With a proxy the name goes to
+				// the proxy unresolved, and there is no direct dial behind it.
+				webSocket: proxy
+					? nodeWebSocketVia(
+							socks5SocketFactory(proxy, this.socks5TimeoutMs),
+							limits
+					  )
+					: class extends NodeWebSocket {
+							constructor(target: string) {
+								super(target, limits);
+							}
+					  },
+				onCircuit: (circuit): void => this.handleInboundConnection(circuit)
+			});
+			host.on('status', (status: IPorchHostStatus) => {
+				this.emit('porch:status', status);
+			});
+			this.porchRelays.push(relay);
+			this.porchHosts.push(host);
+		}
+	}
+
+	/** Sorted, distinct and well formed, as a registration lists them. */
+	private static porchTagList(tags: readonly Uint8Array[]): Buffer[] {
+		if (tags.length > PORCH_MAX_TAGS) {
+			throw new Error(`A Porch host serves at most ${PORCH_MAX_TAGS} links`);
+		}
+		const sorted = tags.map((tag) => {
+			if (tag.length !== PORCH_TAG_BYTES) {
+				throw new Error(`Porch link tag must be ${PORCH_TAG_BYTES} bytes`);
+			}
+			return Buffer.from(tag);
+		});
+		sorted.sort(Buffer.compare);
+		return sorted.filter((tag, i) => i === 0 || !tag.equals(sorted[i - 1]));
+	}
+
+	/** Whether Porch relays are configured. */
+	isPorchEnabled(): boolean {
+		return this.porchHosts.length > 0;
+	}
+
+	/**
+	 * Start waiting at the configured Porch relays. It returns at once and
+	 * dials in the background: a relay that is away or refuses is reported
+	 * through 'porch:status' and getPorchStatus(), and retried, where a port
+	 * that cannot be bound is an error.
+	 */
+	listenPorch(): void {
+		if (this.connectionsDisabled()) throw new Error('Connections are disabled');
+		if (!this.isPorchEnabled()) {
+			throw new Error('Porch is not enabled; configure porch.relays');
+		}
+		for (const host of this.porchHosts) host.start();
+	}
+
+	/** Whether the node is waiting at its Porch relays (reachable or not). */
+	isListeningPorch(): boolean {
+		return this.porchHosts.some((host) => host.status().state !== 'stopped');
+	}
+
+	/** One entry per configured relay, in the order they were given. */
+	getPorchStatus(): IPorchHostStatus[] {
+		return this.porchHosts.map((host) => host.status());
+	}
+
+	/**
+	 * The peer URIs this node can be reached by through Porch: one per link
+	 * and relay. A URI works while that relay's status is 'ready'.
+	 */
+	getPorchLinks(): IPorchLink[] {
+		const hostKey = this.porchHostKey;
+		if (!hostKey) return [];
+		const links: IPorchLink[] = [];
+		for (const tag of this.porchTags) {
+			const routeId = porchRouteId(hostKey, tag);
+			for (const relay of this.porchRelays) {
+				links.push({
+					relay: relay.origin,
+					tag: tag.toString('hex'),
+					uri: porchLink(this.localPubkeyHex, relay, routeId)
+				});
+			}
+		}
+		return links;
+	}
+
+	/**
+	 * Replace the links served. A link that is no longer listed stops
+	 * resolving at the relays, and the connections that came in through it
+	 * are closed, channel peers included: a link is revoked for whoever
+	 * holds it.
+	 */
+	setPorchTags(tags: readonly Uint8Array[]): void {
+		if (!this.isPorchEnabled()) {
+			throw new Error('Porch is not enabled; configure porch.relays');
+		}
+		const next = PeerManager.porchTagList(tags);
+		const kept = new Set(next.map((tag) => tag.toString('hex')));
+		const removed = this.porchTags
+			.map((tag) => tag.toString('hex'))
+			.filter((tag) => !kept.has(tag));
+		this.porchTags = next;
+		for (const host of this.porchHosts) {
+			host.refresh();
+			for (const tag of removed) host.closeCircuits(tag);
+		}
 	}
 
 	/** Stop all inbound listeners, retaining the endpoint for outbound dials. */
@@ -1787,6 +2292,7 @@ export class PeerManager extends EventEmitter {
 		this.irohListenEpoch++;
 		this.irohListening = false;
 		this.irohEndpoint?.stopListening();
+		for (const host of this.porchHosts) host.stop();
 		if (this.server) {
 			this.server.close();
 			this.server = null;
@@ -1799,13 +2305,14 @@ export class PeerManager extends EventEmitter {
 
 	/**
 	 * Whether the peer manager is listening for inbound connections
-	 * (TCP, WebSocket or Iroh).
+	 * (TCP, WebSocket, Iroh or Porch).
 	 */
 	isListening(): boolean {
 		return (
 			(this.server !== null && this.server.listening) ||
 			(this.wsServer !== null && this.wsServer.isListening()) ||
-			this.irohListening
+			this.irohListening ||
+			this.isListeningPorch()
 		);
 	}
 
@@ -2191,7 +2698,14 @@ export class PeerManager extends EventEmitter {
 			for (const addr of this.reconnectCandidates(pubkey)) {
 				if (cancelled()) return;
 				try {
-					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
+					await this.dialPeer(
+						pubkey,
+						addr.host,
+						addr.port,
+						addr.transport,
+						undefined,
+						addr.learned === true
+					);
 					return;
 				} catch {
 					// try the next candidate

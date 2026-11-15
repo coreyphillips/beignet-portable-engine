@@ -27,8 +27,54 @@ export interface IIrohStream {
 	diagnostics(): IIrohDiagnostics;
 }
 
+/**
+ * How a relay-only endpoint keeps its traffic on the relay.
+ *
+ * - `'native'`: the endpoint has no IP transport at all, so it has no
+ *   socket to send from, nothing to map on the router and no address to
+ *   discover.
+ * - `'loopback-pin'`: the binding cannot remove the IP transport, so its
+ *   sockets are bound to loopback instead. No direct path can form, but
+ *   Iroh's port mapper still runs, and on a network where UPnP, NAT-PMP or
+ *   PCP answers it adds the router's public address to the endpoint's own
+ *   address list. The endpoint is watched before it accepts or makes a
+ *   connection and for as long as it lives, and it shuts itself down when a
+ *   routable address appears. So this mode is best effort: it holds on
+ *   networks with no port mapper to answer (a Docker bridge) and refuses to
+ *   run on the others. A mapping first granted while peers are connected
+ *   can reach them in the moment before the endpoint closes.
+ */
+export type IrohRelayOnlyMode = 'native' | 'loopback-pin';
+
+/** A relay-only endpoint that can no longer keep the node's address private. */
+export class IrohRelayOnlyError extends Error {
+	readonly code = 'IROH_RELAY_ONLY_VIOLATED';
+	constructor(message: string) {
+		super(message);
+		this.name = 'IrohRelayOnlyError';
+	}
+}
+
+/**
+ * A dial a relay-only endpoint will not make, because it could not be kept on
+ * the endpoint's own relays: any other relay would see where the dial comes
+ * from, and whoever is dialed chooses that relay. Nothing was sent, and the
+ * endpoint goes on serving, which is what tells this from IrohRelayOnlyError.
+ */
+export class IrohRelayOnlyDialError extends Error {
+	readonly code = 'IROH_RELAY_ONLY_DIAL_REFUSED';
+	constructor(message: string) {
+		super(message);
+		this.name = 'IrohRelayOnlyDialError';
+	}
+}
+
 export interface IIrohEndpoint {
 	address(): IIrohAddress;
+	/**
+	 * A relay-only endpoint rejects with IrohRelayOnlyDialError when it cannot
+	 * keep the dial on its own relays (irohRelayOnlyDialRefusal).
+	 */
 	connect(address: IIrohAddress, timeoutMs: number): Promise<IDuplexTransport>;
 	listen(
 		onConnection: (socket: IDuplexTransport) => void,
@@ -36,6 +82,13 @@ export interface IIrohEndpoint {
 	): void;
 	stopListening(): void;
 	close(): Promise<void>;
+	/**
+	 * Set by an endpoint that was bound relay-only, and only by one. A factory
+	 * that ignores IIrohEndpointOptions.relayOnly leaves it unset, which is how
+	 * the peer manager tells a relay-only endpoint from one that would offer
+	 * its addresses to every peer.
+	 */
+	readonly relayOnly?: IrohRelayOnlyMode;
 }
 
 export interface IIrohEndpointOptions {
@@ -44,6 +97,24 @@ export interface IIrohEndpointOptions {
 	relays?: string[];
 	/** False disables public address discovery and publication. */
 	discovery?: boolean;
+	/**
+	 * true: no direct paths. All traffic rides the relay and no IP address is
+	 * offered to a peer, so whoever holds this endpoint's link cannot learn
+	 * where it runs. The relay operator still sees the address. Needs a
+	 * relay, and an endpoint that sets IIrohEndpoint.relayOnly in return.
+	 *
+	 * That covers the relays this endpoint was given and no others. A dial
+	 * goes to the relay the dialed peer names, in its link or in the record it
+	 * publishes, so the endpoint dials out only with discovery off and only to
+	 * a peer on one of its own relays (irohRelayOnlyDialRefusal).
+	 */
+	relayOnly?: boolean;
+	/**
+	 * Called once when a bound relay-only endpoint finds it cannot keep that
+	 * promise. The endpoint has already closed itself. A problem found while
+	 * binding rejects the factory instead.
+	 */
+	onRelayOnlyViolation?: (error: IrohRelayOnlyError) => void;
 	maxPendingInbound?: number;
 	handshakeTimeoutMs?: number;
 }
@@ -53,6 +124,25 @@ export type IrohEndpointFactory = (
 ) => Promise<IIrohEndpoint>;
 export interface IIrohConfig extends IIrohEndpointOptions {
 	factory: IrohEndpointFactory;
+}
+
+/**
+ * Whether an `ip:port` socket address is loopback: 127.0.0.0/8, ::1, or
+ * either one mapped into IPv6. Strict on purpose: a private LAN address is
+ * not loopback, and neither is anything this cannot parse.
+ */
+export function isLoopbackSocketAddress(address: string): boolean {
+	const bracketed = /^\[([0-9a-f:.]+)\](?::\d+)?$/i.exec(address);
+	const host = bracketed ? bracketed[1] : address.replace(/:\d+$/, '');
+	const mapped = /^::ffff:(.+)$/i.exec(host);
+	const ip = (mapped ? mapped[1] : host).toLowerCase();
+	if (/^127(\.\d{1,3}){3}$/.test(ip)) return true;
+	return ip === '::1' || ip === '0:0:0:0:0:0:0:1';
+}
+
+/** The addresses in an endpoint's list that a peer could route to. */
+export function routableSocketAddresses(addresses: string[]): string[] {
+	return addresses.filter((address) => !isLoopbackSocketAddress(address));
 }
 
 /** HKDF-SHA256 from the BIP39 seed, independent of Lightning signing keys. */
@@ -109,6 +199,57 @@ export function validateIrohRelayUrl(value: string): string {
 		);
 	}
 	return url.toString();
+}
+
+/**
+ * The server a relay URL reaches, in one spelling: scheme, host and port.
+ * Iroh writes its own relays as fully qualified names (a trailing dot) and a
+ * link may carry either form, so the dot is dropped. The path and query do
+ * not change who runs the server, and are left out.
+ */
+export function irohRelayServer(value: string): string {
+	const url = new URL(validateIrohRelayUrl(value));
+	const host = url.hostname.toLowerCase().replace(/\.$/, '');
+	return `${url.protocol}//${host}${url.port ? `:${url.port}` : ''}`;
+}
+
+/**
+ * Why a relay-only endpoint must refuse to dial `address`, or undefined when
+ * the dial stays on `ownRelays` (the relays the endpoint was bound with).
+ *
+ * A dial reaches the peer through the peer's relay, and that relay sees the
+ * dialer's IP address. The peer chooses it twice over: as the relay named in
+ * its link, and as the relay in the record it publishes, which Iroh looks up
+ * on every dial while discovery is on and then sends to as well. So with
+ * discovery on no dial can be held to this endpoint's relays, and with it
+ * off the relay in the address has to be one of them.
+ *
+ * An address with no relay is left to the caller's own rules: it names
+ * nothing this could leak to.
+ */
+export function irohRelayOnlyDialRefusal(
+	address: Pick<IIrohAddress, 'relayUrl'>,
+	discovery: boolean,
+	ownRelays: string[]
+): string | undefined {
+	if (discovery)
+		return (
+			'Iroh relay-only does not dial out while discovery is on: the dial ' +
+			'would also go to whichever relay the peer has published, and that ' +
+			"relay would see this node's address. Turn Iroh discovery off to " +
+			"dial a peer on one of this node's own relays, or let the peer " +
+			'connect in'
+		);
+	if (!address.relayUrl) return undefined;
+	const server = irohRelayServer(address.relayUrl);
+	if (ownRelays.some((relay) => irohRelayServer(relay) === server))
+		return undefined;
+	return (
+		`Iroh relay-only does not dial through ${server}: it is not one of ` +
+		"this node's own relays, and the relay a dial goes through sees this " +
+		"node's address. Let the peer connect in, or add the relay to this " +
+		"node's own if you trust whoever runs it"
+	);
 }
 
 export function parseIrohAddress(address: string): IIrohAddress {

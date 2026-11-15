@@ -17,12 +17,15 @@
 
 import type { EventEmitter } from 'events';
 import type { IIrohDiagnostics } from './iroh';
+import type { IPorchCircuitInfo } from './porch-host';
 
 export interface IDuplexTransport extends EventEmitter {
 	/** The selected stream uses Tor or a configured SOCKS proxy. */
 	readonly viaTor?: boolean;
 	readonly transportType?: 'tcp' | 'ws' | 'iroh';
 	getIrohDiagnostics?(): IIrohDiagnostics;
+	/** Set on a connection a Porch relay carried in. */
+	readonly porch?: IPorchCircuitInfo;
 	/**
 	 * Queue bytes for sending. The optional callback fires once the data has
 	 * been handed to the underlying transport (or with an error on failure).
@@ -40,6 +43,12 @@ export interface IDuplexTransport extends EventEmitter {
 	setTimeout(timeout: number, callback?: () => void): this;
 	/** Enable transport-level keepalive probing where supported (else no-op). */
 	setKeepAlive(enable?: boolean, initialDelay?: number): this;
+	/**
+	 * Send every write at once, instead of holding a small one back until
+	 * the one before it is acknowledged (TCP_NODELAY on a TCP socket).
+	 * Optional: a transport that does not hold writes back leaves it out.
+	 */
+	setNoDelay?(noDelay?: boolean): this;
 	/**
 	 * Tear the transport down immediately. When `error` is provided it is
 	 * emitted as 'error' (if listeners exist) and 'close' reports hadError.
@@ -78,8 +87,9 @@ export interface IPeerTransportOptions {
 	fallbackOnion?: { host: string; port: number };
 	/**
 	 * WS only: explicit WebSocket URL (ws:// or wss://). Defaults to
-	 * `ws://host:port` built from the dial address. Note that WebSocket
-	 * connections do not route through the SOCKS5 proxy.
+	 * `ws://host:port` built from the dial address. The host in this URL is
+	 * the one dialed, and it decides whether the SOCKS5 proxy carries the
+	 * connection, as a TCP peer's host does.
 	 */
 	url?: string;
 }

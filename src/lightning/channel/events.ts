@@ -38,6 +38,8 @@ export interface ChannelManagerEvents {
 	'channel:reestablished': (channelId: Buffer) => void;
 	/** The connection to a peer ended; its channels are being marked for reestablish. Emitted before any of them is. */
 	'peer:disconnected': (peerPubkey: string) => void;
+	/** A protocol violation was answered with a warning and the connection must close. Emitted only when no PeerManager holds the peer's connection. */
+	'peer:disconnect-needed': (peerPubkey: string, reason: string) => void;
 	/** The real short channel id was assigned once the funding reached announcement depth. */
 	'channel:scid-assigned': (channelId: Buffer, shortChannelId: Buffer) => void;
 	/** A caller-driven v2 open owes its tx_signatures. */
@@ -152,11 +154,16 @@ export interface ChannelManagerEvents {
 		amountMsat: bigint,
 		paymentHash: Buffer
 	) => void;
-	/** An offered HTLC was fulfilled. */
+	/**
+	 * An offered HTLC was fulfilled. `replay` is true when the fulfil was
+	 * already processed once and is delivered again (re-emitted from the
+	 * stored entry on reestablish, or retransmitted by the peer).
+	 */
 	'htlc:fulfilled': (
 		channelId: Buffer,
 		htlcId: bigint,
-		preimage: Buffer
+		preimage: Buffer,
+		replay: boolean
 	) => void;
 	/** An offered HTLC was failed. `malformedCode` is set only for update_fail_malformed_htlc. */
 	'htlc:failed': (

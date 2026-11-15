@@ -21,6 +21,7 @@ import { buildHrp } from './amount';
 import { bufferToWords, encodeUintToWords, encodeTaggedField } from './words';
 import { signInvoice } from './signing';
 import { encodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
+import { encodeBolt1String } from '../message/field-rules';
 
 /**
  * Encode a BOLT 11 invoice from creation options.
@@ -75,7 +76,9 @@ export function encode(options: IInvoiceCreationOptions): string {
 
 	// Tag 13: description OR Tag 23: description_hash
 	if (options.description !== undefined) {
-		const descWords = bufferToWords(Buffer.from(options.description, 'utf8'));
+		const descWords = bufferToWords(
+			encodeBolt1String(options.description, 'Invoice description')
+		);
 		dataWords.push(...encodeTaggedField(TagType.DESCRIPTION, descWords));
 	} else if (options.descriptionHash) {
 		if (options.descriptionHash.length !== 32) {
@@ -119,8 +122,8 @@ export function encode(options: IInvoiceCreationOptions): string {
 		);
 	}
 
-	// Tag 5: feature bits
-	if (options.featureBits) {
+	// Tag 5: feature bits, left out when none are set as BOLT 11 requires
+	if (options.featureBits && options.featureBits.listSetBits().length > 0) {
 		dataWords.push(
 			...encodeTaggedField(
 				TagType.FEATURE_BITS,
@@ -176,12 +179,10 @@ export function encode(options: IInvoiceCreationOptions): string {
 }
 
 /**
- * Encode a non-negative integer as variable-width 5-bit words (minimum words needed).
+ * Encode a non-negative integer as variable-width 5-bit words (minimum words
+ * needed). Zero is no words at all: a reader refuses a leading zero word.
  */
 function encodeVarInt(value: number): number[] {
-	if (value === 0) {
-		return [0];
-	}
 	const words: number[] = [];
 	let v = value;
 	while (v > 0) {
@@ -221,10 +222,6 @@ function encodeFallbackAddress(addr: IFallbackAddress): number[] {
  */
 function encodeFeatureBits(features: FeatureFlags): number[] {
 	const setBits = features.listSetBits();
-	if (setBits.length === 0) {
-		return [0];
-	}
-
 	const maxBit = setBits[setBits.length - 1];
 	const wordCount = Math.ceil((maxBit + 1) / 5);
 	const words: number[] = new Array(wordCount).fill(0);
